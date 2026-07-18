@@ -3,15 +3,48 @@
 // makes sense if it also has a `free` method, i.e., also encompasses the
 // memory allocator. Come up with better names and change them throughout the
 // codebase.
+//
+// Claude: a few candidates worth considering — `Backable` -> `Store` (the
+// plain, non-backed value type; reads as "a Vec you can store") or `Data`;
+// `Backed` (the wrapper role, currently doing double duty as both "the
+// mutable-access wrapper trait" and implicitly "a thing that is backed") ->
+// `Handle` or `View` (emphasizes "a live, mutation-capable view into backed
+// data", and doesn't collide with the crate-level idea of "a backed data
+// structure" as a whole); `Sink` -> `Journal` or `Store` (but `Store` would
+// then collide with the `Backable` rename above) — maybe `Journal` for the
+// `record` half and keep `free`/allocation on a separate small trait that
+// `Journal: Alloc` or similar composes, since "journal" doesn't obviously
+// cover freeing memory either. Worth deciding once the `Sink`/`alloc`
+// boundary from the pointer-representation discussion below settles, since
+// that affects what this trait's responsibilities actually are.
 
 // CRATE `traits` =============================================================
 use std::ops::{Deref, DerefMut};
 
+// Claude: `OwnedPointer<T>` is used here but never defined anywhere in this
+// sketch. Per the README discussion (pointer-representation open question),
+// it should be a small, opaque, position-keyed marker, e.g.
+// `struct OwnedPointer<T> { position: u32, _marker: PhantomData<T> }`.
+// Where it lives matters for the crate graph: `Sink::free` (here, in
+// `traits`) takes it by value, so if `OwnedPointer` were defined in `alloc`,
+// `traits` would depend on `alloc` — contradicting "alloc depends on traits,
+// not the other way around". `OwnedPointer` (or at least a trait for it)
+// needs to live in `traits` itself, with `alloc` providing the logic that
+// interprets it.
 trait Sink {
     fn record<T: Backable>(&self, op: &T::Op);
     fn free<T: Backable>(&self, pointer: OwnedPointer<T>);
 }
 
+// Claude: `type Backed<S: Sink>: Backed;` declares this GAT with one generic
+// parameter (`S`). But every use site below assumes two (a lifetime plus
+// `S`): `back`'s return type is `Self::Backed<'_, S>`, and the impl further
+// down declares `type Backed<'s, S: Sink> = VecMut<'s, T, S>;`. A GAT's
+// implementations must match the arity/kind of generic parameters declared
+// by the trait exactly, so this won't compile as written — the trait needs
+// `type Backed<'s, S: Sink>: Backed;` (with the lifetime), and `back`'s
+// signature needs an explicit `'s` too:
+// `fn back<'s, S: Sink>(&'s mut self, sink: &'s S) -> Self::Backed<'s, S>;`
 trait Backable {
     type Op;
     type Backed<S: Sink>: Backed;
@@ -29,6 +62,18 @@ trait Backed {
     fn sink(&self) -> &Self::Sink;
 }
 
+// Claude: this pair of blanket impls won't compile — `Deref`/`DerefMut` are
+// foreign traits (from std), and `T` here is a fully generic, unconstrained
+// type parameter, which is exactly what Rust's orphan rules forbid
+// (`error[E0210]`: "type parameter `T` must be covered by a local type").
+// It doesn't help that `T: Backed` is a local bound; coherence checking
+// only looks at whether `Self` is a local type, not at trait bounds on it.
+// Fix: don't blanket-impl `Deref` here at all. Instead, have the derive
+// macro generate a concrete `Deref`/`DerefMut` impl for each generated
+// wrapper type individually (e.g. for `VecMut<'s, T, S>` below) — those are
+// local types in the crate where the macro expands, so there's no orphan
+// issue, and it matches the "one generated wrapper struct per derived type"
+// approach already used for `Backed` further down.
 impl<T: Backed> Deref for T {
     type Target = T::Backable;
 
@@ -67,11 +112,40 @@ impl<T> Vec<T> {
 }
 
 impl<'s, T: Backable, S: Sink> VecMut<'s, T, S> {
+    // Claude: use-after-move — `value` is moved into `VecOp::Push(value)`
+    // on the line above, then moved again into `self.data.push(value)`.
+    // `T` has no `Copy` bound, so this doesn't compile. Fix: since `record`
+    // only needs the op for the duration of the call (it's meant to
+    // serialize immediately, not retain the `Op` value), have it borrow
+    // rather than own the payload — e.g. push first, then record a
+    // reference to what's now the last element:
+    //   self.data.push(value);
+    //   self.sink.record(&VecOp::Push(&self.data[self.data.len() - 1]));
+    // (this needs `VecOp<'a, T>` to hold `&'a T` instead of owned `T`).
+    // Cloning `value` before the move would also work but costs a clone
+    // that shouldn't be necessary.
     pub fn push(&mut self, value: T) {
         self.sink.record(&VecOp::Push(value));
         self.data.push(value);
     }
 
+    // Claude: this takes an extra `sink: &mut impl Sink` parameter even
+    // though `VecMut` already carries `self.sink` — inconsistent with
+    // `push` above, which uses `self.sink` directly and takes no such
+    // parameter. This looks like it's mixing the two competing designs
+    // discussed in the README (sink stored once on the wrapper vs. sink
+    // passed per-call) — see my reply there under "Mut wrapper /
+    // mutable getters", which recommends standardizing on the
+    // stored-on-the-wrapper approach `push` already uses, threading the
+    // *same* `&'s S` further down rather than taking a new one here:
+    //   pub fn get_mut(&mut self, index: usize) -> Option<T::Backed<'_, S>> {
+    //       self.data.get_mut(index).map(|item| item.back(self.sink))
+    //   }
+    // Also note `T::Backed<S>` is missing the lifetime argument (see my
+    // comment on the `Backable` trait declaration above), and wrapping the
+    // already-a-wrapper `T::Backed<...>` in an extra `&mut` looks like a
+    // leftover from a plain `Option<&mut T>`-style signature — the
+    // generated wrapper is meant to be returned by value, not borrowed.
     pub fn get_mut(&mut self, sink: &mut impl Sink, index: usize) -> Option<&mut T::Backed<S>> {
         self.data.get_mut(index).map(|item| item.back(sink))
     }
@@ -80,6 +154,12 @@ impl<'s, T: Backable, S: Sink> VecMut<'s, T, S> {
 // MACRO-GENERATED CODE IN CRATE `types` ======================================
 
 /// Generated from #[derive(Backable)] on `struct Vec<T>`.
+// Claude: `back`'s body does `data: self`, where `self: &mut Vec<T>` — but
+// `VecMut::data` is declared as `Vec<T>` (owned) below, not `&mut Vec<T>`.
+// That's a type mismatch (and conceptually wrong too: `VecMut` is meant to
+// *borrow* the real backing structure for the duration of `'s`, not own a
+// copy of it). `data` should be `&'s mut Vec<T>`; see the field declaration
+// below for the matching fix.
 impl<T> Backable for Vec<T> {
     type Op = VecOp<T>;
     type Backed<'s, S: Sink> = VecMut<'s, T, S>;
@@ -90,6 +170,17 @@ impl<T> Backable for Vec<T> {
 }
 
 /// Generated from #[derive(Backable)] on `struct Vec<T>`.
+// Claude: `data: Vec<T>` should be `data: &'s mut Vec<T>` (see `back` above
+// — it assigns `self`, a `&mut Vec<T>`, into this field). With that fixed,
+// `as_backable`/`as_backable_mut` below need a reborrow rather than `&self.data`
+// / `&mut self.data` (which would produce `&&mut Vec<T>` / doubly-indirect
+// references) — e.g. `fn as_backable(&self) -> &Vec<T> { self.data }` and
+// `fn as_backable_mut(&mut self) -> &mut Vec<T> { self.data }` (Rust
+// reborrows a `&mut` field automatically in return position here).
+//
+// `DefaultSink` is used as the default type argument but never defined —
+// presumably lives in `frontend`, per the README discussion ("`types`
+// probably needs to depend on `frontend`" for exactly this default).
 struct VecMut<'s, T, S = DefaultSink> {
     data: Vec<T>,
     sink: &'s S,
