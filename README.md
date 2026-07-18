@@ -121,6 +121,15 @@ This layout implies two callback boundaries that `traits` needs to make possible
 
      There is one place this still needs care: `position` (where the pointer's own bytes currently sit) has to stay correct not just when the *target* moves, but also when the block *containing* the pointer moves — e.g., if `alloc` compacts an unrelated region and slides a `HashMap`'s bucket block over by a few bytes, something has to walk that block and patch every embedded `OwnedPointer`'s `position`. That "something" has to be type-aware (only the `HashMap` implementation knows which bytes inside its own block are pointer fields), which is exactly the `alloc`→`types` callback this point was trying to avoid. With `OwnedPointer` the callback doesn't disappear, but it only fires when a block *containing* embedded pointers is relocated — and in practice that already tends to happen as part of a type-driven rewrite (the type is already visiting every field to re-serialize it, so patching `position` is free at that point), not as a background operation `alloc` does silently behind a type's back. As long as we commit to "`alloc` never silently relocates a block with embedded pointers without going through its owning type," this stays cheap; generic defragmentation of arbitrary regions independent of type-level operations would need the callback for real.
 
+     - **Response:** counterproposal: `alloc` keeps a list of all live `OwnedPointer`s that stores both the `target` and the `position` of each pointer, and that is sorted by `position` (e.g., a B-tree).
+       When alloc moves memory, it does two things: (i) update the (single) pointer that points to the beginning of the memory section and (ii) search the sorted list for all live pointers whose `position` is within the memory area, update their `position`s, and ensure the B-tree stays sorted.
+       In total, we should probably reconsider the pointer design:
+       - `alloc` keeps indices with the full information: the `target` and `position` of each pointer, a B-tree or otherwise sorted list sorted by `position`, and any additional data required to keep track of allocated and free memory regions and the (indices of) pointers that point to them.
+         These lists should only exist in memory, not in the backed file (they are constructed when the file is first opened and then kept up to date with every change).
+       - the data type implementations probably don't need to hold both `target` and `position`.
+         It suffices if they hold some small opaque data type `OwnedPointer` that can be serialized to the journal and that `alloc` can translate to a `target` and `position`.
+         But I'm not sure yet how to do this.
+
      One trade-off worth flagging given your stated goal of many small, deeply nested types (thus lots of pointers): `Rc<Cell<(u32,u32)>>` is a heap allocation per pointer (refcounts + cell, roughly 24–40 bytes with allocator overhead), whereas a flat handle-table slot would be 4–8 contiguous bytes in an array with no per-pointer heap allocation. That's a real memory-density and cache-locality cost in `alloc`'s bookkeeping for a system meant to have many small pointers — but it stays off-disk either way, which was your main concern, so it seems like a reasonable trade to accept in exchange for not persisting a handle table. Recommendation: go with `OwnedPointer`, store it directly as the value in `alloc`'s block-metadata table rather than a separate registry (single ownership makes them the same thing), and treat "who relocates blocks with embedded pointers" as a rule — only the owning type does it, during its own rewrites — rather than something `alloc` does independently.
 2. `types` (which does not depend on `frontend`) must still get its mutations appended to the file's journal. Resolved by having mutating methods on `types` return `Op` values rather than perform I/O themselves; `frontend` (and `derive`-generated glue) is what actually appends returned `Op`s to the journal.
    - Good catch. No, I don't want mutating methods to return `Op` values because I don't want the user to have to remember to persist changes.
@@ -138,13 +147,25 @@ This layout implies two callback boundaries that `traits` needs to make possible
        ```
        (or generic over an already-serialized byte payload, if `Sink` itself shouldn't need `serde` bounds).
      - Every `Backed` value holds a handle to a `Sink` — recommend a type-erased `Rc<dyn Sink>` (or `&dyn Sink` where lifetimes allow) rather than threading a generic `S: Sink` parameter through every nested container type. The generic version would force `BackedHashMap<K, V, S>`, `BackedVec<T, S>`, every `#[derive(Backed)]` struct, etc. to all carry `S` as a parameter, cascading through the entire type tree for something that only matters on the write path. One dynamic-dispatch call per mutation is a fine price for avoiding that.
+       - Response: Use static dispatch with a generic `S` instead but assign a default type from `frontend` to it. This provides generality without sacrificing performance or ergonomy (application can simply ignore the `S` type parameter if they only need the default sink).
      - Mutating methods call `self.sink.record(...)` themselves and don't return anything journal-related — matches your requirement that persistence isn't optional or forgettable.
      - Nested `Backed` fields need their `Sink` handle propagated from their parent at construction/open/deserialize time; this is a natural thing for `#[derive(Backed)]` to generate automatically (clone the parent's `Rc<dyn Sink>` into each nested field), so application authors never touch it directly.
+       - Response: I'd rather like to use a normal reference `&S` (where `S: Sink`) that is attached to nested data structures on the fly when we access them so that there's no reference counting for every field access, and every nested data structure doesn't explictly have to hold a reference to the sink.
+         Roughly, the way I'm thinking about this is that each mutating operation on a backed data type takes an additional function argument `sink: &mut impl Sink`.
+         This includes mutable getters.
+         One way I could do this would be with a wrapper type `struct Mut<'s, T, S: Sink + 's = DefaultSink>{ data: T, sink: &'s mut S }`.
+         In this approach, backed data types like `HashMap<K, V>` only have non-mutating access methods but they don't directly declare any mutating access methods.
+         For mutating access, one creates an `impl` block for `Mut<'s, HashMap<K, V>, S>`, which defines, for example, a method `.get_mut(&mut self, key: K) -> Mut<'_, &mut V, S>`, where the return type is generated on the fly from the `V` stored in the `HashMap` and the reference to `S` stored in the `Mut` wrapper.
+         To make non-mutating access easy, `Mut<'s, T, S>` should probably implement `Deref<Target=T>`.
+         Does this work? In particular, can third-party crates implement their own methods on `Mut<'s, MyType, S>` as long as `MyType` is theirs? Is there a simpler way to do this? Explain similarities and differences of this `Mut` wrapper compared to the `Py` wraper in the PyO3 library.
+         How would this or any alternative approach work on `[#derive]`d `struct` types (where we want to make sure that mutable access to fields always has an associated reference to the `Sink`).
      - This resolves the dependency question in your favor without `types` needing to depend on `frontend` at all: `types` depends only on the `Sink` trait in `traits`; `frontend` provides the real file-backed implementation.
+       - Response: In order to declare a default type for `S: Sink`, `types` probably needs to depend on `frontend`, but I think that's fine.
      - Being generic over `Sink` (rather than hard-coding the real frontend type) does earn its keep — other implementations worth having:
        - A no-op or purely in-memory `Sink`, for unit-testing `types` logic without touching a file.
        - A recording/spy `Sink`, for asserting exactly which `Op`s a mutation produces.
        - A batching `Sink` that buffers ops for an explicit `commit()` instead of persisting on every call, if that's ever wanted as an opt-in.
+         - Response: yes, this is a good idea. Include this when formulating the final plans from these notes.
        - Eventually, a replicated/networked `Sink` — worth keeping the door open for given the concurrency question below, without committing to it now.
 
 
@@ -161,6 +182,7 @@ This layout implies two callback boundaries that `traits` needs to make possible
   We want to be able to move memory around either without invalidating pointers, or with a way to update existing pointers, and we want to know which memory regions are allocated and where the pointer(s) to them are without needing to involve the data structure implementations, so that the memory unit alone can do compactification.
 
   **Revised design decision** (see the full discussion under [Workspace Layout](#workspace-layout)): use single-owner `OwnedPointer`s (`Rc<Cell<(target, position)>>`, allocated only by `alloc`) rather than a separate on-disk handle table. Because every allocation has exactly one owning pointer, `alloc`'s own per-allocation bookkeeping doubles as that pointer's registry — no extra structure needs to live in the file. The trade-off against a true handle table: relocating a block that has `OwnedPointer`s *embedded in it* (as opposed to being the *target* of one) still needs type-specific cooperation to patch each embedded pointer's `position` — cheap when the owning type is already rewriting that block anyway (the common case), but not free if `alloc` ever wants to relocate arbitrary regions on its own.
+  - **Response:** superseded by above discussion.
 
   Originally considered, kept here for context:
   - A `Rc<Cell<u32>>`-style shared pointer *without* the single-ownership restriction — rejected because with arbitrary aliasing you'd need a runtime registry to find every live copy of a pointer in order to rewrite it, not just one.
@@ -168,8 +190,27 @@ This layout implies two callback boundaries that `traits` needs to make possible
 
   Remaining implementation questions:
   - Whether `alloc` should hold a strong or weak reference to each `OwnedPointer` it hands out — a strong `Rc` clone would need an explicit `free()` call to release a block; relying on `Drop`/refcounting to free automatically would need `alloc` to hold only a `Weak` reference plus some way to reach the block's metadata without it.
+    - Response: `alloc` should keep (in memory) a table that assigns a size to each life `OwnedPointer`.
+      When a type implementation drops an `OwnedPointer`, the `Drop` implementation should remove the corresponding entry from `alloc`s table and mark the memory area as free (this dropping should probably only occur during flushing; unflushed removals of container entries only move the `OwnedPointer` to a graveyard).
+      How can this be implemented?
+      I think it would suffice to use the convention that the mutable wrappers of all container types must implement `Drop`, and the drop handler must (i) turn each contained item in a mutable wrapper and drop it and (ii) call `Sink::free` on any contained `OwnedPointer`s (which is a method that tells `alloc` to remove the pointer from the table and mark the corresponding memory as free, see sketched code example in the file `sketch.rs`).
+      Imagine, for example, the user has an `Option<String>` with value `Some(s)`, and they want to replace it with `None` (here, `Option` and `String` are not std library `Option` and `String` but instead our backed implementation of those data structures from the crate `types`).
+      Let's say that the user does this by calling the method `OptionMut<String>::take(&mut self) -> std::Option<StringMut>`.
+      Note thre things: first, `take` is implemented on `OptionMut` and not on `Option` since it mutates;
+      second, `take` returns a `std::Option` from the standard library because, at the time `take` returns, the original option with value `Some(s)` logically no longer exists in the file;
+      and third, the type wrapped inside `std::Option` returned by `take` is `StringMut`, i.e., a mutable backed string because (i) we don't want the API to drop mutability unless necessary and (ii) unlike the original `Option`, the string `s` itself still exists in the backing file because the caller of `take` might just want to move it to a different location (we have to make sure that the operation recorded on the journal by `take` doesn't instruct the flushing mechanism to remove `s` yet, just to change the enum tag of the `Option`).
+      In summary, the after calling `take`, the user has a `Some` variant of `std::Option` containing an `StringMut`.
+      As soon as the user drops this `std::Option`, the `StringMut` gets dropped.
+      Our `String` type might be implemented as a tuple `(std::String, OwnedPointer)` where the `OwnedPointer` is used to keep track of where the string is located in the backing file.
+      As usual, `StringMut` additionally has access to a `Sink`.
+      The above convention means that `StringMut` must implement `Drop` which must call `sink.free(owned_pointer)`.
+      This is not ideal since it relies on a convention.
+      Is there a way to enforce freeing, i.e., to call `sink.free()` automatically any time an `OwnedPointer` gets dropped?
+      The problem is that the `OwnedPointer` itself doesn't have access to the `Sink` (and I don't want it to because that would make it unnecessarily big).
   - Whether pointers should carry a generation counter (to catch use-after-free / stale-handle bugs) at the cost of extra bytes per pointer.
+    - **Response:** don't do this for the first version, but include this comment in a new section about things to be considered for the next version (along with concurrency).
   - The exact rule for when `alloc` is allowed to relocate a block containing embedded pointers on its own vs. only ever doing so through the owning type — this determines whether the `alloc`→`types` callback from [Workspace Layout](#workspace-layout) is ever actually exercised in practice.
+    - **Response:** superseded by above discussion.
 
 **See my comment above:** I'd rather explore alternatives where I don't have to store a handle table in the file.
 I want this library to be used for nested data types that span a wide range of sizes, but I want that users shouldn't have to think differently about how they design their data types just because they are automatically backed to a file.
