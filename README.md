@@ -1,9 +1,10 @@
-# Auto-Saved Data Strucktures in Rust
+# Auto-Saved Data Structures in Rust
 
 This repository is a rust workspace implementing a rust library "backed" data structures, i.e., data structures that are automatically persisted to a file with every mutation.
 The library implements backed variants of common types such as vectors, hash maps, and ropes, and it also allows rust application developers to `#[derive(Backed)]` for their own data structures.
 Any backed data structure can be "opened" from a file, which loads the data structure into memory but also keeps a connection to the file.
-Any modification to the data structure (or to one of its nested members) mutates the representation in memory as usual, but is also immediately persisted to the file.
+Any modification to the data structure (or to one of its nested members) mutates the representation in memory as usual, and is also durably appended to the file's journal immediately, so that no committed mutation is ever lost even if the process crashes right after the call returns.
+Note that "immediately persisted" means "immediately appended to the journal", not "immediately reflected in the compact snapshot representation" — the latter only happens periodically, when the journal is flushed (see below).
 
 Read acces only goes to the in-memory representation (it does not touch the backing file).
 The in-memory representations of the provided data types are optimized for reading speed similar to corresponding normal (non-backed) data types, but they typically hold some meta information to keep track of where data lies in the backed representation.
@@ -16,13 +17,11 @@ The backed representation is updated using an efficient combination of journalli
 The in-memory representation of data types contains at least a part that is similar to the in-memory representation of corresponding normal (non-backed) data types.
 In addition, the in-memory representation typically contains some pointers or other meta data that helps keeping track of how things are layed out in the backing file (so that the data types can translate data-type level operations to microoperations, see [sketched pipeline below](#flushing-the-journal)).
 
-Further, complex container data types might need to hold a local journal in memory (i.e., the subset of the operations in the in-file journal that apply to this data type, possibly already in shorened diff representation that gets rid of redundant activities) in order to keep track of everything.
-This would mean that, e.g., a lookup in a hash map would have to first look up the key in a primary table and then check a secondary table if that key was removed or replaced since the last journal flush.
-I'm not sure yet if this will be necessary.
-I'd prefer to get away without this since it seems to make more advanced read access such as iteration quite difficult.
+Further, complex container data types need to hold some metadata in memory that tracks changes since the last journal flush, so that flushing can find and update the right locations in the snapshot section without re-deriving that information from scratch.
 
-Maybe a compromise could work: store the current state in a way that can be immediately accessed for read operations and keep additional metadata on the side that contains any information needed to flush the journal.
-For example, a hash map implementation would contain a (mostly, except for additional pointer meta data) regular hash map as well as an additional "graveyard" hash map of any relevant data regarding keys that have been removed since the last journal flush (so that we can still recover their memory locations in the snapshot section of the backed representation, see below).
+**Design decision:** the primary in-memory representation (e.g., a regular hash map, plus pointer meta data) is always fully up to date and is the *only* thing read operations ever touch — a lookup never has to consult anything beyond this primary structure, so read performance stays close to that of the non-backed equivalent, and iteration stays straightforward.
+Alongside it, each container keeps a small amount of side metadata — e.g., for a hash map, a "graveyard" recording keys that have been removed or overwritten since the last flush, together with their old snapshot locations (so that flushing can free/reuse that memory).
+This graveyard is consulted only while flushing, never during normal reads or writes, so it does not sit on the hot path.
 
 
 ## Backed Representation
@@ -72,6 +71,7 @@ Each backing file contains a dedicated storage slot for a vector of hashes of us
 This vector is used for two things: (i) to detect files with incompatible data, and (ii) the order in which these hashes are listed in the header defines the indices / IDs used to specify data types in the journal.
 This approach makes the format somewhat extensible / backward compatible: a new version of an application can _add_ new data types and still read backing files generated by versions that did not have those extra data types.
 And the old version of the software can even still read any parts of backing files generated by the new version that contain only the old data types and detect which parts of the file contain data it cannot understand.
+Indices must never be reused: even if a data type is dropped in a later version, its slot in the hash vector stays reserved (e.g., with a tombstone hash) so that IDs already recorded in existing backing files remain valid.
 
 
 ## Workspace Layout
@@ -88,6 +88,11 @@ This rust workspace contains the following crates:
 - `alloc`: memory management agnostic to data types (allocating, freeing and moving, ponter types, ...).
   Should not need to use any of the above crates except maybe `traits`.
 
+This layout implies two callback boundaries that `traits` needs to make possible without creating a dependency cycle:
+
+1. `alloc` (which does not depend on `types`) must still be able to ask a concrete data type to update its pointer meta data during compactification. Resolved by the handle-table pointer design below, which removes the need for this callback in the common case (see [Open Questions](#open-questions)).
+2. `types` (which does not depend on `frontend`) must still get its mutations appended to the file's journal. Resolved by having mutating methods on `types` return `Op` values rather than perform I/O themselves; `frontend` (and `derive`-generated glue) is what actually appends returned `Op`s to the journal.
+
 
 ## Implementation Details
 
@@ -98,17 +103,24 @@ This rust workspace contains the following crates:
 
 ## Open Questions
 
-- How to represent pointers in the backed representation?
-  - We want to be able to move memory around either without invalidating pointers or with a way to update existing pointers.
-  - We want to be able to know which memory regions are allocated and where the pointer(s) to it is, ideally without needing to involve the data structure implementations so that the memory unit alone can do compactification.
-  - Thus, we probably want to introduce an opaque "pointer" or "slice" type (or both) that the implementations of data types have to use whenever they want to record to the journal an operation that involves pointers.
-    This pointer or slice type might help the memory management unit to keep track of allocated memory regions without requiring us to explicitly store this information in the backing file.
-    Under the hood, the pointer type might be something like an `Rc<Cell<u32>>` (or its atomic variant), which would even allow us to move memory around while updating all pointers that point to it, if this is necessary.
-    However, this would probably also somehow have to keep track of where the serialized pointer in the snapshot section of the backing file is located, so that it can be updated when we move the memory around.
-  - But maybe it's not necessary to have an `Rc<Cell<T>>`.
-    Maybe we can get by with requiring each memory location to be only pointed to from one place in the snapshot section (i.e., we treat this like "ownership").
-    The journal section may contain additional pointers but that's OK because when we apply the journal we can keep track of moving pointers (or maybe we don't even have to because it is logically impossible to have pointer invalidations before an operation that uses a pointer; in this case pointers in the journal sections would be like normal rust references `&T`, which can no longer be around once we get to modifying `T`).
-    But it's unclear how that would allow us to update not only the serialized pointer in the snapshot section of the backing file but also any pointers stored as meta data in the in-memory representation of the data structure.
-- Do container data types need to keep track of their changes since the last journal flush (see [In-Memory Representation](#in-memory-representation))?
-  How can this be done in the most efficient way and in a way that makes read and write access as easy as possible to get right.
-- Does the workspace layout make sense or should it be broken up in a different way / did I miss any important components that would be required for this system to work?
+- **How to represent pointers in the backed representation?**
+  We want to be able to move memory around either without invalidating pointers, or with a way to update existing pointers, and we want to know which memory regions are allocated and where the pointer(s) to them are without needing to involve the data structure implementations, so that the memory unit alone can do compactification.
+
+  **Design decision:** use a level of indirection — an allocator-maintained *handle table* (conceptually a page table, or like classic Mac OS "Handles" / a generational arena). A pointer stored anywhere (in the snapshot section, in the journal, or as in-memory meta data) is really just a stable integer *handle* that indexes into this table; the table maps each handle to its current physical file offset (and, in memory, to whatever native representation is needed). When the memory management unit moves or compacts an allocation, it only updates the *one* table entry for that handle — every holder of the handle keeps working unchanged, because it never stored a raw offset, only the handle.
+
+  This avoids both problems raised by the alternatives originally considered: the `Rc<Cell<u32>>`-style shared pointer would need a runtime registry to find and rewrite every live copy of a pointer (plus refcounting overhead on the hot path), while the single-ownership scheme left it unclear how to update pointers duplicated into in-memory meta data when the underlying memory moves. With a handle table, neither problem arises: there's nothing to find and rewrite, because every copy only ever holds the immutable handle.
+
+  Remaining implementation questions:
+  - How the handle table itself is stored and grown on disk — it's another dynamically sized structure, so it likely needs to be bootstrapped specially in `alloc` rather than being just another backed type.
+  - Whether handles should be generational (to catch use-after-free / stale-handle bugs) at the cost of extra bytes per handle.
+  - How aggressively to prune or reuse freed handle-table slots.
+
+- ~~Do container data types need to keep track of their changes since the last journal flush?~~ Resolved — see [In-Memory Representation](#in-memory-representation): yes, via a side "graveyard"-style structure that ordinary reads never touch.
+  Still open: for *nested* backed types (e.g., a backed `Vec` of backed `HashMap`s), does every nested instance maintain its own local graveyard, or only the outermost opened object?
+  Per-instance bookkeeping is simpler to implement in isolation but may duplicate work; a single root-level graveyard requires threading flush-time information down through arbitrary nesting.
+
+- **Does the workspace layout make sense?** Broadly yes — see the two callback boundaries noted in [Workspace Layout](#workspace-layout), which the crate dependency directions force into narrow trait interfaces defined in `traits`. One likely addition: the handle table from the pointer design above is needed just to open a file at all, before any *typed* backed value exists, so it probably belongs entirely inside `alloc`, with `traits` only defining the shared interfaces (`Op`, handle types) that both `alloc` and `types` use.
+
+- **Concurrency scope.** Assuming v1 targets a single process holding exclusive write access to a backing file — no concurrent writers, no shared-memory-mapped readers from other processes. This keeps `alloc` and the journal free of locking concerns. Worth confirming before implementation starts, since retrofitting multi-writer support later would likely require format changes.
+
+- **Crash consistency.** Since a core selling point is that "no committed mutation is ever lost," the on-disk journal entry format needs enough framing (e.g., a length prefix and checksum per entry) that, after a crash mid-write, reopening the file can detect and discard a torn trailing entry rather than misinterpreting garbage as a valid operation. This should be designed into the journal format from the start rather than retrofitted.
