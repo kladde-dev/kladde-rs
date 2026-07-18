@@ -23,6 +23,17 @@ Further, complex container data types need to hold some metadata in memory that 
 Alongside it, each container keeps a small amount of side metadata — e.g., for a hash map, a "graveyard" recording keys that have been removed or overwritten since the last flush, together with their old snapshot locations (so that flushing can free/reuse that memory).
 This graveyard is consulted only while flushing, never during normal reads or writes, so it does not sit on the hot path.
 
+**Open questions:** this might need more thought.
+Consider, e.g., a situation where since the last journal flush, key "A" was inserted into a hash map and then deleted.
+Should the key end up in the graveyard?
+The snapshot section of the backing file doesn't contain key "A", but the journal section does, so maybe it works out?
+Now a different situation: consider key "A" already exists in the snapshot and now it is deleted, reinserted, and deleted again.
+Should it end up in the graveyard twice?
+The two insertions are likely at different memory locations, so we do have to delete both of them unless optimization cancels out the first deletion and re-insertion.
+This can probably all be resolved but I feel like my way of thinking about this is too ad-hoc to be confident that I catched every corner case.
+Is there a more structured way to think about this?
+Maybe from the literature on CRDTs?
+
 
 ## Backed Representation
 
@@ -91,7 +102,19 @@ This rust workspace contains the following crates:
 This layout implies two callback boundaries that `traits` needs to make possible without creating a dependency cycle:
 
 1. `alloc` (which does not depend on `types`) must still be able to ask a concrete data type to update its pointer meta data during compactification. Resolved by the handle-table pointer design below, which removes the need for this callback in the common case (see [Open Questions](#open-questions)).
+   - Actually, I'd like to explore if I can get away withoaut a handle table because I'd rather not have to include additional metadata to in the file that can be derived from the payload itself.
+     Wouldn't it suffice if `alloc` defines an `OwnedPointer` type which, internally, is something like `Rc<Cell<(u32, u32)>>` and keeps track of (i) the pointer target in the fiel and (ii) where in the file the (unique, thus "owned") pointer to that position sits.
+     These `OwnedPointer`s can be held by types in the `types` crate (or in user-defined crates) but those crates can obtain an `OwnedPointer` only from the `alloc` crate (by allocating memory).
+     When an `OwnedPointer` gets serialized to the snapshot section of the file, serialization writes the target address (first `u32` of the tuple) and sets the position (second `u32`) to the current offset in the file.
+     The alloc crate would hold on to a clone of all `Rc`s of `OwnedPointers` that it hands out and thus has the full picture of what points from where to where.
+     Isn't this similar to how garbage collection and compactification in, e.g., the JVM works or am I missing something?
 2. `types` (which does not depend on `frontend`) must still get its mutations appended to the file's journal. Resolved by having mutating methods on `types` return `Op` values rather than perform I/O themselves; `frontend` (and `derive`-generated glue) is what actually appends returned `Op`s to the journal.
+   - Good catch. No, I don't want mutating methods to return `Op` values because I don't want the user to have to remember to persist changes.
+     Application authors should not be able (in safe rust code assuming correctly implemented `types`) to mutate an instance of a backed type without automatically persisting it to the file.
+     Thus, all types would either have to hold a reference to the overall machinary that persists changes or all their mutating operations should require such a reference as an additional function argument.
+     I'm leaning towards the former at least per default.
+     Come up with a clean way of organizing this into appropriate traits.
+     Either `types` would have to depend on `frontend` (which seems fine because `frontend` shouldn't depend on `types` anyway); or, maybe it's better to be generic over the frontend anyway and define a trait for frontends that a type in `frontend` implements (would this be useful? what other implementations of such a trait are conceivable?).
 
 
 ## Implementation Details
@@ -115,12 +138,27 @@ This layout implies two callback boundaries that `traits` needs to make possible
   - Whether handles should be generational (to catch use-after-free / stale-handle bugs) at the cost of extra bytes per handle.
   - How aggressively to prune or reuse freed handle-table slots.
 
+**See my comment above:** I'd rather explore alternatives where I don't have to store a handle table in the file.
+I want this library to be used for nested data types that span a wide range of sizes, but I want that users shouldn't have to think differently about how they design their data types just because they are automatically backed to a file.
+Thus, I expect that there will be quite a lot of small data types floating around, and thus lots of pointers, which is why I'd like to avoid having to store a handle table in the file.
+
 - ~~Do container data types need to keep track of their changes since the last journal flush?~~ Resolved — see [In-Memory Representation](#in-memory-representation): yes, via a side "graveyard"-style structure that ordinary reads never touch.
   Still open: for *nested* backed types (e.g., a backed `Vec` of backed `HashMap`s), does every nested instance maintain its own local graveyard, or only the outermost opened object?
   Per-instance bookkeeping is simpler to implement in isolation but may duplicate work; a single root-level graveyard requires threading flush-time information down through arbitrary nesting.
+  - The way that I'm thinking about it, I don't think that this is an issue.
+    When a nested type (e.g., an entry of a `HashMap` in a `Vec`) is modified, then usually only the modification of the leaf type needs to be recorded.
+    E.g., if the entry is a string, then only the modifications of the string are recorded to the journal, and the recorded operation identifies the string by a pointer to where it is stored in the file.
+    If the memory location has to be moved (e.g., because we're making the string longer) then we know where in the serialized representation of the `HashMap` the pointer to the memory location written because of my above proposed in-memory representation of `OwnedPointer`, and so we can update that pointer without having to know anything about the internals of the `HashMap` or `Vec` implementations (again, I think this is similar to how the JVM does it in main memory, but I'm not sure if I'm missing something).
+    Check if my thinking makes sense and if it does, rewrite it more eloquently and concisely.
 
 - **Does the workspace layout make sense?** Broadly yes — see the two callback boundaries noted in [Workspace Layout](#workspace-layout), which the crate dependency directions force into narrow trait interfaces defined in `traits`. One likely addition: the handle table from the pointer design above is needed just to open a file at all, before any *typed* backed value exists, so it probably belongs entirely inside `alloc`, with `traits` only defining the shared interfaces (`Op`, handle types) that both `alloc` and `types` use.
 
 - **Concurrency scope.** Assuming v1 targets a single process holding exclusive write access to a backing file — no concurrent writers, no shared-memory-mapped readers from other processes. This keeps `alloc` and the journal free of locking concerns. Worth confirming before implementation starts, since retrofitting multi-writer support later would likely require format changes.
+  - The first version will likely not support concurrency.
+    I do want to think about concurrency before starting with the implementation to avoid making any architectural decisions that are fundamentally incompatible with concurrency, but I want to get a better idea of the overall architecture before thinking about issues that could arise if a future version supports concurrency.
 
 - **Crash consistency.** Since a core selling point is that "no committed mutation is ever lost," the on-disk journal entry format needs enough framing (e.g., a length prefix and checksum per entry) that, after a crash mid-write, reopening the file can detect and discard a torn trailing entry rather than misinterpreting garbage as a valid operation. This should be designed into the journal format from the start rather than retrofitted.
+  - Yes, tell me more about the trade-offs.
+    I think making the journal itself crash resistant should be relatively easy, but a crash consistent flushing operation might be hard or require more temporary memory and more writes.
+    I could imagine a scenario where each operation (either on the data-type level or on the microoperation level) is transactional, but this would probably require us to do a lot more work (like multi-step updates of pointers, recording how far through the journal we are after each operation, ...).
+    How can flushing be made crash consistent?
