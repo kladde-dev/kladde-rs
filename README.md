@@ -1,4 +1,4 @@
-# Auto-Saved Data Structures in Rust
+# Kladde — Auto-Saved Data Structures in Rust
 
 This repository is a Rust workspace implementing "backed" data structures: data structures that behave like their normal in-memory counterparts but are automatically and durably persisted to a file with every mutation. The library provides backed variants of common container types (vectors, hash maps, ropes) and a derive macro so application developers can turn their own `struct`s and `enum`s into backed types, as long as those types are themselves built from backed types.
 
@@ -194,6 +194,11 @@ One observation ties this lineage back to our own design: ZODB, Realm, and GemSt
 5. Mutation ergonomics closer to plain `std::collections` — direct `.push()`/`.insert()`/`.remove()` through a `Mut` view, rather than operations scoped inside a transaction against a generic document tree.
 
 None of this makes Automerge worse — every trade-off above is the direct cost of solving a harder problem (multi-writer merge) that this project explicitly scopes out for now (see [Concurrency](#concurrency) and [Future Work](#future-work-v2)). The reverse trade holds too: the moment concurrency/sync becomes a real requirement, Automerge's model is already there, and ours would have to grow substantially to get anywhere close.
+
+## Why the Name "Kladde"?
+
+*Kladde* is German for a merchant's rough day-book: transactions scribbled down messily, in order, as they happened, later transcribed into the clean *Hauptbuch* ("main ledger").
+This project's on-disk format follows the same two-part shape — a chaotic, continuously-appended journal, periodically compiled into a clean snapshot (see [Flushing](#flushing)) — so the name doubles as a description of the file format itself, not just the library.
 
 ## Open Questions
 
