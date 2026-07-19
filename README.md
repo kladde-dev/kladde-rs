@@ -142,6 +142,59 @@ Deliberately deferred, to be revisited once the v1 architecture is validated:
 - **Generation counters on pointers**, to catch use-after-free / stale-handle bugs, at the cost of extra bytes per pointer.
 - **Resumable, ARIES-style flush recovery** (fine-grained redo logging of the flush's own writes, instead of shadow-paging's restart-from-scratch) — only worth it if flush cost becomes a real problem.
 
+## Prior Work
+
+This design overlaps with several existing systems, though none combine all of its constraints at once: native Rust types (not a fixed generic document model), no translation to database commands, no full-object/full-document reserialization on each mutation, and read speed close to the non-backed equivalent.
+
+### Tier 1: transparent/"orthogonal" persistence for ordinary objects
+
+These give you ordinary-looking mutable objects with automatic, no-SQL persistence, but generally at *per-object* (or per-page) granularity rather than per-mutation-operation granularity — a single field write still tends to trigger rewriting some encompassing structure (a whole pickled object in ZODB, a chain of B+-tree nodes in Realm), not just one small logged op.
+
+- **ZODB** (Python) — `Persistent` subclasses track dirty attributes via `__setattr__`; only dirty objects get re-pickled on commit. Its `FileStorage` backend is an append-only transaction log with periodic `pack()` compaction — structurally close to our journal + flush.
+- **GemStone/S** (Smalltalk) — the deepest historical precedent for our pointer design: its *object table* maps object IDs to physical page locations, so compaction only ever touches that one indirection layer, closely matching our position-keyed `alloc` registry.
+- **Realm** (Swift/Kotlin/JS) — "live objects" with native property syntax over an MVCC, copy-on-write storage engine; no SQL, fine page-level granularity. See detailed comparison below.
+- **db4o** / **ObjectDB** (Java/.NET) — bytecode enhancement intercepts field writes on plain objects; no SQL, no ORM-to-relational translation.
+
+### Tier 2: fine-grained, per-operation journaling
+
+Closer to our actual granularity — the CRDT / local-first world — despite solving a different problem (multi-writer merge, not single-writer durability):
+
+- **Automerge** (`automerge-rs`) — ordinary-looking maps/lists/text; every change is captured as a small op, persisted as an append-only, compact (columnar-encoded) change log with periodic compaction into a snapshot. See detailed comparison below.
+- **Yjs** — same idea, JS ecosystem.
+
+### Academic lineage
+
+The general idea has a name: **orthogonal persistence** — persistence that's automatic and independent of an object's type or size, with no explicit save step. It originates with **PS-algol** and **Napier88** (Glasgow/St Andrews, 1980s); Sun's **PJama** was the closest attempt to bring it to a mainstream language, via incremental, differential persistence of a Java object heap. None of these are things to depend on today, but they're the right search terms for how far this idea has historically been pushed, and what tends to go wrong at scale.
+
+One observation ties this lineage back to our own design: ZODB, Realm, and GemStone all make persistence syntactically invisible (`self.foo = bar` just works) because Python/Swift/Smalltalk each have a hook — `__setattr__`, property wrappers + KVO, message dispatch — that intercepts an ordinary-looking mutation. Rust has no such hook, which is exactly why our design needs the more visible `Mut` wrapper and explicit `.back(sink)`: we're compensating for a language capability those systems quietly rely on and Rust doesn't have.
+
+### Realm, in more detail
+
+**Overlap:** both maintain a canonical, cheap-to-read representation, use copy-on-write so writes never corrupt live data mid-commit, and hide persistence behind generated wrapper types with native-feeling mutation syntax (Realm's codegen'd `@Persisted` properties ~ our derive-generated `Mut` wrappers).
+
+**Where it diverges:** Realm has no representation separate from the file — its "live objects" are thin accessors directly over the mmap'd, columnar on-disk layout; reads go through that layout (cheap, page-cached, zero-copy, but still not "a plain `HashMap` sitting in your process"). We deliberately went the other way: keep a fully separate, natively-typed in-memory structure that's independently as fast as the non-backed equivalent, and let the file lag behind via the journal. This also means Realm writes cost more per-mutation in principle — a single property write still triggers copy-on-write up a B+-tree-like path to the root (O(log n) node copies), where our journal append is O(1) until the next flush. Realm also does real multi-thread/multi-process concurrency with auto-updating objects (explicitly out of scope for our v1 — see [Concurrency](#concurrency)), and is schema/table-oriented (a fixed set of property types, links, lists-of-X) rather than arbitrary recursively-nested user-defined Rust types. It's also a full product (query language, hosted sync service, SDKs across many languages) — a different weight class from a building-block library.
+
+### Automerge, in more detail
+
+**Overlap is specific and real:** `save_incremental()` appends a compact chunk of new ops; `save()`/compaction folds everything into one dense base representation; loading replays that back into a queryable structure — essentially our journal+flush pattern, already implemented. Its columnar op-encoding (splitting ops into separate compressed columns rather than serializing each op as a struct) is more sophisticated than our plain serde-per-op journal and worth studying for our own format.
+
+**Where it diverges — driven by the problem it solves (multi-writer merge), not incidental:**
+
+- **Retention.** CRDT lists need tombstones for deleted elements (a concurrent insert might still reference a deleted position), and enough causal history survives to resolve concurrent conflicting writes deterministically. We never need this — a delete is final and its `OwnedPointer` is immediately, unconditionally freeable.
+- **Value representation.** Every Automerge value can, in principle, need conflict resolution, so reading "the current value" is resolving something, not a raw field access. Our read-speed goal is only reachable because we don't have to support that.
+- **Data model.** Automerge's document is a fixed generic tree of Map/List/Text/scalar; getting your own Rust types in and out goes through a separate reflection/reconciliation layer (`autosurgeon`). Our derive macro makes *your* type the backed type directly, with real methods and arbitrary nesting.
+- **Scope of the storage layer.** Automerge's persistence is bespoke to its own op log, not a reusable file-backed heap — there's no analog to our `alloc` crate as a general-purpose, relocatable-pointer foundation other backed structures could be built on.
+
+**What our design provides that Automerge doesn't**, as a direct consequence of not needing to support merge:
+
+1. Native persistence of arbitrary Rust types, with real derive-generated methods and arbitrary nesting — not a fixed document model plus a reflection layer.
+2. No CRDT retention tax — deletions are final and immediately reclaim storage.
+3. Read performance that can genuinely match native collections, unconditionally.
+4. A reusable, general-purpose persistent-heap abstraction (`alloc` + `OwnedPointer`) as a foundation for building new kinds of backed structures.
+5. Mutation ergonomics closer to plain `std::collections` — direct `.push()`/`.insert()`/`.remove()` through a `Mut` view, rather than operations scoped inside a transaction against a generic document tree.
+
+None of this makes Automerge worse — every trade-off above is the direct cost of solving a harder problem (multi-writer merge) that this project explicitly scopes out for now (see [Concurrency](#concurrency) and [Future Work](#future-work-v2)). The reverse trade holds too: the moment concurrency/sync becomes a real requirement, Automerge's model is already there, and ours would have to grow substantially to get anywhere close.
+
 ## Open Questions
 
 - **Naming.** `Backable`, `Backed` (the mutable-view trait), and `Sink` are all placeholders. `Sink` in particular no longer fits well now that it also owns freeing (`free`), not just journaling (`record`) — worth deciding whether that should stay one trait or split into a journaling half and a freeing/allocation half.
