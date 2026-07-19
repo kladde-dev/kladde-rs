@@ -10,20 +10,38 @@ A working sketch of the core traits and a concrete example (`Vec<T>`) lives in [
 
 The file consists of a collection of dynamically allocated memory regions, similar to a heap, split into two kinds:
 
-- **The snapshot section** holds a typically-recent-but-not-fully-up-to-date state of every backed data structure, in a compact binary form similar to (but not identical to) the in-memory representation. Complex data structures — nested hash maps, ropes — are generally distributed over several non-contiguous regions of the file.
-- **The journal section** is an append-only, linked sequence of allocated regions holding serialized high-level operations. Every mutation appends one entry: a data-type ID, an op code, and (depending on the op code) a payload. Each entry is framed with a length prefix and a checksum, so a crash mid-append leaves a detectable, truncatable torn entry at the tail — nothing before it is affected.
+- **The snapshot** holds a typically-recent-but-not-fully-up-to-date state of every backed data structure, in a compact binary form similar to (but not identical to) the in-memory representation. Complex data structures — nested hash maps, ropes — are generally distributed over several non-contiguous regions of the file.
+- **The journal** is an append-only, linked sequence of allocated regions holding serialized high-level operations. Every mutation appends one entry: a data-type ID, an op code, and (depending on the op code) a payload. Each entry is framed with a length prefix and a checksum, so a crash mid-append leaves a detectable, truncatable torn entry at the tail — nothing before it is affected.
 
 Operations are defined per data type as an associated `Op` type (typically an enum) on the `Backable` trait — see [The Trait Layer](#the-trait-layer). `Op` must implement `serde::Serialize`/`Deserialize`; entries are serialized with a fast, compact binary `serde` format.
 
 ### Type Registry and Extensibility
 
-The file format isn't fully self-describing — the declaration of a data type can't be recovered by looking at a file alone — but the library can detect whether a file's contents match the types an application expects. Each file has a dedicated slot holding a vector of type-hashes, stored and managed like any other backed vector. This vector serves two purposes: detecting files with incompatible data, and defining the indices/IDs used to reference data types in the journal (a type's ID is its position in this vector).
+The file format isn't fully self-describing — the declaration of a data type can't be recovered by looking at a file alone — but the library can detect whether a file's contents match the types an application expects. Each file has a dedicated slot holding a vector of type hashes, stored and managed like any other backed vector. This vector serves two purposes: detecting files with incompatible data, and defining the indices/IDs used to reference data types in the journal (a type's ID is its position in this vector).
 
 This makes the format extensible: a new application version can *add* data types and still read files written by older versions, and an old version can still read the parts of a newer file that use only types it recognizes. The one hard rule: **indices are never reused**. Even if a type is dropped in a later version, its slot stays reserved (e.g., with a tombstone hash) so IDs already recorded in existing files stay valid.
 
+- **Comment:** I don't think this rule is necessary, or I might be misunderstanding it. If a type is dropped and that type is indeed no longer referenced anywhere in the file, then its slot in the list of type hashes can be overwritten with a new type and thus its index reused by the new type. Since the order in which indices appear in the file defines the mapping from IDs to types, this mapping has to be defined on a per-file basis anyway (two different files intended for the same version of an application might list the type hashes in different orders, and that's fine as long as the contents of each file uses type IDs according to the order in which type hashes are listed in the respective file).
+
 ## Pointers and Memory Management
 
-Every pointer in the backed representation — in the snapshot or held as metadata in memory — is a single-owner `OwnedPointer<T>`: a small, opaque handle, essentially a serialized-position marker (`struct OwnedPointer<T> { position: u32, _marker: PhantomData<T> }`), allocated only by the `alloc` crate. "Single-owner" means exactly one live value holds a given `OwnedPointer` at a time — matching ordinary Rust ownership — which is what makes the rest of this design tractable.
+Pointers are serialized to the snapshot as byte-offsets into the file. Every pointer points at the beginning of an allocated memory region, and every live region has exactly a single pointer pointing to it serialized in the snapshot (the "owner" of that memory region).
+Thus, when a memory region is moved around (for compactification), only the single owning pointer has to be updated to point to the new location.
+The journal can contain additional, non-owning pointers (aka references), which do not necessarily have to point at the beginning of a memory region but can point anywhere from the beginning to the end (both inclusively) of any memory region.
+These references are untracked, which is why compactification is only allowed when the journal is empty.
+References in the journal also have to satisfy a lifeness guarantee, i.e., when flushing the journal one operation after another, and an operation frees a memory region, then subsequent references in the journal must not point into that memory region.
+It will likely turn out to be impossible to violate this constraint anyway, but we should keep it in mind until we've fully designe the system.
+
+The in-memory representations of some complex backed data structures (e.g., container types) also contain pointers to the snapshot section as part of their meta data to keep track of where things are layed out in memory.
+To simplify memory management, we require that the collection of all live backed data structures must hold exactly one pointer in memory for each allocated memory region.
+In-memory representations of pointers are small opaque handles (`struct OwnedPointer<T> { index: NonZeroU32, _marker: PhantomData<T> }`) where the `index` is used by the `alloc` trait to resolve the pointer to an up-to-date optional `position` (where the only serilized representation of this pointer is in the snapshot, if it is already flushed) and an optional `target` (where the pointed to memory region sits, if the allocation operation has already been flushed).
+It is yet unclear how exactly this resolution will work.
+We'll mock `alloc` initially and implement the higher-level parts of the system to see what the exact requirements on `alloc` are before we reconsider how `alloc` works precisely.
+
+**Comments:**
+- Is `OwnedPointer` a good name or would `OwningPointer` or `UniquePointer` be better?
+- I removed some text that indicated that the in-memory representation of `OwnedPointer`s gets resolved by looking up the pointer's `position` in a table held by alloc. I'm not sure if this would work since memory can be moved around, so if memory contains serialized pointers, than those pointers will be moved around, so indexing by position is unstable.
+- Variance: should `OwnedPointer<T>` contain `PhantomData<T>` or `PhantomData<*T>` or `PhantomData<NonZero<T>>`?
 
 `alloc` keeps an in-memory-only registry (reconstructed from the file when it's opened, never itself persisted) mapping each live pointer's `position` to its current target and size — conceptually a `BTreeMap<Position, (Target, Size)>`. This one structure supports two operations:
 
@@ -31,6 +49,8 @@ Every pointer in the backed representation — in the snapshot or held as metada
 - **Range query** (given a byte range being relocated, find every pointer whose *position* falls inside it): needed whenever `alloc` moves a block of memory that has `OwnedPointer`s embedded inside its own serialized bytes (e.g., a hash map's bucket array), so their `position` fields can be updated to reflect the new location.
 
 Each block's own allocation metadata additionally records the identity of its single owning pointer, so that when a block's *content* moves, updating the one pointer that targets it is an O(1) lookup rather than a search.
+
+- **Comment:** this might turn out to be necessary, but I'm not sure yet. It might also turn out that any time we want to move a memory block we already come from a pointer to it. Let's defer this issue, mock `alloc` for now, and then revisit the internals of compactification once we know more about the requirements on `alloc`.
 
 Together, these let `alloc` relocate and compact memory — including blocks that themselves contain embedded pointers — entirely on its own, using nothing but byte-range geometry, without ever needing to call back into type-specific code to ask "which of your bytes are pointer fields." (An earlier version of this design didn't have this property; see [Alternatives Considered](#alternatives-considered).)
 
@@ -41,6 +61,8 @@ Together, these let `alloc` relocate and compact memory — including blocks tha
 `OwnedPointer` is deliberately *not* self-freeing: it doesn't hold a reference to `alloc`/`Sink`, to keep it small, so it can't call `Sink::free` from its own `Drop`. Instead, freeing is the responsibility of the generated container wrapper types: a wrapper's `Drop` impl calls `Sink::free` on any `OwnedPointer`s it directly owns. For example, taking the value out of a backed `Option<String>` (`OptionMut::take(&mut self) -> std::Option<StringMut>`) transfers ownership of the string's `OwnedPointer` from the option's slot to the returned `StringMut` without ever freeing it; only once *that* value is eventually dropped does its `OwnedPointer` get freed — at every point exactly one live value owns the pointer, so the transfer can't double-free or leak.
 
 Because application code never constructs or holds a bare `OwnedPointer` — only derive-macro-generated code does, as an implementation detail of the generated `Drop` impls — this isn't a convention a human needs to remember each time they write a mutating method; it's an invariant of generated code, verified once. A debug-only leak check (e.g., a thread-local counter of outstanding `OwnedPointer`s that should net to zero when a `Sink` closes) would be a cheap, optional addition for extra insurance during development, but the core design doesn't depend on it.
+
+- **Comment:** note that not all date types will be derive-macro-generatable. Complex data types such as containers will likely require some manual fiddeling with backed pointers, similar to how the implementation of containers in the rust standard library has to manually fiddle with raw pointers. But this is fine because we'll try to provide implementations for the most common such container types in the `types` crate.
 
 ### Alternatives Considered
 
@@ -95,6 +117,7 @@ trait Sink {
 Mutating access never happens directly on the plain type — it always goes through a generated wrapper (e.g. `VecMut<'s, T, S>`), obtained via `.back(sink)`, which borrows both the underlying value and the `Sink` for its lifetime `'s`. Every mutating method on the wrapper records its `Op` via `self.sink.record(...)` and mutates the in-memory data directly. Mutating methods never *return* an `Op` for the caller to separately apply — persistence isn't optional or forgettable by construction. Nested `Backable` fields get their own `_mut()` accessor that reborrows the *same* sink further down, so callers only ever supply a sink once, at the point they obtain the outermost wrapper:
 
 ```rust
+/// Derive-generated accessors for a `struct Point { x: i32, y: BackedString }`:
 impl<'s, S: Sink> PointMut<'s, S> {
     fn set_x(&mut self, value: i32) {
         self.sink.record(&PointOp::SetX(value));
@@ -203,7 +226,22 @@ This project's on-disk format follows the same two-part shape — a chaotic, con
 ## Open Questions
 
 - **Naming.** `Backable`, `Backed` (the mutable-view trait), and `Sink` are all placeholders. `Sink` in particular no longer fits well now that it also owns freeing (`free`), not just journaling (`record`) — worth deciding whether that should stay one trait or split into a journaling half and a freeing/allocation half.
+  - **Comment:** (regarding `Backable` and `Backed`): Come up with appropriate names for these. They should be short and communicate at least some of the following aspects:
+    - `Backable` is a type that -- in principle -- supports orthogonal persistence but doesn't actually because it's not associated with any backing store.
+    - `Backable` therefore only allows read access.
+    - `Backed` is a type that actually suports orthogonal persistence (it is associated with a backing store / sink / whatever we rename sink to below)
+    - `Backed` allows write access (mutation).
+    - `Backed` is typically but not strictly necessarily a wrapper around a `Backable`.
+    - `Backed` and `Backable` go hand in hand, ideally the names should reflect this but make them less easy to confuse as they currently are.
+    - There should be a convention of how the name of a `Backed` wrapper is derived from the name of its corresponding `Backable` (in `sketch.rs`, I appended `Mut` to the type name). Ideally, the names of the traits should somehow fit to the naming convention of the types that implement them.
+  - **Comment:** (regarding `Sink`) three options:
+    - (a) come up with a new name for `Sink` to refer to the full "persistency backend"; or
+    - (b) split `Sink` into two traits: one related to recording operations in the journal and one related to memory allocation. Find appropriate names for both parts. Then find an appropriate name or letter for the type parameter formerly referred to as `S`, which now has to implement both of the traits; or
+    - (c) split `Sink` into two traits as in option (b), and also split the type parameter `S` into two type parameters, so that one can mix and match. Consider, however, that appending to the journal might require allocation (when the journal exceeds its current memory allocation but not its flushing threshold, or when a single large Op has to be appended to the journal)
+    Respond below with a deliberation of the pros and cons of the above three options a-c.
 - **The exact shape of `alloc`'s registry.** A position-keyed `BTreeMap` covers point lookup and range query conceptually, but the concrete data structure — including how block-size/free-list bookkeeping integrates with it, and how it's efficiently rebuilt when a large file is opened — still needs to be designed and prototyped.
+  - **Comment:** Defer this discussion. Since backed types are generic over the sink / allocator, we'll want to start developing with a mock allocator anyway. The mock allocator essentially falls back to creating `Box<[u8]>` (or maybe `Rc<[u8]>` but that's probably not necessary), it associates each allocated memory region with an ID based on an simple incrementing counter, and it has a hash map that maps those ids to the `Box`es and some meta data. This will allow us to design the higher-level parts of the system on top of the mock allocator, which whill show us what the exact requirements on the allocator are.
 - **The `Backable`/`Backed` GAT signature.** The lifetime-parameterized associated type above needs to be checked against a real, compiling example — an earlier draft in `sketch.rs` had a lifetime-arity mismatch between the trait declaration and its impl. Worth nailing down before it's relied on elsewhere.
+  - **Comment:** fix all my errors in `sketch.rs` using your best judgment. Don't take my code in `sketch.rs` too literally, I sketched it up hastily and I am aware that it is internally inconsistent. Once you've converged to a consistent picture in `sketch.rs`, remove any obsolete comments.
 - **Derive macro coverage.** The mutable-view-wrapper generation pattern is sketched above for plain structs (the `Point` example); it still needs to be worked out for enums with multiple variants, generic types, and types with where-clauses.
 - **Concurrency design**, once revisited (see [Future Work](#future-work-v2)).
