@@ -13,11 +13,11 @@ The file consists of a collection of dynamically allocated memory regions, simil
 - **The snapshot** holds a typically-recent-but-not-fully-up-to-date state of every backed data structure, in a compact binary form similar to (but not identical to) the in-memory representation. Complex data structures — nested hash maps, ropes — are generally distributed over several non-contiguous regions of the file.
 - **The journal** is an append-only, linked sequence of allocated regions holding serialized high-level operations. Every mutation appends one entry: a data-type ID, an op code, and (depending on the op code) a payload. Each entry is framed with a length prefix and a checksum, so a crash mid-append leaves a detectable, truncatable torn entry at the tail — nothing before it is affected.
 
-Operations are defined per data type as an associated `Op` type (typically an enum) on the `Persistable` trait — see [The Trait Layer](#the-trait-layer). `Op` must implement `serde::Serialize`/`Deserialize`; entries are serialized with a fast, compact binary `serde` format.
+Operations are defined per data type as an associated `Op` type (typically an enum) on the `Persistable` trait — see [The Trait Layer](#the-trait-layer). `Op` must implement `serde::Serialize`/`Deserialize`; entries are serialized with [`postcard`](https://crates.io/crates/postcard), a compact, `serde`-based binary format (chosen after `bincode`, an earlier candidate, lost its maintainers — see [RUSTSEC-2025-0141](https://rustsec.org/advisories/RUSTSEC-2025-0141.html)).
 
 ### Type Registry and Extensibility
 
-The file format isn't fully self-describing — the declaration of a data type can't be recovered by looking at a file alone — but the library can detect whether a file's contents match the types an application expects. Each file has a dedicated slot holding a vector of type hashes, stored and managed like any other backed vector. This vector serves two purposes: detecting files with incompatible data, and defining the indices/IDs used to reference data types in the journal (a type's ID is its position in this vector).
+The file format isn't fully self-describing — the declaration of a data type can't be recovered by looking at a file alone — but the library can detect whether a file's contents match the types an application expects. Each file has a dedicated slot holding a vector of type hashes, stored and managed like any other backed vector — part of a general principle that the file's own header/metadata (this registry, the root pointer, ...) is represented using the same backed-data-structure machinery as application data wherever practical, rather than a bespoke special-cased format. This vector serves two purposes: detecting files with incompatible data, and defining the indices/IDs used to reference data types in the journal (a type's ID is its position in this vector).
 
 This makes the format extensible: a new application version can *add* data types and still read files written by older versions, and an old version can still read the parts of a newer file that use only types it recognizes. The default rule for now: **indices are never reused**, even if a type is dropped in a later version (its slot stays reserved, e.g. with a tombstone hash). Reusing a slot would only be safe once no data of the dropped type survives anywhere in the file — not just the snapshot, but any not-yet-flushed journal entry too — which is a global liveness question nothing else in the design otherwise needs to answer; tombstoning avoids ever having to answer it, at the cost of a few extra bytes per dropped type in a vector that's realistically never large. Worth revisiting only if that cost is ever actually shown to matter.
 
@@ -40,10 +40,12 @@ struct UniquePointer<T> {
 
 `Allocator` keeps an in-memory-only registry (reconstructed from the file when it's opened, never itself persisted):
 
-- A primary structure (a dense table/slab, keyed by `index`) mapping each pointer's `index` to its current, mutable `(position, target, size)` — both `position` and `target` start `None` and become `Some` the first time the pointer's allocation and its own serialization are actually flushed. Supports point lookup: given an `index`, resolve its current target.
+- A primary structure (a dense table/slab, keyed by `index`) mapping each pointer's `index` to its current, mutable `(position, target, size)` — each represented as `Option<NonZeroU32>`, `None` before the pointer's allocation and its own serialization have actually been flushed. Real positions/targets are never zero (the file starts with a fixed-size header region), so `None` costs nothing extra via niche optimization. `Position`/`Size` are their own type aliases rather than bare integers, so widening them later (to `u64`, or to a variable-length encoding) only touches one definition. Supports point lookup: given an `index`, resolve its current target.
 - An auxiliary structure ordered by `position` (e.g. a `BTreeMap<Position, Index>`), kept in sync whenever a `position` changes, supporting range queries: given a byte range being relocated, find every `index` whose current `position` falls inside it. Needed whenever `Allocator` moves a block that has `UniquePointer`s embedded in its own serialized bytes (e.g. a hash map's bucket array), so their `position`s can be updated. Because this structure is purely an internal lookup aid — never treated as identity by anything outside `Allocator` — keeping it in sync with a moving key isn't a problem.
 
-Each block's own allocation metadata additionally records the identity of its single owning pointer, so that when a block's *content* moves, updating the one pointer that targets it is an O(1) lookup rather than a search. Whether this extra bookkeeping actually pays for itself — versus always already having a pointer in hand whenever a block needs to move — is left open until the higher-level system has been built against a mock `Allocator` and shows what's actually required (see [Open Questions](#open-questions)).
+`UniquePointer` itself is never `Serialize`/`Deserialize` — its `index` is meaningless outside the process that assigned it, and exposing it to serde directly would invite accidentally serializing that meaningless value. Instead, `Allocator::resolve` borrows both the allocator and the pointer to produce a `ResolvedPointer<'a, T>`, which *is* serializable — it holds the pointer's current on-disk `target` (the offset of the region it points *at*, which is what a pointer's serialized value actually is; `position` is a separate concept, the offset of the pointer's *own* serialized bytes, tracked by `Allocator` as internal bookkeeping once this value has actually landed somewhere in the file — not something `ResolvedPointer` itself knows). Borrowing `Allocator` for `'a` is deliberate: it prevents, at compile time, any `Allocator` operation that could invalidate that snapshot (most importantly, compaction moving the target) for as long as a `ResolvedPointer` derived from it is still alive — the borrow checker enforces that a serialized `target` was still current when it was written. Deserializing goes the other way without needing serde's stateful-deserialization machinery: the raw `target` is read back as an ordinary integer, and a fresh `UniquePointer` (with a newly assigned `index`) is minted for it via a plain `Allocator` method call, not via `Deserialize`.
+
+Each block's own allocation metadata additionally records the identity of its single owning pointer, so that when a block's *content* moves, updating the one pointer that targets it is an O(1) lookup rather than a search. Whether this extra bookkeeping actually pays for itself — versus always already having a pointer in hand whenever a block needs to move — is left open until the higher-level system has been built against a mock `Allocator` and shows what's actually required.
 
 Together, these let `Allocator` relocate and compact memory — including blocks that themselves contain embedded pointers — entirely on its own, using nothing but byte-range geometry, without ever needing to call back into type-specific code to ask "which of your bytes are pointer fields." (An earlier version of this design didn't have this property; see [Alternatives Considered](#alternatives-considered).)
 
@@ -55,13 +57,13 @@ Together, these let `Allocator` relocate and compact memory — including blocks
 
 Because application code never constructs or holds a bare `UniquePointer` — only derive-macro-generated code does, as an implementation detail of the generated `Drop` impls — this isn't a convention a human needs to remember each time they write a mutating method; it's an invariant of generated code, verified once. A debug-only leak check (e.g. a thread-local counter of outstanding `UniquePointer`s that should net to zero when a `Backend` closes) would be a cheap, optional addition for extra insurance during development, but the core design doesn't depend on it.
 
-Not all data types will be derive-macro-generatable: complex container types will typically require manual use of `UniquePointer` directly, the same way `std`'s own collections manually manage raw pointers rather than expressing their internals in safe, derivable terms. The derive macro targets the common case — application-level structs/enums composed from already-`Persistable` fields — not container internals; see the `types` crate under [Workspace Layout](#workspace-layout).
+Not all data types will be derive-macro-generatable: complex container types will typically require manual use of `UniquePointer` directly, the same way `std`'s own collections manually manage raw pointers rather than expressing their internals in safe, derivable terms. The derive macro targets the common case — application-level structs/enums composed from already-`Persistable` fields — not container internals; see the `kladde-types` crate under [Workspace Layout](#workspace-layout).
 
 ### Alternatives Considered
 
 - A freely-aliased `Rc<Cell<u32>>`-style pointer, without the single-owner restriction — rejected because aliasing means a moved target could have arbitrarily many live copies elsewhere, requiring a full registry just to find and rewrite all of them.
 - A dense on-disk *handle table* (conceptually a page table, or classic Mac OS "Handles") — fully decouples pointer identity from location, so block moves never need any patching, at the cost of persisting an extra indirection structure to the file. Set aside mainly because of that footprint, given the target workload (many small, deeply nested pointers).
-- An intermediate design holding `Rc<Cell<(target, position)>>` per pointer, with `alloc` retaining a clone of each — superseded by the plain, index-keyed registry above, which needs no per-pointer heap allocation or refcounting at all.
+- An intermediate design holding `Rc<Cell<(target, position)>>` per pointer, with the allocator retaining a clone of each — superseded by the plain, index-keyed registry above, which needs no per-pointer heap allocation or refcounting at all.
 
 ## Flushing
 
@@ -69,10 +71,10 @@ Periodically (e.g., when the journal exceeds a size threshold), the journal is *
 
 1. **Operations** in the journal (data-type-dependent, e.g. "remove key X from the hash map at pointer Y").
 2. → **optimized operations**, by the data type implementations (e.g. a modify-then-delete on the same key drops the obsolete modification; a rope implementation might collapse a run of single-character deletions into one range deletion).
-3. → **microoperations**, compiled by the data type implementations calling into `alloc` (data-type-independent: "allocate size N" / "free pointer P").
-4. → **optimized microoperations**, by `alloc` (e.g. modify-then-free on the same region drops the obsolete modification).
+3. → **microoperations**, compiled by the data type implementations calling into `kladde-alloc` (data-type-independent: "allocate size N" / "free pointer P").
+4. → **optimized microoperations**, by `kladde-alloc` (e.g. modify-then-free on the same region drops the obsolete modification).
 5. → **applied** to the snapshot section.
-6. → **compactified**, by `alloc` alone — relocating and shortening allocations to reclaim fragmentation, using the pointer registry described above. Unlike earlier drafts of this pipeline, this step no longer needs to call back into data-type implementations.
+6. → **compactified**, by `kladde-alloc` alone — relocating and shortening allocations to reclaim fragmentation, using the pointer registry described above. Unlike earlier drafts of this pipeline, this step no longer needs to call back into data-type implementations.
 
 ### Crash Consistency
 
@@ -86,13 +88,15 @@ The journal's own append-only, framed format already makes it crash-safe (see [O
 
 A more elaborate alternative — fine-grained ARIES-style redo logging of the flush's own writes, so a crash mid-flush can *resume* instead of restart — is only worth the complexity if flushes become expensive enough that discarding a half-finished one on every crash is unacceptable; not needed until that's shown to matter (see [Future Work](#future-work-v2)).
 
+Note: none of this crash-consistency machinery is exercised by the v1 implementation, which runs against a mock, in-memory `Allocator` rather than a real file — see `kladde-alloc` under [Workspace Layout](#workspace-layout).
+
 ## The Trait Layer
 
-Five traits, all defined in the `traits` crate:
+Five traits, all defined in the `kladde-traits` crate:
 
 ```rust
 trait Persistable {
-    type Op<'a>: 'a where Self: 'a;
+    type Op: serde::Serialize + serde::de::DeserializeOwned;
     type Guard<'s, B: Backend>: Guard;
     fn guard<'s, B: Backend>(&'s mut self, backend: &'s B) -> Self::Guard<'s, B>;
 }
@@ -106,7 +110,7 @@ trait Guard {
 }
 
 trait Journal {
-    fn record<T: Persistable>(&self, op: &T::Op<'_>);
+    fn record<T: Persistable>(&self, op: &T::Op);
 }
 
 trait Allocator {
@@ -117,22 +121,23 @@ trait Backend: Journal + Allocator {}
 impl<B: Journal + Allocator> Backend for B {}
 ```
 
-`Persistable` is implemented by every plain value type that has the right shape to be persisted (`Vec<T>`, a user's `#[derive(Persistable)]` struct, ...) but isn't yet tied to any backend — read-only, matching ordinary in-memory access. It declares its own operation-log entry type (`Op`) and, via a generic associated type, the type of its *guard*. `Guard` is the write-side counterpart obtained from a `Persistable`, bound to a `Backend` for a lifetime — the same relationship `MutexGuard` has to `Mutex`, and the naming is deliberate: a `Guard` is exactly an RAII token proving exclusive, backend-recording access. **Naming convention**: a `Persistable` type named `Foo` gets a generated guard type named `FooGuard`.
+`Persistable` is implemented by every plain value type that has the right shape to be persisted (`PersistedVec<T>`, a user's `#[derive(Persistable)]` struct, ...) but isn't yet tied to any backend — read-only, matching ordinary in-memory access. It declares its own operation-log entry type (`Op`) and, via a generic associated type, the type of its *guard*. `Guard` is the write-side counterpart obtained from a `Persistable`, bound to a `Backend` for a lifetime — the same relationship `MutexGuard` has to `Mutex`, and the naming is deliberate: a `Guard` is exactly an RAII token proving exclusive, backend-recording access. **Naming convention**: a `Persistable` type named `Foo` gets a generated guard type named `FooGuard`.
 
-`Op` is lifetime-parameterized (rather than a plain associated type) so that, e.g., `Vec::push` can record a *reference* to the value it just pushed instead of needing to clone it or move it twice — a real complexity cost of avoiding an unnecessary clone or an extra `Clone` bound, not just a syntax detail; it propagates into `Journal::record`'s signature too.
+`Op` is a plain (non-lifetime-parameterized) associated type, and owned rather than borrowed — the simpler of two designs considered, chosen deliberately for v1. The alternative, a lifetime-parameterized `type Op<'a>`, would let e.g. `PersistedVec::push` record a *reference* to the value it just pushed instead of cloning it, but that's real complexity: it propagates into `Journal::record`'s signature, and the derive macro would need to generate correct GAT impls for every derived type. v1 accepts the clone cost instead — operations like `push` require `T: Clone` — to keep the first end-to-end implementation simpler; see [Future Work](#future-work-v2) for revisiting this once it's clear where the clone costs actually hurt.
 
 `Journal` and `Allocator` are two focused traits — recording operations, and allocating/freeing/resolving pointers — rather than one combined trait or two fully independent ones. A single combined trait would have to describe two different jobs under one name. Two fully independent type parameters would be misleading: a `Journal` implementation generally needs the same `Allocator` the rest of the system uses, since appending to the journal can itself require allocation (growing the journal's own storage, or a single oversized `Op`). The `Backend: Journal + Allocator` marker trait (blanket-implemented for anything that implements both) reconciles this: application and derive-generated code only ever needs to name one type parameter, `B: Backend`, while the two responsibilities stay separately documented and implementable.
 
 ### Guards and the `Backend`
 
-Mutating access never happens directly on the plain type — it always goes through a generated wrapper (e.g. `VecGuard<'s, T, B>`), obtained via `.guard(backend)`, which borrows both the underlying value and the `Backend` for its lifetime `'s`. Every mutating method on the wrapper records its `Op` via `self.backend.record(...)` and mutates the in-memory data directly. Mutating methods never *return* an `Op` for the caller to separately apply — persistence isn't optional or forgettable by construction. Nested `Persistable` fields get their own `_mut()` accessor that reborrows the *same* backend further down, so callers only ever supply a backend once, at the point they obtain the outermost wrapper:
+Mutating access never happens directly on the plain type — it always goes through a generated wrapper (e.g. `PersistedVecGuard<'s, T, B>`), obtained via `.guard(backend)`, which borrows both the underlying value and the `Backend` for its lifetime `'s`. Every mutating method on the wrapper records its `Op` via `self.backend.record(...)` and mutates the in-memory data directly. Mutating methods never *return* an `Op` for the caller to separately apply — persistence isn't optional or forgettable by construction. Every field of a `#[derive(Persistable)]` type gets a `_mut()` accessor that reborrows the *same* backend further down into a nested guard — including scalar/primitive fields (`i32`, `bool`, `String`, ...), which get blanket `Persistable` impls in `kladde-types` specifically so the derive macro can treat every field uniformly rather than special-casing "leaf" types differently from nested `Persistable` fields. Callers only ever supply a backend once, at the point they obtain the outermost wrapper:
 
 ```rust
-/// Derive-generated accessors for a `struct Point { x: i32, y: BackedString }`:
+/// Derive-generated accessors for a `struct Point { x: i32, y: BackedString }`
+/// — every field, including `i32`, is itself `Persistable`, so the macro
+/// generates the same kind of accessor uniformly:
 impl<'s, B: Backend> PointGuard<'s, B> {
-    fn set_x(&mut self, value: i32) {
-        self.backend.record(&PointOp::SetX(value));
-        self.data.x = value;
+    fn x_mut(&mut self) -> I32Guard<'_, B> {
+        self.data.x.guard(self.backend)
     }
     fn y_mut(&mut self) -> BackedStringGuard<'_, B> {
         self.data.y.guard(self.backend)
@@ -142,31 +147,33 @@ impl<'s, B: Backend> PointGuard<'s, B> {
 
 Non-mutating access uses the plain type directly; the wrapper implements `Deref` (to the plain type) so read-only methods stay available while inside a mutating context.
 
-Each guard type is generated *per concrete `Persistable` type* (rather than one shared generic wrapper) specifically so that application and library authors can write ordinary `impl` blocks on their own generated wrapper types without hitting Rust's orphan rules — a single shared wrapper defined in `traits` would be a foreign type from the point of view of any downstream crate, and Rust forbids inherent `impl` blocks on foreign types outright, regardless of what its generic parameters are filled with. (Downstream crates *can* still extend a foreign wrapper via their own local extension trait, but that's more boilerplate than just owning the type.)
+Each guard type is generated *per concrete `Persistable` type* (rather than one shared generic wrapper) specifically so that application and library authors can write ordinary `impl` blocks on their own generated wrapper types without hitting Rust's orphan rules — a single shared wrapper defined in `kladde-traits` would be a foreign type from the point of view of any downstream crate, and Rust forbids inherent `impl` blocks on foreign types outright, regardless of what its generic parameters are filled with. (Downstream crates *can* still extend a foreign wrapper via their own local extension trait, but that's more boilerplate than just owning the type.)
 
-`B: Backend` is a static (generic, not trait-object) type parameter, defaulted to a concrete `DefaultBackend` provided by `frontend`, so application code that only ever uses the default backend never has to name `B` at all. Being generic over `Backend` still earns its keep for cases that want a different one:
+`B: Backend` is a static (generic, not trait-object) type parameter, defaulted to a concrete `DefaultBackend` provided by `kladde`, so application code that only ever uses the default backend never has to name `B` at all. Being generic over `Backend` still earns its keep for cases that want a different one:
 
-- A no-op / purely in-memory `Backend`, for unit-testing `types` logic without touching a file.
+- A no-op / purely in-memory `Backend`, for unit-testing `kladde-types` logic without touching a file.
 - A recording/spy `Backend`, for asserting exactly which `Op`s a mutation produces.
 - A batching `Backend` that buffers ops for an explicit `commit()` instead of persisting on every call, as an opt-in.
 - Eventually, a replicated/networked `Backend` — kept possible, not committed to (see [Concurrency](#concurrency)).
 
 ## Workspace Layout
 
-- `traits`: `Persistable`, `Guard`, `Journal`, `Allocator`, `Backend`, `UniquePointer` — the shared vocabulary `alloc` and `types` both build on.
-- `alloc`: implements `Allocator` — owns all pointer/allocation bookkeeping (the index-keyed registry, block metadata) and the microoperation-level memory management. Depends only on `traits`.
-- `types`: the built-in backed container types (vectors, hash maps, ropes) and their generated guard wrappers. Builds on `traits`, `alloc`, `derive` (for nested data), and `frontend` (solely for the `DefaultBackend` default type argument — a convenience dependency, not a functional one; `types`'s own logic is written purely against the `B: Backend` bound). Most of what lives here will likely be hand-implemented directly against `Persistable`/`Guard`/`UniquePointer` rather than derive-macro output — the same way `std`'s own collections hand-write unsafe raw-pointer manipulation internally; the derive macro targets the common case (application-level structs/enums composed from already-`Persistable` fields), not container internals.
-- `derive`: the macro that turns a user's `struct`/`enum` into a `Persistable` type, generating the same wrapper/`Deref`/`Drop` machinery `types` uses internally for its own built-in types.
-- `frontend`: opening files, reading headers, running the flushing pipeline, and the concrete `DefaultBackend` implementation (implementing both `Journal` and `Allocator`). Meant to be used by application crates, not by library crates implementing their own `Persistable` types.
+- `kladde-traits`: `Persistable`, `Guard`, `Journal`, `Allocator`, `Backend`, `UniquePointer`, `ResolvedPointer` — the shared vocabulary `kladde-alloc` and `kladde-types` both build on.
+- `kladde-alloc`: implements `Allocator` — owns all pointer/allocation bookkeeping (the index-keyed registry, block metadata) and the microoperation-level memory management. Depends only on `kladde-traits`. v1 ships only a mock, in-memory implementation (no real file, no compaction, no crash consistency) — see [Crash Consistency](#crash-consistency).
+- `kladde-types`: the built-in backed container types (`PersistedVec`, `PersistedHashMap`, eventually a rope) and their generated guard wrappers, plus blanket `Persistable` impls for primitives (`i32`, `bool`, `String`, ...). Builds on `kladde-traits`, `kladde-alloc`, `kladde-derive` (for nested data), and `kladde` (solely for the `DefaultBackend` default type argument — a convenience dependency, not a functional one; `kladde-types`'s own logic is written purely against the `B: Backend` bound). Most of the container types will likely be hand-implemented directly against `Persistable`/`Guard`/`UniquePointer` rather than derive-macro output — the same way `std`'s own collections hand-write unsafe raw-pointer manipulation internally; the derive macro targets the common case (application-level structs/enums composed from already-`Persistable` fields), not container internals.
+- `kladde-derive`: the macro that turns a user's `struct`/`enum` into a `Persistable` type, generating the same wrapper/`Deref`/`Drop` machinery `kladde-types` uses internally for its own built-in types.
+- `kladde`: opening files, reading headers, running the flushing pipeline, and the concrete `DefaultBackend` implementation (implementing both `Journal` and `Allocator`). This is the crate application code actually depends on — there's no separate facade crate, since this is already the application-facing entry point. (An earlier draft called this crate `frontend`; renamed after it also became the crate implementing `Backend`, which made "frontend" read backwards.)
+
+An `example` crate (not part of the published library) demonstrates the whole stack end to end.
 
 The two cross-crate callback boundaries this layout originally seemed to require are both resolved by the design above, rather than needing a runtime callback mechanism:
 
-1. `alloc` asking a concrete data type to update pointer metadata during compaction — resolved by the index-keyed registry, which lets `Allocator` patch every affected pointer using only byte-range geometry.
-2. `types` getting its mutations into the journal without depending on `frontend` — resolved by `Backend`, which every guard wrapper already holds.
+1. `kladde-alloc` asking a concrete data type to update pointer metadata during compaction — resolved by the index-keyed registry, which lets `Allocator` patch every affected pointer using only byte-range geometry.
+2. `kladde-types` getting its mutations into the journal without depending on `kladde` — resolved by `Backend`, which every guard wrapper already holds.
 
 ## Concurrency
 
-v1 targets a single process with exclusive write access to a file — no concurrent writers, no shared-memory-mapped readers from other processes — which keeps `alloc` and the journal free of locking concerns. This is deliberate: get the core architecture right first, but avoid decisions that would be fundamentally incompatible with a concurrent future. Two choices already made lean the right way: single-owner `UniquePointer`s (rather than freely-aliased pointers) map more naturally onto typical single-writer/multiple-reader schemes (e.g. MVCC-style snapshot isolation) than aliasing would have, and `Backend` being swappable leaves room for a replicated/networked implementation later without touching `types`.
+v1 targets a single process with exclusive write access to a file — no concurrent writers, no shared-memory-mapped readers from other processes — which keeps `kladde-alloc` and the journal free of locking concerns. This is deliberate: get the core architecture right first, but avoid decisions that would be fundamentally incompatible with a concurrent future. Two choices already made lean the right way: single-owner `UniquePointer`s (rather than freely-aliased pointers) map more naturally onto typical single-writer/multiple-reader schemes (e.g. MVCC-style snapshot isolation) than aliasing would have, and `Backend` being swappable leaves room for a replicated/networked implementation later without touching `kladde-types`.
 
 ## Future Work (v2+)
 
@@ -175,6 +182,8 @@ Deliberately deferred, to be revisited once the v1 architecture is validated:
 - **Concurrency** — see above.
 - **Generation counters on pointers**, to catch use-after-free / stale-handle bugs, at the cost of extra bytes per pointer.
 - **Resumable, ARIES-style flush recovery** (fine-grained redo logging of the flush's own writes, instead of shadow-paging's restart-from-scratch) — only worth it if flush cost becomes a real problem.
+- **Lifetime-GAT `Op`** — replace v1's owned `Op` (see [The Trait Layer](#the-trait-layer)) with a lifetime-parameterized version, removing the clones v1's simpler design requires (e.g. in `PersistedVec::push`).
+- **Fine-grained enum mutation** — v1's `#[derive(Persistable)]` enums only support replacing the whole value; mutating a field within the current variant in place, and/or matching directly on a generated `MyEnumGuard<'_, B>`, is deferred.
 
 ## Prior Work
 
@@ -185,7 +194,7 @@ This design overlaps with several existing systems, though none combine all of i
 These give you ordinary-looking mutable objects with automatic, no-SQL persistence, but generally at *per-object* (or per-page) granularity rather than per-mutation-operation granularity — a single field write still tends to trigger rewriting some encompassing structure (a whole pickled object in ZODB, a chain of B+-tree nodes in Realm), not just one small logged op.
 
 - **ZODB** (Python) — `Persistent` subclasses track dirty attributes via `__setattr__`; only dirty objects get re-pickled on commit. Its `FileStorage` backend is an append-only transaction log with periodic `pack()` compaction — structurally close to our journal + flush.
-- **GemStone/S** (Smalltalk) — the deepest historical precedent for our pointer design: its *object table* maps object IDs to physical page locations, so compaction only ever touches that one indirection layer, closely matching our index-keyed `alloc` registry.
+- **GemStone/S** (Smalltalk) — the deepest historical precedent for our pointer design: its *object table* maps object IDs to physical page locations, so compaction only ever touches that one indirection layer, closely matching our index-keyed `kladde-alloc` registry.
 - **Realm** (Swift/Kotlin/JS) — "live objects" with native property syntax over an MVCC, copy-on-write storage engine; no SQL, fine page-level granularity. See detailed comparison below.
 - **db4o** / **ObjectDB** (Java/.NET) — bytecode enhancement intercepts field writes on plain objects; no SQL, no ORM-to-relational translation.
 
@@ -217,14 +226,14 @@ One observation ties this lineage back to our own design: ZODB, Realm, and GemSt
 - **Retention.** CRDT lists need tombstones for deleted elements (a concurrent insert might still reference a deleted position), and enough causal history survives to resolve concurrent conflicting writes deterministically. We never need this — a delete is final and its `UniquePointer` is immediately, unconditionally freeable.
 - **Value representation.** Every Automerge value can, in principle, need conflict resolution, so reading "the current value" is resolving something, not a raw field access. Our read-speed goal is only reachable because we don't have to support that.
 - **Data model.** Automerge's document is a fixed generic tree of Map/List/Text/scalar; getting your own Rust types in and out goes through a separate reflection/reconciliation layer (`autosurgeon`). Our derive macro makes *your* type the backed type directly, with real methods and arbitrary nesting.
-- **Scope of the storage layer.** Automerge's persistence is bespoke to its own op log, not a reusable file-backed heap — there's no analog to our `alloc` crate as a general-purpose, relocatable-pointer foundation other backed structures could be built on.
+- **Scope of the storage layer.** Automerge's persistence is bespoke to its own op log, not a reusable file-backed heap — there's no analog to our `kladde-alloc` crate as a general-purpose, relocatable-pointer foundation other backed structures could be built on.
 
 **What our design provides that Automerge doesn't**, as a direct consequence of not needing to support merge:
 
 1. Native persistence of arbitrary Rust types, with real derive-generated methods and arbitrary nesting — not a fixed document model plus a reflection layer.
 2. No CRDT retention tax — deletions are final and immediately reclaim storage.
 3. Read performance that can genuinely match native collections, unconditionally.
-4. A reusable, general-purpose persistent-heap abstraction (`alloc` + `UniquePointer`) as a foundation for building new kinds of backed structures.
+4. A reusable, general-purpose persistent-heap abstraction (`kladde-alloc` + `UniquePointer`) as a foundation for building new kinds of backed structures.
 5. Mutation ergonomics closer to plain `std::collections` — direct `.push()`/`.insert()`/`.remove()` through a `Guard` view, rather than operations scoped inside a transaction against a generic document tree.
 
 None of this makes Automerge worse — every trade-off above is the direct cost of solving a harder problem (multi-writer merge) that this project explicitly scopes out for now (see [Concurrency](#concurrency) and [Future Work](#future-work-v2)). The reverse trade holds too: the moment concurrency/sync becomes a real requirement, Automerge's model is already there, and ours would have to grow substantially to get anywhere close.
@@ -232,8 +241,8 @@ None of this makes Automerge worse — every trade-off above is the direct cost 
 ## Why the Name "Kladde"?
 
 *Kladde* is German for a merchant's rough day-book: transactions scribbled down messily, in order, as they happened, later transcribed into the clean *Hauptbuch* ("main ledger").
-This project's on-disk format follows the same two-part shape — a chaotic, continuously-appended journal, periodically compiled into a clean snapshot (see [Flushing](#flushing)) — so the name doubles as a description of the file format itself, not just the library.
+This project's on-disk format follows the same two-part shape — a chaotic, continuously-appended journal, periodically compiled into a clean snapshot (see [Flushing](#flushing)) — so the name doubles as a description of the file format itself, not just the library. It's also, fittingly, the name of the one crate application code actually depends on (see [Workspace Layout](#workspace-layout)).
 
 ## Open Questions
 
-- **Derive macro coverage.** The guard-generation pattern is sketched above for plain structs (the `Point` example); it still needs to be worked out for enums with multiple variants, generic types, and types with where-clauses.
+- **Derive macro coverage for generic types and where-clauses.** The guard-generation pattern is sketched above for plain, non-generic structs (the `Point` example). Enum support is scoped for v1 (whole-value replacement only — see [Future Work](#future-work-v2) for the deferred fine-grained version), but generic types and types with where-clauses still need to be worked out.

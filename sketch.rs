@@ -5,7 +5,7 @@ use std::ops::{Deref, DerefMut};
 
 /// Assigned by `Allocator::alloc`. Deliberately small and opaque: it does
 /// *not* hold a reference to any `Backend`, so it can't free itself in
-/// `Drop` -- see the README's "Freeing" section for why that's fine (the
+/// `Drop` -- see spec.md's "Freeing" section for why that's fine (the
 /// generated `Guard` wrapper types are responsible for freeing the
 /// `UniquePointer`s they own).
 ///
@@ -28,9 +28,38 @@ use std::ops::{Deref, DerefMut};
 /// `UniquePointer` never actually runs `T`'s destructor (freeing just
 /// discards a byte range), so it shouldn't impose `PhantomData<T>`'s
 /// "may drop a T" (drop-check) obligation.
+///
+/// Deliberately *not* `Serialize`/`Deserialize` -- `index` is meaningless
+/// outside the process that assigned it. See `ResolvedPointer` for how a
+/// `UniquePointer` embedded in some other value actually gets written out.
 pub struct UniquePointer<T> {
     index: NonZeroU32,
     _marker: PhantomData<*const T>,
+}
+
+/// The serializable counterpart of `UniquePointer`, produced by
+/// `Allocator::resolve`. Holds the pointer's current on-disk `target` --
+/// the offset of the region it points *at*, which is what a pointer's
+/// serialized value actually is (as opposed to `position`, the offset of
+/// the pointer's *own* serialized bytes, which is separate bookkeeping
+/// `Allocator` tracks internally once this value has actually been
+/// written out somewhere -- not something `ResolvedPointer` itself knows).
+/// Borrowing `Allocator` for `'a` is deliberate: it prevents, at compile
+/// time, any `Allocator` operation that could invalidate this snapshot
+/// (most importantly, compaction moving the target) for as long as a
+/// `ResolvedPointer` derived from it is still alive -- the borrow checker
+/// enforces that a serialized `target` was still current when it was
+/// written.
+pub struct ResolvedPointer<'a, T> {
+    target: NonZeroU32,
+    _allocator: PhantomData<&'a ()>,
+    _marker: PhantomData<*const T>,
+}
+
+impl<'a, T> serde::Serialize for ResolvedPointer<'a, T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.target.serialize(serializer)
+    }
 }
 
 /// Records operations to the journal. Appending may itself require
@@ -41,16 +70,25 @@ pub struct UniquePointer<T> {
 /// `Allocator` the rest of the system uses, so splitting them into
 /// separately-mixable type parameters wouldn't actually decouple them.
 pub trait Journal {
-    fn record<T: Persistable>(&self, op: &T::Op<'_>);
+    fn record<T: Persistable>(&self, op: &T::Op);
 }
 
 /// Allocates and frees regions in the backed heap, and resolves
 /// `UniquePointer`s to their current `(position, target)`. The concrete
 /// registry (index-keyed table + position-ordered range-query structure,
-/// see README) is intentionally not sketched here yet -- see "mock
-/// `Allocator`" under the README's Open Questions.
+/// see spec.md) is intentionally not sketched here yet -- see "mock
+/// `Allocator`" under spec.md's Open Questions.
 pub trait Allocator {
     fn free<T: Persistable>(&self, pointer: UniquePointer<T>);
+
+    /// `None` if `pointer` hasn't been flushed yet (no `target` exists
+    /// to resolve to). Deserializing goes the other way without needing
+    /// serde's stateful-deserialization machinery at all: the raw
+    /// `target` is read back as an ordinary integer via plain `Deserialize`,
+    /// and a fresh `UniquePointer` (with a newly assigned `index`) is
+    /// minted for it via a separate, plain `Allocator` method (not
+    /// sketched here yet), not via `Deserialize` itself.
+    fn resolve<'a, T>(&'a self, pointer: &UniquePointer<T>) -> Option<ResolvedPointer<'a, T>>;
 }
 
 /// The bound every `Persistable`/`Guard` is generic over. A blanket impl
@@ -64,15 +102,16 @@ impl<B: Journal + Allocator> Backend for B {}
 /// right shape (an `Op` log, a paired `Guard` view) -- but isn't yet tied
 /// to any backend. Only ever accessed read-only; see `Guard` for mutation.
 pub trait Persistable {
-    /// Lifetime-parameterized so that, e.g., `Vec::push` can record a
-    /// *reference* to the value it just pushed (see `VecGuard::push`
-    /// below) instead of needing to clone it or move it twice. This is
-    /// more machinery than a plain (non-generic-associated) `type Op`
-    /// would need -- flagged explicitly as a real complexity cost, not a
-    /// mechanical fix, since it propagates into `Journal::record` too.
-    type Op<'a>: 'a
-    where
-        Self: 'a;
+    /// Plain (non-lifetime-parameterized) and owned, deliberately, for v1:
+    /// the alternative -- a lifetime-parameterized `type Op<'a>`, letting
+    /// e.g. `Vec::push` record a *reference* to the value it just pushed
+    /// instead of cloning it -- is real complexity (it would propagate
+    /// into `Journal::record`'s signature, and the derive macro would need
+    /// to generate correct GAT impls for every derived type). v1 accepts
+    /// the clone cost instead (see `VecGuard::push` below, which needs
+    /// `T: Clone`) to keep the first end-to-end implementation simpler;
+    /// see spec.md's Future Work for revisiting this.
+    type Op: serde::Serialize + serde::de::DeserializeOwned;
 
     type Guard<'s, B: Backend>: Guard;
 
@@ -112,8 +151,9 @@ pub struct Vec<T> {
     data: std::vec::Vec<T>,
 }
 
-pub enum VecOp<'a, T> {
-    Push(&'a T),
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum VecOp<T> {
+    Push(T),
 }
 
 impl<T> Vec<T> {
@@ -128,19 +168,10 @@ impl<T> Vec<T> {
     }
 }
 
+// `T: Clone` is only needed for `push` (see below), not `get_mut` -- kept
+// in a separate impl block rather than bounding the whole type so
+// `get_mut` stays available for non-`Clone` element types.
 impl<'s, T: Persistable, B: Backend> VecGuard<'s, T, B> {
-    pub fn push(&mut self, value: T) {
-        // Push first, then record a *reference* to the now-last element,
-        // rather than moving `value` into the `Op` and into `self.inner`
-        // both (which doesn't compile -- `T` isn't `Copy`) or cloning it
-        // (which would need an unnecessary `T: Clone` bound). `.data` here
-        // is `Vec<T>`'s own private field -- accessible because this impl
-        // block is generated into the same module as `struct Vec<T>`.
-        self.inner.data.push(value);
-        let last = &self.inner.data[self.inner.data.len() - 1];
-        self.backend.record::<Vec<T>>(&VecOp::Push(last));
-    }
-
     pub fn get_mut(&mut self, index: usize) -> Option<T::Guard<'_, B>> {
         self.inner
             .data
@@ -149,14 +180,23 @@ impl<'s, T: Persistable, B: Backend> VecGuard<'s, T, B> {
     }
 }
 
+impl<'s, T: Persistable + Clone, B: Backend> VecGuard<'s, T, B> {
+    pub fn push(&mut self, value: T) {
+        // With `Op` owned (see `Persistable::Op`), recording and pushing
+        // both need their own copy of `value` -- clone into the `Op`,
+        // move the original into `self.inner.data`. `.data` here is
+        // `Vec<T>`'s own private field -- accessible because this impl
+        // block is generated into the same module as `struct Vec<T>`.
+        self.backend.record::<Vec<T>>(&VecOp::Push(value.clone()));
+        self.inner.data.push(value);
+    }
+}
+
 // MACRO-GENERATED CODE IN CRATE `types` ======================================
 
 /// Generated from `#[derive(Persistable)]` on `struct Vec<T>`.
-impl<T> Persistable for Vec<T> {
-    type Op<'a>
-        = VecOp<'a, T>
-    where
-        Self: 'a;
+impl<T: serde::Serialize + serde::de::DeserializeOwned> Persistable for Vec<T> {
+    type Op = VecOp<T>;
     type Guard<'s, B: Backend> = VecGuard<'s, T, B>;
 
     fn guard<'s, B: Backend>(&'s mut self, backend: &'s B) -> Self::Guard<'s, B> {
