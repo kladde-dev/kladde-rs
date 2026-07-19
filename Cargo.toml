@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kladde-traits",
+    "crates/kladde-alloc",
+    "crates/kladde",
+    "crates/kladde-derive",
+    "crates/kladde-types",
+    "example",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+kladde-traits = { path = "crates/kladde-traits" }
+kladde-alloc = { path = "crates/kladde-alloc" }
+kladde = { path = "crates/kladde" }
+kladde-derive = { path = "crates/kladde-derive" }
+kladde-types = { path = "crates/kladde-types" }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+thiserror = "2"
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

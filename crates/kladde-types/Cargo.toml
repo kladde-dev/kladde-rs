@@ -1,0 +1,13 @@
+[package]
+name = "kladde-types"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+kladde-traits = { workspace = true }
+kladde-alloc = { workspace = true }
+kladde-derive = { workspace = true }
+kladde = { workspace = true }
+serde = { workspace = true }

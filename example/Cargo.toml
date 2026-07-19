@@ -1,0 +1,18 @@
+[package]
+name = "example"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+kladde = { workspace = true }
+kladde-types = { workspace = true }
+kladde-derive = { workspace = true }
+# Required alongside kladde-derive whenever #[derive(Persistable)] is used
+# directly (as opposed to only using kladde-types' own container types) --
+# the generated code references `::kladde_traits::...`/`::serde::...`
+# paths, which need to resolve as direct dependencies of the crate the
+# macro expands in. The same reason `#[derive(serde::Serialize)]` requires
+# a direct `serde` dependency, not just `serde_derive`.
+kladde-traits = { workspace = true }
+serde = { workspace = true }
