@@ -1,108 +1,125 @@
-// NOTE: I'm not happy with the names `Backable`, `Backed`, and `Sink`. I think
-// the first two are grammatically confusing, and `Sink` no longer necessarily
-// makes sense if it also has a `free` method, i.e., also encompasses the
-// memory allocator. Come up with better names and change them throughout the
-// codebase.
-//
-// Claude: a few candidates worth considering — `Backable` -> `Store` (the
-// plain, non-backed value type; reads as "a Vec you can store") or `Data`;
-// `Backed` (the wrapper role, currently doing double duty as both "the
-// mutable-access wrapper trait" and implicitly "a thing that is backed") ->
-// `Handle` or `View` (emphasizes "a live, mutation-capable view into backed
-// data", and doesn't collide with the crate-level idea of "a backed data
-// structure" as a whole); `Sink` -> `Journal` or `Store` (but `Store` would
-// then collide with the `Backable` rename above) — maybe `Journal` for the
-// `record` half and keep `free`/allocation on a separate small trait that
-// `Journal: Alloc` or similar composes, since "journal" doesn't obviously
-// cover freeing memory either. Worth deciding once the `Sink`/`alloc`
-// boundary from the pointer-representation discussion below settles, since
-// that affects what this trait's responsibilities actually are.
-
 // CRATE `traits` =============================================================
+use std::marker::PhantomData;
+use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};
 
-// Claude: `OwnedPointer<T>` is used here but never defined anywhere in this
-// sketch. Per the README discussion (pointer-representation open question),
-// it should be a small, opaque, position-keyed marker, e.g.
-// `struct OwnedPointer<T> { position: u32, _marker: PhantomData<T> }`.
-// Where it lives matters for the crate graph: `Sink::free` (here, in
-// `traits`) takes it by value, so if `OwnedPointer` were defined in `alloc`,
-// `traits` would depend on `alloc` — contradicting "alloc depends on traits,
-// not the other way around". `OwnedPointer` (or at least a trait for it)
-// needs to live in `traits` itself, with `alloc` providing the logic that
-// interprets it.
-trait Sink {
-    fn record<T: Backable>(&self, op: &T::Op);
-    fn free<T: Backable>(&self, pointer: OwnedPointer<T>);
+/// Assigned by `Allocator::alloc`. Deliberately small and opaque: it does
+/// *not* hold a reference to any `Backend`, so it can't free itself in
+/// `Drop` -- see the README's "Freeing" section for why that's fine (the
+/// generated `Guard` wrapper types are responsible for freeing the
+/// `UniquePointer`s they own).
+///
+/// `index` is a stable identity assigned once by `Allocator` and never
+/// changes for the lifetime of this pointer -- even though the region it
+/// (eventually) refers to may move around on disk during compaction, and
+/// even though this pointer may not have been flushed to the snapshot yet
+/// at all. `Allocator` resolves `index` to the pointer's current
+/// `position` (where it's serialized in the snapshot, once flushed) and
+/// `target` (where the pointed-to region currently sits, once its own
+/// allocation is flushed); both start out `None` and become `Some` the
+/// first time a flush touches them.
+///
+/// Variance: `PhantomData<*const T>` rather than plain `PhantomData<T>`.
+/// Both give covariance in `T`, which is sound here -- mutation only ever
+/// happens through a `Guard` requiring exclusive access, never through a
+/// shared reference the way `Cell<T>`'s interior mutability does, so the
+/// aliasing+mutation+covariance combination that forces `Cell<T>` to be
+/// invariant doesn't apply. `*const T` is preferred over plain `T` because
+/// `UniquePointer` never actually runs `T`'s destructor (freeing just
+/// discards a byte range), so it shouldn't impose `PhantomData<T>`'s
+/// "may drop a T" (drop-check) obligation.
+pub struct UniquePointer<T> {
+    index: NonZeroU32,
+    _marker: PhantomData<*const T>,
 }
 
-// Claude: `type Backed<S: Sink>: Backed;` declares this GAT with one generic
-// parameter (`S`). But every use site below assumes two (a lifetime plus
-// `S`): `back`'s return type is `Self::Backed<'_, S>`, and the impl further
-// down declares `type Backed<'s, S: Sink> = VecMut<'s, T, S>;`. A GAT's
-// implementations must match the arity/kind of generic parameters declared
-// by the trait exactly, so this won't compile as written — the trait needs
-// `type Backed<'s, S: Sink>: Backed;` (with the lifetime), and `back`'s
-// signature needs an explicit `'s` too:
-// `fn back<'s, S: Sink>(&'s mut self, sink: &'s S) -> Self::Backed<'s, S>;`
-trait Backable {
-    type Op;
-    type Backed<S: Sink>: Backed;
-
-    fn back<S: Sink>(&mut self, sink: &S) -> Self::Backed<'_, S>;
+/// Records operations to the journal. Appending may itself require
+/// allocation (growing the journal's own storage, or a single oversized
+/// `Op`) -- which is the reason `Journal` and `Allocator` are kept as two
+/// traits unified by one `Backend` bound, rather than two independent type
+/// parameters: a `Journal` implementation will generally need the same
+/// `Allocator` the rest of the system uses, so splitting them into
+/// separately-mixable type parameters wouldn't actually decouple them.
+pub trait Journal {
+    fn record<T: Persistable>(&self, op: &T::Op<'_>);
 }
 
-/// Rarely implemented manually, usually generated by the `#[backed]` attribute.
-trait Backed {
-    type Backable: Backable;
-    type Sink: Sink;
-
-    fn as_backable(&self) -> &Self::Backable;
-    fn as_backable_mut(&mut self) -> &mut Self::Backable;
-    fn sink(&self) -> &Self::Sink;
+/// Allocates and frees regions in the backed heap, and resolves
+/// `UniquePointer`s to their current `(position, target)`. The concrete
+/// registry (index-keyed table + position-ordered range-query structure,
+/// see README) is intentionally not sketched here yet -- see "mock
+/// `Allocator`" under the README's Open Questions.
+pub trait Allocator {
+    fn free<T: Persistable>(&self, pointer: UniquePointer<T>);
 }
 
-// Claude: this pair of blanket impls won't compile — `Deref`/`DerefMut` are
-// foreign traits (from std), and `T` here is a fully generic, unconstrained
-// type parameter, which is exactly what Rust's orphan rules forbid
-// (`error[E0210]`: "type parameter `T` must be covered by a local type").
-// It doesn't help that `T: Backed` is a local bound; coherence checking
-// only looks at whether `Self` is a local type, not at trait bounds on it.
-// Fix: don't blanket-impl `Deref` here at all. Instead, have the derive
-// macro generate a concrete `Deref`/`DerefMut` impl for each generated
-// wrapper type individually (e.g. for `VecMut<'s, T, S>` below) — those are
-// local types in the crate where the macro expands, so there's no orphan
-// issue, and it matches the "one generated wrapper struct per derived type"
-// approach already used for `Backed` further down.
-impl<T: Backed> Deref for T {
-    type Target = T::Backable;
+/// The bound every `Persistable`/`Guard` is generic over. A blanket impl
+/// means concrete backend types only ever need to implement `Journal` and
+/// `Allocator` separately; application code names `Backend`, not the two
+/// halves.
+pub trait Backend: Journal + Allocator {}
+impl<B: Journal + Allocator> Backend for B {}
 
-    fn deref(&self) -> &Self::Target {
-        self.as_backable()
-    }
+/// A plain, in-memory value type that *could* be persisted -- it has the
+/// right shape (an `Op` log, a paired `Guard` view) -- but isn't yet tied
+/// to any backend. Only ever accessed read-only; see `Guard` for mutation.
+pub trait Persistable {
+    /// Lifetime-parameterized so that, e.g., `Vec::push` can record a
+    /// *reference* to the value it just pushed (see `VecGuard::push`
+    /// below) instead of needing to clone it or move it twice. This is
+    /// more machinery than a plain (non-generic-associated) `type Op`
+    /// would need -- flagged explicitly as a real complexity cost, not a
+    /// mechanical fix, since it propagates into `Journal::record` too.
+    type Op<'a>: 'a
+    where
+        Self: 'a;
+
+    type Guard<'s, B: Backend>: Guard;
+
+    /// Borrows both `self` and a `Backend` for `'s`, producing a `Guard`
+    /// through which mutations are recorded and applied.
+    fn guard<'s, B: Backend>(&'s mut self, backend: &'s B) -> Self::Guard<'s, B>;
 }
 
-impl<T: Backed> DerefMut for T {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.as_backable_mut()
-    }
+/// A live, mutation-capable, RAII-style view onto a `Persistable` value,
+/// tied to a `Backend` for its lifetime -- the write-side counterpart of
+/// `Persistable`, in the same relationship `MutexGuard` has to `Mutex`.
+/// Rarely implemented manually; usually generated by `#[derive(Persistable)]`.
+pub trait Guard {
+    type Persistable: Persistable;
+    type Backend: Backend;
+
+    fn as_persistable(&self) -> &Self::Persistable;
+    fn as_persistable_mut(&mut self) -> &mut Self::Persistable;
+    fn backend(&self) -> &Self::Backend;
 }
+
+// Note: there is deliberately no blanket `impl<T: Guard> Deref for T`
+// here. `Guard` is a foreign trait from the point of view of any
+// downstream crate, so `Self` in a blanket impl over it would be a fully
+// generic, uncovered type parameter -- exactly what Rust's orphan rules
+// forbid (E0210), regardless of the trait bound on it. Instead, each
+// concrete guard type (e.g. `VecGuard` below) gets its own `Deref`/
+// `DerefMut` impl generated alongside it, since those are local types in
+// whatever crate the macro expands in.
 
 // CRATE `types` ==============================================================
 
-#[derive(Backable(op=VecOp, mut=VecMut))]
-struct Vec<T> {
-    data: std::Vec<T>,
+/// Naming convention: a `Persistable` named `Foo` gets a generated guard
+/// type named `FooGuard`.
+#[derive(Persistable(op = VecOp, guard = VecGuard))]
+pub struct Vec<T> {
+    data: std::vec::Vec<T>,
 }
 
-enum VecOp<T> {
-    Push(T),
+pub enum VecOp<'a, T> {
+    Push(&'a T),
 }
 
 impl<T> Vec<T> {
     pub fn new() -> Self {
         Vec {
-            data: std::Vec::new(),
+            data: std::vec::Vec::new(),
         }
     }
 
@@ -111,95 +128,87 @@ impl<T> Vec<T> {
     }
 }
 
-impl<'s, T: Backable, S: Sink> VecMut<'s, T, S> {
-    // Claude: use-after-move — `value` is moved into `VecOp::Push(value)`
-    // on the line above, then moved again into `self.data.push(value)`.
-    // `T` has no `Copy` bound, so this doesn't compile. Fix: since `record`
-    // only needs the op for the duration of the call (it's meant to
-    // serialize immediately, not retain the `Op` value), have it borrow
-    // rather than own the payload — e.g. push first, then record a
-    // reference to what's now the last element:
-    //   self.data.push(value);
-    //   self.sink.record(&VecOp::Push(&self.data[self.data.len() - 1]));
-    // (this needs `VecOp<'a, T>` to hold `&'a T` instead of owned `T`).
-    // Cloning `value` before the move would also work but costs a clone
-    // that shouldn't be necessary.
+impl<'s, T: Persistable, B: Backend> VecGuard<'s, T, B> {
     pub fn push(&mut self, value: T) {
-        self.sink.record(&VecOp::Push(value));
-        self.data.push(value);
+        // Push first, then record a *reference* to the now-last element,
+        // rather than moving `value` into the `Op` and into `self.inner`
+        // both (which doesn't compile -- `T` isn't `Copy`) or cloning it
+        // (which would need an unnecessary `T: Clone` bound). `.data` here
+        // is `Vec<T>`'s own private field -- accessible because this impl
+        // block is generated into the same module as `struct Vec<T>`.
+        self.inner.data.push(value);
+        let last = &self.inner.data[self.inner.data.len() - 1];
+        self.backend.record::<Vec<T>>(&VecOp::Push(last));
     }
 
-    // Claude: this takes an extra `sink: &mut impl Sink` parameter even
-    // though `VecMut` already carries `self.sink` — inconsistent with
-    // `push` above, which uses `self.sink` directly and takes no such
-    // parameter. This looks like it's mixing the two competing designs
-    // discussed in the README (sink stored once on the wrapper vs. sink
-    // passed per-call) — see my reply there under "Mut wrapper /
-    // mutable getters", which recommends standardizing on the
-    // stored-on-the-wrapper approach `push` already uses, threading the
-    // *same* `&'s S` further down rather than taking a new one here:
-    //   pub fn get_mut(&mut self, index: usize) -> Option<T::Backed<'_, S>> {
-    //       self.data.get_mut(index).map(|item| item.back(self.sink))
-    //   }
-    // Also note `T::Backed<S>` is missing the lifetime argument (see my
-    // comment on the `Backable` trait declaration above), and wrapping the
-    // already-a-wrapper `T::Backed<...>` in an extra `&mut` looks like a
-    // leftover from a plain `Option<&mut T>`-style signature — the
-    // generated wrapper is meant to be returned by value, not borrowed.
-    pub fn get_mut(&mut self, sink: &mut impl Sink, index: usize) -> Option<&mut T::Backed<S>> {
-        self.data.get_mut(index).map(|item| item.back(sink))
+    pub fn get_mut(&mut self, index: usize) -> Option<T::Guard<'_, B>> {
+        self.inner
+            .data
+            .get_mut(index)
+            .map(|item| item.guard(self.backend))
     }
 }
 
 // MACRO-GENERATED CODE IN CRATE `types` ======================================
 
-/// Generated from #[derive(Backable)] on `struct Vec<T>`.
-// Claude: `back`'s body does `data: self`, where `self: &mut Vec<T>` — but
-// `VecMut::data` is declared as `Vec<T>` (owned) below, not `&mut Vec<T>`.
-// That's a type mismatch (and conceptually wrong too: `VecMut` is meant to
-// *borrow* the real backing structure for the duration of `'s`, not own a
-// copy of it). `data` should be `&'s mut Vec<T>`; see the field declaration
-// below for the matching fix.
-impl<T> Backable for Vec<T> {
-    type Op = VecOp<T>;
-    type Backed<'s, S: Sink> = VecMut<'s, T, S>;
+/// Generated from `#[derive(Persistable)]` on `struct Vec<T>`.
+impl<T> Persistable for Vec<T> {
+    type Op<'a>
+        = VecOp<'a, T>
+    where
+        Self: 'a;
+    type Guard<'s, B: Backend> = VecGuard<'s, T, B>;
 
-    fn back<S: Sink>(&mut self, sink: &S) -> Self::Backed<'_, S> {
-        VecMut { data: self, sink }
+    fn guard<'s, B: Backend>(&'s mut self, backend: &'s B) -> Self::Guard<'s, B> {
+        VecGuard {
+            inner: self,
+            backend,
+        }
     }
 }
 
-/// Generated from #[derive(Backable)] on `struct Vec<T>`.
-// Claude: `data: Vec<T>` should be `data: &'s mut Vec<T>` (see `back` above
-// — it assigns `self`, a `&mut Vec<T>`, into this field). With that fixed,
-// `as_backable`/`as_backable_mut` below need a reborrow rather than `&self.data`
-// / `&mut self.data` (which would produce `&&mut Vec<T>` / doubly-indirect
-// references) — e.g. `fn as_backable(&self) -> &Vec<T> { self.data }` and
-// `fn as_backable_mut(&mut self) -> &mut Vec<T> { self.data }` (Rust
-// reborrows a `&mut` field automatically in return position here).
-//
-// `DefaultSink` is used as the default type argument but never defined —
-// presumably lives in `frontend`, per the README discussion ("`types`
-// probably needs to depend on `frontend`" for exactly this default).
-struct VecMut<'s, T, S = DefaultSink> {
-    data: Vec<T>,
-    sink: &'s S,
+/// Generated from `#[derive(Persistable)]` on `struct Vec<T>`.
+/// `inner` borrows the real `Vec<T>` (the `Persistable` wrapper, not its
+/// private `std::vec::Vec` field directly) for `'s`, so that
+/// `as_persistable`/`Deref` below have something to return a reference to.
+/// `backend` is a plain (non-owning, non-refcounted) reference, stored
+/// once here and reborrowed down into nested guards (see `get_mut` above)
+/// rather than re-supplied by the caller at each call.
+pub struct VecGuard<'s, T, B = DefaultBackend> {
+    inner: &'s mut Vec<T>,
+    backend: &'s B,
 }
 
-/// Generated from #[derive(Backable)] on `struct Vec<T>`.
-impl<'s, T, S: Sink> Backed for VecMut<'s, T, S> {
-    type Backable = Vec<T>;
-    type Sink = S;
+/// Generated from `#[derive(Persistable)]` on `struct Vec<T>`.
+impl<'s, T, B: Backend> Guard for VecGuard<'s, T, B> {
+    type Persistable = Vec<T>;
+    type Backend = B;
 
-    fn as_backable(&self) -> &Self::Backable {
-        &self.data
+    fn as_persistable(&self) -> &Self::Persistable {
+        self.inner
     }
 
-    fn as_backable_mut(&mut self) -> &mut Self::Backable {
-        &mut self.data
+    fn as_persistable_mut(&mut self) -> &mut Self::Persistable {
+        self.inner
     }
 
-    fn sink(&self) -> &Self::Sink {
-        &self.sink
+    fn backend(&self) -> &Self::Backend {
+        self.backend
+    }
+}
+
+/// Generated from `#[derive(Persistable)]` on `struct Vec<T>`.
+impl<'s, T, B> Deref for VecGuard<'s, T, B> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner
+    }
+}
+
+/// Generated from `#[derive(Persistable)]` on `struct Vec<T>`.
+impl<'s, T, B> DerefMut for VecGuard<'s, T, B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
     }
 }
