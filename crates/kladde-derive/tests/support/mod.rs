@@ -8,7 +8,9 @@
 //! rather than split further, since it's `#[cfg(test)]`-only fixture code.
 #![allow(dead_code)]
 
-use kladde_traits::{Allocator, Backend, Guard, Journal, Persistable, ResolvedPointer, UniquePointer};
+use kladde_traits::{
+    Allocator, Backend, Guard, Journal, Persistable, ResolvedPointer, UniquePointer,
+};
 use std::cell::RefCell;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]

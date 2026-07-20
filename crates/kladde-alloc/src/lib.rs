@@ -136,7 +136,9 @@ mod tests {
         let alloc = MockAllocator::new();
         let pointer = alloc.alloc::<Dummy>(8);
 
-        let resolved = alloc.resolve(&pointer).expect("just allocated, should resolve");
+        let resolved = alloc
+            .resolve(&pointer)
+            .expect("just allocated, should resolve");
         // The mock stands the index in for the target -- see the doc
         // comment on `MockAllocator`.
         assert_eq!(resolved.target(), pointer.index());

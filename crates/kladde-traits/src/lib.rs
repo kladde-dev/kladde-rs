@@ -286,7 +286,10 @@ mod tests {
                 UniquePointer::from_index(NonZeroU32::new(1).unwrap())
             }
             fn free<T: Persistable>(&self, _pointer: UniquePointer<T>) {}
-            fn resolve<'a, T>(&'a self, _pointer: &UniquePointer<T>) -> Option<ResolvedPointer<'a, T>> {
+            fn resolve<'a, T>(
+                &'a self,
+                _pointer: &UniquePointer<T>,
+            ) -> Option<ResolvedPointer<'a, T>> {
                 None
             }
         }

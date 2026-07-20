@@ -112,10 +112,11 @@ where
     /// recording one `Insert` op. Requires `K`/`V: Clone` for the same
     /// reason `PersistedVec::push` does -- see `spec.md`'s Future Work.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        self.backend.record::<PersistedHashMap<K, V>>(&PersistedHashMapOp::Insert(
-            key.clone(),
-            value.clone(),
-        ));
+        self.backend
+            .record::<PersistedHashMap<K, V>>(&PersistedHashMapOp::Insert(
+                key.clone(),
+                value.clone(),
+            ));
         self.inner.data.insert(key, value)
     }
 }

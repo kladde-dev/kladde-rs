@@ -47,8 +47,8 @@ impl Default for DefaultBackend {
 
 impl Journal for DefaultBackend {
     fn record<T: Persistable>(&self, op: &T::Op) {
-        let bytes =
-            postcard::to_allocvec(op).expect("postcard serialization of an in-memory Op should not fail");
+        let bytes = postcard::to_allocvec(op)
+            .expect("postcard serialization of an in-memory Op should not fail");
         self.journal.borrow_mut().push(bytes);
     }
 }
@@ -122,7 +122,10 @@ mod tests {
             Self: 's,
             B: 's;
 
-        fn guard<'s, B: kladde_traits::Backend>(&'s mut self, backend: &'s B) -> Self::Guard<'s, B> {
+        fn guard<'s, B: kladde_traits::Backend>(
+            &'s mut self,
+            backend: &'s B,
+        ) -> Self::Guard<'s, B> {
             CounterGuard {
                 inner: self,
                 backend,

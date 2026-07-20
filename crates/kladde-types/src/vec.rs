@@ -91,7 +91,10 @@ pub struct PersistedVecGuard<'s, T, B = kladde::DefaultBackend> {
 // `sketch.rs`, so it stays available for non-`Clone` element types.
 impl<'s, T: Persistable, B: Backend> PersistedVecGuard<'s, T, B> {
     pub fn get_mut(&mut self, index: usize) -> Option<T::Guard<'_, B>> {
-        self.inner.data.get_mut(index).map(|item| item.guard(self.backend))
+        self.inner
+            .data
+            .get_mut(index)
+            .map(|item| item.guard(self.backend))
     }
 }
 

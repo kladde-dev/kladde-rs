@@ -120,7 +120,10 @@ fn main() {
                         }
                     };
                     if found {
-                        println!("added phone number (journal entries: {})", journal_len(&book));
+                        println!(
+                            "added phone number (journal entries: {})",
+                            journal_len(&book)
+                        );
                     } else {
                         println!("no such contact: {name}");
                     }
@@ -177,5 +180,7 @@ fn print_help() {
     println!("show <name>                               -- show a contact's details");
     println!("list                                      -- list all contacts");
     println!("remove <name>                             -- remove a contact");
-    println!("quit | exit                               -- leave (state is not saved -- see spec.md)");
+    println!(
+        "quit | exit                               -- leave (state is not saved -- see spec.md)"
+    );
 }
