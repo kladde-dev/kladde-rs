@@ -33,31 +33,67 @@ This is the real gap opened up by choosing (b), and I think it's the crux decisi
 
 **What to run.** Per your follow-up on (0): rather than `Journal::record` serializing bytes that a later interpreter has to look up a type for, it can capture a closure at the call site — `self.journal.push(Box::new(move |allocator: &A| { /* apply this specific op to this specific target */ }))` roughly. The concrete type is fully known to the compiler right there, at record time, so the closure already *is* the specialized code a `Flushable::apply` method would otherwise have needed to be looked up and dispatched to. This is why I agree no separate trait is needed for dispatch — the closure supplies its own "how," so there's nothing left to name a trait method after.
 
+No. Stick with `Journal::record` and separate the serialization into two parts:
+
+- the `Journal` itself serializes a brief header that identifies the type (via its index into the list of type hashes mentioned in `spec.md`);
+- either the type or the `Op` serializes the rest (for now, use `serde` for this, but later we might want to serialize ourselves into a representation that can immediately be reused -- either copied byte for byte or even declared as a memory allocation; see `later.md`).
+- Before letting the `Op` serialize itself, the `Journal` might have to ensure that there's enough room left in the current journal (if it's not at the end of the file). For this, we probably need to introduce an `Op` trait with a trait method `serialized_len(&self) -> u32`.
+
+There's are two minor open questions:
+
+- Most `Op`s will probably be enum types. We might want to enforce this and even require them to implement `EnumTag` from the `enum-tag` crate or something similar. Then, the journal itself would serialize not only the type ide but also the enum tag.
+- One advantage of this could be that it would allow the `Journal` to know the serialized size of all `Op`s upon replay, if this is necessary: we could modify the signature of `serialized_len` such that it returns a tuple `(len: u32, dynamic: bool)` where `dynamic` tells us whether the obtaining the `len` required inspecting the contents of the `Op` (not just the enum variant). If `dynamic` is `true`, upon serialization, the `Journal` itself would write the size as part of the header. Upon deserialization, the `Journal` calls a method `Op::size(variant: <Op as EnumTag>::Tag) -> Option<u32>)` which returns `Some(len)` if `serialized_len` on the deserialized value would return `(len, true)`, and `None` if `serialized_len` would return `(_, false)`. If `None` was returned, then the `Journal` knows that this `Op` variant has a dynamic serialized size, which it can read from the header. If `Some(len)` is returned, then the `Journal` knows that the header does not contain the length (which is already known at this point).
+- But I'm not sure yet if `Op` deserialization (journal replay) will even need to know the size of serialized `Op`s. Maybe we can simply allow the `Op` to read as many bytes as it needs and let it figure out the length itself.
+
 **Which instance.** This is the part a closure doesn't solve for free, and it's the part `Flushable` was actually reaching for. A closure captured inside, say, `PersistedVecGuard::push` can close over `&self.inner` (the live Rust reference) — but that's exactly how ordinary mutation already works, and it's not enough for replay: replay needs to know *which allocated region in the snapshot* this instance corresponds to, so the closure can go update that region specifically (per (1), only types with pointers in their inline representation have a region to update at all — so this only applies to those). Concretely: two different `Contact`s inside a `PersistedHashMap` each have their own `phones: PersistedVec<PhoneNumber>` — both are the same *type*, so both need *some* per-instance handle the closure can capture, not just type-level dispatch info.
 
 The pieces I think this needs, regardless of trait-vs-closure: every value of a type that (per (1)) owns pointers needs a **stable in-memory identity from the moment it's first touched**, not just once it's first flushed — because a closure recorded *before* the first flush still needs to close over *something* that will resolve to the right region once a flush eventually runs. Mechanically, that's a `UniquePointer<Self>` (or an as-yet-unresolved reservation of one), lazily created the first time it's needed. It can't be eager at construction, because containers are built without a backend in hand (`PersistedVec::new()` takes no arguments) — so it has to be created lazily, inside whichever `Guard` method first needs it, where `backend: &'s B` is already available. That likely means `PersistedVec`/`PersistedHashMap` grow an interior-mutable `pointer: Cell<Option<UniquePointer<Self>>>`-shaped field they don't have today, and the guard's mutating methods get-or-create it before capturing the closure. This is a real, if small, structural change to both container types — flagging it explicitly rather than just doing it, since it also touches whatever the derive macro would need for a future user-defined container.
 
+I don't like the closure approach. I was picturing the approach as follows:
+
+- I think construction should be regarded as a mutating operation (it turns nothing into something) so, in principle, I wouldn't mind constructors requiring a `Backend`.
+- In most cases we still probably don't need a `Backend` during construction because the constructor itself does not need to allocate any space. This is analogous to how `Vec::new` from the rust std library doesn't allocate memory; only when one pushes the first entry does the memory allocation get created.
+- I agree that we need a stable in-memory identity for a pointer from the moment it is constructed, even if the actual memory allocation is deferred to when the journal gets flushed. This is why `UniquePointer` in `spec.md` contains an `index`, not the target address. Creating a `UniquePointer` creates an entry in the allocator's table and wraps the `index` to that entry in a `UniquePointer`. The allocator's table maps the `index` to (among maybe other meta data like the size) an `Option<NonZeroU32>`. For pointers whose memory region has been allocated, this has value `Some(target_addres)`; for pointers whose memory region has not yet been allocated, it's `None`.
+- Thus, as far as I can tell, the container types never need to worry about whether the memory region for any `UniquePointer` they hold has already been allocated. They just hold the index, and the allocator worries about lazy/deferred allocations.
+
+Does this resolve your concerns or are there any open questions?
+
 **Question for you:** does the closure-capturing-identity approach above sound right, or would you rather keep entries as plain serialized bytes plus an explicit (small, in-process — not `spec.md`'s persisted file registry, which is a separate, later concern) type tag, with a lookup table doing the dispatch a closure would otherwise do inline? The closure version is less code and matches "interpreter" more literally (the closure *is* the compiled instruction), but it means journal entries are never actually bytes for as long as we're on the mock — which is probably fine now, but worth confirming you're OK with that being true of this whole round, not just a temporary implementation detail.
+
+I don't quite follow. Does my above explanation resolve this or are there open questions?
 
 ## 3. What does "doesn't fit, needs to move" actually do, mechanically?
 
 On replaying a structural op (e.g. `Push`): serialize the new element/entry; if there's no existing allocation yet, `alloc` one. If there is one but the new content doesn't fit in the existing region, `alloc` a new region, write into it, `free` the old one, update the pointer -- no in-place grow, matching how `Allocator` is already shaped (`alloc`/`free`/`resolve`, no `realloc`). **I'd add a small amount of slack on allocation (e.g. round up, or allocate ~2x like `std::Vec` does) so a run of pushes doesn't reallocate on every single flush** -- worth it, or keep it exact-size-only for now and revisit once it's clear whether flush frequency makes this matter?
 
+Yes, implement the snapshot representation of `PersistedVec` analogous to how `Vec` from the rust std library is implemented in memory for now, with two additional comments:
+
+- Add a trait method `resize(&mut UniquPointer, new_size)` on `Allocator`, which records an `Op` that changes an existing allocation to a new size. When this operation is replayed and the allocator realizes that the new allocation still fits at the same position, then it just reuses the existing allocation with an adjusted size. If it doesn't, the allocator finds a new memory region, copies out `min(new_size, old_size)` bytes, frees the old region, and updates where the provided pointer points in its internal table.
+- After testing this version of `PersistedVec` and committing it to git, use the more appropriate memory layout described in `later.md`.
+
 ## 4. How is a flush triggered?
 
 `spec.md` describes an automatic threshold ("when the journal exceeds a size threshold"). For v1, given there's no real durability pressure yet (nothing crashes, nothing reopens), **I'd implement only an explicit `Kladde::flush(&mut self)`** and defer auto-flush-on-threshold as a thin wrapper to add later once flush exists. Agree?
+
+Yes.
 
 ## 5. Root value handling
 
 The root (`Kladde<T>`'s `root: T`) needs to end up allocated too, for the round-trip test in (0) to mean anything (something has to identify "where is the root's blob" so a fresh reload can find it). Unlike other containers, the root doesn't have the "constructed without a backend" problem from Question 2 -- `Kladde::new` already brings `root` and `backend` together in one place -- but I'd still give it a `root_pointer: Option<UniquePointer<T>>` field for symmetry with everything else, populated lazily the same way. **Does the root itself need to be a type that owns pointers in the sense of (1) (i.e., must the app's root type be a `PersistedVec`/`PersistedHashMap`/similar, not an arbitrary `#[derive(Persistable)]` struct)?** I'd guess yes for now, since a plain derived struct has no allocation of its own to be found by a pointer -- meaning `AppState` in the example (a plain derived struct wrapping a `PersistedHashMap`) would need its own allocation-owning wrapper, or `#[derive(Persistable)]` structs need to gain that capability generally. This is also where a trait bound (if any survives Question 2's closure discussion) would actually earn its keep: `Kladde<T>::flush`'s generic `T` needs *some* bound to know it's a legal root type at all, even if nothing else in the design ends up needing a named trait.
 
+This question might be rendered obsolete by now. Let me know if it's still relevant, otherwise delete it.
+
 ## 6. Op-log optimization and compaction (`spec.md` pipeline steps 2, 4, 6)
 
 Under (b), this now genuinely applies -- a run of `Push`/`Remove` against the same instance really is a sequence of real operations that could be optimized (matched push+remove cancelling, etc.), matching `spec.md`'s pipeline steps 2 and 4 literally for the first time (unlike under option (a) last round, where re-snapshotting was already maximally "optimized" by construction). Per your answer to (0), **I'm reading this as explicitly in scope eventually, but deferred to a follow-up commit** -- this round implements naive in-order replay, with optimization as a separate later piece of work. Confirming that reading before I build anything that assumes it. **Compaction** (step 6, reclaiming fragmentation across many allocations) still doesn't obviously mean anything for the mock -- each allocation is its own independent `Box<[u8]>`, not a contiguous file region, so there's no fragmentation to reclaim. **I'd still treat compaction specifically as out of scope until there's a real, file-backed `Allocator`.** Agree?
 
+Yes.
+
 ## 7. What happens to the journal itself after a flush?
 
 Still: clear it (`DefaultBackend` needs something like `clear_journal(&self)`, or `flush` just drains it) once every entry has run. **Anything you want the journal to keep doing after a flush, or is drain-and-discard right?**
+
+Drain and discard is right. Eventually, we'll want to implement a `full_compaction` method that application code can call when the user wants to explicitly export the file. This method would flush the journal, compact the memory, and then actually delete everything that has been freed, including the journal (i.e., actually shorten the file). Add this to `later.md`.
 
 ---
 
