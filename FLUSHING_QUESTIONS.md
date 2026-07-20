@@ -11,17 +11,17 @@ Right now the journal is genuinely decorative: `Journal::record` serializes an `
 
 **I'd recommend (a) for this round**, and treat (b) — real per-op replay, with a type registry — as a separate, later piece of work once (a) has established the pointer/allocation mechanics. Reasonable, since v1 has no real crash scenario forcing "reconstruct purely from the journal" to matter yet; that's specifically what (b) would buy you, and it's expensive to build correctly. Flag if you want to go straight for (b).
 
-Assuming (a), here's how I'd propose defining "done," concretely, since it doubles as the test:
-
-> Mutate a root value through its `Guard`s, call `flush()`, then reconstruct a **fresh** value by reading *only* from the (same) `MockAllocator`'s storage — no reference to the live value that was flushed — and assert it equals what was flushed. That's a real round-trip through `Allocator`, which nothing today exercises.
-
-**OK with that framing?**
+No, go with option (b): journal replay. Start with a simple journal replay that just iterates over all `Op`s and executes them (akin to an interpreter for a scripting language). In subsequent commits, implement the optimization steps mentioned in `spec.md`. I also think this means the `Flushable` trait you recommended in the chat is probably not needed, but I might be mistaken here. If you still find a use for `Flushable`, feel free to declare it.
 
 ## 1. Which types get their own allocation/pointer, and which are inline?
 
 Not every `Persistable` value should need its own `UniquePointer` — a scalar (`i32`) or a plain derived struct (`Op = ()`, embedded by value in whatever contains it) clearly shouldn't. The natural line: only *container* types (`PersistedVec`, `PersistedHashMap`, and presumably any future type with the same "can grow independently, benefits from being relocatable" shape) get their own allocation; everything nested inside one is serialized inline as part of that container's single blob, no matter how deeply nested.
 
+Agreed. More precisely: similar to the memory layout of containers in rust or C++, containers aren't necessarily just a single pointer. For example, a `PersistedVec` would be stored as a length and a pointer (and possibly a capacity, although that can probably be deduced from the size of the allocation). This might also tie in with the discussion about `Flushable`.
+
 **Follow-on:** does that mean a `PersistedVec<PersistedVec<i32>>` serializes as *one* blob containing everything, with the inner vecs *not* independently relocatable? That's the simple version, and I'd recommend it for now — independently-relocatable nested containers is real complexity (each one needs its own pointer, its own entry in the allocator's registry, updated on its own schedule) that doesn't seem justified before there's a concrete need for it. **Agree, or do nested containers need independent allocations from the start?**
+
+No, see our discussion in the chat. In summary: in principle, every data type is stored inline and has a fixed size. However, for some data types (mostly variably-sized collections), the inline stored part is mostly a small fixed number of pointers and maybe some small amount of meta data, and the bulk of the payload sits in a separate memory allocation pointed to by the pointers. All pointers in the snapshot region are "owning", i.e., the memory allocation they point to semantically "belongs to" the data type that holds the pointer (i.e., that data type is in charge of freeing the memory allocation). Whether a data type has pointers to other memory allocations or not depends only on the data type and not whether the _instance_ sits at the top level of the persisted data structure or somewhere nested inside another variable-sized container.
 
 ## 2. Does this need a new trait, or does it belong on `Persistable`?
 
