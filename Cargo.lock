@@ -45,16 +45,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
-name = "example"
-version = "0.1.0"
-dependencies = [
- "kladde",
- "kladde-derive",
- "kladde-traits",
- "kladde-types",
-]
-
-[[package]]
 name = "hash32"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -6,7 +6,6 @@ members = [
     "crates/kladde",
     "crates/kladde-derive",
     "crates/kladde-types",
-    "example",
 ]
 
 [workspace.package]

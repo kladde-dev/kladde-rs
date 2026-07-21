@@ -2,7 +2,8 @@
 //! stack: a `#[derive(Persistable)]` struct (`Contact`) and enum
 //! (`PhoneNumber`), nested inside a `PersistedVec` and a
 //! `PersistedHashMap`, mutated through generated `Guard`s and backed by
-//! `kladde`'s `DefaultBackend`.
+//! `kladde`'s `DefaultBackend`. Run with `cargo run -p kladde-types
+//! --example phonebook`.
 //!
 //! v1 has no real file behind any of this (see `spec.md`'s "Crash
 //! Consistency" note) -- state lives only for the duration of this
