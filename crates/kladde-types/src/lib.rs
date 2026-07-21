@@ -13,6 +13,7 @@
 mod map;
 #[cfg(feature = "serde")]
 mod persisted;
+mod string;
 mod vec;
 
 #[cfg(test)]
@@ -21,6 +22,7 @@ mod test_support;
 pub use map::{PersistedHashMap, PersistedHashMapGuard};
 #[cfg(feature = "serde")]
 pub use persisted::{Persisted, PersistedGuard};
+pub use string::{PersistedString, PersistedStringGuard};
 pub use vec::{PersistedVec, PersistedVecGuard};
 
 // `Persistable` here names two different things in two different

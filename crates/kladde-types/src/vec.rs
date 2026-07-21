@@ -51,6 +51,17 @@ impl<T> PersistedVec<T> {
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.data.iter()
     }
+
+    /// Crate-internal escape hatch for [`crate::PersistedString`], the
+    /// only thing that needs a raw `&[T]`/`Vec<T>` view rather than going
+    /// through `get`/`iter`/`push`/`remove` one element at a time.
+    pub(crate) fn as_slice(&self) -> &[T] {
+        &self.data
+    }
+
+    pub(crate) fn into_data(self) -> Vec<T> {
+        self.data
+    }
 }
 
 impl<T> Default for PersistedVec<T> {
@@ -59,6 +70,12 @@ impl<T> Default for PersistedVec<T> {
     }
 }
 
+/// Backend-free, like `new()` -- but unlike `new()`, the result may hold
+/// real content with `pointer` still `None` if `iter` isn't empty (e.g.
+/// `PersistedString::from("hello")` goes through this). `store`'s `None`
+/// branch below handles that: it's not the same "genuinely never
+/// touched" case `new()`/`load` produce, so it can't just assume there's
+/// nothing to allocate.
 impl<T> FromIterator<T> for PersistedVec<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         PersistedVec {
@@ -123,13 +140,40 @@ impl<T: Persistable> Persistable for PersistedVec<T> {
             Some(existing) => {
                 write_header(backend, location, existing.index(), self.data.len() as u32);
             }
-            None => {
-                // `pointer` is only ever `None` when `data` is empty too
-                // (see `new`/`load`) -- nothing to allocate, just record
+            None if self.data.is_empty() => {
+                // The genuinely-never-touched case (`new`/`load`, or an
+                // empty `from_iter`) -- nothing to allocate, just record
                 // "no allocation yet" directly (`write_header` requires a
                 // real index, so this can't go through it).
-                debug_assert!(self.data.is_empty());
                 backend.write(location.anchor, location.offset, &[0u8; 8]);
+            }
+            None => {
+                // `data` is non-empty despite `pointer` being `None`: a
+                // `from_iter`-constructed value (see its doc comment)
+                // that's never been pushed/set through a `Guard`, so
+                // there's been no chance yet to remember an allocation.
+                // Allocating here is correct, not a leak, for the same
+                // reason `push`'s very first call is: there's nothing to
+                // reuse yet. The one residual caveat: calling `store`
+                // *again* on this exact in-memory value while its own
+                // `pointer` field stays `None` in the caller's copy
+                // (rather than going through a `Guard`, which does update
+                // it) would allocate a second time -- treat a
+                // `from_iter`-constructed value as something to push/set
+                // exactly once, not to `store` repeatedly.
+                let elem_size = T::INLINE_SIZE as u32;
+                let byte_size = self.data.len() * T::INLINE_SIZE;
+                let pointer = backend.alloc::<PersistedVec<T>>(byte_size);
+                for (i, item) in self.data.iter().enumerate() {
+                    item.store(
+                        backend,
+                        Location {
+                            anchor: pointer.raw(),
+                            offset: i as u32 * elem_size,
+                        },
+                    );
+                }
+                write_header(backend, location, pointer.index(), self.data.len() as u32);
             }
         }
     }
@@ -392,5 +436,18 @@ mod tests {
 
         let reloaded = PersistedVec::<i32>::load(&backend, location_b);
         assert_eq!(reloaded, vec);
+    }
+
+    #[test]
+    fn store_allocates_content_for_a_from_iter_constructed_vec() {
+        let backend = MockBackend::default();
+        let location = root_location(&backend);
+
+        let vec: PersistedVec<i32> = [1, 2, 3].into_iter().collect();
+        vec.store(&backend, location);
+        backend.flush();
+
+        let reloaded = PersistedVec::<i32>::load(&backend, location);
+        assert_eq!(reloaded.data, vec![1, 2, 3]);
     }
 }
