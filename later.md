@@ -14,6 +14,9 @@
 - A `full_compaction` method that application code can call explicitly (e.g. when the user wants to export the file): flush the journal, compact the memory, then actually delete everything that's been freed, including shortening the journal/file itself rather than just marking space reusable.
 - Introduce a semantic versioning into files that tracks both which app versions can read a given file and which kladde-versions can. We'll probably need a `min_version` and an `last_writer_version` for both, not sure yet.
 - It might be useful to introduce additional microops that combine typical behavior. For example: `split` (splits an allocation into two; combines `alloc`, `copy`, `resize`) or maybe only `copy_part` (combines only `alloc` and `copy` but leaves the old data in place for the caller to potentially overwrite). Introducing such microops with higher level semantics might enable additional optimizations.
+- Figure out how the derived guards for `struct`s and `enum`s can be used ergonomically in application code.
+  - For `struct` guards, it might be worth implementing `set_<field>(value)` convenience methods for each field so that one doesn't have to the dance to get a guard for the field and write to it.
+  - For `enum` guards: can we support pattern matching somehow?
 
 ## Things to check later
 

@@ -148,7 +148,7 @@ struct Location {
 
 This means `Persistable::guard` needs a `Location` parameter alongside `backend`, and every derive-generated field accessor needs to compute and pass one down. Does this shape look right, or is there a simpler mechanism I'm not seeing? I'd rather get this confirmed than build it and find out it's wrong five files in.
 
-TODO
+I agree, this proposal looks good to me.
 
 ## 10. Folding `Journal` into `Allocator` — confirm
 
