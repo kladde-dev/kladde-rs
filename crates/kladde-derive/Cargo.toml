@@ -15,5 +15,3 @@ proc-macro2 = { workspace = true }
 
 [dev-dependencies]
 kladde-traits = { workspace = true }
-serde = { workspace = true }
-postcard = { workspace = true }

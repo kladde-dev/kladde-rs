@@ -10,20 +10,19 @@
 //!   compile time), and it never owns an allocation of its own -- it just
 //!   threads the `Location` it's given down to its fields, extended by
 //!   each field's static offset.
-//! - A derived enum is treated as an "owning" type instead (fixed 8-byte
-//!   header, like `String`/`PersistedVec`): only whole-value replacement
-//!   is supported (`guard.set(new_value)`), not mutating a field within
-//!   the current variant in place, so its content is just the
-//!   `postcard`-serialized whole value. See `spec.md`'s Future Work.
+//! - `enum`s are not yet supported (see `spec.md`'s Future Work) --
+//!   `derive_enum` was removed along with the `serde`/`postcard`-based
+//!   "owning blob" representation it used to generate, pending the inline
+//!   (discriminant + per-variant static offsets) layout redesign. Wrap an
+//!   enum field in `kladde_types::Persisted<T>` in the meantime.
 //! - Generic types and types with where-clauses are not yet supported.
 //!
-//! **Dependency note:** generated code references `::kladde_traits::...`,
-//! `::serde::...`, and (for enums) `::postcard::...` paths directly, so
-//! any crate using this macro needs `kladde-traits`, `serde`, and (if it
-//! derives on any enum) `postcard` as *direct* dependencies too --
-//! re-exports (e.g. via `kladde-types`) aren't enough to make
-//! `::kladde_traits` resolve. The same reason `#[derive(serde::Serialize)]`
-//! requires a direct `serde` dependency, not just `serde_derive`.
+//! **Dependency note:** generated code references `::kladde_traits::...`
+//! paths directly, so any crate using this macro needs `kladde-traits` as
+//! a *direct* dependency too -- re-exports (e.g. via `kladde-types`)
+//! aren't enough to make `::kladde_traits` resolve. The same reason
+//! `#[derive(serde::Serialize)]` requires a direct `serde` dependency,
+//! not just `serde_derive`.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -45,7 +44,12 @@ pub fn derive_persistable(input: TokenStream) -> TokenStream {
 
     let expanded = match &input.data {
         Data::Struct(data) => derive_struct(&input, data),
-        Data::Enum(data) => derive_enum(&input, data),
+        Data::Enum(data) => syn::Error::new_spanned(
+            data.enum_token,
+            "#[derive(Persistable)] does not yet support enums -- see spec.md's Future Work \
+             (wrap the field in kladde_types::Persisted<T> in the meantime)",
+        )
+        .to_compile_error(),
         Data::Union(data) => syn::Error::new_spanned(
             data.union_token,
             "#[derive(Persistable)] does not support unions",
@@ -273,126 +277,6 @@ fn derive_unit_like_struct(
 
             fn load<B: ::kladde_traits::Backend>(_backend: &B, _location: ::kladde_traits::Location) -> Self {
                 #ident
-            }
-        }
-    }
-}
-
-fn derive_enum(input: &DeriveInput, _data: &syn::DataEnum) -> proc_macro2::TokenStream {
-    let ident = &input.ident;
-    let vis = &input.vis;
-    let guard_ident = format_ident!("{}Guard", ident);
-
-    quote! {
-        // v1 scope (see spec.md's Future Work): the only mutation is
-        // replacing the whole value, so there's no per-variant,
-        // per-field granularity yet, and an enum is treated as an
-        // "owning" type (fixed 8-byte header, content elsewhere) rather
-        // than trying to give each variant its own static byte layout --
-        // see this module's doc comment.
-        #[doc(hidden)]
-        #vis struct #guard_ident<'s, B> {
-            inner: &'s mut #ident,
-            backend: &'s B,
-            location: ::kladde_traits::Location,
-        }
-
-        impl<'s, B: ::kladde_traits::Backend> #guard_ident<'s, B> {
-            /// Replaces the whole value with `value`. See spec.md's
-            /// Future Work for the deferred fine-grained alternative
-            /// (mutating a field within the current variant in place,
-            /// and/or matching directly on this guard).
-            #vis fn set(&mut self, value: #ident) {
-                ::kladde_traits::Persistable::store(&value, self.backend, self.location);
-                *self.inner = value;
-            }
-        }
-
-        impl<'s, B: ::kladde_traits::Backend> ::kladde_traits::Guard for #guard_ident<'s, B> {
-            type Persistable = #ident;
-            type Backend = B;
-
-            fn as_persistable(&self) -> &#ident {
-                self.inner
-            }
-            fn as_persistable_mut(&mut self) -> &mut #ident {
-                self.inner
-            }
-            fn backend(&self) -> &B {
-                self.backend
-            }
-        }
-
-        impl<'s, B> ::std::ops::Deref for #guard_ident<'s, B> {
-            type Target = #ident;
-            fn deref(&self) -> &#ident {
-                self.inner
-            }
-        }
-
-        impl<'s, B> ::std::ops::DerefMut for #guard_ident<'s, B> {
-            fn deref_mut(&mut self) -> &mut #ident {
-                self.inner
-            }
-        }
-
-        impl ::kladde_traits::Persistable for #ident
-        where
-            #ident: ::serde::Serialize + ::serde::de::DeserializeOwned,
-        {
-            /// A fixed 8-byte `{ target, len }` header -- see
-            /// `String`/`PersistedVec`'s identical layout note. Note the
-            /// same interim limitation `String` has: a plain derived
-            /// enum has no room for a persistent `pointer` field of its
-            /// own, so every `store` allocates fresh rather than
-            /// resizing/reusing, leaking the previous allocation (see
-            /// `spec.md`).
-            const INLINE_SIZE: usize = 8;
-
-            type Guard<'s, B: ::kladde_traits::Backend>
-                = #guard_ident<'s, B>
-            where
-                Self: 's,
-                B: 's;
-
-            fn guard<'s, B: ::kladde_traits::Backend>(
-                &'s mut self,
-                backend: &'s B,
-                location: ::kladde_traits::Location,
-            ) -> Self::Guard<'s, B> {
-                #guard_ident {
-                    inner: self,
-                    backend,
-                    location,
-                }
-            }
-
-            fn store<B: ::kladde_traits::Backend>(&self, backend: &B, location: ::kladde_traits::Location) {
-                let bytes = ::postcard::to_allocvec(self)
-                    .expect("postcard serialization of an in-memory value should not fail");
-                let pointer = ::kladde_traits::Allocator::alloc::<#ident>(backend, bytes.len());
-                ::kladde_traits::Allocator::write(
-                    backend,
-                    ::kladde_traits::UniquePointer::raw(&pointer),
-                    0,
-                    &bytes,
-                );
-                ::kladde_traits::write_header(backend, location, ::kladde_traits::UniquePointer::index(&pointer), bytes.len() as u32);
-            }
-
-            fn load<B: ::kladde_traits::Backend>(backend: &B, location: ::kladde_traits::Location) -> Self {
-                let (target, len) = ::kladde_traits::read_header(backend, location);
-                let target = target.expect(concat!(
-                    "no ", stringify!(#ident), " stored at this location -- load() called \
-                     before this value was ever set"
-                ));
-                let bytes = ::kladde_traits::Allocator::read(
-                    backend,
-                    ::kladde_traits::RawPointer::from_index(target),
-                    0,
-                    len,
-                );
-                ::postcard::from_bytes(&bytes).expect("corrupt persisted enum bytes")
             }
         }
     }
