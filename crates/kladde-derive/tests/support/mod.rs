@@ -39,7 +39,7 @@ impl Persistable for Number {
         }
     }
 
-    fn store<B: kladde_traits::Backend>(&self, backend: &B, location: Location) {
+    fn store<B: kladde_traits::Backend>(&mut self, backend: &B, location: Location) {
         backend.write(location.anchor, location.offset, &self.0.to_le_bytes());
     }
 

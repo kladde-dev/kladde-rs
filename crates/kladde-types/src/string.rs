@@ -130,7 +130,7 @@ impl Persistable for PersistedString {
         }
     }
 
-    fn store<B: Backend>(&self, backend: &B, location: Location) {
+    fn store<B: Backend>(&mut self, backend: &B, location: Location) {
         self.0.store(backend, location);
     }
 

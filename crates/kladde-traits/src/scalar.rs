@@ -12,11 +12,12 @@
 //! `kladde-traits`' point of view the trait is local, so it's allowed.
 //! `kladde-types` re-exports these names for convenience.
 
-use crate::{read_header, write_header, Backend, Guard, Location, Persistable, RawPointer};
+use crate::{Backend, Guard, Location, Persistable};
 
 /// Numeric scalars all have native `to_le_bytes`/`from_le_bytes` with a
-/// fixed-width array, so one macro covers them; `bool`/`char`/`String`
-/// don't fit that shape and are implemented by hand below.
+/// fixed-width array, so one macro covers them; `bool`/`char` don't fit
+/// that shape and are implemented by hand below. `String` doesn't
+/// implement `Persistable` at all -- see the note further down.
 macro_rules! impl_persistable_numeric_scalar {
     ($ty:ty, $guard:ident) => {
         #[doc = concat!("The `Guard` for `", stringify!($ty), "`.")]
@@ -29,8 +30,8 @@ macro_rules! impl_persistable_numeric_scalar {
         impl<'s, B: Backend> $guard<'s, B> {
             /// Replaces the value, writing its inline bytes at this
             /// guard's location.
-            pub fn set(&mut self, value: $ty) {
-                Persistable::store(&value, self.backend, self.location);
+            pub fn set(&mut self, mut value: $ty) {
+                Persistable::store(&mut value, self.backend, self.location);
                 *self.inner = value;
             }
         }
@@ -84,7 +85,7 @@ macro_rules! impl_persistable_numeric_scalar {
                 }
             }
 
-            fn store<B: Backend>(&self, backend: &B, location: Location) {
+            fn store<B: Backend>(&mut self, backend: &B, location: Location) {
                 backend.write(location.anchor, location.offset, &self.to_le_bytes());
             }
 
@@ -121,8 +122,8 @@ macro_rules! impl_persistable_scalar_via {
         }
 
         impl<'s, B: Backend> $guard<'s, B> {
-            pub fn set(&mut self, value: $ty) {
-                Persistable::store(&value, self.backend, self.location);
+            pub fn set(&mut self, mut value: $ty) {
+                Persistable::store(&mut value, self.backend, self.location);
                 *self.inner = value;
             }
         }
@@ -176,7 +177,7 @@ macro_rules! impl_persistable_scalar_via {
                 }
             }
 
-            fn store<B: Backend>(&self, backend: &B, location: Location) {
+            fn store<B: Backend>(&mut self, backend: &B, location: Location) {
                 let to_repr: fn($ty) -> $repr = $to_repr;
                 let repr = to_repr(*self);
                 backend.write(location.anchor, location.offset, &repr.to_le_bytes());
@@ -198,108 +199,21 @@ impl_persistable_scalar_via!(char, CharGuard, u32, |v| v as u32, |b| {
     char::from_u32(b).expect("corrupt persisted char")
 });
 
-/// The `Guard` for [`String`]. Hand-written rather than going through
-/// either macro above -- unlike the fixed-size scalars, `String` is
-/// variably sized, so it needs its own content allocation (see below),
-/// not just a `write` of a few fixed bytes.
-pub struct StringGuard<'s, B> {
-    inner: &'s mut String,
-    backend: &'s B,
-    location: Location,
-}
-
-impl<'s, B: Backend> StringGuard<'s, B> {
-    pub fn set(&mut self, value: String) {
-        value.store(self.backend, self.location);
-        *self.inner = value;
-    }
-}
-
-impl<'s, B: Backend> Guard for StringGuard<'s, B> {
-    type Persistable = String;
-    type Backend = B;
-
-    fn as_persistable(&self) -> &String {
-        self.inner
-    }
-    fn as_persistable_mut(&mut self) -> &mut String {
-        self.inner
-    }
-    fn backend(&self) -> &B {
-        self.backend
-    }
-}
-
-impl<'s, B> ::std::ops::Deref for StringGuard<'s, B> {
-    type Target = String;
-    fn deref(&self) -> &String {
-        self.inner
-    }
-}
-
-impl<'s, B> ::std::ops::DerefMut for StringGuard<'s, B> {
-    fn deref_mut(&mut self) -> &mut String {
-        self.inner
-    }
-}
-
-impl Persistable for String {
-    /// A fixed 8-byte `{ target, len }` header -- see [`write_header`].
-    const INLINE_SIZE: usize = 8;
-
-    type Guard<'s, B: Backend>
-        = StringGuard<'s, B>
-    where
-        Self: 's,
-        B: 's;
-
-    fn guard<'s, B: Backend>(
-        &'s mut self,
-        backend: &'s B,
-        location: Location,
-    ) -> Self::Guard<'s, B> {
-        StringGuard {
-            inner: self,
-            backend,
-            location,
-        }
-    }
-
-    /// Note on an interim limitation (see `spec.md`): unlike
-    /// `PersistedVec`/`PersistedHashMap`, a plain `String` has no room
-    /// for a persistent `pointer` field of its own (it's a foreign,
-    /// `std`-defined type), so there's nowhere in memory to cache the
-    /// index of a previous call's content allocation. Every `store` call
-    /// therefore allocates a *fresh* region rather than resizing an
-    /// existing one, leaving any previous allocation at this `location`
-    /// unreferenced (never freed). Harmless for the in-memory mock (it
-    /// only ever lives for one process), but a real, file-backed
-    /// `Allocator` would leak space this way -- revisit if/when a
-    /// `String`-like wrapper type with its own `pointer` field (the same
-    /// shape as `PersistedVec`) is introduced.
-    fn store<B: Backend>(&self, backend: &B, location: Location) {
-        let bytes = self.as_bytes();
-        let pointer = backend.alloc::<String>(bytes.len());
-        backend.write(pointer.raw(), 0, bytes);
-        write_header(backend, location, pointer.index(), bytes.len() as u32);
-    }
-
-    fn load<B: Backend>(backend: &B, location: Location) -> Self {
-        let (target, len) = read_header(backend, location);
-        match target {
-            None => String::new(),
-            Some(target) => {
-                let bytes = backend.read(RawPointer::from_index(target), 0, len);
-                String::from_utf8(bytes).expect("corrupt UTF-8 in persisted String")
-            }
-        }
-    }
-}
+// `String` deliberately does *not* implement `Persistable`: it's a
+// foreign, `std`-defined type with no room for a persistent `pointer`
+// field of its own, so a `store` implementation would have nowhere to
+// cache a previous call's content allocation and would leak a fresh one
+// on every call (a real, file-backed `Allocator` would leak space this
+// way, unlike the in-memory mock). This absence *is* the enforcement
+// mechanism the derive macro relies on (see `spec.md`): a struct field
+// typed as plain `String` simply fails to compile, pointing application
+// authors at `kladde_types::PersistedString` -- a wrapper with its own
+// `pointer` field, the same shape `PersistedVec` already has -- instead.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Allocator, ResolvedPointer, UniquePointer};
+    use crate::{Allocator, RawPointer, ResolvedPointer, UniquePointer};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::num::NonZeroU32;
@@ -391,30 +305,5 @@ mod tests {
         let mut c = 'a';
         c.guard(&backend, char_location).set('z');
         assert_eq!(char::load(&backend, char_location), 'z');
-    }
-
-    #[test]
-    fn string_guard_records_and_mutates() {
-        let backend = MockBackend::default();
-        let location = root_location(&backend, String::INLINE_SIZE);
-        let mut value = String::from("hello");
-        let mut guard = value.guard(&backend, location);
-        guard.set(String::from("a longer string than before"));
-        assert_eq!(*guard, "a longer string than before");
-        assert_eq!(value, "a longer string than before");
-        assert_eq!(
-            String::load(&backend, location),
-            "a longer string than before"
-        );
-    }
-
-    #[test]
-    fn string_loads_as_empty_before_ever_being_set() {
-        let backend = MockBackend::default();
-        let location = root_location(&backend, String::INLINE_SIZE);
-        // Nothing has been written here at all yet (header bytes are
-        // still zeroed) -- `load` should see "no allocation" and produce
-        // an empty string rather than panicking.
-        assert_eq!(String::load(&backend, location), "");
     }
 }

@@ -113,7 +113,7 @@ where
     /// content is already correct -- only a fresh header needs
     /// publishing, not new content. Re-serializing here is just to learn
     /// the byte length cheaply, not to write it anywhere.
-    fn store<B: Backend>(&self, backend: &B, location: Location) {
+    fn store<B: Backend>(&mut self, backend: &B, location: Location) {
         match &self.pointer {
             Some(existing) => {
                 let bytes = postcard::to_allocvec(&self.value)
@@ -252,7 +252,7 @@ mod tests {
         let backend = MockBackend::default();
         let location = root_location(&backend);
 
-        let value = Persisted::new(42i32, &backend);
+        let mut value = Persisted::new(42i32, &backend);
         value.store(&backend, location);
         backend.flush();
 
@@ -267,7 +267,7 @@ mod tests {
         backend.flush(); // materialize the root anchor itself, unrelated to `Persisted<T>`
         let live_before = backend.live_count();
 
-        let value = Persisted::<i32>::default();
+        let mut value = Persisted::<i32>::default();
         value.store(&backend, location);
         backend.flush();
 

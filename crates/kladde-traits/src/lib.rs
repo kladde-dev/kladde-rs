@@ -250,7 +250,22 @@ pub trait Persistable: Sized {
     /// internally by `Guard::set`-style methods and by container types
     /// writing a brand-new element/entry that didn't exist at `location`
     /// before.
-    fn store<B: Backend>(&self, backend: &B, location: Location);
+    ///
+    /// Takes `&mut self`, not `&self`: a type with its own cached
+    /// allocation pointer (`PersistedVec`, `PersistedString`, ...) may
+    /// need to *learn* that pointer for the first time here -- e.g. a
+    /// value built via `PersistedVec::from_iter`/`PersistedString::from`
+    /// can hold real content while its pointer is still `None` (nothing
+    /// has allocated for it yet), and `store` is exactly the place that
+    /// allocation happens the first time such a value is written
+    /// somewhere. If `store` only had `&self`, it could still allocate
+    /// and write the content correctly, but the caller's own copy would
+    /// stay stuck believing it has no allocation -- breaking any `Guard`
+    /// obtained from it afterward (e.g. `get_mut`). Types with nothing of
+    /// their own to fix up (scalars, derived structs, whose fields just
+    /// forward this same call recursively) simply never need the
+    /// mutability.
+    fn store<B: Backend>(&mut self, backend: &B, location: Location);
 
     /// Reconstructs a fresh value purely from what's stored at
     /// `location` -- the read-side counterpart of `store`, used by the
@@ -324,7 +339,7 @@ mod tests {
                 }
             }
 
-            fn store<B: Backend>(&self, backend: &B, location: Location) {
+            fn store<B: Backend>(&mut self, backend: &B, location: Location) {
                 backend.write(location.anchor, location.offset, &self.0.to_le_bytes());
             }
 

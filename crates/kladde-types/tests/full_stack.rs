@@ -12,7 +12,7 @@
 //! treats its wrapped value as an opaque postcard-serialized blob.
 
 use kladde::Kladde;
-use kladde_types::{Persistable, Persisted, PersistedHashMap, PersistedVec};
+use kladde_types::{Persistable, Persisted, PersistedHashMap, PersistedString, PersistedVec};
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Default)]
 enum Role {
@@ -23,15 +23,15 @@ enum Role {
 
 #[derive(Persistable)]
 struct User {
-    name: String,
+    name: PersistedString,
     age: i32,
     role: Persisted<Role>,
-    tags: PersistedVec<String>,
+    tags: PersistedVec<PersistedString>,
 }
 
 #[derive(Persistable)]
 struct AppState {
-    users: PersistedHashMap<String, User>,
+    users: PersistedHashMap<PersistedString, User>,
 }
 
 #[test]
@@ -43,31 +43,33 @@ fn derived_struct_nested_in_a_persisted_hash_map_via_kladde() {
     // Built before `app.guard()` so this immutable borrow of `app` (for
     // `Persisted::new`) ends before the mutable one begins.
     let ada = User {
-        name: "Ada".to_string(),
+        name: PersistedString::from("Ada"),
         age: 30,
         role: Persisted::new(Role::Admin, app.backend()),
         tags: PersistedVec::new(),
     };
-    app.guard().users_mut().insert("ada".to_string(), ada);
+    app.guard()
+        .users_mut()
+        .insert(PersistedString::from("ada"), ada);
 
     // Mutate it through the derived, nested Guards.
     {
         let mut guard = app.guard();
         let mut users = guard.users_mut();
         let mut ada = users
-            .get_mut(&"ada".to_string())
+            .get_mut(&PersistedString::from("ada"))
             .expect("ada should be present");
         ada.age_mut().set(31);
         ada.role_mut().set(Role::Member);
-        ada.tags_mut().push("engineer".to_string());
+        ada.tags_mut().push(PersistedString::from("engineer"));
     }
 
-    let ada = app.get().users.get(&"ada".to_string()).unwrap();
+    let ada = app.get().users.get(&PersistedString::from("ada")).unwrap();
     assert_eq!(ada.name, "Ada");
     assert_eq!(ada.age, 31);
     assert_eq!(*ada.role, Role::Member);
     assert_eq!(ada.tags.len(), 1);
-    assert_eq!(ada.tags.get(0), Some(&"engineer".to_string()));
+    assert_eq!(ada.tags.get(0), Some(&PersistedString::from("engineer")));
 
     // The actual point of this round: flush, then reconstruct a *fresh*
     // `AppState` purely from the backend's storage -- no reference to
@@ -75,12 +77,15 @@ fn derived_struct_nested_in_a_persisted_hash_map_via_kladde() {
     app.flush();
     let reloaded = app.load();
 
-    let reloaded_ada = reloaded.users.get(&"ada".to_string()).unwrap();
+    let reloaded_ada = reloaded.users.get(&PersistedString::from("ada")).unwrap();
     assert_eq!(reloaded_ada.name, "Ada");
     assert_eq!(reloaded_ada.age, 31);
     assert_eq!(*reloaded_ada.role, Role::Member);
     assert_eq!(reloaded_ada.tags.len(), 1);
-    assert_eq!(reloaded_ada.tags.get(0), Some(&"engineer".to_string()));
+    assert_eq!(
+        reloaded_ada.tags.get(0),
+        Some(&PersistedString::from("engineer"))
+    );
 
     assert_eq!(app.backend().journal_len(), 0);
 }
@@ -92,30 +97,59 @@ fn mutating_one_element_does_not_disturb_an_unrelated_sibling() {
     });
 
     let ada = User {
-        name: "Ada".to_string(),
+        name: PersistedString::from("Ada"),
         age: 30,
         role: Persisted::new(Role::Admin, app.backend()),
         tags: PersistedVec::new(),
     };
-    app.guard().users_mut().insert("ada".to_string(), ada);
+    app.guard()
+        .users_mut()
+        .insert(PersistedString::from("ada"), ada);
     let bob = User {
-        name: "Bob".to_string(),
+        name: PersistedString::from("Bob"),
         age: 25,
         role: Persisted::new(Role::Member, app.backend()),
         tags: PersistedVec::new(),
     };
-    app.guard().users_mut().insert("bob".to_string(), bob);
+    app.guard()
+        .users_mut()
+        .insert(PersistedString::from("bob"), bob);
 
     {
         let mut guard = app.guard();
         let mut users = guard.users_mut();
-        users.get_mut(&"ada".to_string()).unwrap().age_mut().set(99);
+        users
+            .get_mut(&PersistedString::from("ada"))
+            .unwrap()
+            .age_mut()
+            .set(99);
     }
 
     app.flush();
     let reloaded = app.load();
 
-    assert_eq!(reloaded.users.get(&"ada".to_string()).unwrap().age, 99);
-    assert_eq!(reloaded.users.get(&"bob".to_string()).unwrap().age, 25);
-    assert_eq!(reloaded.users.get(&"bob".to_string()).unwrap().name, "Bob");
+    assert_eq!(
+        reloaded
+            .users
+            .get(&PersistedString::from("ada"))
+            .unwrap()
+            .age,
+        99
+    );
+    assert_eq!(
+        reloaded
+            .users
+            .get(&PersistedString::from("bob"))
+            .unwrap()
+            .age,
+        25
+    );
+    assert_eq!(
+        reloaded
+            .users
+            .get(&PersistedString::from("bob"))
+            .unwrap()
+            .name,
+        "Bob"
+    );
 }

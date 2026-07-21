@@ -123,19 +123,22 @@ impl<T: Persistable> Persistable for PersistedVec<T> {
     /// value somewhere (e.g. a struct field being assembled) rather than
     /// via incremental `push`/`remove`.
     ///
-    /// Deliberately does *not* rewrite any elements: `push`/`remove`/
-    /// `get_mut().set(...)` already keep the on-disk content at
-    /// `self.pointer` exactly in sync with `self.data` incrementally, so
-    /// if a pointer already exists, its content is already correct --
-    /// `store` only needs to point a new header at it, not rewrite
-    /// anything. (Rewriting unconditionally, the way an earlier version
-    /// of this method did, wasn't just redundant -- for `PersistedVec` it
-    /// happened to still be *correct*, since elements are always packed
-    /// at `0..data.len()` with no equivalent to `PersistedHashMap`'s
-    /// tombstone/capacity bookkeeping to fall out of sync, but it was
-    /// still doing real work for no reason. Not touching existing content
-    /// at all is both simpler and avoids relying on that coincidence.)
-    fn store<B: Backend>(&self, backend: &B, location: Location) {
+    /// If a pointer already exists, its content is already correct
+    /// (`push`/`remove`/`get_mut().set(...)` keep it in sync
+    /// incrementally) -- `store` only needs to point a new header at it,
+    /// not rewrite anything. The one case that *does* need real work:
+    /// `data` non-empty despite `pointer` being `None`, which happens for
+    /// a value built via `PersistedVec::from_iter` (see its doc comment)
+    /// that's never been pushed/set through a `Guard`, so there's been no
+    /// chance yet to allocate. This is why `store` takes `&mut self`, not
+    /// `&self` (see the trait doc comment): it allocates *and* remembers
+    /// the new pointer in `self`, so a second `store` call later reuses
+    /// it instead of allocating (and leaking) again, and so any `Guard`
+    /// obtained from `self` afterward (e.g. via a container's `get_mut`)
+    /// sees consistent bookkeeping. Each element gets the same treatment
+    /// recursively, in case it's itself an "owning" type with the same
+    /// possible gap (e.g. a `PersistedString`).
+    fn store<B: Backend>(&mut self, backend: &B, location: Location) {
         match &self.pointer {
             Some(existing) => {
                 write_header(backend, location, existing.index(), self.data.len() as u32);
@@ -148,23 +151,10 @@ impl<T: Persistable> Persistable for PersistedVec<T> {
                 backend.write(location.anchor, location.offset, &[0u8; 8]);
             }
             None => {
-                // `data` is non-empty despite `pointer` being `None`: a
-                // `from_iter`-constructed value (see its doc comment)
-                // that's never been pushed/set through a `Guard`, so
-                // there's been no chance yet to remember an allocation.
-                // Allocating here is correct, not a leak, for the same
-                // reason `push`'s very first call is: there's nothing to
-                // reuse yet. The one residual caveat: calling `store`
-                // *again* on this exact in-memory value while its own
-                // `pointer` field stays `None` in the caller's copy
-                // (rather than going through a `Guard`, which does update
-                // it) would allocate a second time -- treat a
-                // `from_iter`-constructed value as something to push/set
-                // exactly once, not to `store` repeatedly.
                 let elem_size = T::INLINE_SIZE as u32;
                 let byte_size = self.data.len() * T::INLINE_SIZE;
                 let pointer = backend.alloc::<PersistedVec<T>>(byte_size);
-                for (i, item) in self.data.iter().enumerate() {
+                for (i, item) in self.data.iter_mut().enumerate() {
                     item.store(
                         backend,
                         Location {
@@ -174,6 +164,7 @@ impl<T: Persistable> Persistable for PersistedVec<T> {
                     );
                 }
                 write_header(backend, location, pointer.index(), self.data.len() as u32);
+                self.pointer = Some(pointer);
             }
         }
     }
@@ -233,7 +224,7 @@ impl<'s, T: Persistable, B: Backend> PersistedVecGuard<'s, T, B> {
     /// crash/torn-journal prefix of this sequence leaves the previous,
     /// still-valid state (the header update is always last -- see
     /// `spec.md`'s Crash Consistency section).
-    pub fn push(&mut self, value: T) {
+    pub fn push(&mut self, mut value: T) {
         let elem_size = T::INLINE_SIZE as u32;
         let old_len = self.inner.data.len();
         let new_len = old_len + 1;
@@ -443,11 +434,40 @@ mod tests {
         let backend = MockBackend::default();
         let location = root_location(&backend);
 
-        let vec: PersistedVec<i32> = [1, 2, 3].into_iter().collect();
+        let mut vec: PersistedVec<i32> = [1, 2, 3].into_iter().collect();
         vec.store(&backend, location);
         backend.flush();
 
         let reloaded = PersistedVec::<i32>::load(&backend, location);
         assert_eq!(reloaded.data, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn store_on_a_from_iter_constructed_vec_remembers_its_own_pointer() {
+        let backend = MockBackend::default();
+        let location = root_location(&backend);
+
+        // Constructed without a backend, so `pointer` starts `None` even
+        // though `data` is non-empty -- `store`'s first call has to
+        // allocate. It must also remember that allocation in `self`, or
+        // a later `push` (via `get_mut`-adjacent bookkeeping) would
+        // either panic or allocate (and leak) a second time.
+        let mut vec: PersistedVec<i32> = [1, 2, 3].into_iter().collect();
+        vec.store(&backend, location);
+        backend.flush();
+        let live_before = backend.live_count();
+
+        vec.guard(&backend, location).push(4);
+        backend.flush();
+
+        assert_eq!(
+            backend.live_count(),
+            live_before,
+            "push() should reuse the allocation store() already made, not leak a second one"
+        );
+        assert_eq!(vec.get(3), Some(&4));
+
+        let reloaded = PersistedVec::<i32>::load(&backend, location);
+        assert_eq!(reloaded.data, vec![1, 2, 3, 4]);
     }
 }

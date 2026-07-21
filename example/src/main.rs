@@ -11,7 +11,7 @@
 //! everything into the (also in-memory, mock) allocator.
 
 use kladde::Kladde;
-use kladde_types::{Persistable, Persisted, PersistedHashMap, PersistedVec};
+use kladde_types::{Persistable, Persisted, PersistedHashMap, PersistedString, PersistedVec};
 use std::io::{self, Write};
 
 // TODO(enum redesign): `#[derive(Persistable)]` doesn't support enums yet
@@ -42,13 +42,13 @@ impl std::fmt::Display for PhoneNumber {
 
 #[derive(Persistable, Debug)]
 struct Contact {
-    email: String,
+    email: PersistedString,
     phones: PersistedVec<Persisted<PhoneNumber>>,
 }
 
 #[derive(Persistable)]
 struct AddressBook {
-    contacts: PersistedHashMap<String, Contact>,
+    contacts: PersistedHashMap<PersistedString, Contact>,
 }
 
 fn main() {
@@ -86,9 +86,9 @@ fn main() {
             "add" => match words.as_slice() {
                 [_, name, email] => {
                     book.guard().contacts_mut().insert(
-                        name.to_string(),
+                        PersistedString::from(*name),
                         Contact {
-                            email: email.to_string(),
+                            email: PersistedString::from(*email),
                             phones: PersistedVec::new(),
                         },
                     );
@@ -100,9 +100,9 @@ fn main() {
                 [_, name, email] => {
                     let found = {
                         let mut guard = book.guard();
-                        match guard.contacts_mut().get_mut(&name.to_string()) {
+                        match guard.contacts_mut().get_mut(&PersistedString::from(*name)) {
                             Some(mut contact) => {
-                                contact.email_mut().set(email.to_string());
+                                contact.email_mut().set(*email);
                                 true
                             }
                             None => false,
@@ -131,7 +131,7 @@ fn main() {
                     let phone = Persisted::new(phone, book.backend());
                     let found = {
                         let mut guard = book.guard();
-                        match guard.contacts_mut().get_mut(&name.to_string()) {
+                        match guard.contacts_mut().get_mut(&PersistedString::from(*name)) {
                             Some(mut contact) => {
                                 contact.phones_mut().push(phone);
                                 true
@@ -151,14 +151,18 @@ fn main() {
                 _ => println!("usage: add-phone <name> mobile|landline <number>"),
             },
             "remove" => match words.as_slice() {
-                [_, name] => match book.guard().contacts_mut().remove(&name.to_string()) {
+                [_, name] => match book
+                    .guard()
+                    .contacts_mut()
+                    .remove(&PersistedString::from(*name))
+                {
                     Some(_) => println!("removed {name} (journal entries: {})", journal_len(&book)),
                     None => println!("no such contact: {name}"),
                 },
                 _ => println!("usage: remove <name>"),
             },
             "show" => match words.as_slice() {
-                [_, name] => match book.get().contacts.get(&name.to_string()) {
+                [_, name] => match book.get().contacts.get(&PersistedString::from(*name)) {
                     Some(contact) => {
                         println!("{name}: {}", contact.email);
                         for phone in contact.phones.iter() {

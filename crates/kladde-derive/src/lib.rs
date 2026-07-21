@@ -178,10 +178,10 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::To
                 }
             }
 
-            fn store<B: ::kladde_traits::Backend>(&self, backend: &B, location: ::kladde_traits::Location) {
+            fn store<B: ::kladde_traits::Backend>(&mut self, backend: &B, location: ::kladde_traits::Location) {
                 #(
                     ::kladde_traits::Persistable::store(
-                        &self.#field_ident,
+                        &mut self.#field_ident,
                         backend,
                         ::kladde_traits::Location {
                             anchor: location.anchor,
@@ -273,7 +273,7 @@ fn derive_unit_like_struct(
                 }
             }
 
-            fn store<B: ::kladde_traits::Backend>(&self, _backend: &B, _location: ::kladde_traits::Location) {}
+            fn store<B: ::kladde_traits::Backend>(&mut self, _backend: &B, _location: ::kladde_traits::Location) {}
 
             fn load<B: ::kladde_traits::Backend>(_backend: &B, _location: ::kladde_traits::Location) -> Self {
                 #ident
