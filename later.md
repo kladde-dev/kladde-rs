@@ -15,8 +15,11 @@
 - Introduce a semantic versioning into files that tracks both which app versions can read a given file and which kladde-versions can. We'll probably need a `min_version` and an `last_writer_version` for both, not sure yet.
 - It might be useful to introduce additional microops that combine typical behavior. For example: `split` (splits an allocation into two; combines `alloc`, `copy`, `resize`) or maybe only `copy_part` (combines only `alloc` and `copy` but leaves the old data in place for the caller to potentially overwrite). Introducing such microops with higher level semantics might enable additional optimizations.
 - Figure out how the derived guards for `struct`s and `enum`s can be used ergonomically in application code.
-  - For `struct` guards, it might be worth implementing `set_<field>(value)` convenience methods for each field so that one doesn't have to the dance to get a guard for the field and write to it.
-  - For `enum` guards: can we support pattern matching somehow?
+    - For `struct` guards, it might be worth implementing `set_<field>(value)` convenience methods for each field so that one doesn't have to the dance to get a guard for the field and write to it.
+    - For `enum` guards: can we support pattern matching somehow?
+- Introduce two kinds of variable-sized integers. Both are represented as normal fixed-sized integers in memory but differently in the file):
+    - One type for integers that typically have a small, _statically known range of allowed values_. For those, use the smallest number of bytes (not necessarily powers of 2) that can hold all allowed values. This type could be used for enum variants (maybe not for those marked `#[non_exhaustive]`, not sure), and it might make quite a big difference in containers that contain long lists of small enums since most enums will only need a single byte. And there's likely no or barly any runtime cost because it's just some statically known bit shifts without branching.
+    - A second type for integers that may span large ranges but are usually not huge. They are serialized to a dynamically sized sequence of bytes that describes its own length. I think `postcard` uses such a dynamic small integer representation. Use it if it makes sense. Since this type is dynamically sized, it cannot be used in situations where memory layout and offsets have to be calculated statically. But it could be used, e.g., when writing allocation sizes and pointer indices as part of an `Op` to the journal. We should reconsider if this is worth the additional runtime cost.
 
 ## Things to check later
 
