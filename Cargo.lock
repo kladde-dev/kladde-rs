@@ -52,6 +52,7 @@ dependencies = [
  "kladde-derive",
  "kladde-traits",
  "kladde-types",
+ "postcard",
  "serde",
 ]
 
@@ -101,6 +102,7 @@ name = "kladde-derive"
 version = "0.1.0"
 dependencies = [
  "kladde-traits",
+ "postcard",
  "proc-macro2",
  "quote",
  "serde",
@@ -123,6 +125,7 @@ dependencies = [
  "kladde-alloc",
  "kladde-derive",
  "kladde-traits",
+ "postcard",
  "serde",
 ]
 

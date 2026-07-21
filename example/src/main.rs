@@ -5,17 +5,17 @@
 //! `kladde`'s `DefaultBackend`.
 //!
 //! v1 has no real file behind any of this (see `spec.md`'s "Crash
-//! Consistency" note and `V1_QUESTIONS.md` questions 1 and 6) -- state
-//! lives only for the duration of this process. Every mutating command
-//! still gets recorded to an in-memory journal; the entry count printed
-//! after each command is that journal growing, one entry per recorded
-//! `Op`.
+//! Consistency" note) -- state lives only for the duration of this
+//! process. Every mutating command still gets recorded to an in-memory
+//! journal of microoperations; the count printed after each command is
+//! that journal growing, and `flush` (or quitting) drains it by replaying
+//! everything into the (also in-memory, mock) allocator.
 
 use kladde::Kladde;
 use kladde_types::{Persistable, PersistedHashMap, PersistedVec};
 use std::io::{self, Write};
 
-#[derive(Persistable, Clone, serde::Serialize, serde::Deserialize, Debug)]
+#[derive(Persistable, serde::Serialize, serde::Deserialize, Debug)]
 enum PhoneNumber {
     Mobile(String),
     Landline(String),
@@ -30,7 +30,7 @@ impl std::fmt::Display for PhoneNumber {
     }
 }
 
-#[derive(Persistable, Clone, serde::Serialize, serde::Deserialize, Debug)]
+#[derive(Persistable, Debug)]
 struct Contact {
     email: String,
     phones: PersistedVec<PhoneNumber>,
@@ -43,7 +43,10 @@ struct AddressBook {
 
 fn main() {
     println!("kladde contact book (v1 prototype -- in-memory only, see spec.md)");
-    println!("commands: add <name> <email> | set-email <name> <email> | add-phone <name> mobile|landline <number> | show <name> | list | remove <name> | help | quit");
+    println!(
+        "commands: add <name> <email> | set-email <name> <email> | add-phone <name> mobile|landline <number> \
+         | show <name> | list | remove <name> | flush | help | quit"
+    );
 
     let mut book = Kladde::new(AddressBook {
         contacts: PersistedHashMap::new(),
@@ -66,6 +69,10 @@ fn main() {
         match command {
             "quit" | "exit" => break,
             "help" => print_help(),
+            "flush" => {
+                book.flush();
+                println!("flushed (journal entries: {})", journal_len(&book));
+            }
             "add" => match words.as_slice() {
                 [_, name, email] => {
                     book.guard().contacts_mut().insert(
@@ -162,15 +169,15 @@ fn main() {
         }
     }
 
+    book.flush();
     println!(
-        "goodbye -- {} contact(s), {} op(s) journaled this session",
+        "goodbye -- {} contact(s), flushed and 0 op(s) left in the journal",
         book.get().contacts.len(),
-        journal_len(&book)
     );
 }
 
 fn journal_len(book: &Kladde<AddressBook>) -> usize {
-    book.backend().journal_entries().len()
+    book.backend().journal_len()
 }
 
 fn print_help() {
@@ -180,7 +187,8 @@ fn print_help() {
     println!("show <name>                               -- show a contact's details");
     println!("list                                      -- list all contacts");
     println!("remove <name>                             -- remove a contact");
+    println!("flush                                     -- replay the journal into the (in-memory) snapshot");
     println!(
-        "quit | exit                               -- leave (state is not saved -- see spec.md)"
+        "quit | exit                               -- flush and leave (state is not saved to a real file -- see spec.md)"
     );
 }

@@ -1,21 +1,29 @@
 //! `#[derive(Persistable)]` for application-level `struct`s and `enum`s
 //! composed from already-`Persistable` fields. See `spec.md`'s "The Trait
-//! Layer" and "Workspace Layout" for the pattern this generates, and
-//! `V1_QUESTIONS.md` for the v1 scoping decisions this implements:
+//! Layer" and "Workspace Layout" for the pattern this generates:
 //!
 //! - Every field is treated uniformly (including primitives, via blanket
-//!   `Persistable` impls in `kladde-types`) -- no special-cased scalar
+//!   `Persistable` impls in `kladde-traits`) -- no special-cased scalar
 //!   setters, just a `{field}_mut()` accessor per field.
-//! - Enums only support whole-value replacement (`guard.set(new_value)`),
-//!   not mutating a field within the current variant in place.
+//! - A derived struct's own `INLINE_SIZE` is the sum of its fields'
+//!   (each field's offset within it is therefore static, computable at
+//!   compile time), and it never owns an allocation of its own -- it just
+//!   threads the `Location` it's given down to its fields, extended by
+//!   each field's static offset.
+//! - A derived enum is treated as an "owning" type instead (fixed 8-byte
+//!   header, like `String`/`PersistedVec`): only whole-value replacement
+//!   is supported (`guard.set(new_value)`), not mutating a field within
+//!   the current variant in place, so its content is just the
+//!   `postcard`-serialized whole value. See `spec.md`'s Future Work.
 //! - Generic types and types with where-clauses are not yet supported.
 //!
-//! **Dependency note:** generated code references `::kladde_traits::...`
-//! and `::serde::...` paths directly, so any crate using this macro needs
-//! `kladde-traits` and `serde` as *direct* dependencies too -- re-exports
-//! (e.g. via `kladde-types`) aren't enough to make `::kladde_traits`
-//! resolve. The same reason `#[derive(serde::Serialize)]` requires a
-//! direct `serde` dependency, not just `serde_derive`.
+//! **Dependency note:** generated code references `::kladde_traits::...`,
+//! `::serde::...`, and (for enums) `::postcard::...` paths directly, so
+//! any crate using this macro needs `kladde-traits`, `serde`, and (if it
+//! derives on any enum) `postcard` as *direct* dependencies too --
+//! re-exports (e.g. via `kladde-types`) aren't enough to make
+//! `::kladde_traits` resolve. The same reason `#[derive(serde::Serialize)]`
+//! requires a direct `serde` dependency, not just `serde_derive`.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -74,11 +82,26 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::To
         .map(|f| format_ident!("{}_mut", f))
         .collect();
 
+    // Field `i`'s static byte offset within this struct's own inline
+    // representation is the sum of every *earlier* field's `INLINE_SIZE`
+    // -- computable purely from the field types, so it's a `const`-like
+    // expression the compiler evaluates, not something tracked at
+    // runtime.
+    let field_offset: Vec<_> = (0..field_ty.len())
+        .map(|i| {
+            let earlier = &field_ty[..i];
+            quote! {
+                (0usize #( + <#earlier as ::kladde_traits::Persistable>::INLINE_SIZE )*) as u32
+            }
+        })
+        .collect();
+
     quote! {
         #[doc(hidden)]
         #vis struct #guard_ident<'s, B> {
             inner: &'s mut #ident,
             backend: &'s B,
+            location: ::kladde_traits::Location,
         }
 
         impl<'s, B: ::kladde_traits::Backend> #guard_ident<'s, B> {
@@ -89,6 +112,10 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::To
                     <#field_ty as ::kladde_traits::Persistable>::guard(
                         &mut self.inner.#field_ident,
                         self.backend,
+                        ::kladde_traits::Location {
+                            anchor: self.location.anchor,
+                            offset: self.location.offset + #field_offset,
+                        },
                     )
                 }
             )*
@@ -123,11 +150,12 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::To
         }
 
         impl ::kladde_traits::Persistable for #ident {
-            // A struct never directly records an op of its own -- every
-            // mutation is expressed as some leaf field's own `Op`,
-            // recursively, so there's nothing for this type's `Op` to
-            // carry. `()` is trivially `Serialize`/`Deserialize`.
-            type Op = ();
+            // A struct never owns an allocation of its own -- it's just
+            // the sum of its fields' inline representations, threaded
+            // through at static offsets.
+            const INLINE_SIZE: usize =
+                0usize #( + <#field_ty as ::kladde_traits::Persistable>::INLINE_SIZE )*;
+
             type Guard<'s, B: ::kladde_traits::Backend>
                 = #guard_ident<'s, B>
             where
@@ -137,18 +165,48 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::To
             fn guard<'s, B: ::kladde_traits::Backend>(
                 &'s mut self,
                 backend: &'s B,
+                location: ::kladde_traits::Location,
             ) -> Self::Guard<'s, B> {
                 #guard_ident {
                     inner: self,
                     backend,
+                    location,
+                }
+            }
+
+            fn store<B: ::kladde_traits::Backend>(&self, backend: &B, location: ::kladde_traits::Location) {
+                #(
+                    ::kladde_traits::Persistable::store(
+                        &self.#field_ident,
+                        backend,
+                        ::kladde_traits::Location {
+                            anchor: location.anchor,
+                            offset: location.offset + #field_offset,
+                        },
+                    );
+                )*
+            }
+
+            fn load<B: ::kladde_traits::Backend>(backend: &B, location: ::kladde_traits::Location) -> Self {
+                #ident {
+                    #(
+                        #field_ident: <#field_ty as ::kladde_traits::Persistable>::load(
+                            backend,
+                            ::kladde_traits::Location {
+                                anchor: location.anchor,
+                                offset: location.offset + #field_offset,
+                            },
+                        ),
+                    )*
                 }
             }
         }
     }
 }
 
-/// A unit struct (`struct Foo;`) has no fields to mutate at all -- same
-/// shape as the struct case but with an empty accessor impl block.
+/// A unit struct (`struct Foo;`) has no fields to mutate, load, or store
+/// at all -- same shape as the struct case but with empty bodies
+/// everywhere and `INLINE_SIZE = 0`.
 fn derive_unit_like_struct(
     ident: &syn::Ident,
     vis: &syn::Visibility,
@@ -159,6 +217,7 @@ fn derive_unit_like_struct(
         #vis struct #guard_ident<'s, B> {
             inner: &'s mut #ident,
             backend: &'s B,
+            location: ::kladde_traits::Location,
         }
 
         impl<'s, B: ::kladde_traits::Backend> ::kladde_traits::Guard for #guard_ident<'s, B> {
@@ -190,7 +249,8 @@ fn derive_unit_like_struct(
         }
 
         impl ::kladde_traits::Persistable for #ident {
-            type Op = ();
+            const INLINE_SIZE: usize = 0;
+
             type Guard<'s, B: ::kladde_traits::Backend>
                 = #guard_ident<'s, B>
             where
@@ -200,11 +260,19 @@ fn derive_unit_like_struct(
             fn guard<'s, B: ::kladde_traits::Backend>(
                 &'s mut self,
                 backend: &'s B,
+                location: ::kladde_traits::Location,
             ) -> Self::Guard<'s, B> {
                 #guard_ident {
                     inner: self,
                     backend,
+                    location,
                 }
+            }
+
+            fn store<B: ::kladde_traits::Backend>(&self, _backend: &B, _location: ::kladde_traits::Location) {}
+
+            fn load<B: ::kladde_traits::Backend>(_backend: &B, _location: ::kladde_traits::Location) -> Self {
+                #ident
             }
         }
     }
@@ -214,38 +282,28 @@ fn derive_enum(input: &DeriveInput, _data: &syn::DataEnum) -> proc_macro2::Token
     let ident = &input.ident;
     let vis = &input.vis;
     let guard_ident = format_ident!("{}Guard", ident);
-    let op_ident = format_ident!("{}Op", ident);
 
     quote! {
         // v1 scope (see spec.md's Future Work): the only mutation is
-        // replacing the whole value, so `Op` just carries the new value
-        // wholesale -- no per-variant, per-field granularity yet.
-        #[derive(::serde::Serialize, ::serde::Deserialize)]
-        #[doc(hidden)]
-        #vis enum #op_ident {
-            Set(#ident),
-        }
-
+        // replacing the whole value, so there's no per-variant,
+        // per-field granularity yet, and an enum is treated as an
+        // "owning" type (fixed 8-byte header, content elsewhere) rather
+        // than trying to give each variant its own static byte layout --
+        // see this module's doc comment.
         #[doc(hidden)]
         #vis struct #guard_ident<'s, B> {
             inner: &'s mut #ident,
             backend: &'s B,
+            location: ::kladde_traits::Location,
         }
 
-        impl<'s, B: ::kladde_traits::Backend> #guard_ident<'s, B>
-        where
-            #ident: ::std::clone::Clone,
-        {
-            /// Replaces the whole value with `value`, recording a single
-            /// `Set` op. See spec.md's Future Work for the deferred
-            /// fine-grained alternative (mutating a field within the
-            /// current variant in place, and/or matching directly on
-            /// this guard).
+        impl<'s, B: ::kladde_traits::Backend> #guard_ident<'s, B> {
+            /// Replaces the whole value with `value`. See spec.md's
+            /// Future Work for the deferred fine-grained alternative
+            /// (mutating a field within the current variant in place,
+            /// and/or matching directly on this guard).
             #vis fn set(&mut self, value: #ident) {
-                ::kladde_traits::Journal::record::<#ident>(
-                    self.backend,
-                    &#op_ident::Set(::std::clone::Clone::clone(&value)),
-                );
+                ::kladde_traits::Persistable::store(&value, self.backend, self.location);
                 *self.inner = value;
             }
         }
@@ -282,7 +340,15 @@ fn derive_enum(input: &DeriveInput, _data: &syn::DataEnum) -> proc_macro2::Token
         where
             #ident: ::serde::Serialize + ::serde::de::DeserializeOwned,
         {
-            type Op = #op_ident;
+            /// A fixed 8-byte `{ target, len }` header -- see
+            /// `String`/`PersistedVec`'s identical layout note. Note the
+            /// same interim limitation `String` has: a plain derived
+            /// enum has no room for a persistent `pointer` field of its
+            /// own, so every `store` allocates fresh rather than
+            /// resizing/reusing, leaking the previous allocation (see
+            /// `spec.md`).
+            const INLINE_SIZE: usize = 8;
+
             type Guard<'s, B: ::kladde_traits::Backend>
                 = #guard_ident<'s, B>
             where
@@ -292,11 +358,41 @@ fn derive_enum(input: &DeriveInput, _data: &syn::DataEnum) -> proc_macro2::Token
             fn guard<'s, B: ::kladde_traits::Backend>(
                 &'s mut self,
                 backend: &'s B,
+                location: ::kladde_traits::Location,
             ) -> Self::Guard<'s, B> {
                 #guard_ident {
                     inner: self,
                     backend,
+                    location,
                 }
+            }
+
+            fn store<B: ::kladde_traits::Backend>(&self, backend: &B, location: ::kladde_traits::Location) {
+                let bytes = ::postcard::to_allocvec(self)
+                    .expect("postcard serialization of an in-memory value should not fail");
+                let pointer = ::kladde_traits::Allocator::alloc::<#ident>(backend, bytes.len());
+                ::kladde_traits::Allocator::write(
+                    backend,
+                    ::kladde_traits::UniquePointer::raw(&pointer),
+                    0,
+                    &bytes,
+                );
+                ::kladde_traits::write_header(backend, location, ::kladde_traits::UniquePointer::index(&pointer), bytes.len() as u32);
+            }
+
+            fn load<B: ::kladde_traits::Backend>(backend: &B, location: ::kladde_traits::Location) -> Self {
+                let (target, len) = ::kladde_traits::read_header(backend, location);
+                let target = target.expect(concat!(
+                    "no ", stringify!(#ident), " stored at this location -- load() called \
+                     before this value was ever set"
+                ));
+                let bytes = ::kladde_traits::Allocator::read(
+                    backend,
+                    ::kladde_traits::RawPointer::from_index(target),
+                    0,
+                    len,
+                );
+                ::postcard::from_bytes(&bytes).expect("corrupt persisted enum bytes")
             }
         }
     }

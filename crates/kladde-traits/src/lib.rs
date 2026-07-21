@@ -31,9 +31,9 @@ pub type Size = NonZeroU32;
 ///
 /// `index` is a stable identity assigned once by `Allocator` and never
 /// changes for the lifetime of this pointer -- even though the region it
-/// (eventually) refers to may move around during compaction, and even
-/// though this pointer may not have been flushed to the snapshot at all
-/// yet.
+/// (eventually) refers to may move around during compaction or a
+/// [`Allocator::resize`] relocation, and even though this pointer may not
+/// have been flushed to the snapshot at all yet.
 ///
 /// Deliberately *not* `Clone`/`Copy` (so double-freeing is a compile-time
 /// impossibility, matching the single-owner design) and *not*
@@ -59,6 +59,70 @@ impl<T> UniquePointer<T> {
     pub fn index(&self) -> NonZeroU32 {
         self.index
     }
+
+    /// Erases `T`, for use as the `anchor` of a [`Location`] or as the
+    /// target of [`Allocator::write`]/`copy`/`read` -- a deeply nested
+    /// leaf writing into some ancestor's allocation doesn't know or care
+    /// what concrete type that ancestor's own pointer was created as.
+    pub fn raw(&self) -> RawPointer {
+        RawPointer(self.index)
+    }
+}
+
+/// A type-erased [`UniquePointer`] index -- see [`UniquePointer::raw`].
+/// `Copy`, since (unlike `UniquePointer`) there's no single-owner
+/// invariant to protect here: a `RawPointer` is just an address to write
+/// at or read from, not something that owns or frees the region it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RawPointer(NonZeroU32);
+
+impl RawPointer {
+    pub fn from_index(index: NonZeroU32) -> Self {
+        RawPointer(index)
+    }
+
+    pub fn index(&self) -> NonZeroU32 {
+        self.0
+    }
+}
+
+/// Where a [`Persistable`] value's fixed-size inline representation lives:
+/// the nearest ancestor allocation that owns real storage (per
+/// `spec.md`'s Question 1 -- only types whose own inline representation
+/// includes a pointer own an allocation at all), plus a byte offset
+/// within it. A `Guard` for a value that owns its own allocation hands
+/// its children a *fresh* `Location` (its own pointer, offset `0`); a
+/// `Guard` for an inline value (a struct field, a container element) just
+/// extends the `Location` it was given -- see `spec.md`'s "The Trait
+/// Layer" for the full rationale (this was Question 9 of
+/// `FLUSHING_QUESTIONS.md`).
+#[derive(Debug, Clone, Copy)]
+pub struct Location {
+    pub anchor: RawPointer,
+    pub offset: u32,
+}
+
+/// Writes an 8-byte `{ target: u32, len: u32 }` header at `location` --
+/// the fixed-size inline representation every "owning" [`Persistable`]
+/// type (one with a separate content allocation: `String`, `PersistedVec`,
+/// a derived enum, ...) uses. `target` is `0` to mean "no allocation yet",
+/// matching `UniquePointer`'s `index`/registry `Option<NonZeroU32>`
+/// convention from `spec.md`'s Pointers and Memory Management section.
+pub fn write_header<B: Backend>(backend: &B, location: Location, index: NonZeroU32, len: u32) {
+    let mut bytes = [0u8; 8];
+    bytes[0..4].copy_from_slice(&index.get().to_le_bytes());
+    bytes[4..8].copy_from_slice(&len.to_le_bytes());
+    backend.write(location.anchor, location.offset, &bytes);
+}
+
+/// Reads back a header written by [`write_header`]. `None` for `target`
+/// means "no allocation yet" -- either this value has never been stored
+/// (freshly `None`-headed) or nothing has been flushed yet.
+pub fn read_header<B: Backend>(backend: &B, location: Location) -> (Option<NonZeroU32>, u32) {
+    let bytes = backend.read(location.anchor, location.offset, 8);
+    let target = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let len = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    (NonZeroU32::new(target), len)
 }
 
 /// The serializable counterpart of [`UniquePointer`], produced by
@@ -100,55 +164,75 @@ impl<'a, T> serde::Serialize for ResolvedPointer<'a, T> {
     }
 }
 
-/// Records operations to the journal. Appending may itself require
-/// allocation (growing the journal's own storage, or a single oversized
-/// `Op`) -- the reason [`Journal`] and [`Allocator`] are kept as two
-/// traits unified by one [`Backend`] bound, rather than two independent
-/// type parameters: a `Journal` implementation generally needs the same
-/// `Allocator` the rest of the system uses, so splitting them into
-/// separately-mixable type parameters wouldn't actually decouple them.
-pub trait Journal {
-    fn record<T: Persistable>(&self, op: &T::Op);
-}
-
-/// Allocates and frees regions in the backed heap, and resolves
-/// [`UniquePointer`]s to their current target.
+/// Allocates, frees, resizes, and reads/writes bytes in the backed heap.
+/// This is the *only* thing a [`Guard`] ever calls to make a mutation
+/// durable -- there is deliberately no separate `Journal` trait anymore
+/// (an earlier draft of `spec.md` had one): once every recorded thing is
+/// one of these primitives, a second trait around a `record` method would
+/// have nothing type-specific left to do. See `spec.md`'s "The Trait
+/// Layer" for the full rationale, including why `Persistable::Op` (and
+/// the type-specific journal entries it implied) was dropped entirely.
 pub trait Allocator {
     /// Allocates a fresh region of `size` bytes, returning a pointer that
-    /// uniquely (and, for now, exclusively in-memory) identifies it.
+    /// uniquely identifies it. The index is assigned immediately; the
+    /// underlying bytes aren't necessarily materialized until the next
+    /// flush -- see `spec.md`'s Pointers and Memory Management section.
     fn alloc<T>(&self, size: usize) -> UniquePointer<T>;
 
     /// Frees the region `pointer` identifies. See the "Freeing" section
     /// of `spec.md`: this doesn't necessarily touch live allocator state
     /// synchronously -- a real, file-backed `Allocator` would journal the
     /// free and apply it at the next flush.
-    fn free<T: Persistable>(&self, pointer: UniquePointer<T>);
+    fn free<T>(&self, pointer: UniquePointer<T>);
 
     /// `None` if `pointer` hasn't been flushed yet (no target exists to
-    /// resolve to). A real `Allocator` also needs some way to go the
-    /// other direction -- reconstructing a `UniquePointer` (with a freshly
-    /// assigned `index`) from a `target` read back off disk -- but that's
-    /// a plain method call, not something threaded through `Deserialize`,
-    /// so it isn't part of this trait's read path.
+    /// resolve to).
     fn resolve<'a, T>(&'a self, pointer: &UniquePointer<T>) -> Option<ResolvedPointer<'a, T>>;
+
+    /// Reads `len` bytes starting at `offset` within the region `target`
+    /// identifies. Reflects only already-flushed (materialized) state --
+    /// unlike `write`/`copy`/`resize`/`alloc`/`free`, this isn't itself a
+    /// journaled mutation, just a query.
+    fn read(&self, target: RawPointer, offset: u32, len: u32) -> Vec<u8>;
+
+    /// Overwrites the span `offset..offset + bytes.len()` within the
+    /// region `target` identifies with `bytes`.
+    fn write(&self, target: RawPointer, offset: u32, bytes: &[u8]);
+
+    /// Copies `len` bytes from `src_offset` within `src` to `dst_offset`
+    /// within `dst` (`src` and `dst` may be the same region, for an
+    /// in-place shift -- e.g. `PersistedVec::remove`'s tail memmove).
+    fn copy(&self, src: RawPointer, src_offset: u32, len: u32, dst: RawPointer, dst_offset: u32);
+
+    /// Changes an existing allocation's size, in place if it still fits
+    /// at its current position, or by relocating (copying over
+    /// `min(old_size, new_size)` bytes and freeing the old region)
+    /// otherwise. The pointer's `index` never changes either way -- only
+    /// `alloc`/`free` mint or retire an index; `resize` never does.
+    fn resize<T>(&self, pointer: &UniquePointer<T>, new_size: usize);
 }
 
-/// The bound every [`Persistable`]/[`Guard`] is generic over. A blanket
-/// impl means concrete backend types only ever need to implement
-/// [`Journal`] and [`Allocator`] separately; application code names
-/// `Backend`, not the two halves.
-pub trait Backend: Journal + Allocator {}
-impl<B: Journal + Allocator> Backend for B {}
+/// The bound every [`Persistable`]/[`Guard`] is generic over. A thin,
+/// blanket-implemented marker so application and derive-generated code
+/// only ever needs to name `Backend`, not `Allocator` directly.
+pub trait Backend: Allocator {}
+impl<B: Allocator> Backend for B {}
 
 /// A plain, in-memory value type that *could* be persisted -- it has the
-/// right shape (an `Op` log, a paired [`Guard`] view) -- but isn't yet
-/// tied to any backend. Only ever accessed read-only; see `Guard` for
-/// mutation.
+/// right shape (a fixed-size inline representation, a paired [`Guard`]
+/// view) -- but isn't yet tied to any backend. Only ever accessed
+/// read-only; see `Guard` for mutation.
 pub trait Persistable: Sized {
-    /// Plain (non-lifetime-parameterized) and owned, deliberately, for
-    /// v1 -- see `spec.md`'s "The Trait Layer" for why, and Future Work
-    /// for the lifetime-GAT version this is expected to eventually become.
-    type Op: serde::Serialize + serde::de::DeserializeOwned;
+    /// The size, in bytes, of this type's fixed-size inline
+    /// representation -- either the value itself (a scalar), the sum of
+    /// its fields' `INLINE_SIZE` (a derived struct), or a small fixed
+    /// header (`target`/`len`, 8 bytes) for a type that owns a separate,
+    /// variably-sized content allocation (`String`, `PersistedVec`, a
+    /// derived enum). Every `Persistable` type has *some* fixed inline
+    /// size -- that's what makes sibling fields' offsets within a
+    /// containing struct statically computable regardless of how much
+    /// content a variable-length field currently holds.
+    const INLINE_SIZE: usize;
 
     type Guard<'s, B: Backend>: Guard<Persistable = Self, Backend = B>
     where
@@ -156,8 +240,27 @@ pub trait Persistable: Sized {
         B: 's;
 
     /// Borrows both `self` and a `Backend` for `'s`, producing a `Guard`
-    /// through which mutations are recorded and applied.
-    fn guard<'s, B: Backend>(&'s mut self, backend: &'s B) -> Self::Guard<'s, B>;
+    /// through which mutations are recorded and applied. `location` is
+    /// where *this* value's own inline representation lives (or will
+    /// live, once first written) -- see [`Location`].
+    fn guard<'s, B: Backend>(
+        &'s mut self,
+        backend: &'s B,
+        location: Location,
+    ) -> Self::Guard<'s, B>;
+
+    /// Writes `self`'s current value as its fixed-size inline
+    /// representation at `location`, creating/growing/writing whatever
+    /// separate content allocation it needs along the way. Used both
+    /// internally by `Guard::set`-style methods and by container types
+    /// writing a brand-new element/entry that didn't exist at `location`
+    /// before.
+    fn store<B: Backend>(&self, backend: &B, location: Location);
+
+    /// Reconstructs a fresh value purely from what's stored at
+    /// `location` -- the read-side counterpart of `store`, used by the
+    /// round-trip test and (eventually) by opening a file.
+    fn load<B: Backend>(backend: &B, location: Location) -> Self;
 }
 
 /// A live, mutation-capable, RAII-style view onto a [`Persistable`]
@@ -217,38 +320,54 @@ mod tests {
     mod mock_usage {
         use super::*;
         use std::cell::RefCell;
-
-        #[derive(serde::Serialize, serde::Deserialize)]
-        enum CounterOp {
-            Set(u32),
-        }
+        use std::collections::HashMap;
 
         struct Counter(u32);
 
         impl Persistable for Counter {
-            type Op = CounterOp;
+            const INLINE_SIZE: usize = 4;
+
             type Guard<'s, B: Backend>
                 = CounterGuard<'s, B>
             where
                 Self: 's,
                 B: 's;
 
-            fn guard<'s, B: Backend>(&'s mut self, backend: &'s B) -> Self::Guard<'s, B> {
+            fn guard<'s, B: Backend>(
+                &'s mut self,
+                backend: &'s B,
+                location: Location,
+            ) -> Self::Guard<'s, B> {
                 CounterGuard {
                     inner: self,
                     backend,
+                    location,
                 }
+            }
+
+            fn store<B: Backend>(&self, backend: &B, location: Location) {
+                backend.write(location.anchor, location.offset, &self.0.to_le_bytes());
+            }
+
+            fn load<B: Backend>(backend: &B, location: Location) -> Self {
+                let bytes = backend.read(location.anchor, location.offset, 4);
+                Counter(u32::from_le_bytes(bytes.try_into().unwrap()))
             }
         }
 
         struct CounterGuard<'s, B> {
             inner: &'s mut Counter,
             backend: &'s B,
+            location: Location,
         }
 
         impl<'s, B: Backend> CounterGuard<'s, B> {
             fn set(&mut self, value: u32) {
-                self.backend.record::<Counter>(&CounterOp::Set(value));
+                self.backend.write(
+                    self.location.anchor,
+                    self.location.offset,
+                    &value.to_le_bytes(),
+                );
                 self.inner.0 = value;
             }
         }
@@ -270,39 +389,75 @@ mod tests {
 
         #[derive(Default)]
         struct MockBackend {
-            recorded: RefCell<Vec<u32>>,
-        }
-
-        impl Journal for MockBackend {
-            fn record<T: Persistable>(&self, _op: &T::Op) {
-                // Real journals would serialize `op`; this mock just
-                // counts calls to prove the plumbing works.
-                self.recorded.borrow_mut().push(1);
-            }
+            regions: RefCell<HashMap<NonZeroU32, Vec<u8>>>,
+            next_index: std::cell::Cell<u32>,
         }
 
         impl Allocator for MockBackend {
-            fn alloc<T>(&self, _size: usize) -> UniquePointer<T> {
-                UniquePointer::from_index(NonZeroU32::new(1).unwrap())
+            fn alloc<T>(&self, size: usize) -> UniquePointer<T> {
+                let raw = self.next_index.get() + 1;
+                self.next_index.set(raw);
+                let index = NonZeroU32::new(raw).unwrap();
+                self.regions.borrow_mut().insert(index, vec![0u8; size]);
+                UniquePointer::from_index(index)
             }
-            fn free<T: Persistable>(&self, _pointer: UniquePointer<T>) {}
+            fn free<T>(&self, pointer: UniquePointer<T>) {
+                self.regions.borrow_mut().remove(&pointer.index());
+            }
             fn resolve<'a, T>(
                 &'a self,
-                _pointer: &UniquePointer<T>,
+                pointer: &UniquePointer<T>,
             ) -> Option<ResolvedPointer<'a, T>> {
-                None
+                self.regions
+                    .borrow()
+                    .contains_key(&pointer.index())
+                    .then(|| ResolvedPointer::from_target(pointer.index()))
+            }
+            fn read(&self, target: RawPointer, offset: u32, len: u32) -> Vec<u8> {
+                let regions = self.regions.borrow();
+                let region = &regions[&target.index()];
+                region[offset as usize..(offset + len) as usize].to_vec()
+            }
+            fn write(&self, target: RawPointer, offset: u32, bytes: &[u8]) {
+                let mut regions = self.regions.borrow_mut();
+                let region = regions.get_mut(&target.index()).unwrap();
+                let start = offset as usize;
+                region[start..start + bytes.len()].copy_from_slice(bytes);
+            }
+            fn copy(
+                &self,
+                src: RawPointer,
+                src_offset: u32,
+                len: u32,
+                dst: RawPointer,
+                dst_offset: u32,
+            ) {
+                let bytes = self.read(src, src_offset, len);
+                self.write(dst, dst_offset, &bytes);
+            }
+            fn resize<T>(&self, pointer: &UniquePointer<T>, new_size: usize) {
+                let mut regions = self.regions.borrow_mut();
+                let region = regions.get_mut(&pointer.index()).unwrap();
+                region.resize(new_size, 0);
             }
         }
 
         #[test]
         fn traits_compose_end_to_end() {
             let backend = MockBackend::default();
+            let root_pointer = backend.alloc::<Counter>(Counter::INLINE_SIZE);
+            let location = Location {
+                anchor: root_pointer.raw(),
+                offset: 0,
+            };
             let mut counter = Counter(0);
 
-            let mut guard = counter.guard(&backend);
+            let mut guard = counter.guard(&backend, location);
             guard.set(5);
             assert_eq!(guard.as_persistable().0, 5);
-            assert_eq!(backend.recorded.borrow().len(), 1);
+
+            let reloaded = Counter::load(&backend, location);
+            assert_eq!(reloaded.0, 5);
         }
     }
 }

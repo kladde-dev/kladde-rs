@@ -11,3 +11,6 @@ kladde-alloc = { workspace = true }
 kladde-derive = { workspace = true }
 kladde = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+postcard = { workspace = true }

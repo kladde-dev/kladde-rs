@@ -16,3 +16,9 @@ kladde-derive = { workspace = true }
 # a direct `serde` dependency, not just `serde_derive`.
 kladde-traits = { workspace = true }
 serde = { workspace = true }
+# Needed directly too: `#[derive(Persistable)]` on an enum generates code
+# that calls `::postcard::to_allocvec`/`from_bytes` (an enum is treated
+# as an "owning" type storing its postcard-serialized whole value -- see
+# kladde-derive's crate doc comment), same direct-dependency requirement
+# as kladde-traits/serde above.
+postcard = { workspace = true }
