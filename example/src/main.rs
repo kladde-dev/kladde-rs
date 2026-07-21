@@ -1,7 +1,8 @@
 //! A small interactive contact-book CLI demonstrating the whole `kladde`
-//! stack: a `#[derive(Persistable)]` struct (`Contact`) nesting a
-//! `PersistedVec`/`PersistedHashMap`, mutated through generated `Guard`s
-//! and backed by `kladde`'s `DefaultBackend`.
+//! stack: a `#[derive(Persistable)]` struct (`Contact`) and enum
+//! (`PhoneNumber`), nested inside a `PersistedVec` and a
+//! `PersistedHashMap`, mutated through generated `Guard`s and backed by
+//! `kladde`'s `DefaultBackend`.
 //!
 //! v1 has no real file behind any of this (see `spec.md`'s "Crash
 //! Consistency" note) -- state lives only for the duration of this
@@ -11,24 +12,13 @@
 //! everything into the (also in-memory, mock) allocator.
 
 use kladde::Kladde;
-use kladde_types::{Persistable, Persisted, PersistedHashMap, PersistedString, PersistedVec};
+use kladde_types::{Persistable, PersistedHashMap, PersistedString, PersistedVec};
 use std::io::{self, Write};
 
-// TODO(enum redesign): `#[derive(Persistable)]` doesn't support enums yet
-// (see spec.md's Future Work) -- once the inline per-variant layout lands,
-// drop the `serde`/`Default` derives here and the `Persisted<...>`
-// wrapping around `Contact::phones` below, and derive `Persistable`
-// directly on `PhoneNumber` again.
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(Persistable, Debug)]
 enum PhoneNumber {
-    Mobile(String),
-    Landline(String),
-}
-
-impl Default for PhoneNumber {
-    fn default() -> Self {
-        PhoneNumber::Mobile(String::new())
-    }
+    Mobile(PersistedString),
+    Landline(PersistedString),
 }
 
 impl std::fmt::Display for PhoneNumber {
@@ -43,7 +33,7 @@ impl std::fmt::Display for PhoneNumber {
 #[derive(Persistable, Debug)]
 struct Contact {
     email: PersistedString,
-    phones: PersistedVec<Persisted<PhoneNumber>>,
+    phones: PersistedVec<PhoneNumber>,
 }
 
 #[derive(Persistable)]
@@ -119,16 +109,13 @@ fn main() {
             "add-phone" => match words.as_slice() {
                 [_, name, kind, number] => {
                     let phone = match *kind {
-                        "mobile" => PhoneNumber::Mobile(number.to_string()),
-                        "landline" => PhoneNumber::Landline(number.to_string()),
+                        "mobile" => PhoneNumber::Mobile(PersistedString::from(*number)),
+                        "landline" => PhoneNumber::Landline(PersistedString::from(*number)),
                         other => {
                             println!("unknown phone kind {other:?}, expected mobile|landline");
                             continue;
                         }
                     };
-                    // Constructed before `book.guard()` so this immutable
-                    // borrow of `book` ends before the mutable one begins.
-                    let phone = Persisted::new(phone, book.backend());
                     let found = {
                         let mut guard = book.guard();
                         match guard.contacts_mut().get_mut(&PersistedString::from(*name)) {
@@ -166,7 +153,7 @@ fn main() {
                     Some(contact) => {
                         println!("{name}: {}", contact.email);
                         for phone in contact.phones.iter() {
-                            println!("  {}", **phone);
+                            println!("  {phone}");
                         }
                     }
                     None => println!("no such contact: {name}"),

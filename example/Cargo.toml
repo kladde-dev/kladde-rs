@@ -6,9 +6,7 @@ publish = false
 
 [dependencies]
 kladde = { workspace = true }
-# "serde" enables kladde-types' Persisted<T> -- the TODO in main.rs
-# wrapping PhoneNumber in it (pending the enum-derive redesign).
-kladde-types = { workspace = true, features = ["serde"] }
+kladde-types = { workspace = true }
 kladde-derive = { workspace = true }
 # Required alongside kladde-derive whenever #[derive(Persistable)] is used
 # directly (as opposed to only using kladde-types' own container types) --
@@ -17,6 +15,3 @@ kladde-derive = { workspace = true }
 # same reason `#[derive(serde::Serialize)]` requires a direct `serde`
 # dependency, not just `serde_derive`.
 kladde-traits = { workspace = true }
-# For `#[derive(serde::Serialize, serde::Deserialize)]` directly on
-# `PhoneNumber` (needed so it satisfies `Persisted<T>`'s bounds).
-serde = { workspace = true }

@@ -52,7 +52,6 @@ dependencies = [
  "kladde-derive",
  "kladde-traits",
  "kladde-types",
- "serde",
 ]
 
 [[package]]

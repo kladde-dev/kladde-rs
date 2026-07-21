@@ -1,23 +1,15 @@
 //! Exercises the whole stack together: `#[derive(Persistable)]` on a
-//! custom struct nesting `kladde-types` containers, backed by `kladde`'s
-//! real `Kladde`/`DefaultBackend` (not a test-local mock), and -- the
-//! point of this whole round -- an explicit `flush()` followed by
+//! custom struct and enum, nesting `kladde-types` containers, backed by
+//! `kladde`'s real `Kladde`/`DefaultBackend` (not a test-local mock), and
+//! -- the point of this whole round -- an explicit `flush()` followed by
 //! reconstructing everything fresh purely from the backend's storage.
-//!
-//! `Role` doesn't derive `Persistable` directly: `#[derive(Persistable)]`
-//! doesn't support enums yet (see `spec.md`'s Future Work), so `User`
-//! wraps it in `Persisted<Role>` instead -- see `kladde-derive`'s crate
-//! doc comment for the TODO to drop this once the enum-derive redesign
-//! lands. `Serialize`/`Deserialize` are needed because `Persisted<T>`
-//! treats its wrapped value as an opaque postcard-serialized blob.
 
 use kladde::Kladde;
-use kladde_types::{Persistable, Persisted, PersistedHashMap, PersistedString, PersistedVec};
+use kladde_types::{Persistable, PersistedHashMap, PersistedString, PersistedVec};
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Default)]
+#[derive(Persistable, Debug, PartialEq)]
 enum Role {
     Admin,
-    #[default]
     Member,
 }
 
@@ -25,7 +17,7 @@ enum Role {
 struct User {
     name: PersistedString,
     age: i32,
-    role: Persisted<Role>,
+    role: Role,
     tags: PersistedVec<PersistedString>,
 }
 
@@ -40,12 +32,10 @@ fn derived_struct_nested_in_a_persisted_hash_map_via_kladde() {
         users: PersistedHashMap::new(),
     });
 
-    // Built before `app.guard()` so this immutable borrow of `app` (for
-    // `Persisted::new`) ends before the mutable one begins.
     let ada = User {
         name: PersistedString::from("Ada"),
         age: 30,
-        role: Persisted::new(Role::Admin, app.backend()),
+        role: Role::Admin,
         tags: PersistedVec::new(),
     };
     app.guard()
@@ -67,7 +57,7 @@ fn derived_struct_nested_in_a_persisted_hash_map_via_kladde() {
     let ada = app.get().users.get(&PersistedString::from("ada")).unwrap();
     assert_eq!(ada.name, "Ada");
     assert_eq!(ada.age, 31);
-    assert_eq!(*ada.role, Role::Member);
+    assert_eq!(ada.role, Role::Member);
     assert_eq!(ada.tags.len(), 1);
     assert_eq!(ada.tags.get(0), Some(&PersistedString::from("engineer")));
 
@@ -80,7 +70,7 @@ fn derived_struct_nested_in_a_persisted_hash_map_via_kladde() {
     let reloaded_ada = reloaded.users.get(&PersistedString::from("ada")).unwrap();
     assert_eq!(reloaded_ada.name, "Ada");
     assert_eq!(reloaded_ada.age, 31);
-    assert_eq!(*reloaded_ada.role, Role::Member);
+    assert_eq!(reloaded_ada.role, Role::Member);
     assert_eq!(reloaded_ada.tags.len(), 1);
     assert_eq!(
         reloaded_ada.tags.get(0),
@@ -99,7 +89,7 @@ fn mutating_one_element_does_not_disturb_an_unrelated_sibling() {
     let ada = User {
         name: PersistedString::from("Ada"),
         age: 30,
-        role: Persisted::new(Role::Admin, app.backend()),
+        role: Role::Admin,
         tags: PersistedVec::new(),
     };
     app.guard()
@@ -108,7 +98,7 @@ fn mutating_one_element_does_not_disturb_an_unrelated_sibling() {
     let bob = User {
         name: PersistedString::from("Bob"),
         age: 25,
-        role: Persisted::new(Role::Member, app.backend()),
+        role: Role::Member,
         tags: PersistedVec::new(),
     };
     app.guard()
