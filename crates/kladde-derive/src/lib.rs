@@ -60,6 +60,33 @@ pub fn derive_persistable(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+/// For a list of field types meant to be laid out contiguously, back to
+/// back (a struct's fields, or one `enum` variant's fields, based at some
+/// offset the caller adds separately), computes each field's own static
+/// byte offset within that layout: the sum of every *earlier* field's
+/// `INLINE_SIZE`. Purely a function of the field *types*, not how the
+/// caller's generated code actually accesses each field (`self.foo`,
+/// `self.0`, a `match`-bound local, ...) -- shared by struct-derive and
+/// (per-variant) enum-derive.
+fn field_offsets(field_ty: &[syn::Type]) -> Vec<proc_macro2::TokenStream> {
+    (0..field_ty.len())
+        .map(|i| {
+            let earlier = &field_ty[..i];
+            quote! {
+                (0usize #( + <#earlier as ::kladde_traits::Persistable>::INLINE_SIZE )*) as u32
+            }
+        })
+        .collect()
+}
+
+/// The total inline size of a list of field types laid out contiguously,
+/// back to back -- the sum of each field's own `INLINE_SIZE`.
+fn total_size(field_ty: &[syn::Type]) -> proc_macro2::TokenStream {
+    quote! {
+        0usize #( + <#field_ty as ::kladde_traits::Persistable>::INLINE_SIZE )*
+    }
+}
+
 fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::TokenStream {
     let ident = &input.ident;
     let vis = &input.vis;
@@ -86,19 +113,8 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::To
         .map(|f| format_ident!("{}_mut", f))
         .collect();
 
-    // Field `i`'s static byte offset within this struct's own inline
-    // representation is the sum of every *earlier* field's `INLINE_SIZE`
-    // -- computable purely from the field types, so it's a `const`-like
-    // expression the compiler evaluates, not something tracked at
-    // runtime.
-    let field_offset: Vec<_> = (0..field_ty.len())
-        .map(|i| {
-            let earlier = &field_ty[..i];
-            quote! {
-                (0usize #( + <#earlier as ::kladde_traits::Persistable>::INLINE_SIZE )*) as u32
-            }
-        })
-        .collect();
+    let field_offset = field_offsets(&field_ty);
+    let total_size = total_size(&field_ty);
 
     quote! {
         #[doc(hidden)]
@@ -157,8 +173,7 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::To
             // A struct never owns an allocation of its own -- it's just
             // the sum of its fields' inline representations, threaded
             // through at static offsets.
-            const INLINE_SIZE: usize =
-                0usize #( + <#field_ty as ::kladde_traits::Persistable>::INLINE_SIZE )*;
+            const INLINE_SIZE: usize = #total_size;
 
             type Guard<'s, B: ::kladde_traits::Backend>
                 = #guard_ident<'s, B>
