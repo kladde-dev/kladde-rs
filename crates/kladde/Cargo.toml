@@ -8,5 +8,3 @@ publish.workspace = true
 [dependencies]
 kladde-traits = { workspace = true }
 kladde-alloc = { workspace = true }
-serde = { workspace = true }
-postcard = { workspace = true }

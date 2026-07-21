@@ -85,8 +85,6 @@ version = "0.1.0"
 dependencies = [
  "kladde-alloc",
  "kladde-traits",
- "postcard",
- "serde",
 ]
 
 [[package]]
@@ -112,10 +110,6 @@ dependencies = [
 [[package]]
 name = "kladde-traits"
 version = "0.1.0"
-dependencies = [
- "postcard",
- "serde",
-]
 
 [[package]]
 name = "kladde-types"

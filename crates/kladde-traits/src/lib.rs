@@ -125,13 +125,14 @@ pub fn read_header<B: Backend>(backend: &B, location: Location) -> (Option<NonZe
     (NonZeroU32::new(target), len)
 }
 
-/// The serializable counterpart of [`UniquePointer`], produced by
+/// The on-disk-facing counterpart of [`UniquePointer`], produced by
 /// [`Allocator::resolve`]. Holds the pointer's current on-disk `target` --
 /// the offset of the region it points *at*, which is what a pointer's
-/// serialized value actually is (as opposed to `position`, the offset of
-/// the pointer's *own* serialized bytes, which is separate bookkeeping an
-/// `Allocator` tracks internally once this value has actually been
-/// written out somewhere -- not something `ResolvedPointer` itself knows).
+/// written-out representation actually is (as opposed to `position`, the
+/// offset of the pointer's *own* serialized bytes, which is separate
+/// bookkeeping an `Allocator` tracks internally once this value has
+/// actually been written out somewhere -- not something `ResolvedPointer`
+/// itself knows).
 ///
 /// Borrowing the allocator for `'a` is deliberate: it prevents, at compile
 /// time, any allocator operation that could invalidate this snapshot
@@ -155,12 +156,6 @@ impl<'a, T> ResolvedPointer<'a, T> {
 
     pub fn target(&self) -> NonZeroU32 {
         self.target
-    }
-}
-
-impl<'a, T> serde::Serialize for ResolvedPointer<'a, T> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.target.serialize(serializer)
     }
 }
 
@@ -295,22 +290,6 @@ mod tests {
         let index = NonZeroU32::new(7).unwrap();
         let pointer = UniquePointer::<()>::from_index(index);
         assert_eq!(pointer.index(), index);
-    }
-
-    #[test]
-    fn resolved_pointer_serializes_as_a_plain_target() {
-        let target = NonZeroU32::new(42).unwrap();
-        let resolved = ResolvedPointer::<()>::from_target(target);
-
-        // The whole point of `ResolvedPointer` is that it serializes
-        // exactly like the raw `target` would -- no extra framing, no
-        // trace of the allocator borrow it carries at the type level.
-        let resolved_bytes = postcard::to_allocvec(&resolved).unwrap();
-        let target_bytes = postcard::to_allocvec(&target).unwrap();
-        assert_eq!(resolved_bytes, target_bytes);
-
-        let round_tripped: NonZeroU32 = postcard::from_bytes(&resolved_bytes).unwrap();
-        assert_eq!(round_tripped, target);
     }
 
     // A minimal, self-contained mock of a `Persistable`/`Guard`/`Backend`

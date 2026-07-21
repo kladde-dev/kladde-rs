@@ -1,0 +1,328 @@
+//! [`Persisted<T>`] -- a generic escape hatch for wrapping a plain, foreign
+//! `T` (one with no room of its own for a cached `pointer` field, so it
+//! can't safely implement [`Persistable`] directly without leaking on
+//! every `store` -- see `spec.md`'s notes on `String`/derived `enum`s)
+//! so it can be persisted anyway, by treating its postcard-serialized
+//! bytes as an opaque content allocation and keeping the allocation
+//! identity here instead.
+//!
+//! Gated behind this crate's `serde` Cargo feature -- this is the only
+//! thing in the whole `kladde` workspace that needs `serde`/`postcard`.
+//!
+//! Two ways to construct one:
+//! - [`Persisted::new`] -- eager: always allocates immediately, so
+//!   `pointer` is always `Some`. The general-purpose constructor.
+//! - `Persisted::default()`, via `impl<T: Default> Default for
+//!   Persisted<T>` -- lazy: `pointer` starts `None`, paired with the
+//!   invariant `value == T::default()`. This carries no leak risk, for
+//!   the same reason `PersistedVec::new()`/`PersistedHashMap::new()`
+//!   don't: a freshly-defaulted, never-mutated value legitimately has
+//!   nothing to allocate yet. [`PersistedGuard::set`] promotes
+//!   `None -> Some` the first time it's actually mutated;
+//!   [`PersistedGuard::set_to_default`] explicitly frees whatever
+//!   allocation existed and resets back to the lazy `None` state.
+//!
+//! Note the `T: Default` bound on `Persistable`'s own impl below (not
+//! just on the separate `std::default::Default` impl): `load` has to be
+//! able to reconstruct the lazy (`pointer: None`) case somehow, and
+//! `Persistable::load`'s signature can't be conditional on which
+//! constructor originally produced the value -- so every `T` used with
+//! `Persisted<T>` needs to be `Default`, even if an application only
+//! ever calls `new()` and never touches the lazy path.
+
+use kladde_traits::{
+    read_header, write_header, Backend, Guard, Location, Persistable, UniquePointer,
+};
+use std::ops::{Deref, DerefMut};
+
+#[derive(Debug, PartialEq)]
+pub struct Persisted<T> {
+    value: T,
+    /// The content allocation holding `value`'s postcard-serialized bytes
+    /// -- `None` only while `value` is still exactly `T::default()`,
+    /// courtesy of the `Default` impl below. See the module doc comment.
+    pointer: Option<UniquePointer<Persisted<T>>>,
+}
+
+impl<T: serde::Serialize> Persisted<T> {
+    /// Allocates immediately: writes `value`'s postcard-serialized bytes
+    /// to a fresh allocation and remembers the pointer, so a later
+    /// `store` can reuse (not leak) it -- see `vec.rs`'s identical
+    /// reasoning for `PersistedVec`.
+    pub fn new<B: Backend>(value: T, backend: &B) -> Self {
+        let bytes = postcard::to_allocvec(&value)
+            .expect("postcard serialization of an in-memory value should not fail");
+        let pointer = backend.alloc::<Persisted<T>>(bytes.len());
+        backend.write(pointer.raw(), 0, &bytes);
+        Persisted {
+            value,
+            pointer: Some(pointer),
+        }
+    }
+}
+
+impl<T: Default> Default for Persisted<T> {
+    fn default() -> Self {
+        Persisted {
+            value: T::default(),
+            pointer: None,
+        }
+    }
+}
+
+impl<T> Deref for Persisted<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> Persistable for Persisted<T>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + Default,
+{
+    /// A fixed 8-byte `{ target, len }` header -- see `String`/
+    /// `PersistedVec`'s identical layout note. `len` here is the
+    /// postcard-serialized content's byte length (there's no static
+    /// per-element size to derive it from, unlike `PersistedVec`).
+    const INLINE_SIZE: usize = 8;
+
+    type Guard<'s, B: Backend>
+        = PersistedGuard<'s, T, B>
+    where
+        Self: 's,
+        B: 's;
+
+    fn guard<'s, B: Backend>(
+        &'s mut self,
+        backend: &'s B,
+        location: Location,
+    ) -> Self::Guard<'s, B> {
+        PersistedGuard {
+            inner: self,
+            backend,
+            location,
+        }
+    }
+
+    /// Deliberately doesn't rewrite content when `pointer` is already
+    /// `Some`: `PersistedGuard::set` always writes a value's postcard
+    /// bytes to its allocation immediately, so by the time `store` runs
+    /// separately (e.g. assembling a struct field from an
+    /// already-complete `Persisted<T>`) the existing allocation's
+    /// content is already correct -- only a fresh header needs
+    /// publishing, not new content. Re-serializing here is just to learn
+    /// the byte length cheaply, not to write it anywhere.
+    fn store<B: Backend>(&self, backend: &B, location: Location) {
+        match &self.pointer {
+            Some(existing) => {
+                let bytes = postcard::to_allocvec(&self.value)
+                    .expect("postcard serialization of an in-memory value should not fail");
+                write_header(backend, location, existing.index(), bytes.len() as u32);
+            }
+            None => {
+                // `pointer` is only ever `None` when this value was
+                // constructed via `Default` and never mutated -- `value`
+                // is exactly `T::default()` by construction, the same
+                // "no allocation yet" state `PersistedVec`/
+                // `PersistedHashMap` use for their own legitimately-empty
+                // case.
+                backend.write(location.anchor, location.offset, &[0u8; 8]);
+            }
+        }
+    }
+
+    fn load<B: Backend>(backend: &B, location: Location) -> Self {
+        let (target, len) = read_header(backend, location);
+        match target {
+            Some(target) => {
+                let pointer = UniquePointer::from_index(target);
+                let bytes = backend.read(pointer.raw(), 0, len);
+                let value = postcard::from_bytes(&bytes).expect("corrupt persisted value bytes");
+                Persisted {
+                    value,
+                    pointer: Some(pointer),
+                }
+            }
+            None => Persisted {
+                value: T::default(),
+                pointer: None,
+            },
+        }
+    }
+}
+
+/// `B` defaults to [`kladde::DefaultBackend`](../../kladde/struct.DefaultBackend.html)
+/// so application code that only ever uses the default backend never has
+/// to name it.
+pub struct PersistedGuard<'s, T, B = kladde::DefaultBackend> {
+    inner: &'s mut Persisted<T>,
+    backend: &'s B,
+    location: Location,
+}
+
+impl<'s, T: serde::Serialize, B: Backend> PersistedGuard<'s, T, B> {
+    /// Replaces the whole value: allocates (first time) or resizes
+    /// (reusing the existing pointer, never leaking it -- see
+    /// `PersistedVec::push`'s identical pattern) the content allocation
+    /// to fit, writes the new postcard bytes, then publishes the updated
+    /// header. Promotes `pointer` from `None` to `Some` the first time
+    /// this is called on a `Default`-constructed value.
+    pub fn set(&mut self, value: T) {
+        let bytes = postcard::to_allocvec(&value)
+            .expect("postcard serialization of an in-memory value should not fail");
+        match &self.inner.pointer {
+            Some(existing) => self.backend.resize(existing, bytes.len()),
+            None => self.inner.pointer = Some(self.backend.alloc::<Persisted<T>>(bytes.len())),
+        }
+        let pointer = self.inner.pointer.as_ref().unwrap();
+        self.backend.write(pointer.raw(), 0, &bytes);
+        write_header(
+            self.backend,
+            self.location,
+            pointer.index(),
+            bytes.len() as u32,
+        );
+        self.inner.value = value;
+    }
+}
+
+impl<'s, T: Default, B: Backend> PersistedGuard<'s, T, B> {
+    /// Frees the existing content allocation (if any) and resets back to
+    /// the lazy `None`/`T::default()` state, publishing the empty header
+    /// immediately -- the explicit counterpart to `Default`'s implicit
+    /// lazy construction.
+    pub fn set_to_default(&mut self) {
+        if let Some(existing) = self.inner.pointer.take() {
+            self.backend.free(existing);
+        }
+        self.inner.value = T::default();
+        self.backend
+            .write(self.location.anchor, self.location.offset, &[0u8; 8]);
+    }
+}
+
+impl<'s, T, B: Backend> Guard for PersistedGuard<'s, T, B>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + Default,
+{
+    type Persistable = Persisted<T>;
+    type Backend = B;
+
+    fn as_persistable(&self) -> &Persisted<T> {
+        self.inner
+    }
+    fn as_persistable_mut(&mut self) -> &mut Persisted<T> {
+        self.inner
+    }
+    fn backend(&self) -> &B {
+        self.backend
+    }
+}
+
+impl<'s, T, B> Deref for PersistedGuard<'s, T, B> {
+    type Target = Persisted<T>;
+    fn deref(&self) -> &Persisted<T> {
+        self.inner
+    }
+}
+
+impl<'s, T, B> DerefMut for PersistedGuard<'s, T, B> {
+    fn deref_mut(&mut self) -> &mut Persisted<T> {
+        self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::MockBackend;
+    use kladde_traits::Allocator;
+
+    fn root_location(backend: &MockBackend) -> Location {
+        let pointer = backend.alloc::<()>(Persisted::<i32>::INLINE_SIZE);
+        Location {
+            anchor: pointer.raw(),
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn new_round_trips_through_store_and_load() {
+        let backend = MockBackend::default();
+        let location = root_location(&backend);
+
+        let value = Persisted::new(42i32, &backend);
+        value.store(&backend, location);
+        backend.flush();
+
+        let reloaded = Persisted::<i32>::load(&backend, location);
+        assert_eq!(*reloaded, 42);
+    }
+
+    #[test]
+    fn default_is_lazy_and_round_trips_as_the_default_value() {
+        let backend = MockBackend::default();
+        let location = root_location(&backend);
+        backend.flush(); // materialize the root anchor itself, unrelated to `Persisted<T>`
+        let live_before = backend.live_count();
+
+        let value = Persisted::<i32>::default();
+        value.store(&backend, location);
+        backend.flush();
+
+        assert_eq!(
+            backend.live_count(),
+            live_before,
+            "default() shouldn't allocate anything"
+        );
+
+        let reloaded = Persisted::<i32>::load(&backend, location);
+        assert_eq!(*reloaded, 0);
+    }
+
+    #[test]
+    fn set_reuses_an_existing_allocation_instead_of_leaking_it() {
+        let backend = MockBackend::default();
+        let location = root_location(&backend);
+
+        let mut value = Persisted::new(1i32, &backend);
+        value.store(&backend, location);
+        backend.flush();
+        let live_before = backend.live_count();
+
+        value.guard(&backend, location).set(2);
+        backend.flush();
+
+        assert_eq!(
+            backend.live_count(),
+            live_before,
+            "set() should reuse the existing allocation, not leak a second one"
+        );
+        assert_eq!(*value, 2);
+
+        let reloaded = Persisted::<i32>::load(&backend, location);
+        assert_eq!(*reloaded, 2);
+    }
+
+    #[test]
+    fn set_to_default_frees_the_allocation_and_goes_back_to_lazy() {
+        let backend = MockBackend::default();
+        let location = root_location(&backend);
+
+        let mut value = Persisted::new(5i32, &backend);
+        value.store(&backend, location);
+        backend.flush();
+        let live_before = backend.live_count();
+        assert!(live_before > 0);
+
+        value.guard(&backend, location).set_to_default();
+        backend.flush();
+
+        assert_eq!(backend.live_count(), live_before - 1);
+        assert_eq!(*value, 0);
+
+        let reloaded = Persisted::<i32>::load(&backend, location);
+        assert_eq!(*reloaded, 0);
+    }
+}
