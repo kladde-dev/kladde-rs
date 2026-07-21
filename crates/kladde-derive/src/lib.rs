@@ -13,10 +13,8 @@
 //! - An `enum`'s own `INLINE_SIZE` is a 4-byte discriminant plus whichever
 //!   variant's fields are largest -- each variant is laid out like a
 //!   struct in its own right (the same per-field offset computation,
-//!   based at offset 4 instead of 0), so an enum never owns an
-//!   allocation of its own either, and needs no `serde`/`postcard` at
-//!   all (unlike an earlier version of this macro, which treated a
-//!   derived enum as a `postcard`-serialized "owning blob"). Only
+//!   based at offset 4 instead of 0), so an enum never owns an allocation
+//!   of its own either and needs no `serde`/`postcard` at all. Only
 //!   whole-value replacement is supported for now (`guard.set(new_value)`)
 //!   -- mutating a field within the current variant in place, and/or
 //!   matching directly on a generated `Guard`, is deferred (see

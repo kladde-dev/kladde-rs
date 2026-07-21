@@ -34,6 +34,18 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 
+/// A hash map whose contents are persisted to the backing store.
+///
+/// Behaves like `std::collections::HashMap<K, V>` for reads (`get`,
+/// `contains_key`, `iter`, `len`, ...), which touch only the in-memory
+/// copy. Mutation goes through a [`PersistedHashMapGuard`] obtained from
+/// [`Persistable::guard`] (or a derived parent's `_mut()` accessor):
+/// `insert`/`remove`/`get_mut` each update memory *and* record the change
+/// to the backend in one step. Both `K` and `V` need to implement
+/// [`Persistable`] (and `K: Eq + Hash`, as usual); notably `K` does *not*
+/// need `Clone`. Keys are not mutable in place -- no guard is ever handed
+/// out for a key -- so a `PersistedString` key, for instance, is written
+/// once and thereafter only read.
 #[derive(Debug, PartialEq)]
 pub struct PersistedHashMap<K: Eq + Hash, V> {
     /// key -> (slot index into the on-disk array, value). Only ever
@@ -129,25 +141,18 @@ where
     /// brand-new value somewhere (e.g. a struct field being assembled)
     /// rather than via incremental `insert`/`remove`.
     ///
-    /// Deliberately does *not* rewrite any entries: `insert`/`remove`
-    /// already keep the on-disk content at `self.pointer` exactly in
-    /// sync with `self.entries`/`self.capacity` incrementally, so if a
-    /// pointer already exists, its content is already correct -- `store`
-    /// only needs to point a new header at it, not recompute anything.
-    ///
-    /// This replaces an earlier version that rewrote every entry at a
-    /// freshly `enumerate()`d, compacted position on every `store` call.
-    /// That was worse than just wasteful: `self.entries`' own per-key
-    /// `(slot, value)` tracking still pointed at the *old* (pre-compaction)
-    /// slots afterward, since `store` -- taking `&self` -- can't update
-    /// it. If this same live map were later mutated again through
-    /// `get_mut`/`remove` (realistic: `store` runs whenever this map is
-    /// inserted as a value into another container, and the embedded map
-    /// stays reachable and mutable afterward through that container), it
-    /// would compute offsets from those stale slots -- silently
-    /// corrupting or reading out of the actual (now-compacted, smaller)
-    /// allocation. Not touching existing content at all sidesteps the
-    /// mismatch entirely, rather than just reducing how often it bites.
+    /// Deliberately does *not* rewrite or compact any entries: `insert`/
+    /// `remove` already keep the on-disk content at `self.pointer` in sync
+    /// with `self.entries`/`self.capacity` incrementally, so if a pointer
+    /// already exists its content is already correct and `store` only
+    /// needs to point a new header at it. Rewriting entries at compacted
+    /// positions here would be a correctness bug, not just wasted work:
+    /// the map stays reachable and mutable at its original location too
+    /// (it's typically a struct field being copied into another
+    /// container), and its in-memory `(slot, value)` tracking would then
+    /// disagree with the moved on-disk layout, so a later `get_mut`/
+    /// `remove` there would read/write the wrong bytes. (Regression test:
+    /// `store_does_not_disturb_further_mutation_of_the_same_live_map`.)
     fn store<B: Backend>(&mut self, backend: &B, location: Location) {
         match &self.pointer {
             Some(existing) => {

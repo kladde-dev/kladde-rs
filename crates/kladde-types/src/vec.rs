@@ -1,30 +1,36 @@
-//! [`PersistedVec`] -- the backed variant of `Vec<T>`. Named distinctly
-//! from `std::vec::Vec` (rather than shadowing it) per `V1_QUESTIONS.md`
-//! question 10.
+//! [`PersistedVec`] -- the backed variant of `Vec<T>`, named distinctly
+//! from `std::vec::Vec` rather than shadowing it.
 //!
-//! Snapshot layout (per `FLUSHING_QUESTIONS.md` question 3): a small,
-//! fixed 8-byte inline header (`target`, `len` -- see
-//! `kladde_traits::write_header`) plus a separate content allocation
-//! holding `len` fixed-size (`T::INLINE_SIZE`) element slots, analogous
-//! to how `std::vec::Vec` is laid out in memory. No slack/amortized
-//! growth yet -- every push/remove resizes the content allocation to
-//! exactly fit. Per `later.md`, this straightforward layout is meant to
-//! be replaced with a chunked-list representation once this version is
-//! tested and committed.
+//! Snapshot layout: a small, fixed 8-byte inline header (`target`, `len`
+//! -- see `kladde_traits::write_header`) plus a separate content
+//! allocation holding `len` fixed-size (`T::INLINE_SIZE`) element slots,
+//! analogous to how `std::vec::Vec` is laid out in memory. No
+//! slack/amortized growth yet -- every push/remove resizes the content
+//! allocation to exactly fit. Per `later.md`, this straightforward layout
+//! is meant to be replaced with a chunked-list representation eventually.
 
 use kladde_traits::{
     read_header, write_header, Backend, Guard, Location, Persistable, RawPointer, UniquePointer,
 };
 use std::ops::{Deref, DerefMut};
 
+/// A growable array whose contents are persisted to the backing store.
+///
+/// Behaves like `std::vec::Vec<T>` for reads (`len`, `get`, `iter`, ...),
+/// which touch only the in-memory copy. Mutation goes through a
+/// [`PersistedVecGuard`] obtained from [`Persistable::guard`] (or a
+/// derived parent's `_mut()` accessor): `push`/`remove`/`get_mut` each
+/// update memory *and* record the change to the backend in one step, so
+/// persistence is never a separate, forgettable action. The element type
+/// `T` only needs to implement [`Persistable`] -- any scalar, container,
+/// `PersistedString`, or `#[derive(Persistable)]` type.
 #[derive(Debug, PartialEq)]
 pub struct PersistedVec<T> {
     data: Vec<T>,
     /// The content allocation holding this vec's elements -- `None`
-    /// until the first `push` ever needs one. Lazily created rather than
-    /// eager, since `PersistedVec::new()` takes no `Backend` to create
-    /// one with; see `FLUSHING_QUESTIONS.md` question 2's "which
-    /// instance" resolution.
+    /// until the first `push` (or a `store` of a `from_iter`-built vec)
+    /// ever needs one. Lazily created rather than eager, since
+    /// `PersistedVec::new()` takes no `Backend` to create one with.
     pointer: Option<UniquePointer<PersistedVec<T>>>,
 }
 
@@ -96,8 +102,7 @@ impl<'a, T> IntoIterator for &'a PersistedVec<T> {
 
 impl<T: Persistable> Persistable for PersistedVec<T> {
     /// A fixed 8-byte `{ target, len }` header -- the content allocation
-    /// itself (`len * T::INLINE_SIZE` bytes) is separate, per Question 1
-    /// of `FLUSHING_QUESTIONS.md`.
+    /// itself (`len * T::INLINE_SIZE` bytes) is separate.
     const INLINE_SIZE: usize = 8;
 
     type Guard<'s, B: Backend>

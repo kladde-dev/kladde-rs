@@ -5,10 +5,9 @@
 //! is what actually materializes, reads, and mutates bytes.
 //!
 //! v1 deliberately defers the real, file-backed, compaction-capable
-//! allocator (see `spec.md`'s "Pointers and Memory Management" and
-//! `V1_QUESTIONS.md`): the plan is to build the rest of the system
-//! against this mock first, and let its real requirements emerge from
-//! that rather than guessing upfront.
+//! allocator (see `spec.md`'s "Pointers and Memory Management"): the plan
+//! is to build the rest of the system against this mock first, and let
+//! its real requirements emerge from that rather than guessing upfront.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -17,10 +16,10 @@ use std::num::NonZeroU32;
 /// Each allocation is a `Box<[u8]>`, keyed by an index that's assigned
 /// *elsewhere* (by `DefaultBackend`, at the moment a `Guard` calls
 /// `Allocator::alloc`) -- this type only ever materializes an index it's
-/// told to use, it never generates one itself. See `spec.md`'s "How
-/// exactly are pointer indices introduced" discussion (`FLUSHING_QUESTIONS.md`
-/// question 8's surrounding chat) for why index generation and content
-/// materialization are split this way.
+/// told to use, it never generates one itself. See `spec.md`'s Pointers
+/// and Memory Management for why index generation (eager, so an index is
+/// a stable identity from the moment anything might reference it) and
+/// content materialization (deferred to flush, here) are split this way.
 #[derive(Default)]
 pub struct MockAllocator {
     regions: RefCell<HashMap<NonZeroU32, Box<[u8]>>>,

@@ -191,7 +191,7 @@ impl Allocator for DefaultBackend {
 /// "constructed without a backend in hand" problem that makes every other
 /// container's pointer lazy, since `root` and `backend` are brought
 /// together in the same call. See `spec.md`'s "Pointers and Memory
-/// Management" (Root value handling).
+/// Management".
 pub struct Kladde<T> {
     root: T,
     backend: DefaultBackend,

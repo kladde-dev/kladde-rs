@@ -87,15 +87,14 @@ impl RawPointer {
 }
 
 /// Where a [`Persistable`] value's fixed-size inline representation lives:
-/// the nearest ancestor allocation that owns real storage (per
-/// `spec.md`'s Question 1 -- only types whose own inline representation
-/// includes a pointer own an allocation at all), plus a byte offset
-/// within it. A `Guard` for a value that owns its own allocation hands
-/// its children a *fresh* `Location` (its own pointer, offset `0`); a
-/// `Guard` for an inline value (a struct field, a container element) just
-/// extends the `Location` it was given -- see `spec.md`'s "The Trait
-/// Layer" for the full rationale (this was Question 9 of
-/// `FLUSHING_QUESTIONS.md`).
+/// the nearest ancestor allocation that owns real storage (`anchor`),
+/// plus a byte `offset` within it. Threaded down through
+/// [`Persistable::guard`]/[`store`](Persistable::store)/[`load`](Persistable::load)
+/// so even a deeply nested leaf (a struct field, a container element)
+/// knows where to write. A value that owns its own allocation hands its
+/// children a *fresh* `Location` (its own pointer, offset `0`); an inline
+/// value just extends the one it was given by its own static offset. See
+/// `spec.md`'s "The Trait Layer" for the full rationale.
 #[derive(Debug, Clone, Copy)]
 pub struct Location {
     pub anchor: RawPointer,
@@ -104,10 +103,10 @@ pub struct Location {
 
 /// Writes an 8-byte `{ target: u32, len: u32 }` header at `location` --
 /// the fixed-size inline representation every "owning" [`Persistable`]
-/// type (one with a separate content allocation: `String`, `PersistedVec`,
-/// a derived enum, ...) uses. `target` is `0` to mean "no allocation yet",
-/// matching `UniquePointer`'s `index`/registry `Option<NonZeroU32>`
-/// convention from `spec.md`'s Pointers and Memory Management section.
+/// type (one with a separate content allocation: `PersistedVec`,
+/// `PersistedHashMap`, `PersistedString`, `Persisted<T>`) uses. `target`
+/// is `0` to mean "no allocation yet", the same convention the pointer
+/// registry uses (see `spec.md`'s Pointers and Memory Management).
 pub fn write_header<B: Backend>(backend: &B, location: Location, index: NonZeroU32, len: u32) {
     let mut bytes = [0u8; 8];
     bytes[0..4].copy_from_slice(&index.get().to_le_bytes());
@@ -161,12 +160,10 @@ impl<'a, T> ResolvedPointer<'a, T> {
 
 /// Allocates, frees, resizes, and reads/writes bytes in the backed heap.
 /// This is the *only* thing a [`Guard`] ever calls to make a mutation
-/// durable -- there is deliberately no separate `Journal` trait anymore
-/// (an earlier draft of `spec.md` had one): once every recorded thing is
-/// one of these primitives, a second trait around a `record` method would
-/// have nothing type-specific left to do. See `spec.md`'s "The Trait
-/// Layer" for the full rationale, including why `Persistable::Op` (and
-/// the type-specific journal entries it implied) was dropped entirely.
+/// durable: every recorded change is one of these type-agnostic
+/// primitives, so there's no separate journal/recording abstraction and
+/// nothing type-specific ever reaches the file. See `spec.md`'s "The
+/// Trait Layer" for the full rationale.
 pub trait Allocator {
     /// Allocates a fresh region of `size` bytes, returning a pointer that
     /// uniquely identifies it. The index is assigned immediately; the
@@ -219,14 +216,15 @@ impl<B: Allocator> Backend for B {}
 /// read-only; see `Guard` for mutation.
 pub trait Persistable: Sized {
     /// The size, in bytes, of this type's fixed-size inline
-    /// representation -- either the value itself (a scalar), the sum of
-    /// its fields' `INLINE_SIZE` (a derived struct), or a small fixed
-    /// header (`target`/`len`, 8 bytes) for a type that owns a separate,
-    /// variably-sized content allocation (`String`, `PersistedVec`, a
-    /// derived enum). Every `Persistable` type has *some* fixed inline
-    /// size -- that's what makes sibling fields' offsets within a
-    /// containing struct statically computable regardless of how much
-    /// content a variable-length field currently holds.
+    /// representation -- what a containing struct reserves for it inline,
+    /// regardless of how much variable-length content it may own
+    /// elsewhere. For a scalar it's the value's own bytes; for a derived
+    /// struct, the sum of its fields'; for a derived enum, a 4-byte
+    /// discriminant plus its largest variant; and for an "owning" type
+    /// with a separate content allocation (`PersistedVec`,
+    /// `PersistedString`, ...), a fixed 8-byte `{ target, len }` header.
+    /// Having *some* fixed inline size is what makes sibling fields'
+    /// offsets within a containing struct statically computable.
     const INLINE_SIZE: usize;
 
     type Guard<'s, B: Backend>: Guard<Persistable = Self, Backend = B>

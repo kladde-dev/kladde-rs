@@ -3,7 +3,7 @@
 //! treat every struct field uniformly -- a `_mut()` accessor returning a
 //! nested `Guard` -- rather than special-casing "leaf" types with direct
 //! setters. See `spec.md`'s "The Trait Layer" (Guards and the Backend)
-//! for the rationale, and `V1_QUESTIONS.md` question 7 for the decision.
+//! for the rationale.
 //!
 //! These live here, in the crate that defines `Persistable`, rather than
 //! in `kladde-types` (where `spec.md` originally described them) --
