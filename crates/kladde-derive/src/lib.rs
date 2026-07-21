@@ -23,6 +23,35 @@
 //!   `spec.md`'s Future Work).
 //! - Generic types and types with where-clauses are not yet supported.
 //!
+//! **Field requirements:** every field of a derived `struct`/`enum` has
+//! to be a type that itself implements `Persistable`. Plain `String`
+//! doesn't (use `kladde_types::PersistedString` instead), but scalars
+//! (`i32`, `bool`, ...), `kladde-types` containers (`PersistedVec`,
+//! `PersistedHashMap`, `PersistedString`), and other
+//! `#[derive(Persistable)]` types all do. There's no special error
+//! message for this -- an unsuitable field type just fails to compile
+//! with an ordinary `` `Foo` doesn't implement `Persistable` `` error
+//! pointing at the field:
+//!
+//! ```compile_fail
+//! #[derive(kladde_derive::Persistable)]
+//! struct Contact {
+//!     name: String, // error[E0277]: the trait bound `String: Persistable` is not satisfied
+//! }
+//! ```
+//!
+//! Swapping in any type that *does* implement `Persistable` compiles the
+//! same way -- a scalar like `i32` here, or in a real application a
+//! `kladde-types` container, another `#[derive(Persistable)]` type, or
+//! (for a `String`-like field specifically) `kladde_types::PersistedString`:
+//!
+//! ```
+//! #[derive(kladde_derive::Persistable)]
+//! struct Contact {
+//!     name: i32, // more realistically, kladde_types::PersistedString in this case
+//! }
+//! ```
+//!
 //! **Dependency note:** generated code references `::kladde_traits::...`
 //! paths directly, so any crate using this macro needs `kladde-traits` as
 //! a *direct* dependency too -- re-exports (e.g. via `kladde-types`)

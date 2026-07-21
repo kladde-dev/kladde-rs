@@ -23,6 +23,32 @@ use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 
+/// `String` itself deliberately has no `Persistable` impl at all (see
+/// `kladde-traits/src/scalar.rs`) -- it has no room to cache an
+/// allocation pointer, so every `store` would have to allocate fresh and
+/// leak the previous one. This is what enforces using `PersistedString`
+/// for backed text fields: a struct field still typed as plain `String`
+/// simply fails to compile under `#[derive(Persistable)]`.
+///
+/// ```compile_fail
+/// use kladde_types::Persistable;
+///
+/// #[derive(Persistable)]
+/// struct Contact {
+///     name: String, // error[E0277]: the trait bound `String: Persistable` is not satisfied
+/// }
+/// ```
+///
+/// Swapping in `PersistedString` fixes the exact same struct:
+///
+/// ```
+/// use kladde_types::{Persistable, PersistedString};
+///
+/// #[derive(Persistable)]
+/// struct Contact {
+///     name: PersistedString,
+/// }
+/// ```
 #[derive(Debug, Default)]
 pub struct PersistedString(PersistedVec<u8>);
 
