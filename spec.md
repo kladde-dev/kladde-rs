@@ -4,8 +4,6 @@ This repository is a Rust workspace implementing "backed" data structures: data 
 
 **Mental model.** A backed data structure is "opened" from a file, which loads it into memory and keeps a live connection to the file. Reads only ever touch the in-memory representation — never the file — so read performance stays close to the non-backed equivalent. A mutation does two things at once: it updates the in-memory representation immediately, as usual, and it durably appends a description of the change to an on-disk journal, so that no committed mutation is ever lost even if the process crashes right after the call returns. The bulk, compact on-disk representation (the "snapshot") is *not* updated on every mutation — it's brought up to date periodically, when the journal is flushed (see [Flushing](#flushing)).
 
-`sketch.rs` was an early exploratory draft of the core traits and predates most of the design described below (it still has the type-specific `Op` this doc's Trait Layer section explains dropping, among other things since superseded) — the `crates/` workspace is the current, working implementation; see [Workspace Layout](#workspace-layout).
-
 ## On-Disk Layout
 
 The file consists of a collection of dynamically allocated memory regions, similar to a heap, split into two kinds:
