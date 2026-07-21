@@ -75,6 +75,13 @@ impl DefaultBackend {
         self.journal.borrow().len()
     }
 
+    /// Number of currently-materialized (flushed, not yet freed)
+    /// allocations. Mainly for tests asserting that a mutation didn't
+    /// leak an allocation it should have reused or freed.
+    pub fn live_count(&self) -> usize {
+        self.allocator.live_count()
+    }
+
     /// Replays every recorded microoperation against the underlying
     /// `MockAllocator`, in order, then drains the journal. See
     /// `spec.md`'s "Flushing": since the journal already holds nothing

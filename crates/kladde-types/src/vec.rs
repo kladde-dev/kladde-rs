@@ -101,17 +101,35 @@ impl<T: Persistable> Persistable for PersistedVec<T> {
         }
     }
 
-    /// Writes every current element fresh into a newly-sized content
-    /// allocation, then publishes the header. Used when a whole
-    /// `PersistedVec` is being written as a brand-new value somewhere
-    /// (e.g. a struct field being assembled), not via incremental
-    /// `push`/`remove` -- those go through `PersistedVecGuard` instead,
-    /// which reuses (resizes) the existing content allocation rather
-    /// than always starting fresh.
+    /// Writes every current element fresh into a content allocation,
+    /// then publishes the header. Used when a whole `PersistedVec` is
+    /// being written as a brand-new value somewhere (e.g. a struct field
+    /// being assembled) rather than via incremental `push`/`remove`.
+    ///
+    /// Reuses (resizes) `self.pointer`'s existing allocation if it
+    /// already has one, rather than always allocating fresh -- `self`
+    /// can already own a live allocation here despite this being a
+    /// "fresh" write from the caller's point of view: e.g. a value
+    /// `remove`d from one container and then inserted into another calls
+    /// `store` again on a value whose nested fields were never reset.
+    /// Always allocating unconditionally would silently orphan whatever
+    /// `self.pointer` already pointed at.
     fn store<B: Backend>(&self, backend: &B, location: Location) {
         let elem_size = T::INLINE_SIZE as u32;
         let byte_size = self.data.len() * T::INLINE_SIZE;
-        let pointer = backend.alloc::<PersistedVec<T>>(byte_size);
+
+        let fresh;
+        let pointer = match &self.pointer {
+            Some(existing) => {
+                backend.resize(existing, byte_size);
+                existing
+            }
+            None => {
+                fresh = backend.alloc::<PersistedVec<T>>(byte_size);
+                &fresh
+            }
+        };
+
         for (i, item) in self.data.iter().enumerate() {
             item.store(
                 backend,
@@ -349,6 +367,38 @@ mod tests {
 
         let reloaded = PersistedVec::<i32>::load(&backend, location);
         assert_eq!(reloaded.data, vec![10, 30]);
+        assert_eq!(reloaded, vec);
+    }
+
+    #[test]
+    fn store_reuses_an_existing_allocation_instead_of_leaking_it() {
+        let backend = MockBackend::default();
+        let location_a = root_location(&backend);
+        let location_b = root_location(&backend);
+
+        let mut vec = PersistedVec::<i32>::new();
+        {
+            let mut guard = vec.guard(&backend, location_a);
+            guard.push(1);
+            guard.push(2);
+        }
+        backend.flush();
+        let live_before = backend.live_count();
+
+        // `vec` already owns a live allocation from the pushes above --
+        // `store` writing it somewhere new (e.g. as part of assembling a
+        // struct field, without ever resetting `vec`'s own pointer)
+        // should reuse that allocation rather than leaking it.
+        vec.store(&backend, location_b);
+        backend.flush();
+
+        assert_eq!(
+            backend.live_count(),
+            live_before,
+            "store() should reuse the existing allocation, not leak a second one"
+        );
+
+        let reloaded = PersistedVec::<i32>::load(&backend, location_b);
         assert_eq!(reloaded, vec);
     }
 }

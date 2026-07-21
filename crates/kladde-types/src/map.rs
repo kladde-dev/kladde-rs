@@ -124,15 +124,44 @@ where
         }
     }
 
-    /// Writes every current (live) entry fresh into a newly-sized,
-    /// fully-packed content allocation -- no tombstones survive a
-    /// `store`, since it only ever sees `self.entries`, which never
-    /// tracks dead slots at all. Used when a whole `PersistedHashMap` is
-    /// being written as a brand-new value somewhere (e.g. a struct field
-    /// being assembled), not via incremental `insert`/`remove`.
+    /// Writes every current (live) entry fresh into a fully-packed
+    /// content allocation -- no tombstones survive a `store`, since it
+    /// only ever sees `self.entries`, which never tracks dead slots at
+    /// all. Used when a whole `PersistedHashMap` is being written as a
+    /// brand-new value somewhere (e.g. a struct field being assembled)
+    /// rather than via incremental `insert`/`remove`.
+    ///
+    /// Reuses (resizes) `self.pointer`'s existing allocation if it
+    /// already has one, rather than always allocating fresh -- see
+    /// `PersistedVec::store`'s doc comment for why `self` can already own
+    /// a live allocation even on what looks like a "fresh" write, and
+    /// why always allocating unconditionally would silently leak it.
+    ///
+    /// Note: since this always writes a *compacted* (tombstone-free)
+    /// copy, reusing an existing allocation here can shrink it below
+    /// `self.capacity`'s worth of space, leaving `self.capacity` stale
+    /// (too large) relative to what's actually on disk afterward. Not a
+    /// correctness bug -- a later `insert` computing a new slot from the
+    /// stale `capacity` just ends up reserving a few more dead slots than
+    /// strictly necessary, which `load` still reads back correctly -- but
+    /// worth knowing about rather than assuming this fully closes every
+    /// gap between `self.capacity` and what's really allocated.
     fn store<B: Backend>(&self, backend: &B, location: Location) {
         let entry_size = entry_size::<K, V>();
-        let pointer = backend.alloc::<PersistedHashMap<K, V>>(self.entries.len() * entry_size);
+        let byte_size = self.entries.len() * entry_size;
+
+        let fresh;
+        let pointer = match &self.pointer {
+            Some(existing) => {
+                backend.resize(existing, byte_size);
+                existing
+            }
+            None => {
+                fresh = backend.alloc::<PersistedHashMap<K, V>>(byte_size);
+                &fresh
+            }
+        };
+
         for (slot, (key, (_, value))) in self.entries.iter().enumerate() {
             write_entry(
                 backend,
@@ -569,5 +598,46 @@ mod tests {
         let reloaded = PersistedHashMap::<NonCloneKey, i32>::load(&backend, location);
         assert_eq!(reloaded.get(&NonCloneKey(2)), Some(&20));
         assert_eq!(reloaded.get(&NonCloneKey(3)), Some(&30));
+    }
+
+    #[test]
+    fn store_reuses_an_existing_allocation_instead_of_leaking_it() {
+        // Deliberately `i32` keys/values, not `String` -- `String` has
+        // its own, separate, not-yet-fixed leak (no room for a cached
+        // pointer of its own, so it always allocates fresh on `store`;
+        // see `spec.md`). Using it here would make this test fail for a
+        // *different* reason than the one it's checking: it'd also catch
+        // `write_entry` re-`store`-ing each key/value on every call to
+        // the map's own `store`, which is real but out of scope for this
+        // fix (the map's *own* content-pointer reuse).
+        let backend = MockBackend::default();
+        let location_a = root_location(&backend);
+        let location_b = root_location(&backend);
+
+        let mut map = PersistedHashMap::<i32, i32>::new();
+        {
+            let mut guard = map.guard(&backend, location_a);
+            guard.insert(1, 10);
+            guard.insert(2, 20);
+        }
+        backend.flush();
+        let live_before = backend.live_count();
+
+        // `map` already owns a live allocation from the inserts above --
+        // `store` writing it somewhere new (e.g. as part of assembling a
+        // struct field, without ever resetting `map`'s own pointer)
+        // should reuse that allocation rather than leaking it.
+        map.store(&backend, location_b);
+        backend.flush();
+
+        assert_eq!(
+            backend.live_count(),
+            live_before,
+            "store() should reuse the existing allocation, not leak a second one"
+        );
+
+        let reloaded = PersistedHashMap::<i32, i32>::load(&backend, location_b);
+        assert_eq!(reloaded.get(&1), Some(&10));
+        assert_eq!(reloaded.get(&2), Some(&20));
     }
 }
