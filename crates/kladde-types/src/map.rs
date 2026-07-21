@@ -124,59 +124,44 @@ where
         }
     }
 
-    /// Writes every current (live) entry fresh into a fully-packed
-    /// content allocation -- no tombstones survive a `store`, since it
-    /// only ever sees `self.entries`, which never tracks dead slots at
-    /// all. Used when a whole `PersistedHashMap` is being written as a
+    /// Publishes a header at `location` pointing at this map's content --
+    /// used when a whole `PersistedHashMap` is being written as a
     /// brand-new value somewhere (e.g. a struct field being assembled)
     /// rather than via incremental `insert`/`remove`.
     ///
-    /// Reuses (resizes) `self.pointer`'s existing allocation if it
-    /// already has one, rather than always allocating fresh -- see
-    /// `PersistedVec::store`'s doc comment for why `self` can already own
-    /// a live allocation even on what looks like a "fresh" write, and
-    /// why always allocating unconditionally would silently leak it.
+    /// Deliberately does *not* rewrite any entries: `insert`/`remove`
+    /// already keep the on-disk content at `self.pointer` exactly in
+    /// sync with `self.entries`/`self.capacity` incrementally, so if a
+    /// pointer already exists, its content is already correct -- `store`
+    /// only needs to point a new header at it, not recompute anything.
     ///
-    /// Note: since this always writes a *compacted* (tombstone-free)
-    /// copy, reusing an existing allocation here can shrink it below
-    /// `self.capacity`'s worth of space, leaving `self.capacity` stale
-    /// (too large) relative to what's actually on disk afterward. Not a
-    /// correctness bug -- a later `insert` computing a new slot from the
-    /// stale `capacity` just ends up reserving a few more dead slots than
-    /// strictly necessary, which `load` still reads back correctly -- but
-    /// worth knowing about rather than assuming this fully closes every
-    /// gap between `self.capacity` and what's really allocated.
+    /// This replaces an earlier version that rewrote every entry at a
+    /// freshly `enumerate()`d, compacted position on every `store` call.
+    /// That was worse than just wasteful: `self.entries`' own per-key
+    /// `(slot, value)` tracking still pointed at the *old* (pre-compaction)
+    /// slots afterward, since `store` -- taking `&self` -- can't update
+    /// it. If this same live map were later mutated again through
+    /// `get_mut`/`remove` (realistic: `store` runs whenever this map is
+    /// inserted as a value into another container, and the embedded map
+    /// stays reachable and mutable afterward through that container), it
+    /// would compute offsets from those stale slots -- silently
+    /// corrupting or reading out of the actual (now-compacted, smaller)
+    /// allocation. Not touching existing content at all sidesteps the
+    /// mismatch entirely, rather than just reducing how often it bites.
     fn store<B: Backend>(&self, backend: &B, location: Location) {
-        let entry_size = entry_size::<K, V>();
-        let byte_size = self.entries.len() * entry_size;
-
-        let fresh;
-        let pointer = match &self.pointer {
+        match &self.pointer {
             Some(existing) => {
-                backend.resize(existing, byte_size);
-                existing
+                write_header(backend, location, existing.index(), self.capacity as u32);
             }
             None => {
-                fresh = backend.alloc::<PersistedHashMap<K, V>>(byte_size);
-                &fresh
+                // `pointer` is only ever `None` when `entries`/`capacity`
+                // are too (see `new`/`load`) -- nothing to allocate, just
+                // record "no allocation yet" directly (`write_header`
+                // requires a real index, so this can't go through it).
+                debug_assert!(self.entries.is_empty() && self.capacity == 0);
+                backend.write(location.anchor, location.offset, &[0u8; 8]);
             }
-        };
-
-        for (slot, (key, (_, value))) in self.entries.iter().enumerate() {
-            write_entry(
-                backend,
-                pointer.raw(),
-                slot as u32 * entry_size as u32,
-                key,
-                value,
-            );
         }
-        write_header(
-            backend,
-            location,
-            pointer.index(),
-            self.entries.len() as u32,
-        );
     }
 
     fn load<B: Backend>(backend: &B, location: Location) -> Self {
@@ -602,14 +587,6 @@ mod tests {
 
     #[test]
     fn store_reuses_an_existing_allocation_instead_of_leaking_it() {
-        // Deliberately `i32` keys/values, not `String` -- `String` has
-        // its own, separate, not-yet-fixed leak (no room for a cached
-        // pointer of its own, so it always allocates fresh on `store`;
-        // see `spec.md`). Using it here would make this test fail for a
-        // *different* reason than the one it's checking: it'd also catch
-        // `write_entry` re-`store`-ing each key/value on every call to
-        // the map's own `store`, which is real but out of scope for this
-        // fix (the map's *own* content-pointer reuse).
         let backend = MockBackend::default();
         let location_a = root_location(&backend);
         let location_b = root_location(&backend);
@@ -639,5 +616,55 @@ mod tests {
         let reloaded = PersistedHashMap::<i32, i32>::load(&backend, location_b);
         assert_eq!(reloaded.get(&1), Some(&10));
         assert_eq!(reloaded.get(&2), Some(&20));
+    }
+
+    /// Proves the bug the *previous* version of `store` had, which this
+    /// version's design (never rewrite existing content, only point a
+    /// new header at it) sidesteps entirely: with tombstones already
+    /// present, `store` used to rewrite every live entry at a freshly
+    /// `enumerate()`d, compacted position -- but had no way to update
+    /// `self.entries`' own tracked `(slot, value)` per key (`store` only
+    /// has `&self`), so continuing to mutate the same live map
+    /// afterward, through `get_mut`/`remove`, would compute offsets from
+    /// those now-stale slots and silently read/write the wrong bytes.
+    #[test]
+    fn store_does_not_disturb_further_mutation_of_the_same_live_map() {
+        let backend = MockBackend::default();
+        let location_a = root_location(&backend);
+        let location_b = root_location(&backend);
+
+        let mut map = PersistedHashMap::<String, i32>::new();
+        {
+            let mut guard = map.guard(&backend, location_a);
+            guard.insert("a".to_string(), 1);
+            guard.insert("b".to_string(), 2);
+            guard.insert("c".to_string(), 3);
+            // Tombstones slot 0, leaving "b"/"c" at their original
+            // slots (1, 2) with a gap before them -- capacity (3) now
+            // exceeds the live count (2).
+            guard.remove(&"a".to_string());
+        }
+
+        // Simulate writing this already-tombstone-laden map as a value
+        // somewhere else (e.g. it's a struct field, and the struct is
+        // being inserted as a new entry into another container).
+        map.store(&backend, location_b);
+
+        // Still reachable and mutable at its *original* location -- must
+        // keep working correctly, using "b"/"c"'s pre-existing tracked
+        // slots, which `store` must not have disturbed.
+        {
+            let mut guard = map.guard(&backend, location_a);
+            guard.get_mut(&"b".to_string()).unwrap().set(20);
+            guard.remove(&"c".to_string());
+        }
+
+        assert_eq!(map.get(&"b".to_string()), Some(&20));
+        assert_eq!(map.get(&"c".to_string()), None);
+
+        backend.flush();
+        let reloaded_a = PersistedHashMap::<String, i32>::load(&backend, location_a);
+        assert_eq!(reloaded_a.get(&"b".to_string()), Some(&20));
+        assert_eq!(reloaded_a.get(&"c".to_string()), None);
     }
 }

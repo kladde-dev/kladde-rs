@@ -101,45 +101,37 @@ impl<T: Persistable> Persistable for PersistedVec<T> {
         }
     }
 
-    /// Writes every current element fresh into a content allocation,
-    /// then publishes the header. Used when a whole `PersistedVec` is
-    /// being written as a brand-new value somewhere (e.g. a struct field
-    /// being assembled) rather than via incremental `push`/`remove`.
+    /// Publishes a header at `location` pointing at this vec's content --
+    /// used when a whole `PersistedVec` is being written as a brand-new
+    /// value somewhere (e.g. a struct field being assembled) rather than
+    /// via incremental `push`/`remove`.
     ///
-    /// Reuses (resizes) `self.pointer`'s existing allocation if it
-    /// already has one, rather than always allocating fresh -- `self`
-    /// can already own a live allocation here despite this being a
-    /// "fresh" write from the caller's point of view: e.g. a value
-    /// `remove`d from one container and then inserted into another calls
-    /// `store` again on a value whose nested fields were never reset.
-    /// Always allocating unconditionally would silently orphan whatever
-    /// `self.pointer` already pointed at.
+    /// Deliberately does *not* rewrite any elements: `push`/`remove`/
+    /// `get_mut().set(...)` already keep the on-disk content at
+    /// `self.pointer` exactly in sync with `self.data` incrementally, so
+    /// if a pointer already exists, its content is already correct --
+    /// `store` only needs to point a new header at it, not rewrite
+    /// anything. (Rewriting unconditionally, the way an earlier version
+    /// of this method did, wasn't just redundant -- for `PersistedVec` it
+    /// happened to still be *correct*, since elements are always packed
+    /// at `0..data.len()` with no equivalent to `PersistedHashMap`'s
+    /// tombstone/capacity bookkeeping to fall out of sync, but it was
+    /// still doing real work for no reason. Not touching existing content
+    /// at all is both simpler and avoids relying on that coincidence.)
     fn store<B: Backend>(&self, backend: &B, location: Location) {
-        let elem_size = T::INLINE_SIZE as u32;
-        let byte_size = self.data.len() * T::INLINE_SIZE;
-
-        let fresh;
-        let pointer = match &self.pointer {
+        match &self.pointer {
             Some(existing) => {
-                backend.resize(existing, byte_size);
-                existing
+                write_header(backend, location, existing.index(), self.data.len() as u32);
             }
             None => {
-                fresh = backend.alloc::<PersistedVec<T>>(byte_size);
-                &fresh
+                // `pointer` is only ever `None` when `data` is empty too
+                // (see `new`/`load`) -- nothing to allocate, just record
+                // "no allocation yet" directly (`write_header` requires a
+                // real index, so this can't go through it).
+                debug_assert!(self.data.is_empty());
+                backend.write(location.anchor, location.offset, &[0u8; 8]);
             }
-        };
-
-        for (i, item) in self.data.iter().enumerate() {
-            item.store(
-                backend,
-                Location {
-                    anchor: pointer.raw(),
-                    offset: i as u32 * elem_size,
-                },
-            );
         }
-        write_header(backend, location, pointer.index(), self.data.len() as u32);
     }
 
     fn load<B: Backend>(backend: &B, location: Location) -> Self {
