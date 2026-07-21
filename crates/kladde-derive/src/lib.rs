@@ -10,11 +10,17 @@
 //!   compile time), and it never owns an allocation of its own -- it just
 //!   threads the `Location` it's given down to its fields, extended by
 //!   each field's static offset.
-//! - `enum`s are not yet supported (see `spec.md`'s Future Work) --
-//!   `derive_enum` was removed along with the `serde`/`postcard`-based
-//!   "owning blob" representation it used to generate, pending the inline
-//!   (discriminant + per-variant static offsets) layout redesign. Wrap an
-//!   enum field in `kladde_types::Persisted<T>` in the meantime.
+//! - An `enum`'s own `INLINE_SIZE` is a 4-byte discriminant plus whichever
+//!   variant's fields are largest -- each variant is laid out like a
+//!   struct in its own right (the same per-field offset computation,
+//!   based at offset 4 instead of 0), so an enum never owns an
+//!   allocation of its own either, and needs no `serde`/`postcard` at
+//!   all (unlike an earlier version of this macro, which treated a
+//!   derived enum as a `postcard`-serialized "owning blob"). Only
+//!   whole-value replacement is supported for now (`guard.set(new_value)`)
+//!   -- mutating a field within the current variant in place, and/or
+//!   matching directly on a generated `Guard`, is deferred (see
+//!   `spec.md`'s Future Work).
 //! - Generic types and types with where-clauses are not yet supported.
 //!
 //! **Dependency note:** generated code references `::kladde_traits::...`
@@ -44,12 +50,7 @@ pub fn derive_persistable(input: TokenStream) -> TokenStream {
 
     let expanded = match &input.data {
         Data::Struct(data) => derive_struct(&input, data),
-        Data::Enum(data) => syn::Error::new_spanned(
-            data.enum_token,
-            "#[derive(Persistable)] does not yet support enums -- see spec.md's Future Work \
-             (wrap the field in kladde_types::Persisted<T> in the meantime)",
-        )
-        .to_compile_error(),
+        Data::Enum(data) => derive_enum(&input, data),
         Data::Union(data) => syn::Error::new_spanned(
             data.union_token,
             "#[derive(Persistable)] does not support unions",
@@ -292,6 +293,264 @@ fn derive_unit_like_struct(
 
             fn load<B: ::kladde_traits::Backend>(_backend: &B, _location: ::kladde_traits::Location) -> Self {
                 #ident
+            }
+        }
+    }
+}
+
+/// Inline layout: a 4-byte discriminant (this macro's own, assigned in
+/// declaration order -- unrelated to any `#[repr]`/explicit discriminant
+/// on the source enum) followed by whichever variant's own fields, laid
+/// out exactly like a struct's (see `field_offsets`/`total_size`) but
+/// based at offset 4 instead of 0. Sized to fit the *largest* variant,
+/// since the same bytes have to be able to hold any of them -- unused
+/// tail bytes for a smaller variant are simply never read, the same way
+/// a `union`'s would be.
+///
+/// Supports unit, tuple (`Fields::Unnamed`), and named-field variants,
+/// all in the same enum. Positional (tuple) fields get synthetic
+/// `field_0`, `field_1`, ... bindings in generated match patterns, since
+/// they have no identifier of their own to reuse.
+fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenStream {
+    let ident = &input.ident;
+    let vis = &input.vis;
+    let guard_ident = format_ident!("{}Guard", ident);
+
+    if data.variants.is_empty() {
+        return syn::Error::new_spanned(
+            &data.variants,
+            "#[derive(Persistable)] does not support enums with no variants",
+        )
+        .to_compile_error();
+    }
+
+    let variant_ident: Vec<_> = data.variants.iter().map(|v| v.ident.clone()).collect();
+    let discriminant: Vec<u32> = (0..data.variants.len() as u32).collect();
+
+    // Each variant's own field types (for its own offset/size
+    // computation) and the binding names generated code uses to refer to
+    // them in a match pattern -- the variant's own field idents for a
+    // named variant, synthetic `field_N` for a tuple variant, none for a
+    // unit variant.
+    let variant_field_ty: Vec<Vec<syn::Type>> = data
+        .variants
+        .iter()
+        .map(|variant| match &variant.fields {
+            Fields::Named(f) => f.named.iter().map(|f| f.ty.clone()).collect(),
+            Fields::Unnamed(f) => f.unnamed.iter().map(|f| f.ty.clone()).collect(),
+            Fields::Unit => Vec::new(),
+        })
+        .collect();
+    let variant_binding: Vec<Vec<syn::Ident>> = data
+        .variants
+        .iter()
+        .map(|variant| match &variant.fields {
+            Fields::Named(f) => f.named.iter().map(|f| f.ident.clone().unwrap()).collect(),
+            Fields::Unnamed(f) => (0..f.unnamed.len())
+                .map(|i| format_ident!("field_{}", i))
+                .collect(),
+            Fields::Unit => Vec::new(),
+        })
+        .collect();
+    let variant_field_offset: Vec<Vec<proc_macro2::TokenStream>> = variant_field_ty
+        .iter()
+        .map(|tys| field_offsets(tys))
+        .collect();
+    let variant_size: Vec<proc_macro2::TokenStream> =
+        variant_field_ty.iter().map(|tys| total_size(tys)).collect();
+
+    // A match pattern binding a variant's own fields (if any) -- shared
+    // by `store` (matched against `&mut Self`, so bindings come out as
+    // `&mut FieldTy` via match ergonomics) and, negated, doesn't apply to
+    // `load` (which reconstructs a value rather than matching one).
+    let variant_pattern: Vec<proc_macro2::TokenStream> = data
+        .variants
+        .iter()
+        .zip(&variant_binding)
+        .map(|(variant, bindings)| {
+            let v_ident = &variant.ident;
+            match &variant.fields {
+                Fields::Named(_) => quote! { #ident::#v_ident { #(#bindings),* } },
+                Fields::Unnamed(_) => quote! { #ident::#v_ident(#(#bindings),*) },
+                Fields::Unit => quote! { #ident::#v_ident },
+            }
+        })
+        .collect();
+
+    // `store`'s per-variant match arm: write the discriminant, then each
+    // field at its static offset (base 4). Recurses into
+    // `Persistable::store` on each field's `&mut` binding, same as
+    // `derive_struct`'s `store` -- see that trait method's own doc
+    // comment for why `&mut self` matters (a field may need to learn its
+    // own allocation pointer for the first time here).
+    let variant_store_arm: Vec<proc_macro2::TokenStream> = (0..data.variants.len())
+        .map(|i| {
+            let pattern = &variant_pattern[i];
+            let bindings = &variant_binding[i];
+            let field_offset = &variant_field_offset[i];
+            let disc = discriminant[i];
+            quote! {
+                #pattern => {
+                    ::kladde_traits::Allocator::write(
+                        backend,
+                        location.anchor,
+                        location.offset,
+                        &(#disc as u32).to_le_bytes(),
+                    );
+                    #(
+                        ::kladde_traits::Persistable::store(
+                            #bindings,
+                            backend,
+                            ::kladde_traits::Location {
+                                anchor: location.anchor,
+                                offset: location.offset + 4 + #field_offset,
+                            },
+                        );
+                    )*
+                }
+            }
+        })
+        .collect();
+
+    // `load`'s per-discriminant reconstruction expression: read each
+    // field back from its static offset and rebuild the variant.
+    let variant_load_expr: Vec<proc_macro2::TokenStream> = (0..data.variants.len())
+        .map(|i| {
+            let v_ident = &variant_ident[i];
+            let field_ty = &variant_field_ty[i];
+            let field_offset = &variant_field_offset[i];
+            match &data.variants[i].fields {
+                Fields::Named(f) => {
+                    let field_ident: Vec<_> =
+                        f.named.iter().map(|f| f.ident.clone().unwrap()).collect();
+                    quote! {
+                        #ident::#v_ident {
+                            #(
+                                #field_ident: <#field_ty as ::kladde_traits::Persistable>::load(
+                                    backend,
+                                    ::kladde_traits::Location {
+                                        anchor: location.anchor,
+                                        offset: location.offset + 4 + #field_offset,
+                                    },
+                                ),
+                            )*
+                        }
+                    }
+                }
+                Fields::Unnamed(_) => quote! {
+                    #ident::#v_ident(
+                        #(
+                            <#field_ty as ::kladde_traits::Persistable>::load(
+                                backend,
+                                ::kladde_traits::Location {
+                                    anchor: location.anchor,
+                                    offset: location.offset + 4 + #field_offset,
+                                },
+                            ),
+                        )*
+                    )
+                },
+                Fields::Unit => quote! { #ident::#v_ident },
+            }
+        })
+        .collect();
+
+    quote! {
+        #[doc(hidden)]
+        #vis struct #guard_ident<'s, B> {
+            inner: &'s mut #ident,
+            backend: &'s B,
+            location: ::kladde_traits::Location,
+        }
+
+        impl<'s, B: ::kladde_traits::Backend> #guard_ident<'s, B> {
+            /// Replaces the whole value with `value`. See `spec.md`'s
+            /// Future Work for the deferred fine-grained alternative
+            /// (mutating a field within the current variant in place,
+            /// and/or matching directly on this guard).
+            #vis fn set(&mut self, mut value: #ident) {
+                ::kladde_traits::Persistable::store(&mut value, self.backend, self.location);
+                *self.inner = value;
+            }
+        }
+
+        impl<'s, B: ::kladde_traits::Backend> ::kladde_traits::Guard for #guard_ident<'s, B> {
+            type Persistable = #ident;
+            type Backend = B;
+
+            fn as_persistable(&self) -> &#ident {
+                self.inner
+            }
+            fn as_persistable_mut(&mut self) -> &mut #ident {
+                self.inner
+            }
+            fn backend(&self) -> &B {
+                self.backend
+            }
+        }
+
+        impl<'s, B> ::std::ops::Deref for #guard_ident<'s, B> {
+            type Target = #ident;
+            fn deref(&self) -> &#ident {
+                self.inner
+            }
+        }
+
+        impl<'s, B> ::std::ops::DerefMut for #guard_ident<'s, B> {
+            fn deref_mut(&mut self) -> &mut #ident {
+                self.inner
+            }
+        }
+
+        impl ::kladde_traits::Persistable for #ident {
+            const INLINE_SIZE: usize = 4 + {
+                let variant_sizes = [#(#variant_size),*];
+                let mut max = 0usize;
+                let mut i = 0usize;
+                while i < variant_sizes.len() {
+                    if variant_sizes[i] > max {
+                        max = variant_sizes[i];
+                    }
+                    i += 1;
+                }
+                max
+            };
+
+            type Guard<'s, B: ::kladde_traits::Backend>
+                = #guard_ident<'s, B>
+            where
+                Self: 's,
+                B: 's;
+
+            fn guard<'s, B: ::kladde_traits::Backend>(
+                &'s mut self,
+                backend: &'s B,
+                location: ::kladde_traits::Location,
+            ) -> Self::Guard<'s, B> {
+                #guard_ident {
+                    inner: self,
+                    backend,
+                    location,
+                }
+            }
+
+            fn store<B: ::kladde_traits::Backend>(&mut self, backend: &B, location: ::kladde_traits::Location) {
+                match self {
+                    #(#variant_store_arm)*
+                }
+            }
+
+            fn load<B: ::kladde_traits::Backend>(backend: &B, location: ::kladde_traits::Location) -> Self {
+                let discriminant_bytes = ::kladde_traits::Allocator::read(backend, location.anchor, location.offset, 4);
+                let discriminant = u32::from_le_bytes(discriminant_bytes.try_into().unwrap());
+                match discriminant {
+                    #(#discriminant => #variant_load_expr,)*
+                    other => panic!(
+                        "corrupt persisted {}: unknown discriminant {}",
+                        stringify!(#ident),
+                        other,
+                    ),
+                }
             }
         }
     }
