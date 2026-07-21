@@ -11,6 +11,8 @@
 - Rewrite `{Bool, Char, I32, ...}Guard` to `Guard<Primitive>` if possible.
 - Better in-file representation of `PersistedVec`: the most streight-forward representation of a `PersistedVec` in the snapshot would probably mirror how `Vec`s are represented in memory: a contiguous region in memory that grows (and, in the snapshot, also shrinks) when necessary. But this would require exponential growth to keep the amortized cost of `push` constant, and exponential growth means that as much as almost half of the allocated space might be unused. This might be acceptable in memory but not in a file on disk. For storage in files, it might be more appropriate to represent a variably-sized array as a linked list of fixed-size chucks, where all but the last chunk are always fully filled. This would usually make random access slow, but not in our case because we'll have to hold a list of `UniquePointer`s to the chunks _in memory_ anyway, which will allow for fast random acces. We probably want to make the chunk size (in numbers of entries) a (run-time) parameter, defaulted to some number calculated from the size of each entry and a target chunk size in bytes.
 
+- A `full_compaction` method that application code can call explicitly (e.g. when the user wants to export the file): flush the journal, compact the memory, then actually delete everything that's been freed, including shortening the journal/file itself rather than just marking space reusable.
+
 ## Regarding write-ahead-logging discipline
 
 Memory operations must be recorded in a carefully thought-out order so that even when the application crashes after only some of the operations have been written to the journal no uninitialized memory is reachable.

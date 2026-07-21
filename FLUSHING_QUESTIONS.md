@@ -45,6 +45,8 @@ There's are two minor open questions:
 - One advantage of this could be that it would allow the `Journal` to know the serialized size of all `Op`s upon replay, if this is necessary: we could modify the signature of `serialized_len` such that it returns a tuple `(len: u32, dynamic: bool)` where `dynamic` tells us whether the obtaining the `len` required inspecting the contents of the `Op` (not just the enum variant). If `dynamic` is `true`, upon serialization, the `Journal` itself would write the size as part of the header. Upon deserialization, the `Journal` calls a method `Op::size(variant: <Op as EnumTag>::Tag) -> Option<u32>)` which returns `Some(len)` if `serialized_len` on the deserialized value would return `(len, true)`, and `None` if `serialized_len` would return `(_, false)`. If `None` was returned, then the `Journal` knows that this `Op` variant has a dynamic serialized size, which it can read from the header. If `Some(len)` is returned, then the `Journal` knows that the header does not contain the length (which is already known at this point).
 - But I'm not sure yet if `Op` deserialization (journal replay) will even need to know the size of serialized `Op`s. Maybe we can simply allow the `Op` to read as many bytes as it needs and let it figure out the length itself.
 
+**Superseded.** This was written before we pivoted away from type-specific `Op`s entirely — at the time it was a reasonable refinement of the closure-vs-structured-`Op` question. Under the pivot (now reflected in `spec.md`'s Trait Layer and Flushing sections), there's no more `Op` for a header to identify a *type* for: the journal only ever holds a fixed, five-primitive vocabulary (`Alloc`/`Free`/`Write`/`Copy`/`Resize`), each with a small, uniform, statically-known encoding. No type hash, no per-entry dispatch, no `EnumTag`/`serialized_len` machinery needed — there's no longer a variable, type-dependent `Op` shape whose size or identity needs describing. I think this resolves both of the minor open points you raised here by making them moot rather than by answering them directly. One thing this doesn't cover, which I raised as a trade-off a few messages ago and don't think is mitigated: raw microops are much less human-readable than semantic `Op`s were, which matters if you ever want to inspect journal contents while debugging. Flag if that's worth addressing now; I'd otherwise leave it for later.
+
 **Which instance.** This is the part a closure doesn't solve for free, and it's the part `Flushable` was actually reaching for. A closure captured inside, say, `PersistedVecGuard::push` can close over `&self.inner` (the live Rust reference) — but that's exactly how ordinary mutation already works, and it's not enough for replay: replay needs to know *which allocated region in the snapshot* this instance corresponds to, so the closure can go update that region specifically (per (1), only types with pointers in their inline representation have a region to update at all — so this only applies to those). Concretely: two different `Contact`s inside a `PersistedHashMap` each have their own `phones: PersistedVec<PhoneNumber>` — both are the same *type*, so both need *some* per-instance handle the closure can capture, not just type-level dispatch info.
 
 The pieces I think this needs, regardless of trait-vs-closure: every value of a type that (per (1)) owns pointers needs a **stable in-memory identity from the moment it's first touched**, not just once it's first flushed — because a closure recorded *before* the first flush still needs to close over *something* that will resolve to the right region once a flush eventually runs. Mechanically, that's a `UniquePointer<Self>` (or an as-yet-unresolved reservation of one), lazily created the first time it's needed. It can't be eager at construction, because containers are built without a backend in hand (`PersistedVec::new()` takes no arguments) — so it has to be created lazily, inside whichever `Guard` method first needs it, where `backend: &'s B` is already available. That likely means `PersistedVec`/`PersistedHashMap` grow an interior-mutable `pointer: Cell<Option<UniquePointer<Self>>>`-shaped field they don't have today, and the guard's mutating methods get-or-create it before capturing the closure. This is a real, if small, structural change to both container types — flagging it explicitly rather than just doing it, since it also touches whatever the derive macro would need for a future user-defined container.
@@ -58,9 +60,15 @@ I don't like the closure approach. I was picturing the approach as follows:
 
 Does this resolve your concerns or are there any open questions?
 
+**Resolved, and I think this is exactly right.** To restate the shape so I'm sure I've got it: `PersistedVec::new()` (and similar) stay backend-less and pointer-less — nothing exists in the allocator's table yet. The first `Guard` method that actually needs backing storage (first `push`) is what touches `Allocator` for the first time; at that point a real index is created immediately (target `None`), and that index is what the container's own pointer field holds from then on. Containers never branch on "do I have a real address yet" — that's entirely `Allocator`'s problem, exactly as you said.
+
+One thing this raises that I want to confirm rather than assume, since it changes `Allocator`'s method shape directly: does creating the index (`alloc`) still take a size, or does *all* sizing — including the very first real allocation — go through `resize` (Question 3), with `alloc` reduced to "mint a bare index, target `None`, no size involved at all"? I'd lean toward the latter — one mechanism for every size change, first one included, treating "never allocated" as size zero — but see Question 8 below rather than assuming.
+
 **Question for you:** does the closure-capturing-identity approach above sound right, or would you rather keep entries as plain serialized bytes plus an explicit (small, in-process — not `spec.md`'s persisted file registry, which is a separate, later concern) type tag, with a lookup table doing the dispatch a closure would otherwise do inline? The closure version is less code and matches "interpreter" more literally (the closure *is* the compiled instruction), but it means journal entries are never actually bytes for as long as we're on the mock — which is probably fine now, but worth confirming you're OK with that being true of this whole round, not just a temporary implementation detail.
 
 I don't quite follow. Does my above explanation resolve this or are there open questions?
+
+**Moot now — sorry for the confusing carry-over.** This question was asking you to choose between closures and a type-tag-plus-lookup-table; you rejected closures above, and separately, the whole "What to run" sub-question this was under got superseded by the pivot away from type-specific `Op`s (no more per-entry dispatch of any kind, closure or tag-based). Nothing left to answer here.
 
 ## 3. What does "doesn't fit, needs to move" actually do, mechanically?
 
@@ -70,6 +78,14 @@ Yes, implement the snapshot representation of `PersistedVec` analogous to how `V
 
 - Add a trait method `resize(&mut UniquPointer, new_size)` on `Allocator`, which records an `Op` that changes an existing allocation to a new size. When this operation is replayed and the allocator realizes that the new allocation still fits at the same position, then it just reuses the existing allocation with an adjusted size. If it doesn't, the allocator finds a new memory region, copies out `min(new_size, old_size)` bytes, frees the old region, and updates where the provided pointer points in its internal table.
 - After testing this version of `PersistedVec` and committing it to git, use the more appropriate memory layout described in `later.md`.
+
+**Confirmed, and it fits the microops pivot cleanly — a few notes:**
+
+- `resize` slots in as a fifth microop alongside `alloc`/`free`/`write`/`copy` (now in `spec.md`). It's a genuine addition beyond what I had, and a nice one: it collapses what would otherwise be a caller-orchestrated alloc-new + copy + free-old sequence into one atomic, replayable journal entry, and it's the only one of the five that can change an allocation's size while keeping its *index* stable — an `alloc`+`free` pair would mint a *new* index, which would be wrong here given `spec.md`'s "index never changes, target can" invariant.
+- `copy` is still independently useful, separate from `resize` — for shifting a span within (or between) allocations, e.g. `remove`-from-the-middle memmove'ing the tail down by one element. I wasn't sure earlier whether `copy` earned its keep beyond compaction; this answers that.
+- Worth stating explicitly for whoever implements `remove`: compact/shift first (`copy`), *then* shrink (`resize`) — shrinking first would truncate live elements before they've been moved out of the way. Same "ordering matters for crash safety" discipline now written up in `spec.md`'s Crash Consistency section.
+- I've staged the implementation plan to match your two-step instruction: first land `PersistedVec`'s snapshot layout as the straightforward `Vec`-like single growable allocation (via `resize`), test and commit; only then switch to the chunked-list layout from `later.md`. See the plan at the end of this document.
+- Open question this raises, tied to Question 2 above: does `alloc` still take a `size`, or does *all* sizing — including the first — go through `resize`? See Question 8.
 
 ## 4. How is a flush triggered?
 
@@ -83,6 +99,8 @@ The root (`Kladde<T>`'s `root: T`) needs to end up allocated too, for the round-
 
 This question might be rendered obsolete by now. Let me know if it's still relevant, otherwise delete it.
 
+**Still relevant, but with a simpler resolution than I'd originally framed.** "Every container gets its own lazily-created pointer" (Question 1/2) doesn't cover the root's own *plain* fields — if `T` mixes container fields with scalar ones (e.g. `AppState { contacts: PersistedHashMap<...>, app_version: i32 }`), `app_version`'s value needs to live *somewhere* for a round trip to reconstruct it, and it's not a container so it gets no pointer of its own under Question 1's rule. I don't think this needs `T` to be a special container/`Flushable` type, though, the way I'd originally asked: `Kladde::new(root)` already brings `root` and `backend` together in one call, so — unlike every *other* `Persistable` value, which is constructed without a backend in hand — the root's own allocation can be created *eagerly*, right there, sidestepping the "constructed without a backend" problem that's why everything else has to be lazy. So: any `#[derive(Persistable)]` type works as root uniformly, no trait bound needed; `Kladde<T>` just always has a real (not `Option`-wrapped) `root_pointer: UniquePointer<T>`, created unconditionally in `Kladde::new`, pointing at the root's own small inline blob — the same shape as `spec.md`'s existing "file header's pointer to the current root object" idea. I'd keep this question, resolved this way, rather than delete it outright — flag if you disagree.
+
 ## 6. Op-log optimization and compaction (`spec.md` pipeline steps 2, 4, 6)
 
 Under (b), this now genuinely applies -- a run of `Push`/`Remove` against the same instance really is a sequence of real operations that could be optimized (matched push+remove cancelling, etc.), matching `spec.md`'s pipeline steps 2 and 4 literally for the first time (unlike under option (a) last round, where re-snapshotting was already maximally "optimized" by construction). Per your answer to (0), **I'm reading this as explicitly in scope eventually, but deferred to a follow-up commit** -- this round implements naive in-order replay, with optimization as a separate later piece of work. Confirming that reading before I build anything that assumes it. **Compaction** (step 6, reclaiming fragmentation across many allocations) still doesn't obviously mean anything for the mock -- each allocation is its own independent `Box<[u8]>`, not a contiguous file region, so there's no fragmentation to reclaim. **I'd still treat compaction specifically as out of scope until there's a real, file-backed `Allocator`.** Agree?
@@ -95,11 +113,46 @@ Still: clear it (`DefaultBackend` needs something like `clear_journal(&self)`, o
 
 Drain and discard is right. Eventually, we'll want to implement a `full_compaction` method that application code can call when the user wants to explicitly export the file. This method would flush the journal, compact the memory, and then actually delete everything that has been freed, including the journal (i.e., actually shorten the file). Add this to `later.md`.
 
+Added.
+
+---
+
+## 8. Does `alloc` still take a size, or does all sizing — including the first — go through `resize`?
+
+Raised inline above (Questions 2 and 3). I'd make `alloc<T>(&self) -> UniquePointer<T>` mint a bare index only — no size parameter, target always `None` — and have `resize` handle every real size change uniformly, including the very first one (treating "never allocated" as size zero: nothing to preserve, no old region to free). One mechanism for growing, shrinking, and first-allocating, rather than `alloc` and `resize` each handling an overlapping slice of the same concern. Agree, or should `alloc` keep taking an initial size?
+
+## 9. How does a leaf `Guard` find *where* to write? (the gap flagged in `spec.md`'s Trait Layer)
+
+This is the biggest unresolved piece before I can start writing code — it touches every `Guard`, hand-written or derive-generated, not just containers. Every `Guard` currently carries `backend: &'s B` and nothing else; under the pivot, even `I32Guard::set` needs to know *where* its four bytes go, not just that it should write them.
+
+Proposal: every `Guard` also carries a small `Location` alongside `backend`:
+
+```rust
+struct Location {
+    anchor: RawPointer,  // nearest ancestor's own allocation, type-erased
+    offset: u32,         // byte offset of this value within that allocation
+}
+```
+
+- A `Guard` for a value that owns its *own* allocation (a container, per Question 1) hands its children a *fresh* `Location` (its own index, offset `0`) — but its own header (target + len) is written at the `Location` *it* received from its parent.
+- A `Guard` for an inline value just adds to the `Location` it received: a static offset for a struct field (known from the field's position in the type's layout), or a dynamic one for a container element (index × fixed element size for `PersistedVec`, slot offset for `PersistedHashMap`).
+- `anchor` needs to be type-erased (`RawPointer`, not `UniquePointer<T>`) since a deeply nested leaf doesn't know or care what concrete type its ancestor's allocation was created as.
+
+This means `Persistable::guard` needs a `Location` parameter alongside `backend`, and every derive-generated field accessor needs to compute and pass one down. Does this shape look right, or is there a simpler mechanism I'm not seeing? I'd rather get this confirmed than build it and find out it's wrong five files in.
+
+## 10. Folding `Journal` into `Allocator` — confirm
+
+I went ahead and made this call directly in `spec.md`, since there's nothing type-specific left for a separate `record` method to do once every recorded thing is one of `Allocator`'s own primitives — `Backend` is now just `Backend: Allocator {}`. Flag if you wanted `Journal` kept around for a reason I'm not seeing (e.g. as a lower-level abstraction `MockAllocator`/`DefaultBackend` use privately, distinct from what's exposed to `Guard` code).
+
+## 11. Scope for this round: `PersistedVec` first, or both containers together?
+
+Given `Location`-threading, the five `Allocator` primitives, and replay are all new and substantial, I'd land `PersistedVec` end-to-end first (own pointer, `resize`-based growth, `write`/`copy` for content, the round-trip test) as one commit, then `PersistedHashMap` as a follow-up — its "which bucket" dynamic offset computation is a bit trickier and I'd rather not debug both at once. Agree, or do you want both in one pass?
+
 ---
 
 ## Assumptions I'll proceed with unless you say otherwise
 
 - The round-trip test from (0) is the primary/required test for this feature; I'll add smaller unit tests per type alongside it, plus a test asserting a run of structural ops is actually replayed incrementally (not silently reduced to a single re-snapshot) -- otherwise a naive implementation could accidentally collapse back into option (a) without the test suite noticing.
-- `PersistedHashMap` gets the same treatment as `PersistedVec` (own lazily-created pointer, own replay logic), same round-trip test shape.
-- ~~No change to `Journal`'s signature or `DefaultBackend`'s per-op storage format (still untyped bytes)~~ -- superseded now that we're doing (b). Pending Question 2's answer, `DefaultBackend`'s journal most likely stops being `Vec<Vec<u8>>` and becomes something like `Vec<Box<dyn FnOnce(&MockAllocator)>>`, or gains an explicit type tag alongside the bytes -- exact shape depends on which way Question 2 goes.
-- ~~`MockAllocator` doesn't need new methods beyond `alloc`/`free`/`resolve`~~ -- superseded. Actually applying a replayed op means writing real content into an allocated region and reading it back for `load`/the round-trip test; `Allocator` needs read/write-bytes primitives it doesn't have yet (`alloc` currently only zero-fills, nothing ever writes real content into what it returns). I'll add these unless you'd rather see the exact shape first.
+- ~~`PersistedHashMap` gets the same treatment as `PersistedVec` (own lazily-created pointer, own replay logic), same round-trip test shape.~~ -- still true in shape, but per Question 11 I'd land it as a follow-up commit after `PersistedVec`, not in the same pass.
+- ~~No change to `Journal`'s signature or `DefaultBackend`'s per-op storage format (still untyped bytes)~~ -- superseded, twice over now: first by choosing option (b), then by dropping type-specific `Op`s entirely. `Journal` as a separate trait is gone (Question 10); `DefaultBackend`'s journal is a sequence of the five fixed microops (`Alloc`/`Free`/`Write`/`Copy`/`Resize`) from `spec.md`, not `Vec<Vec<u8>>` and not closures.
+- ~~`MockAllocator` doesn't need new methods beyond `alloc`/`free`/`resolve`~~ -- superseded. `Allocator` gains `write`/`copy`/`resize` (see `spec.md`'s Trait Layer), and per Question 8, `alloc` likely loses its `size` parameter now that `resize` can handle first-allocation too.
