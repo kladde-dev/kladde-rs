@@ -167,9 +167,11 @@ i.e. drifting toward a classic object-table design.)
   must be interpretable by *its own* writer layout — so a small **per-allocation schema id** (an
   index into the file's schema table), not one global root schema. That in turn enables **lazy,
   incremental migration**: upgrade an allocation only when you choose to, never a big-bang rewrite
-  on open. This per-allocation tag is close to the "type registry" `spec.md` currently defers —
-  they may want to be the same mechanism. Cost is a few bytes per *allocation* (not per value —
-  inline data inherits its allocation's tag), a far gentler tax than protobuf-style per-value tags.
+  on open. This tag is close to the "type registry" `spec.md` currently defers — likely the same
+  mechanism. Cost is a few bytes per *allocation* (not per value — inline data inherits its
+  allocation's tag), a far gentler tax than protobuf-style per-value tags. If the lazy-**chunk**
+  direction (`later.md`) lands, the natural grain is coarser still — one tag per chunk, backed by a
+  resident deduplicated schema table; see "Chunks and a resident, deduplicated schema table" below.
 
 ## Current ideas for schema evolution
 
@@ -334,6 +336,64 @@ common atoms (add/remove/reorder/rename field, add variant); per-**type**/per-**
 cost only; the fast path stays byte-identical to today; and it degrades gracefully to Idea 3 if you
 ship the header first and add resolution later.
 
+#### Chunks and a resident, deduplicated schema table
+
+`later.md` floats partitioning a file into lazily-loaded **chunks** (disjoint regions, each a
+self-contained subtree, materialized only on access). That direction and schema evolution reinforce
+each other and settle the "per-allocation schema tag" question above into something cleaner:
+
+- **Migration goes per chunk, on first touch.** Resolution and any upgrade happen when a chunk is
+  loaded, not at open — so lazy chunks *are* the incremental-migration mechanism, at an
+  author-meaningful grain. The **chunk becomes the unit of schema tagging and layout policy**
+  (upgrade/retain), more tractable than tagging individual allocations; a chunk never loaded is
+  never resolved or rewritten, so cold data keeps its original format for free.
+- **Keep a resident, deduplicated schema table**, interned by fingerprint (Idea 2's hash), each
+  chunk holding a small **index** (or the hash) into it. Distinct schemas in use are far fewer than
+  chunks, so this is more compact than a schema per chunk; the full schemas live here (Idea 1) so a
+  reader can resolve generically without having pre-enumerated that historical version.
+- **Eager detection with minimal resident state.** Because the table lists *every* live schema, at
+  open you verify the current build supports all of them — and if so, *every* chunk is guaranteed
+  readable whatever index it holds, so you never need the chunk→schema mapping resident, only the
+  schema *set*. This restores the fail-fast-at-open that lazy loading would otherwise lose, without
+  touching a single chunk. (Resolution stays lazy per chunk — the desired split: detect eagerly,
+  migrate lazily.)
+- **Resolve once per schema, not per chunk.** With the table deduplicated, compute each
+  writer→reader read plan (and its native / needs-resolution / unreadable verdict) once at open;
+  every chunk sharing that schema reuses it.
+- **Reclaim entries by reference counting.** Otherwise the table grows monotonically as old,
+  never-rewritten chunks keep old schema versions alive. Ref-count each entry by the number of
+  chunks referencing it and drop it at zero (on chunk migrate/delete), so the table stays
+  proportional to *schemas currently in use*, not to the file's whole version history. If the table
+  is ever compacted, rewrite chunk indices in that pass, or reference schemas by hash (stable, a few
+  bytes more) instead of by index.
+- **Ordering invariant.** A schema must be durable in the table *before* any chunk references it —
+  the same write-ahead discipline the journal already needs, and what makes eager detection sound
+  (the table is authoritative and complete by construction, never re-derived by scanning).
+
+Net: the table is always-resident and a shared write point on schema introduction/migration, but it
+holds *metadata* bounded by distinct schemas in use — trading "hold all data at open" (which chunks
+exist to avoid) for "hold all schema metadata at open" (small, and GC'd by refcount). This table is
+very likely the same mechanism as the file-level semantic-versioning slot and "type registry"
+`spec.md` defers — unify them.
+
+## Prior art: Avro (and why we borrow its schema model, not its format)
+
+Much of the above — a stored writer schema, resolution at load by matching fields **by name**,
+reader defaults for missing fields, skipping unknown ones, and a canonical **fingerprint** for
+identity/dedup — is **Apache Avro's** schema-resolution model, and the convergence is deliberate.
+Avro is the reference solution for evolving a *tagless, positional* binary format (Kladde likewise
+writes tagless, offset-addressed data and keeps the schema out of band — the Avro side of the fork,
+not Protobuf's inline-per-field-tag side), so we borrow its **schema model, resolution rules, and
+canonical-form/fingerprint spec** rather than re-deriving the corner cases.
+
+We do **not** adopt Avro the *format*. Avro serializes an **immutable** value read start-to-finish;
+Kladde is a **mutable, random-access pointer heap** with in-place edits, journaling, and compaction
+— none of which Avro has or could host. The fixed-offset, resolve-at-writer-offsets mechanics are
+closer to **Cap'n Proto/FlatBuffers**; the live-persistence model descends from object databases
+(GemStone/ZODB/Realm — see `spec.md`'s Prior Work). And the parts with *no* Avro analog —
+retain-mode, per-chunk layout tags, lazy per-chunk migration — exist precisely because Kladde
+mutates, which Avro does not. In short: Avro's *schema policy*, on a substrate Avro was never built for.
+
 ## Conclusions
 
 *(Claude:)*
@@ -394,9 +454,10 @@ the concurrency/CRDT direction already deferred in `spec.md`).
   `#[kladde(id=…)]`.)
 - **Layout policy — default and granularity.** Is *upgrade* or *retain* the default, and is it a
   per-type attribute, a per-open flag, or decided per allocation by inspecting the diff? And is the
-  layout tagged **per allocation** (enables heterogeneous, lazy migration; a few bytes per
-  allocation) or **globally** (simpler; all-or-nothing rewrite)? This is the decision the "don't
-  always assume native layout" point turns on.
+  layout/schema tagged **per allocation**, **per chunk** (the natural grain if lazy chunks land —
+  backed by the resident deduplicated schema table, which also restores eager, fail-fast detection),
+  or **globally** (simpler; all-or-nothing rewrite)? This is the decision the "don't always assume
+  native layout" point turns on.
 - Default policy on **flush after a resolving open**: upgrade-and-rewrite (simple, breaks old-app
   readback) vs. an opt-in pin-writer-format mode. Pick a default; expose the other.
 - How much **semantic-migration** machinery to expose (from/to-fingerprint hooks) vs. leaving
