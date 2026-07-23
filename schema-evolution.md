@@ -169,9 +169,10 @@ i.e. drifting toward a classic object-table design.)
   incremental migration**: upgrade an allocation only when you choose to, never a big-bang rewrite
   on open. This tag is close to the "type registry" `spec.md` currently defers — likely the same
   mechanism. Cost is a few bytes per *allocation* (not per value — inline data inherits its
-  allocation's tag), a far gentler tax than protobuf-style per-value tags. If the lazy-**chunk**
-  direction (`later.md`) lands, the natural grain is coarser still — one tag per chunk, backed by a
-  resident deduplicated schema table; see "Chunks and a resident, deduplicated schema table" below.
+  allocation's tag), a far gentler tax than protobuf-style per-value tags. In fact the natural home
+  for this tag is coarser than the allocation — a **capsule** (a schema/version boundary), backed by
+  a resident deduplicated schema table, and orthogonal to the lazy-load boundary (a **segment**);
+  see "Capsules and segments: two orthogonal boundaries" below.
 
 ## Current ideas for schema evolution
 
@@ -336,45 +337,120 @@ common atoms (add/remove/reorder/rename field, add variant); per-**type**/per-**
 cost only; the fast path stays byte-identical to today; and it degrades gracefully to Idea 3 if you
 ship the header first and add resolution later.
 
-#### Chunks and a resident, deduplicated schema table
+#### Capsules and segments: two orthogonal boundaries
 
-`later.md` floats partitioning a file into lazily-loaded **chunks** (disjoint regions, each a
-self-contained subtree, materialized only on access). That direction and schema evolution reinforce
-each other and settle the "per-allocation schema tag" question above into something cleaner:
+Everything above spoke of a "per-allocation schema tag" and (in an earlier draft) bundled schema
+separation together with the lazy-loading idea from `later.md` under one word ("chunks"). Those are
+really **two orthogonal concerns**, and separating them is cleaner. Name them:
 
-- **Migration goes per chunk, on first touch.** Resolution and any upgrade happen when a chunk is
-  loaded, not at open — so lazy chunks *are* the incremental-migration mechanism, at an
-  author-meaningful grain. The **chunk becomes the unit of schema tagging and layout policy**
-  (upgrade/retain), more tractable than tagging individual allocations; a chunk never loaded is
-  never resolved or rewritten, so cold data keeps its original format for free.
-- **Keep a resident, deduplicated schema table**, interned by fingerprint (Idea 2's hash), each
-  chunk holding a small **index** (or the hash) into it. Distinct schemas in use are far fewer than
-  chunks, so this is more compact than a schema per chunk; the full schemas live here (Idea 1) so a
-  reader can resolve generically without having pre-enumerated that historical version.
-- **Eager detection with minimal resident state.** Because the table lists *every* live schema, at
-  open you verify the current build supports all of them — and if so, *every* chunk is guaranteed
-  readable whatever index it holds, so you never need the chunk→schema mapping resident, only the
-  schema *set*. This restores the fail-fast-at-open that lazy loading would otherwise lose, without
-  touching a single chunk. (Resolution stays lazy per chunk — the desired split: detect eagerly,
-  migrate lazily.)
-- **Resolve once per schema, not per chunk.** With the table deduplicated, compute each
-  writer→reader read plan (and its native / needs-resolution / unreadable verdict) once at open;
-  every chunk sharing that schema reuses it.
+- A **capsule** is a *schema/version boundary*: a subtree that carries its own writer-schema and
+  version, migrates independently, and picks its own upgrade/retain policy. It owns a header + a
+  content region precisely so that region can carry its own schema tag (an inline value would share
+  its parent allocation's tag). A capsule need not be lazy.
+- A **segment** is a *load boundary* (`later.md`): a subtree in its own disjoint, contiguous file
+  region, materialized on first access and evictable, so peak memory is bounded by the working set
+  rather than by the whole file. A segment need not be a schema boundary.
+
+They compose freely — a subtree can be a capsule, a segment, both, or neither:
+
+| | ¬ schema boundary | **capsule** (schema boundary) |
+|---|---|---|
+| ¬ load boundary | plain inline/owning data | versions independently, always resident |
+| **segment** (load boundary) | loaded lazily *for memory*, same version as its surroundings | loaded lazily *and* versions independently |
+
+**Schema handling attaches to the capsule**, not to every allocation and not to every segment — the
+capsule is the schema/migration unit:
+
+- **Resident, deduplicated schema table**, interned by fingerprint (Idea 2's hash); each capsule
+  holds a small **index** (or the hash) into it. Distinct schemas in use are far fewer than
+  capsules, so this is far more compact than a schema per capsule; the full schemas live here
+  (Idea 1) so a reader can resolve generically without having pre-enumerated that historical version.
+- **Eager detection with minimal resident state.** The table lists *every* live schema, so at open
+  you verify the current build supports all of them — and if so, *every* capsule is guaranteed
+  readable whatever index it holds. You never need the capsule→schema mapping resident, only the
+  schema *set*, so this restores the fail-fast-at-open that lazy loading would otherwise lose,
+  without touching a single segment. (Resolution stays lazy per capsule — detect eagerly, migrate
+  lazily.)
+- **Resolve once per schema, not per capsule.** Compute each writer→reader read plan (and its
+  native / needs-resolution / unreadable verdict) once at open; every capsule sharing that schema
+  reuses it.
 - **Reclaim entries by reference counting.** Otherwise the table grows monotonically as old,
-  never-rewritten chunks keep old schema versions alive. Ref-count each entry by the number of
-  chunks referencing it and drop it at zero (on chunk migrate/delete), so the table stays
+  never-rewritten capsules keep old schema versions alive. Ref-count each entry by the number of
+  capsules referencing it and drop it at zero (on capsule migrate/delete), so the table stays
   proportional to *schemas currently in use*, not to the file's whole version history. If the table
-  is ever compacted, rewrite chunk indices in that pass, or reference schemas by hash (stable, a few
-  bytes more) instead of by index.
-- **Ordering invariant.** A schema must be durable in the table *before* any chunk references it —
+  is ever compacted, rewrite capsule indices in that pass, or reference schemas by hash (stable, a
+  few bytes more) instead of by index.
+- **Ordering invariant.** A schema must be durable in the table *before* any capsule references it —
   the same write-ahead discipline the journal already needs, and what makes eager detection sound
   (the table is authoritative and complete by construction, never re-derived by scanning).
 
-Net: the table is always-resident and a shared write point on schema introduction/migration, but it
-holds *metadata* bounded by distinct schemas in use — trading "hold all data at open" (which chunks
-exist to avoid) for "hold all schema metadata at open" (small, and GC'd by refcount). This table is
-very likely the same mechanism as the file-level semantic-versioning slot and "type registry"
-`spec.md` defers — unify them.
+**The one rule linking the two axes:** a **segment that is not also a capsule shares — and migrates
+with — its enclosing capsule's schema.** So you cannot migrate a capsule's schema in place while one
+of its unloaded segments still holds bytes in the old schema (the resident metadata would advertise
+the new schema while that region is stale → corruption on eventual load). Two clean resolutions,
+chosen per capsule: migrate the whole capsule as a unit (load its segments, rewrite), or keep the
+capsule in **retain-mode** (never migrate in place; unloaded segments stay valid). To migrate a
+lazily-loaded region *independently and incrementally*, make it a capsule too.
+
+Net: the schema table is always-resident and a shared write point on schema introduction/migration,
+but it holds *metadata* bounded by distinct schemas in use (GC'd by refcount) — trading "hold all
+data at open" (which segments exist to avoid) for "hold all schema metadata at open" (small). This
+table is very likely the same mechanism as the file-level semantic-versioning slot and "type
+registry" `spec.md` defers — unify them.
+
+#### Representing capsules and segments in code
+
+Both are **wrapper types written directly at the field** — `Capsule<T>` and `Segment<T>`, the same
+family as the existing `Persisted<T>` — *not* derive attributes:
+
+```rust
+struct Document {
+    body:  Segment<PersistedString>,   // load boundary: paged in on demand
+    prefs: Capsule<Preferences>,       // schema boundary: versions independently
+}
+```
+
+They must be wrapper types because each carries runtime state that has to live *in the value*.
+`Segment<T>`'s whole point is that its inner `T` may be **non-resident** — its representation is
+essentially `enum { OnDisk(handle), Loaded(T) }` plus a region pointer, and a bare `T` field is
+*always* materialized, so laziness simply cannot be an annotation on a `T`-typed field. `Capsule<T>`
+owns a header plus a cached `UniquePointer` (to avoid re-leaking a fresh allocation on every store)
+and its on-disk schema id (for retain-mode write-back).
+
+**Attributes can't express this** — worth stating, because it's tempting and it doesn't work:
+
+- A *field* attribute (`#[kladde(capsule)] prefs: Preferences`): a `derive` may *read* helper
+  attributes but cannot retype the field or add sibling state, so there's nowhere for the
+  pointer/handle/tag to live — the field stays a bare, always-resident `Preferences`.
+- A *type* attribute (`#[kladde(capsule)] struct Preferences`) escapes the "can't retype fields"
+  limit (the derive controls `Preferences`'s own impl) but not the "can't *add* fields" limit — it
+  can't add the cached-pointer field, so the best it could emit is a *leaky* capsule (no retain).
+- Only an *attribute macro* rewriting the whole struct (`prefs: T` → `prefs: Capsule<T>`) could do
+  it, but that's the bad kind of magic: the struct you wrote isn't the one that exists, direct field
+  access silently changes type, tooling suffers. Reject it — the wrappers' `Deref` already gives the
+  ergonomics an attribute would have promised.
+
+**Access asymmetry:** `Capsule<T>: Deref<Target = T>` reads transparently (a capsule is always
+resident). `Segment<T>` deliberately does **not** `Deref` — materializing an unloaded segment needs
+the *backend* at read time (the "reads now need the backend" tension already noted in `later.md`),
+so segment access goes through a backend-taking method or its guard, not a free `&*`.
+
+**Composition — `Capsule<Segment<T>>` vs `Segment<Capsule<T>>`.** The outer wrapper is the
+containing boundary:
+
+- `Capsule<Segment<T>>` = *a versioned unit that is stored lazily* — one schema stamped over the
+  whole thing, the lazy region inside it, migrate-as-one-capsule.
+- `Segment<Capsule<T>>` = *a lazily-loaded region that contains an independently-versioned thing* —
+  the load boundary is outer, the schema switch is inside.
+
+For a lone `T` these are nearly equivalent; the difference bites when the wrapper contains more than
+one thing, and the rule is **make the coarser concern the outer wrapper**: one version spanning
+several separately-paged pieces → capsule outside (`Capsule<{ Segment<A>, Segment<B> }>`); one paged
+region holding several independently-versioned pieces → segment outside
+(`Segment<{ Capsule<A>, Capsule<B> }>`). The common default is **capsule outside**
+(`Capsule<Segment<T>>`): versioning usually attaches to a whole conceptual object as its stable
+outer identity, schema boundaries are coarse and few while load boundaries are fine and
+opportunistic, and "migrate this capsule (loading its segments)" is the cleaner operation.
 
 ## Prior art: Avro (and why we borrow its schema model, not its format)
 
@@ -391,7 +467,7 @@ Kladde is a **mutable, random-access pointer heap** with in-place edits, journal
 — none of which Avro has or could host. The fixed-offset, resolve-at-writer-offsets mechanics are
 closer to **Cap'n Proto/FlatBuffers**; the live-persistence model descends from object databases
 (GemStone/ZODB/Realm — see `spec.md`'s Prior Work). And the parts with *no* Avro analog —
-retain-mode, per-chunk layout tags, lazy per-chunk migration — exist precisely because Kladde
+retain-mode, the capsule/segment split, lazy per-capsule migration — exist precisely because Kladde
 mutates, which Avro does not. In short: Avro's *schema policy*, on a substrate Avro was never built for.
 
 ## Conclusions
@@ -454,10 +530,10 @@ the concurrency/CRDT direction already deferred in `spec.md`).
   `#[kladde(id=…)]`.)
 - **Layout policy — default and granularity.** Is *upgrade* or *retain* the default, and is it a
   per-type attribute, a per-open flag, or decided per allocation by inspecting the diff? And is the
-  layout/schema tagged **per allocation**, **per chunk** (the natural grain if lazy chunks land —
-  backed by the resident deduplicated schema table, which also restores eager, fail-fast detection),
-  or **globally** (simpler; all-or-nothing rewrite)? This is the decision the "don't always assume
-  native layout" point turns on.
+  schema tagged **per allocation**, **per capsule** (a schema boundary — backed by the resident
+  deduplicated schema table, which also restores eager, fail-fast detection), or **globally**
+  (simpler; all-or-nothing rewrite)? This is the decision the "don't always assume native layout"
+  point turns on. (Lazy loading — **segments** — is an orthogonal axis; see "Capsules and segments".)
 - Default policy on **flush after a resolving open**: upgrade-and-rewrite (simple, breaks old-app
   readback) vs. an opt-in pin-writer-format mode. Pick a default; expose the other.
 - How much **semantic-migration** machinery to expose (from/to-fingerprint hooks) vs. leaving
