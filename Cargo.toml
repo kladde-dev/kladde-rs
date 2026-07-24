@@ -6,6 +6,7 @@ members = [
     "crates/kladde",
     "crates/kladde-derive",
     "crates/kladde-types",
+    "crates/kladde-varint",
 ]
 
 [workspace.package]
@@ -19,6 +20,8 @@ kladde-alloc = { path = "crates/kladde-alloc" }
 kladde = { path = "crates/kladde" }
 kladde-derive = { path = "crates/kladde-derive" }
 kladde-types = { path = "crates/kladde-types" }
+kladde-varint = { path = "crates/kladde-varint" }
+kladde-schema = { path = "crates/kladde-schema" }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 thiserror = "2"
