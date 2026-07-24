@@ -55,10 +55,10 @@ on `Persistable` yet.
   (the descriptor `Vec` + the root index), mirroring spec §2.
 - Canonical storage (de)serialization, spec §3 (`varint`, `string`, per-kind
   encoding, table framing). Round-trip tests.
-- `Fingerprint` (32 bytes; top bit = cyclic flag; §4.1) and the fingerprint
+- `Fingerprint` (16 bytes; top bit = cyclic flag; §4.1) and the fingerprint
   algorithm, spec §4: white/gray/black DFS, memo of `(fingerprint, cyclic)`,
   reference tokens (inline child fingerprint vs. de Bruijn back-reference), cyclic
-  flag propagation, SHA-256 with the top-bit-cleared packing.
+  flag propagation, SHA-256-truncated-to-128-bits with the top-bit-cleared packing.
 - Tests:
   - **reproducibility** — same graph hashed twice (fresh state) → identical;
   - **index-invariance** — renumber/reorder the descriptor table → same fingerprint;
@@ -130,9 +130,12 @@ Connect real types to Phase 1.
 - **Discriminant id source.** For this milestone, declaration order is an acceptable
   `discriminant_value` source; route it through an explicit id field so *Idea 4*'s
   stable ids can replace it later without changing the descriptor encoding.
-- **Hash choice.** SHA-256 per spec §4.2 — ubiquitous and reproducible across
-  languages. Revisit only if a future const/build-time fingerprint path wants a
-  const-friendly hash; that would be a format-version change.
+- **Hash choice.** SHA-256 truncated to 128 bits per spec §4.2 — chosen for exact
+  cross-language reproducibility (ubiquitous stdlib support, universal test vectors)
+  with a 16-byte fingerprint; cryptographic strength is not relied upon (spec §4.9).
+  Revisit only if fingerprints ever become trusted cross-party content-addresses
+  (widen back to a full digest) or a const/build-time path wants a const-friendly
+  hash; either is a format-version change.
 
 ## Verification checklist (whole milestone)
 

@@ -153,17 +153,24 @@ file-format specification and is out of scope here.
 
 ### 4.1 The fingerprint value
 
-A **fingerprint** is 256 bits (32 bytes). The **most-significant bit of byte 0** is
-the **cyclic flag**; the remaining 255 bits are the **hash**. Two fingerprints are
-equal iff all 256 bits are equal (flag included).
+A **fingerprint** is 128 bits (16 bytes). The **most-significant bit of byte 0** is
+the **cyclic flag**; the remaining 127 bits are the **hash**. Two fingerprints are
+equal iff all 128 bits are equal (flag included).
 
 ### 4.2 Hash function
 
-The hash is SHA-256. Where a 255-bit hash is required, compute the full SHA-256
-digest of the input and then clear the most-significant bit of byte 0; that bit
-position instead carries the cyclic flag (§4.6). The one-bit reduction is
-cryptographically negligible. (A future format revision may substitute another
-hash; the choice is a format-version property.)
+The hash is **SHA-256 truncated to its leading 128 bits** (the first 16 bytes of
+the digest, byte 0 first). Where a 127-bit hash is required, take those 16 bytes
+and clear the most-significant bit of byte 0; that bit position instead carries the
+cyclic flag (§4.6). The one-bit reduction is negligible.
+
+SHA-256 is chosen for **exact cross-language reproducibility**: it is present in
+every mainstream language's standard library with universal test vectors, and
+"compute SHA-256, keep the first 16 bytes" is trivial to reimplement identically.
+128 bits gives an astronomically small accidental-collision probability for any
+realistic number of distinct schemas (birthday bound ≈ N²/2¹²⁸); cryptographic
+strength is deliberately *not* relied upon (see §4.9). A future format revision may
+substitute another hash or width; the choice is a format-version property.
 
 ### 4.3 What is and isn't fingerprinted
 
@@ -211,16 +218,17 @@ To compute the fingerprint of a node `N` — colored gray on entry at the curren
 2. For each outgoing reference to a child `C`, in canonical (§3.2) order, emit a
    **reference token**:
    - if `color[C]` is **white**: recursively compute `C`'s fingerprint (this
-     colors `C` black and memoizes it); emit `byte(0x00)` followed by `C`'s 32-byte
+     colors `C` black and memoizes it); emit `byte(0x00)` followed by `C`'s 16-byte
      fingerprint.
    - if `color[C]` is **black**: emit `byte(0x00)` followed by `C`'s memoized
-     32-byte fingerprint.
+     16-byte fingerprint.
    - if `color[C]` is **gray**: emit `byte(0x01)` followed by
      `varint(depth[N] − depth[C])` — a **de Bruijn back-reference** giving the
      number of stack levels from `N` up to the in-progress ancestor `C` (`0`
      denotes `N` itself). Absolute depths never appear; only this difference does.
 
-`N`'s **hash** is the SHA-256 of this byte string, top bit cleared.
+`N`'s **hash** is the leading 128 bits of the SHA-256 of this byte string, top bit
+cleared.
 
 ### 4.6 Cyclic flag
 
@@ -232,13 +240,13 @@ To compute the fingerprint of a node `N` — colored gray on entry at the curren
   black cases).
 
 Equivalently, the flag is set iff **any cycle occurs anywhere in `N`'s reachable
-subgraph.** `N`'s fingerprint packs `N`'s 255-bit hash with this flag in the top
+subgraph.** `N`'s fingerprint packs `N`'s 127-bit hash with this flag in the top
 bit. Record `(fingerprint, cyclic)` in the memo and color `N` black.
 
 ### 4.7 Equality semantics
 
 - Two fingerprints that are **fully equal** were produced by structurally identical
-  inputs (up to SHA-256 collision resistance).
+  inputs (up to the 128-bit hash's collision resistance; see §4.9).
 - If two fingerprints are equal **and their cyclic flag is clear**, the two types
   have **structurally identical representations in every context**. Such a
   fingerprint is a **context-free identity**: it is valid for deduplication, for
@@ -257,6 +265,48 @@ Given a type graph, the fingerprint is fully determined: all encodings are
 byte-exact and endian-fixed; traversal order follows the canonical field/variant
 order; and no table indices, table order, timestamps, or random seeds participate.
 Two conforming implementations, in any language, produce identical fingerprints.
+
+### 4.9 Security considerations
+
+A fingerprint is an **identity and detection** mechanism, not an **authenticity**
+one. Two properties matter here, and they are different:
+
+- **Accidental-collision resistance.** Two structurally *different* schemas must not
+  produce the same fingerprint by chance, or a reader could take a fast path and
+  interpret bytes under the wrong layout. 128 bits makes this negligible for any
+  realistic population of distinct schemas (§4.2), and SHA-256 truncation gives
+  near-ideal distribution even for schemas that differ in a single byte. This is the
+  property the format *does* rely on.
+- **Adversarial-collision resistance** is **not** relied upon. In the intended model
+  a Kladde file is written by an application for itself, or received whole from
+  another party; the schema descriptors and any stored fingerprint travel *inside*
+  the file. An attacker who can supply a file already controls its declared schema
+  and its bytes, so they can make a reader interpret arbitrary bytes under any layout
+  simply by *declaring* that layout honestly — a crafted fingerprint collision grants
+  no capability beyond that. The fingerprint selects an interpretation; it is never a
+  trust or privilege boundary.
+
+Two obligations follow, and they belong to the surrounding system rather than to the
+hash:
+
+1. **The read path must stay memory-safe under a mismatched schema.** Because a
+   collision (accidental or adversarial) degrades to "read bytes under the wrong
+   layout," the loader must bounds-check every read and validate every decoded
+   pointer/index, treating any inconsistency as a clean error — never undefined
+   behavior. With that in place, a mismatch yields wrong data, a clean "corrupt
+   file" error, or a panic, not memory unsafety. This is required anyway, for
+   truncated files and ordinary corruption.
+2. **The fingerprint provides no tamper protection.** A bare hash never does: an
+   attacker who edits the schema or data can recompute it. Detecting *adversarial*
+   modification requires a signature or MAC over the file, which is out of scope
+   here; the fingerprint detects only *accidental* schema corruption.
+
+Cryptographic-strength collision resistance would become relevant only if
+fingerprints were ever used as **trusted content-addresses shared between mutually
+distrusting parties** (as Git and IPFS use object hashes) — a multi-writer/sharing
+scenario outside this specification. Should that arise, widen the fingerprint back
+to a full-length cryptographic digest (a format-version change); nothing else in
+§4 depends on the width.
 
 ## 5. Worked examples
 
