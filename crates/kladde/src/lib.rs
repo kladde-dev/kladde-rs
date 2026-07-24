@@ -299,7 +299,7 @@ mod tests {
 
         fn describe(builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeRef {
             builder.describe(std::any::TypeId::of::<Self>(), |_| {
-                kladde_traits::TypeDescriptor::Primitive(2)
+                kladde_traits::TypeDescriptor::Primitive(kladde_traits::Primitive::U32)
             })
         }
     }

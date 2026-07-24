@@ -60,5 +60,6 @@ pub use kladde_traits::{
 // through `kladde-traits`), so application code that builds or inspects a
 // type's schema needs only this crate.
 pub use kladde_traits::{
-    Field, Fingerprint, SchemaBuilder, TypeDescriptor, TypeRef, TypeTable, Variant, Version,
+    Field, Fingerprint, Primitive, SchemaBuilder, TypeDescriptor, TypeRef, TypeTable, Variant,
+    Version,
 };

@@ -124,7 +124,7 @@ impl<'a> Traversal<'a> {
         m: &mut usize,
     ) {
         match descriptor {
-            TypeDescriptor::Primitive(code) => input.push(*code),
+            TypeDescriptor::Primitive(primitive) => input.push(primitive.code()),
             TypeDescriptor::Struct { fields, .. } => {
                 input.push(crate::descriptor::TAG_STRUCT);
                 kladde_varint::encode(fields.len() as u64, input);
@@ -212,10 +212,12 @@ fn push_string(s: &str, out: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
-    use crate::descriptor::{Field, TypeDescriptor, TypeRef, TypeTable, Variant, Version};
+    use crate::descriptor::{
+        Field, Primitive, TypeDescriptor, TypeRef, TypeTable, Variant, Version,
+    };
 
-    fn primitive(code: u8) -> TypeDescriptor {
-        TypeDescriptor::Primitive(code)
+    fn primitive(p: Primitive) -> TypeDescriptor {
+        TypeDescriptor::Primitive(p)
     }
 
     /// `struct Point { x: i32, y: i32 }` (i32 = code 6).
@@ -234,7 +236,7 @@ mod tests {
                     },
                 ],
             },
-            primitive(6),
+            primitive(Primitive::I32),
         ])
     }
 
@@ -266,7 +268,7 @@ mod tests {
                     },
                 ],
             },
-            primitive(6),
+            primitive(Primitive::I32),
         ])
     }
 
@@ -296,8 +298,8 @@ mod tests {
                     },
                 ],
             },
-            primitive(6),
-            primitive(3),
+            primitive(Primitive::I32),
+            primitive(Primitive::U64),
         ]);
         // Swap indices 1 and 2 (i32 and u64), remap references accordingly.
         let b = TypeTable::new(vec![
@@ -314,8 +316,8 @@ mod tests {
                     },
                 ],
             },
-            primitive(3),
-            primitive(6),
+            primitive(Primitive::U64),
+            primitive(Primitive::I32),
         ]);
         assert_eq!(a.fingerprint(), b.fingerprint());
     }
@@ -339,7 +341,7 @@ mod tests {
                     },
                 ],
             },
-            primitive(6),
+            primitive(Primitive::I32),
         ]);
         assert_ne!(base, reordered.fingerprint());
 
@@ -358,7 +360,7 @@ mod tests {
                     },
                 ],
             },
-            primitive(6),
+            primitive(Primitive::I32),
         ]);
         assert_ne!(base, renamed_field.fingerprint());
 
@@ -377,7 +379,7 @@ mod tests {
                     },
                 ],
             },
-            primitive(7),
+            primitive(Primitive::I64),
         ]);
         assert_ne!(base, retyped.fingerprint());
 
@@ -396,7 +398,7 @@ mod tests {
                     },
                 ],
             },
-            primitive(6),
+            primitive(Primitive::I32),
         ]);
         assert_eq!(base, renamed_type.fingerprint());
     }

@@ -22,8 +22,8 @@ mod serialize;
 mod sha256;
 
 pub use descriptor::{
-    Field, TypeDescriptor, TypeRef, TypeTable, Variant, Version, TAG_ARRAY, TAG_ENUM, TAG_OPAQUE,
-    TAG_POINTER, TAG_STRUCT,
+    Field, Primitive, TypeDescriptor, TypeRef, TypeTable, Variant, Version, TAG_ARRAY, TAG_ENUM,
+    TAG_OPAQUE, TAG_POINTER, TAG_STRUCT,
 };
 pub use fingerprint::Fingerprint;
 pub use serialize::DecodeError;

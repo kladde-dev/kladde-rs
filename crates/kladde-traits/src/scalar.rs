@@ -13,7 +13,7 @@
 //! `kladde-types` re-exports these names for convenience.
 
 use crate::{Backend, Guard, Location, Persistable, SchemaBuilder};
-use kladde_schema::{TypeDescriptor, TypeRef};
+use kladde_schema::{Primitive, TypeDescriptor, TypeRef};
 use std::any::TypeId;
 
 /// Numeric scalars all have native `to_le_bytes`/`from_le_bytes` with a
@@ -104,16 +104,16 @@ macro_rules! impl_persistable_numeric_scalar {
     };
 }
 
-impl_persistable_numeric_scalar!(u8, U8Guard, 0);
-impl_persistable_numeric_scalar!(u16, U16Guard, 1);
-impl_persistable_numeric_scalar!(u32, U32Guard, 2);
-impl_persistable_numeric_scalar!(u64, U64Guard, 3);
-impl_persistable_numeric_scalar!(i8, I8Guard, 4);
-impl_persistable_numeric_scalar!(i16, I16Guard, 5);
-impl_persistable_numeric_scalar!(i32, I32Guard, 6);
-impl_persistable_numeric_scalar!(i64, I64Guard, 7);
-impl_persistable_numeric_scalar!(f32, F32Guard, 8);
-impl_persistable_numeric_scalar!(f64, F64Guard, 9);
+impl_persistable_numeric_scalar!(u8, U8Guard, Primitive::U8);
+impl_persistable_numeric_scalar!(u16, U16Guard, Primitive::U16);
+impl_persistable_numeric_scalar!(u32, U32Guard, Primitive::U32);
+impl_persistable_numeric_scalar!(u64, U64Guard, Primitive::U64);
+impl_persistable_numeric_scalar!(i8, I8Guard, Primitive::I8);
+impl_persistable_numeric_scalar!(i16, I16Guard, Primitive::I16);
+impl_persistable_numeric_scalar!(i32, I32Guard, Primitive::I32);
+impl_persistable_numeric_scalar!(i64, I64Guard, Primitive::I64);
+impl_persistable_numeric_scalar!(f32, F32Guard, Primitive::F32);
+impl_persistable_numeric_scalar!(f64, F64Guard, Primitive::F64);
 
 /// `bool` and `char` don't have `to_le_bytes`/`from_le_bytes`, so they're
 /// encoded by hand (as one byte, and as `u32`, respectively) rather than
@@ -204,14 +204,21 @@ macro_rules! impl_persistable_scalar_via {
     };
 }
 
-impl_persistable_scalar_via!(bool, BoolGuard, u8, |v| v as u8, |b| b != 0, 10);
+impl_persistable_scalar_via!(
+    bool,
+    BoolGuard,
+    u8,
+    |v| v as u8,
+    |b| b != 0,
+    Primitive::Bool
+);
 impl_persistable_scalar_via!(
     char,
     CharGuard,
     u32,
     |v| v as u32,
     |b| { char::from_u32(b).expect("corrupt persisted char") },
-    11
+    Primitive::Char
 );
 
 // `String` deliberately does *not* implement `Persistable`: it's a

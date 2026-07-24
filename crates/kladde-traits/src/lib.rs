@@ -16,7 +16,9 @@ pub use schema::SchemaBuilder;
 // Re-exported so `#[derive(Persistable)]` output and hand-written
 // `describe` impls can name every schema type through `kladde_traits`
 // alone, without a separate `kladde-schema` dependency.
-pub use kladde_schema::{Field, Fingerprint, TypeDescriptor, TypeRef, TypeTable, Variant, Version};
+pub use kladde_schema::{
+    Field, Fingerprint, Primitive, TypeDescriptor, TypeRef, TypeTable, Variant, Version,
+};
 
 /// The offset of a pointer's own serialized bytes within the file.
 /// Type alias rather than a bare integer so widening it later (to `u64`,
@@ -392,7 +394,7 @@ mod tests {
 
             fn describe(builder: &mut SchemaBuilder) -> TypeRef {
                 builder.describe(std::any::TypeId::of::<Self>(), |_| {
-                    TypeDescriptor::Primitive(2)
+                    TypeDescriptor::Primitive(Primitive::U32)
                 })
             }
         }

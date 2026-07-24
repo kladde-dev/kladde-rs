@@ -65,14 +65,67 @@ pub struct Variant {
     pub fields: Vec<Field>,
 }
 
+/// A fixed-width scalar primitive — one of the implemented primitive codes
+/// of `type-descriptors.md` §2.1. The `#[repr(u8)]` discriminant *is* the
+/// on-disk code, so [`code`](Primitive::code) / [`from_code`] round-trip to
+/// and from the wire byte.
+///
+/// Codes the spec reserves but does not yet implement (§2.1.1, e.g. `u128`)
+/// are deliberately absent: a schema that uses one fails to decode here
+/// until a future revision adds the corresponding variant.
+///
+/// [`from_code`]: Primitive::from_code
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Primitive {
+    U8 = 0,
+    U16 = 1,
+    U32 = 2,
+    U64 = 3,
+    I8 = 4,
+    I16 = 5,
+    I32 = 6,
+    I64 = 7,
+    F32 = 8,
+    F64 = 9,
+    Bool = 10,
+    Char = 11,
+}
+
+impl Primitive {
+    /// This primitive's on-disk code byte (`0..=11`).
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// The primitive for a code byte, or `None` if no implemented primitive
+    /// uses that code.
+    pub fn from_code(code: u8) -> Option<Primitive> {
+        Some(match code {
+            0 => Primitive::U8,
+            1 => Primitive::U16,
+            2 => Primitive::U32,
+            3 => Primitive::U64,
+            4 => Primitive::I8,
+            5 => Primitive::I16,
+            6 => Primitive::I32,
+            7 => Primitive::I64,
+            8 => Primitive::F32,
+            9 => Primitive::F64,
+            10 => Primitive::Bool,
+            11 => Primitive::Char,
+            _ => return None,
+        })
+    }
+}
+
 /// One node of the type graph: a description of a single value type's
 /// on-disk representation. See `type-descriptors.md` §2 for the model and
 /// each kind's meaning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeDescriptor {
-    /// A fixed-width scalar, identified by its primitive code (`0..=127`,
-    /// `type-descriptors.md` §2.1).
-    Primitive(u8),
+    /// A fixed-width scalar (`type-descriptors.md` §2.1).
+    Primitive(Primitive),
     /// An ordered set of named fields laid out consecutively, no
     /// discriminant and no header.
     Struct { name: String, fields: Vec<Field> },

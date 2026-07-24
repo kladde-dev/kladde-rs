@@ -37,7 +37,9 @@ fn dump<T: Persistable + 'static>(label: &str) {
 
 fn describe_one(descriptor: &TypeDescriptor) -> String {
     match descriptor {
-        TypeDescriptor::Primitive(code) => format!("Primitive(code={code})"),
+        TypeDescriptor::Primitive(primitive) => {
+            format!("Primitive({primitive:?}, code={})", primitive.code())
+        }
         TypeDescriptor::Struct { name, fields } => {
             let fields: Vec<String> = fields
                 .iter()

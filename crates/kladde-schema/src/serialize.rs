@@ -4,8 +4,8 @@
 //! content. Byte-for-byte reproducible across implementations.
 
 use crate::descriptor::{
-    canonical_variants, Field, TypeDescriptor, TypeRef, TypeTable, Variant, Version, TAG_ARRAY,
-    TAG_ENUM, TAG_OPAQUE, TAG_POINTER, TAG_STRUCT,
+    canonical_variants, Field, Primitive, TypeDescriptor, TypeRef, TypeTable, Variant, Version,
+    TAG_ARRAY, TAG_ENUM, TAG_OPAQUE, TAG_POINTER, TAG_STRUCT,
 };
 
 /// Why a byte string could not be decoded into a [`TypeTable`].
@@ -22,6 +22,9 @@ pub enum DecodeError {
     UnknownKind(u8),
     /// A discriminant width other than 1, 2, 4, or 8.
     InvalidDiscriminantWidth(u8),
+    /// A primitive code with no implemented primitive (a reserved or future
+    /// code, `type-descriptors.md` §2.1.1).
+    UnsupportedPrimitive(u8),
     /// A reference points outside the table.
     ReferenceOutOfRange { index: usize, table_len: usize },
     /// The table had no descriptors (a table must have at least a root).
@@ -39,6 +42,9 @@ impl std::fmt::Display for DecodeError {
             DecodeError::UnknownKind(t) => write!(f, "unknown kind tag {t}"),
             DecodeError::InvalidDiscriminantWidth(w) => {
                 write!(f, "invalid discriminant width {w} (expected 1, 2, 4, or 8)")
+            }
+            DecodeError::UnsupportedPrimitive(c) => {
+                write!(f, "unsupported primitive code {c}")
             }
             DecodeError::ReferenceOutOfRange { index, table_len } => {
                 write!(f, "reference {index} out of range for table of {table_len}")
@@ -119,7 +125,7 @@ fn encode_field(field: &Field, out: &mut Vec<u8>) {
 
 fn encode_descriptor(descriptor: &TypeDescriptor, out: &mut Vec<u8>) {
     match descriptor {
-        TypeDescriptor::Primitive(code) => out.push(*code),
+        TypeDescriptor::Primitive(primitive) => out.push(primitive.code()),
         TypeDescriptor::Struct { name, fields } => {
             out.push(TAG_STRUCT);
             encode_string(name, out);
@@ -219,7 +225,9 @@ impl<'a> Reader<'a> {
 fn decode_descriptor(reader: &mut Reader) -> Result<TypeDescriptor, DecodeError> {
     let tag = reader.byte()?;
     match tag {
-        0..=127 => Ok(TypeDescriptor::Primitive(tag)),
+        0..=127 => Primitive::from_code(tag)
+            .map(TypeDescriptor::Primitive)
+            .ok_or(DecodeError::UnsupportedPrimitive(tag)),
         TAG_STRUCT => {
             let name = reader.string()?;
             let fields = reader.fields()?;
@@ -278,7 +286,9 @@ fn decode_descriptor(reader: &mut Reader) -> Result<TypeDescriptor, DecodeError>
 
 #[cfg(test)]
 mod tests {
-    use crate::descriptor::{Field, TypeDescriptor, TypeRef, TypeTable, Variant, Version};
+    use crate::descriptor::{
+        Field, Primitive, TypeDescriptor, TypeRef, TypeTable, Variant, Version,
+    };
 
     /// `struct Point { x: i32, y: i32 }` over shared `i32` (code 6).
     fn point_table() -> TypeTable {
@@ -296,7 +306,7 @@ mod tests {
                     },
                 ],
             },
-            TypeDescriptor::Primitive(6),
+            TypeDescriptor::Primitive(Primitive::I32),
         ])
     }
 
@@ -330,7 +340,7 @@ mod tests {
                     },
                 ],
             },
-            TypeDescriptor::Primitive(7),
+            TypeDescriptor::Primitive(Primitive::I64),
             TypeDescriptor::Opaque {
                 library_name: "kladde-types".into(),
                 type_name: "PersistedVec".into(),
