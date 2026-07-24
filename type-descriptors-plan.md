@@ -130,9 +130,10 @@ Connect real types to Phase 1.
     it, don't do it now.
 - `kladde-derive`: generate `describe` for structs (a `Struct` descriptor; each field
   recurses via `<FieldTy as Persistable>::describe`) and enums (an `Enum` descriptor;
-  each variant's payload recurses; `discriminant_value` sourced from the same
-  mechanism the derive already uses — declaration order for now, but routed through
-  an explicit id so *Idea 4*'s stable ids can replace it without touching this code).
+  each variant's payload recurses; `discriminant_value` = the variant's explicit Rust
+  discriminant if present, else declaration order — the same number the inline
+  `store`/`load` uses, routed through one id step; see the *Discriminant id source*
+  decision).
 - Hand impls:
   - scalars → `Primitive` (matching the codes in spec §2.1);
   - `PersistedVec<T>` → `Opaque { library_name: "kladde-types", type_name:
@@ -167,9 +168,23 @@ Connect real types to Phase 1.
   across crates and be walkable by generic tooling, but needs its own layout spec.
   Recommend **Opaque now**, revisit if/when a generic file-analysis tool needs to walk
   container internals.
-- **Discriminant id source.** For this milestone, declaration order is an acceptable
-  `discriminant_value` source; route it through an explicit id field so *Idea 4*'s
-  stable ids can replace it later without changing the descriptor encoding.
+- **Discriminant id source.** `discriminant_value` must equal the value the enum
+  actually stores, so `describe` and the inline-layout `store`/`load` codegen take it
+  from one source, per variant: the **explicit Rust discriminant** if the author wrote
+  one (`enum E { A = 42, B = 137 }`), else **declaration order** (`0, 1, 2, …`, which
+  is what Rust assigns anyway). Honor explicit discriminants — an author who pins one
+  expects it to stay put, and doing so *is* *Idea 4*'s stable-id mechanism expressed in
+  native syntax, likely obviating a custom `#[kladde(id = N)]` attribute. (Its only
+  remaining niche: pinning a stable id on a *data-carrying* variant without the
+  primitive `#[repr(...)]` that explicit discriminants on fieldful enums require since
+  Rust 1.66 — leave the door open, don't build it now.) Route every variant's number
+  through a single "id" step so the source can change without touching serialization
+  or the descriptor encoding (§3.2 always stores `varint(discriminant_value)`).
+  Uniqueness is already compiler-enforced (Rust rejects duplicate/colliding
+  discriminants); lean on that by emitting each variant's discriminant as a `const`
+  expression — the explicit expr, or `prev + 1` for implicit ones — and letting the
+  compiler evaluate and reject collisions, which also handles non-literal exprs
+  (`A = 1 << 4`) the macro can't compute itself.
 - **Hash choice.** SHA-256 truncated to 128 bits per spec §4.2 — chosen for exact
   cross-language reproducibility (ubiquitous stdlib support, universal test vectors)
   with a 16-byte fingerprint; cryptographic strength is not relied upon (spec §4.9).
