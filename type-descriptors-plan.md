@@ -180,11 +180,19 @@ Connect real types to Phase 1.
   Rust 1.66 — leave the door open, don't build it now.) Route every variant's number
   through a single "id" step so the source can change without touching serialization
   or the descriptor encoding (§3.2 always stores `varint(discriminant_value)`).
-  Uniqueness is already compiler-enforced (Rust rejects duplicate/colliding
-  discriminants); lean on that by emitting each variant's discriminant as a `const`
-  expression — the explicit expr, or `prev + 1` for implicit ones — and letting the
-  compiler evaluate and reject collisions, which also handles non-literal exprs
-  (`A = 1 << 4`) the macro can't compute itself.
+  Compute each id by Rust's own discriminant rule — the explicit value where written,
+  else **predecessor + 1** (never the *positional index*) — so kladde's ids *coincide
+  with the enum's actual Rust discriminants*. Uniqueness then comes free: an enum whose
+  discriminants collide fails Rust's own discriminant-uniqueness check and never
+  compiles, so every enum the derive sees already has distinct discriminants. Deviating
+  — e.g. giving implicit variants their positional index — decouples kladde's ids from
+  the real discriminants and manufactures collisions the compiler won't catch
+  (`enum { A = 1, B, C }`: positional gives `A = 1, B = 1`, though Rust's real
+  discriminants are `1, 2, 3`). Emit each id as a `const` (`= <explicit expr>` or
+  `= <prev const> + 1`) so the compiler evaluates it — reproducing Rust's values
+  exactly (the const chain isn't itself the uniqueness enforcer; the enum's own
+  definition is) and handling non-literal exprs like `A = 1 << 4` the macro can't
+  compute itself.
 - **Hash choice.** SHA-256 truncated to 128 bits per spec §4.2 — chosen for exact
   cross-language reproducibility (ubiquitous stdlib support, universal test vectors)
   with a 16-byte fingerprint; cryptographic strength is not relied upon (spec §4.9).
