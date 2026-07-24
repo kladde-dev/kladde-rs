@@ -9,7 +9,14 @@ use std::marker::PhantomData;
 use std::num::NonZeroU32;
 
 mod scalar;
+mod schema;
 pub use scalar::*;
+pub use schema::SchemaBuilder;
+
+// Re-exported so `#[derive(Persistable)]` output and hand-written
+// `describe` impls can name every schema type through `kladde_traits`
+// alone, without a separate `kladde-schema` dependency.
+pub use kladde_schema::{Field, Fingerprint, TypeDescriptor, TypeRef, TypeTable, Variant, Version};
 
 /// The offset of a pointer's own serialized bytes within the file.
 /// Type alias rather than a bare integer so widening it later (to `u64`,
@@ -269,6 +276,43 @@ pub trait Persistable: Sized {
     /// `location` -- the read-side counterpart of `store`, used by the
     /// round-trip test and (eventually) by opening a file.
     fn load<B: Backend>(backend: &B, location: Location) -> Self;
+
+    /// Records this type's representation into `builder`, returning a
+    /// reference to its descriptor. `#[derive(Persistable)]` generates this
+    /// for you; hand-written impls call
+    /// [`SchemaBuilder::describe`] once (keyed on their own
+    /// `TypeId`) and describe their fields/parameters by recursing through
+    /// this method. You usually call the higher-level [`schema`] or
+    /// [`fingerprint`] instead of this directly.
+    ///
+    /// [`schema`]: Persistable::schema
+    /// [`fingerprint`]: Persistable::fingerprint
+    fn describe(builder: &mut SchemaBuilder) -> TypeRef
+    where
+        Self: 'static;
+
+    /// This type's full descriptor table (its schema) -- a language-neutral
+    /// description of how it lays out and interprets its bytes, rooted at
+    /// index 0.
+    fn schema() -> TypeTable
+    where
+        Self: 'static,
+    {
+        let mut builder = SchemaBuilder::new();
+        let root = Self::describe(&mut builder);
+        builder.finish(root)
+    }
+
+    /// This type's 128-bit [schema fingerprint](Fingerprint): a compact,
+    /// reproducible identity for its representation, suitable for detecting
+    /// at load time whether a stored file was written with a compatible
+    /// layout.
+    fn fingerprint() -> Fingerprint
+    where
+        Self: 'static,
+    {
+        Self::schema().fingerprint()
+    }
 }
 
 /// A live, mutation-capable, RAII-style view onto a [`Persistable`]
@@ -344,6 +388,12 @@ mod tests {
             fn load<B: Backend>(backend: &B, location: Location) -> Self {
                 let bytes = backend.read(location.anchor, location.offset, 4);
                 Counter(u32::from_le_bytes(bytes.try_into().unwrap()))
+            }
+
+            fn describe(builder: &mut SchemaBuilder) -> TypeRef {
+                builder.describe(std::any::TypeId::of::<Self>(), |_| {
+                    TypeDescriptor::Primitive(2)
+                })
             }
         }
 

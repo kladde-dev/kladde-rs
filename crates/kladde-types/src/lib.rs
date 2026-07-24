@@ -37,10 +37,28 @@ pub use vec::{PersistedVec, PersistedVecGuard};
 // is the only place that impl is legal. Re-exported here so application
 // code only needs one dependency.
 pub use kladde_derive::Persistable;
+
+/// This crate's own version, used as the `Opaque` descriptor version for
+/// every built-in container (`type-descriptors.md` §2.4). Kept in sync with
+/// `Cargo.toml` automatically via the `CARGO_PKG_VERSION_*` environment.
+pub(crate) fn library_version() -> kladde_traits::Version {
+    kladde_traits::Version {
+        major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
+        minor: env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
+        patch: env!("CARGO_PKG_VERSION_PATCH").parse().unwrap(),
+    }
+}
 pub use kladde_traits::{
     Allocator, Backend, Guard, Location, Persistable, RawPointer, ResolvedPointer, UniquePointer,
 };
 pub use kladde_traits::{
     BoolGuard, CharGuard, F32Guard, F64Guard, I16Guard, I32Guard, I64Guard, I8Guard, U16Guard,
     U32Guard, U64Guard, U8Guard,
+};
+
+// Schema/fingerprint surface (originally from `kladde-schema`, re-exported
+// through `kladde-traits`), so application code that builds or inspects a
+// type's schema needs only this crate.
+pub use kladde_traits::{
+    Field, Fingerprint, SchemaBuilder, TypeDescriptor, TypeRef, TypeTable, Variant, Version,
 };

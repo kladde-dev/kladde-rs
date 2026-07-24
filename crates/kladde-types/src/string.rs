@@ -163,6 +163,18 @@ impl Persistable for PersistedString {
     fn load<B: Backend>(backend: &B, location: Location) -> Self {
         PersistedString(PersistedVec::load(backend, location))
     }
+
+    fn describe(builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeRef {
+        builder.describe(std::any::TypeId::of::<Self>(), |_| {
+            kladde_traits::TypeDescriptor::Opaque {
+                library_name: "kladde-types".into(),
+                type_name: "PersistedString".into(),
+                version: crate::library_version(),
+                inline_size: 8,
+                parameters: vec![],
+            }
+        })
+    }
 }
 
 /// `B` defaults to [`kladde::DefaultBackend`](../../kladde/struct.DefaultBackend.html)

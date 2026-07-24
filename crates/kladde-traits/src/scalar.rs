@@ -12,14 +12,16 @@
 //! `kladde-traits`' point of view the trait is local, so it's allowed.
 //! `kladde-types` re-exports these names for convenience.
 
-use crate::{Backend, Guard, Location, Persistable};
+use crate::{Backend, Guard, Location, Persistable, SchemaBuilder};
+use kladde_schema::{TypeDescriptor, TypeRef};
+use std::any::TypeId;
 
 /// Numeric scalars all have native `to_le_bytes`/`from_le_bytes` with a
 /// fixed-width array, so one macro covers them; `bool`/`char` don't fit
 /// that shape and are implemented by hand below. `String` doesn't
 /// implement `Persistable` at all -- see the note further down.
 macro_rules! impl_persistable_numeric_scalar {
-    ($ty:ty, $guard:ident) => {
+    ($ty:ty, $guard:ident, $code:expr) => {
         #[doc = concat!("The `Guard` for `", stringify!($ty), "`.")]
         pub struct $guard<'s, B> {
             inner: &'s mut $ty,
@@ -94,26 +96,30 @@ macro_rules! impl_persistable_numeric_scalar {
                     backend.read(location.anchor, location.offset, Self::INLINE_SIZE as u32);
                 Self::from_le_bytes(bytes.try_into().unwrap())
             }
+
+            fn describe(builder: &mut SchemaBuilder) -> TypeRef {
+                builder.describe(TypeId::of::<Self>(), |_| TypeDescriptor::Primitive($code))
+            }
         }
     };
 }
 
-impl_persistable_numeric_scalar!(i8, I8Guard);
-impl_persistable_numeric_scalar!(i16, I16Guard);
-impl_persistable_numeric_scalar!(i32, I32Guard);
-impl_persistable_numeric_scalar!(i64, I64Guard);
-impl_persistable_numeric_scalar!(u8, U8Guard);
-impl_persistable_numeric_scalar!(u16, U16Guard);
-impl_persistable_numeric_scalar!(u32, U32Guard);
-impl_persistable_numeric_scalar!(u64, U64Guard);
-impl_persistable_numeric_scalar!(f32, F32Guard);
-impl_persistable_numeric_scalar!(f64, F64Guard);
+impl_persistable_numeric_scalar!(u8, U8Guard, 0);
+impl_persistable_numeric_scalar!(u16, U16Guard, 1);
+impl_persistable_numeric_scalar!(u32, U32Guard, 2);
+impl_persistable_numeric_scalar!(u64, U64Guard, 3);
+impl_persistable_numeric_scalar!(i8, I8Guard, 4);
+impl_persistable_numeric_scalar!(i16, I16Guard, 5);
+impl_persistable_numeric_scalar!(i32, I32Guard, 6);
+impl_persistable_numeric_scalar!(i64, I64Guard, 7);
+impl_persistable_numeric_scalar!(f32, F32Guard, 8);
+impl_persistable_numeric_scalar!(f64, F64Guard, 9);
 
 /// `bool` and `char` don't have `to_le_bytes`/`from_le_bytes`, so they're
 /// encoded by hand (as one byte, and as `u32`, respectively) rather than
 /// going through the numeric macro above.
 macro_rules! impl_persistable_scalar_via {
-    ($ty:ty, $guard:ident, $repr:ty, $to_repr:expr, $from_repr:expr) => {
+    ($ty:ty, $guard:ident, $repr:ty, $to_repr:expr, $from_repr:expr, $code:expr) => {
         #[doc = concat!("The `Guard` for `", stringify!($ty), "`.")]
         pub struct $guard<'s, B> {
             inner: &'s mut $ty,
@@ -190,14 +196,23 @@ macro_rules! impl_persistable_scalar_via {
                 let repr = <$repr>::from_le_bytes(bytes.try_into().unwrap());
                 from_repr(repr)
             }
+
+            fn describe(builder: &mut SchemaBuilder) -> TypeRef {
+                builder.describe(TypeId::of::<Self>(), |_| TypeDescriptor::Primitive($code))
+            }
         }
     };
 }
 
-impl_persistable_scalar_via!(bool, BoolGuard, u8, |v| v as u8, |b| b != 0);
-impl_persistable_scalar_via!(char, CharGuard, u32, |v| v as u32, |b| {
-    char::from_u32(b).expect("corrupt persisted char")
-});
+impl_persistable_scalar_via!(bool, BoolGuard, u8, |v| v as u8, |b| b != 0, 10);
+impl_persistable_scalar_via!(
+    char,
+    CharGuard,
+    u32,
+    |v| v as u32,
+    |b| { char::from_u32(b).expect("corrupt persisted char") },
+    11
+);
 
 // `String` deliberately does *not* implement `Persistable`: it's a
 // foreign, `std`-defined type with no room for a persistent `pointer`

@@ -150,6 +150,29 @@ where
             },
         }
     }
+
+    // `T` here is a foreign, `serde`-serialized type that is *not* itself
+    // `Persistable`, so its inner structure cannot be described -- a
+    // `Persisted<T>` is genuinely an opaque `postcard` blob behind an 8-byte
+    // header. That means every `Persisted<_>` shares one fingerprint,
+    // regardless of `T`; the schema cannot tell `Persisted<Foo>` from
+    // `Persisted<Bar>`. This is a known limitation of the `serde` escape
+    // hatch (and a reason to prefer a real `Persistable` type where the
+    // distinction matters).
+    fn describe(builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeRef
+    where
+        Self: 'static,
+    {
+        builder.describe(std::any::TypeId::of::<Self>(), |_| {
+            kladde_traits::TypeDescriptor::Opaque {
+                library_name: "kladde-types".into(),
+                type_name: "Persisted".into(),
+                version: crate::library_version(),
+                inline_size: 8,
+                parameters: vec![],
+            }
+        })
+    }
 }
 
 /// `B` defaults to [`kladde::DefaultBackend`](../../kladde/struct.DefaultBackend.html)

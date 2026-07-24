@@ -209,6 +209,24 @@ where
             pointer,
         }
     }
+
+    fn describe(builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeRef
+    where
+        Self: 'static,
+    {
+        builder.describe(std::any::TypeId::of::<Self>(), |b| {
+            kladde_traits::TypeDescriptor::Opaque {
+                library_name: "kladde-types".into(),
+                type_name: "PersistedHashMap".into(),
+                version: crate::library_version(),
+                inline_size: 8,
+                parameters: vec![
+                    <K as Persistable>::describe(b),
+                    <V as Persistable>::describe(b),
+                ],
+            }
+        })
+    }
 }
 
 fn entry_size<K: Persistable, V: Persistable>() -> usize {
@@ -551,6 +569,12 @@ mod tests {
 
         fn load<B: Backend>(backend: &B, location: Location) -> Self {
             NonCloneKey(i32::load(backend, location))
+        }
+
+        fn describe(builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeRef {
+            // Same representation as `i32`; a test fixture needn't have its
+            // own descriptor.
+            <i32 as Persistable>::describe(builder)
         }
     }
 

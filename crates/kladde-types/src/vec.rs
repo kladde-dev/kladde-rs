@@ -193,6 +193,21 @@ impl<T: Persistable> Persistable for PersistedVec<T> {
         }
         PersistedVec { data, pointer }
     }
+
+    fn describe(builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeRef
+    where
+        Self: 'static,
+    {
+        builder.describe(std::any::TypeId::of::<Self>(), |b| {
+            kladde_traits::TypeDescriptor::Opaque {
+                library_name: "kladde-types".into(),
+                type_name: "PersistedVec".into(),
+                version: crate::library_version(),
+                inline_size: 8,
+                parameters: vec![<T as Persistable>::describe(b)],
+            }
+        })
+    }
 }
 
 /// `B` defaults to [`kladde::DefaultBackend`](../../kladde/struct.DefaultBackend.html)

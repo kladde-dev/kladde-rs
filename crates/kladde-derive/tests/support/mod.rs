@@ -47,6 +47,12 @@ impl Persistable for Number {
         let bytes = backend.read(location.anchor, location.offset, 4);
         Number(i32::from_le_bytes(bytes.try_into().unwrap()))
     }
+
+    fn describe(builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeRef {
+        builder.describe(std::any::TypeId::of::<Self>(), |_| {
+            kladde_traits::TypeDescriptor::Primitive(6)
+        })
+    }
 }
 
 pub struct NumberGuard<'s, B> {

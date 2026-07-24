@@ -247,6 +247,28 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::To
                     )*
                 }
             }
+
+            fn describe(
+                builder: &mut ::kladde_traits::SchemaBuilder,
+            ) -> ::kladde_traits::TypeRef {
+                builder.describe(::std::any::TypeId::of::<Self>(), |__builder| {
+                    ::kladde_traits::TypeDescriptor::Struct {
+                        name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
+                        fields: ::std::vec![
+                            #(
+                                ::kladde_traits::Field {
+                                    name: ::std::string::ToString::to_string(
+                                        ::std::stringify!(#field_ident),
+                                    ),
+                                    ty: <#field_ty as ::kladde_traits::Persistable>::describe(
+                                        __builder,
+                                    ),
+                                },
+                            )*
+                        ],
+                    }
+                })
+            }
         }
     }
 }
@@ -321,18 +343,35 @@ fn derive_unit_like_struct(
             fn load<B: ::kladde_traits::Backend>(_backend: &B, _location: ::kladde_traits::Location) -> Self {
                 #ident
             }
+
+            fn describe(
+                builder: &mut ::kladde_traits::SchemaBuilder,
+            ) -> ::kladde_traits::TypeRef {
+                builder.describe(::std::any::TypeId::of::<Self>(), |_| {
+                    ::kladde_traits::TypeDescriptor::Struct {
+                        name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
+                        fields: ::std::vec![],
+                    }
+                })
+            }
         }
     }
 }
 
-/// Inline layout: a 4-byte discriminant (this macro's own, assigned in
-/// declaration order -- unrelated to any `#[repr]`/explicit discriminant
-/// on the source enum) followed by whichever variant's own fields, laid
-/// out exactly like a struct's (see `field_offsets`/`total_size`) but
-/// based at offset 4 instead of 0. Sized to fit the *largest* variant,
-/// since the same bytes have to be able to hold any of them -- unused
-/// tail bytes for a smaller variant are simply never read, the same way
-/// a `union`'s would be.
+/// Inline layout: a 4-byte discriminant followed by whichever variant's
+/// own fields, laid out exactly like a struct's (see
+/// `field_offsets`/`total_size`) but based at offset 4 instead of 0. Sized
+/// to fit the *largest* variant, since the same bytes have to be able to
+/// hold any of them -- unused tail bytes for a smaller variant are simply
+/// never read, the same way a `union`'s would be.
+///
+/// The discriminant value follows Rust's own rule: the explicit value where
+/// the author wrote one (`A = 42`), otherwise `predecessor + 1`. So the
+/// value stored on disk (and reported in the schema) equals the enum's real
+/// Rust discriminant, an author's pinned values stay stable, and uniqueness
+/// is inherited from Rust's own discriminant check -- a colliding enum never
+/// compiles. `store`, `load`, and `describe` all read it from one generated
+/// `const` chain.
 ///
 /// Supports unit, tuple (`Fields::Unnamed`), and named-field variants,
 /// all in the same enum. Positional (tuple) fields get synthetic
@@ -352,7 +391,37 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenS
     }
 
     let variant_ident: Vec<_> = data.variants.iter().map(|v| v.ident.clone()).collect();
-    let discriminant: Vec<u32> = (0..data.variants.len() as u32).collect();
+    let variant_count = data.variants.len();
+    let variant_index: Vec<usize> = (0..variant_count).collect();
+
+    // Per-variant discriminant, emitted as a `const` chain: the explicit
+    // Rust discriminant where the author wrote one, otherwise
+    // `predecessor + 1` (Rust's own rule, so the values coincide with the
+    // enum's real discriminants and inherit its uniqueness check). Reused
+    // verbatim by `store`, `load`, and `describe`.
+    let disc_assign: Vec<proc_macro2::TokenStream> = data
+        .variants
+        .iter()
+        .enumerate()
+        .map(|(i, variant)| {
+            let value = if let Some((_, expr)) = &variant.discriminant {
+                quote! { (#expr) as u32 }
+            } else if i == 0 {
+                quote! { 0u32 }
+            } else {
+                let prev = i - 1;
+                quote! { d[#prev] + 1 }
+            };
+            quote! { d[#i] = #value; }
+        })
+        .collect();
+    let discriminants = quote! {
+        const DISC: [u32; #variant_count] = {
+            let mut d = [0u32; #variant_count];
+            #(#disc_assign)*
+            d
+        };
+    };
 
     // Each variant's own field types (for its own offset/size
     // computation) and the binding names generated code uses to refer to
@@ -386,6 +455,23 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenS
     let variant_size: Vec<proc_macro2::TokenStream> =
         variant_field_ty.iter().map(|tys| total_size(tys)).collect();
 
+    // The *schema* field names (as opposed to the match-binding idents):
+    // a named variant's field idents, a tuple variant's decimal positions,
+    // none for a unit variant.
+    let variant_field_name: Vec<Vec<String>> = data
+        .variants
+        .iter()
+        .map(|variant| match &variant.fields {
+            Fields::Named(f) => f
+                .named
+                .iter()
+                .map(|f| f.ident.as_ref().unwrap().to_string())
+                .collect(),
+            Fields::Unnamed(f) => (0..f.unnamed.len()).map(|i| i.to_string()).collect(),
+            Fields::Unit => Vec::new(),
+        })
+        .collect();
+
     // A match pattern binding a variant's own fields (if any) -- shared
     // by `store` (matched against `&mut Self`, so bindings come out as
     // `&mut FieldTy` via match ergonomics) and, negated, doesn't apply to
@@ -415,14 +501,13 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenS
             let pattern = &variant_pattern[i];
             let bindings = &variant_binding[i];
             let field_offset = &variant_field_offset[i];
-            let disc = discriminant[i];
             quote! {
                 #pattern => {
                     ::kladde_traits::Allocator::write(
                         backend,
                         location.anchor,
                         location.offset,
-                        &(#disc as u32).to_le_bytes(),
+                        &DISC[#i].to_le_bytes(),
                     );
                     #(
                         ::kladde_traits::Persistable::store(
@@ -478,6 +563,32 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenS
                     )
                 },
                 Fields::Unit => quote! { #ident::#v_ident },
+            }
+        })
+        .collect();
+
+    // Each variant's `Vec<Field>` expression for `describe`: a field's
+    // schema name paired with a recursive `describe` of its type.
+    let variant_describe: Vec<proc_macro2::TokenStream> = (0..variant_count)
+        .map(|i| {
+            let v_ident = &variant_ident[i];
+            let field_name = &variant_field_name[i];
+            let field_ty = &variant_field_ty[i];
+            quote! {
+                ::kladde_traits::Variant {
+                    discriminant: DISC[#i] as u64,
+                    name: ::std::string::ToString::to_string(::std::stringify!(#v_ident)),
+                    fields: ::std::vec![
+                        #(
+                            ::kladde_traits::Field {
+                                name: ::std::string::ToString::to_string(#field_name),
+                                ty: <#field_ty as ::kladde_traits::Persistable>::describe(
+                                    __builder,
+                                ),
+                            },
+                        )*
+                    ],
+                }
             }
         })
         .collect();
@@ -562,22 +673,41 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenS
             }
 
             fn store<B: ::kladde_traits::Backend>(&mut self, backend: &B, location: ::kladde_traits::Location) {
+                #discriminants
                 match self {
                     #(#variant_store_arm)*
                 }
             }
 
             fn load<B: ::kladde_traits::Backend>(backend: &B, location: ::kladde_traits::Location) -> Self {
+                #discriminants
                 let discriminant_bytes = ::kladde_traits::Allocator::read(backend, location.anchor, location.offset, 4);
                 let discriminant = u32::from_le_bytes(discriminant_bytes.try_into().unwrap());
-                match discriminant {
-                    #(#discriminant => #variant_load_expr,)*
-                    other => panic!(
-                        "corrupt persisted {}: unknown discriminant {}",
-                        stringify!(#ident),
-                        other,
-                    ),
-                }
+                #(
+                    if discriminant == DISC[#variant_index] {
+                        return #variant_load_expr;
+                    }
+                )*
+                panic!(
+                    "corrupt persisted {}: unknown discriminant {}",
+                    ::std::stringify!(#ident),
+                    discriminant,
+                );
+            }
+
+            fn describe(
+                builder: &mut ::kladde_traits::SchemaBuilder,
+            ) -> ::kladde_traits::TypeRef {
+                #discriminants
+                builder.describe(::std::any::TypeId::of::<Self>(), |__builder| {
+                    ::kladde_traits::TypeDescriptor::Enum {
+                        name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
+                        discriminant_width: 4,
+                        variants: ::std::vec![
+                            #(#variant_describe),*
+                        ],
+                    }
+                })
             }
         }
     }
