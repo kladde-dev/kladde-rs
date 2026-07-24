@@ -8,8 +8,8 @@ bit-identical fingerprints:
 
 1. the **type-descriptor model** — a language-neutral description of how a Kladde
    value type lays out and interprets its bytes;
-2. a canonical **byte serialization** of a table of type descriptors; and
-3. the computation of a **schema fingerprint** — a fixed-size, reproducible hash
+1. a canonical **byte serialization** of a table of type descriptors; and
+1. the computation of a **schema fingerprint** — a fixed-size, reproducible hash
    that identifies a type's representation.
 
 **Out of scope:** schema *resolution*, migration, compatibility policy, and where
@@ -35,30 +35,54 @@ only how descriptors are modeled, serialized, and fingerprinted.
 
 ## 2. The descriptor model
 
-A descriptor is one of four **kinds**: Primitive, Struct, Enum, or Opaque.
+A descriptor is one of four **kinds** — Primitive, Struct, Enum, or Opaque — plus
+**Array**, a fifth kind reserved for a future revision (§2.5).
 
 ### 2.1 Primitive
 
 A fixed-width scalar with a fixed byte encoding, identified by a **primitive
 code**:
 
-| code | type | width (bytes) | encoding |
-|---|---|---|---|
-| 0  | `u8`   | 1 | little-endian |
-| 1  | `u16`  | 2 | little-endian |
-| 2  | `u32`  | 4 | little-endian |
-| 3  | `u64`  | 8 | little-endian |
-| 4  | `i8`   | 1 | little-endian two's-complement |
-| 5  | `i16`  | 2 | little-endian two's-complement |
-| 6  | `i32`  | 4 | little-endian two's-complement |
-| 7  | `i64`  | 8 | little-endian two's-complement |
-| 8  | `f32`  | 4 | little-endian IEEE-754 |
-| 9  | `f64`  | 8 | little-endian IEEE-754 |
-| 10 | `bool` | 1 | `0x00` = false, `0x01` = true |
-| 11 | `char` | 4 | little-endian Unicode scalar value (`u32`) |
+| code | type   | width (bytes) | encoding                                   |
+| ---- | ------ | ------------- | ------------------------------------------ |
+| 0    | `u8`   | 1             | little-endian                              |
+| 1    | `u16`  | 2             | little-endian                              |
+| 2    | `u32`  | 4             | little-endian                              |
+| 3    | `u64`  | 8             | little-endian                              |
+| 4    | `i8`   | 1             | little-endian two's-complement             |
+| 5    | `i16`  | 2             | little-endian two's-complement             |
+| 6    | `i32`  | 4             | little-endian two's-complement             |
+| 7    | `i64`  | 8             | little-endian two's-complement             |
+| 8    | `f32`  | 4             | little-endian IEEE-754                     |
+| 9    | `f64`  | 8             | little-endian IEEE-754                     |
+| 10   | `bool` | 1             | `0x00` = false, `0x01` = true              |
+| 11   | `char` | 4             | little-endian Unicode scalar value (`u32`) |
 
-The set is extensible: future revisions may append new codes. A Primitive's inline
-width is fixed by its code.
+The primitive **code** doubles as the descriptor's kind-tag byte: codes `0..=127`
+are reserved for primitives (§3.2), so a Primitive descriptor is a *single byte*
+with no further content. A Primitive's inline width is fixed by its code. The set
+is extensible — future revisions may append codes within `0..=127`.
+
+#### 2.1.1 Reserved primitive codes (not yet implemented)
+
+The following codes are reserved for primitives that no `Persistable` type uses
+yet. Their encoding is fixed here so that later additions cannot conflict, but an
+implementation need not accept them until a corresponding type exists and can be
+tested.
+
+| code | type   | width (bytes) | encoding                        |
+| ---- | ------ | ------------- | ------------------------------- |
+| 12   | `u128` | 16            | little-endian                   |
+| 13   | `i128` | 16            | little-endian two's-complement  |
+| 14   | `f16`  | 2             | little-endian IEEE-754 binary16 |
+| 15   | `bf16` | 2             | little-endian bfloat16          |
+
+Codes `16..=23` are reserved for the sub-byte integers whose **bit** width is not a
+power of two, up to 7 bits — `u3`, `u5`, `u6`, `u7` (codes 16–19) and `i3`, `i5`,
+`i6`, `i7` (codes 20–23). These target tight packing of small, range-limited values
+(for example enum discriminants). Their exact storage — whether a lone value
+occupies a whole byte or several pack into one — is deferred to the revision that
+implements them; only the code assignments are reserved here.
 
 ### 2.2 Struct
 
@@ -94,7 +118,8 @@ black box identified nominally. Used for types with hand-written representations
 (for example, length-prefixed blobs, externally-serialized payloads, or built-in
 container types whose layout is not a plain field sum). Carries:
 
-- `crate_name`: UTF-8 string;
+- `library_name`: UTF-8 string — the name of the library (package, module, …) that
+  defines the type. (Language-neutral: not necessarily a Rust crate.)
 - `type_name`: UTF-8 string;
 - `version`: a triple `(major, minor, patch)`;
 - `inline_size`: the fixed number of bytes the type occupies **inline** — required
@@ -105,15 +130,41 @@ container types whose layout is not a plain field sum). Carries:
   if any).
 
 Only the **compatibility component** of `version` participates in the fingerprint
-(§4.3): the leading nonzero component under the semantic-versioning convention —
-`major` when `major > 0`, otherwise `minor`. (Patch- and, above 0.x, minor-level
-changes are thereby treated as representation-compatible.)
+(§4.3). It has two parts, **both fingerprinted**:
 
-### 2.5 References and the root
+- a **stability flag** — `true` when `major > 0` (the `1.x`-and-up "stable" regime),
+  `false` when `major == 0` (the `0.x` "unstable" regime); and
+- the **leading nonzero component** — `major` when `major > 0`, otherwise `minor`.
 
-A **reference** is an index into the descriptor table. Every `type` field above is
-a reference. By convention the descriptor at **index 0 is the root** — the type
-actually stored.
+Both parts are necessary: without the stability flag, `0.1.z` and `1.y.z` would both
+reduce to the value `1` and collide, even though crossing `0.x` → `1.x` is a breaking
+change. (Patch-level changes, and minor-level changes above `0.x`, are thereby
+treated as representation-compatible.)
+
+### 2.5 Array (reserved for a future revision)
+
+A fixed-length, homogeneous sequence: `count` consecutive values of a single element
+type, laid out with no header and no discriminant (the byte layout of a
+source-language `[T; N]`). Carries:
+
+- `element`: a reference to the element type;
+- `count`: the fixed number of elements.
+
+An Array's inline width is `count × element.inline_size`.
+
+This kind is **reserved but not yet implemented**: no `Persistable` type produces one
+today, so its tag (`131`, §3.2), encoding, and fingerprint contribution are fixed
+here, but an implementation need not accept it until an array type exists and can be
+tested. An Array is *not* interchangeable with a Struct of `count` identically-typed
+positional fields: their byte layouts coincide, but they carry distinct kind tags and
+therefore distinct fingerprints. The kind exists precisely to avoid the descriptor-
+and fingerprint-blow-up of spelling out a large `count` as that many Struct fields.
+
+### 2.6 References and the root
+
+A **reference** is an index into the descriptor table. Every `type`, `element`, and
+parameter field above is a reference. By convention the descriptor at **index 0 is
+the root** — the type actually stored.
 
 ## 3. Canonical storage serialization
 
@@ -127,19 +178,24 @@ actually stored.
 
 ### 3.2 Descriptor encoding
 
-Each descriptor is a **kind tag** byte — `Primitive = 0`, `Struct = 1`,
-`Enum = 2`, `Opaque = 3` — followed by kind-specific content:
+Each descriptor begins with a single **kind-tag byte** whose value both selects the
+kind and partitions the tag space:
 
-- **Primitive**: `varint(primitive_code)`.
-- **Struct**: `string(name)`, `varint(field_count)`, then for each field
-  `string(field_name) reference(type)`.
-- **Enum**: `string(name)`, `byte(discriminant_width)`, `varint(variant_count)`,
-  then for each variant `varint(discriminant_value) string(variant_name)
-  varint(field_count)` then for each variant field `string(field_name)
-  reference(type)`.
-- **Opaque**: `string(crate_name) string(type_name) varint(major) varint(minor)
-  varint(patch) varint(inline_size) varint(param_count)` then for each parameter
-  `reference(type)`.
+- `0..=127` — a **Primitive**. The tag byte *is* the primitive code (§2.1); the
+  descriptor has **no further content**.
+- `128..=255` — a non-primitive kind, followed by kind-specific content:
+  - **Struct** (`128`): `string(name)`, `varint(field_count)`, then for each field
+    `string(field_name) reference(type)`.
+  - **Enum** (`129`): `string(name)`, `byte(discriminant_width)`,
+    `varint(variant_count)`, then for each variant `varint(discriminant_value)
+    string(variant_name) varint(field_count)` then for each variant field
+    `string(field_name) reference(type)`.
+  - **Opaque** (`130`): `string(library_name) string(type_name) varint(major)
+    varint(minor) varint(patch) varint(inline_size) varint(param_count)` then for
+    each parameter `reference(type)`.
+  - **Array** (`131`, reserved — §2.5): `reference(element) varint(count)`.
+
+Tags `132..=255` are unassigned, reserved for future kinds.
 
 ### 3.3 Table encoding
 
@@ -182,7 +238,8 @@ type**, encoded as in §4.5. The encoding deliberately:
   representation or the identities used to reconcile it;
 - **excludes** the `name` of Struct and Enum descriptors — a type's own name does
   not affect its byte layout, so renaming a type must not change its fingerprint;
-- reduces an Opaque `version` to its **compatibility component** (§2.4);
+- reduces an Opaque `version` to its **compatibility component** — the stability
+  flag plus the leading nonzero component (§2.4);
 - **excludes table indices entirely** — references are encoded structurally
   (§4.5), so the fingerprint is invariant under any renumbering or reordering of
   the descriptor table.
@@ -212,11 +269,14 @@ To compute the fingerprint of a node `N` — colored gray on entry at the curren
 `depth[N]` — build a byte string:
 
 1. `N`'s **kind tag** and **local scalar content**, encoded exactly as in §3.2,
-   **except** that a Struct/Enum `name` is omitted and an Opaque `version` triple
-   is replaced by `varint(compatibility_component)` (a single value); and with
-   **every reference replaced by a reference token** as defined next.
-2. For each outgoing reference to a child `C`, in canonical (§3.2) order, emit a
+   **except** that a Struct/Enum `name` is omitted and an Opaque `version` triple is
+   replaced by its compatibility component (§2.4) — `byte(stability_flag)
+   varint(leading_nonzero_component)`, where `stability_flag` is `1` if `major > 0`
+   else `0`; and with **every reference replaced by a reference token** as defined
+   next.
+1. For each outgoing reference to a child `C`, in canonical (§3.2) order, emit a
    **reference token**:
+
    - if `color[C]` is **white**: recursively compute `C`'s fingerprint (this
      colors `C` black and memoizes it); emit `byte(0x00)` followed by `C`'s 16-byte
      fingerprint.
@@ -296,7 +356,7 @@ hash:
    behavior. With that in place, a mismatch yields wrong data, a clean "corrupt
    file" error, or a panic, not memory unsafety. This is required anyway, for
    truncated files and ordinary corruption.
-2. **The fingerprint provides no tamper protection.** A bare hash never does: an
+1. **The fingerprint provides no tamper protection.** A bare hash never does: an
    attacker who edits the schema or data can recompute it. Detecting *adversarial*
    modification requires a signature or MAC over the file, which is out of scope
    here; the fingerprint detects only *accidental* schema corruption.

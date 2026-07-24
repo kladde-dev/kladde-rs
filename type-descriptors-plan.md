@@ -96,8 +96,9 @@ Connect real types to Phase 1.
   an explicit id so *Idea 4*'s stable ids can replace it without touching this code).
 - Hand impls:
   - scalars → `Primitive` (matching the codes in spec §2.1);
-  - `PersistedVec<T>` → `Opaque { crate: "kladde-types", name: "PersistedVec",
-    inline_size: 8, parameters: [describe::<T>()] }`; likewise `PersistedHashMap<K,V>`
+  - `PersistedVec<T>` → `Opaque { library_name: "kladde-types", type_name:
+    "PersistedVec", inline_size: 8, parameters: [describe::<T>()] }`; likewise
+    `PersistedHashMap<K,V>`
     (params `[K, V]`), `Persisted<T>` (param `[T]`), `PersistedString` (no params) —
     all `inline_size: 8` (their `{target, len}` header). *Decision:* model the
     built-in containers as **Opaque** (nominal) for now; a *structural* descriptor for
