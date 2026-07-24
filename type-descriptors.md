@@ -69,7 +69,7 @@ The following codes are reserved for primitives that no `Persistable` type uses
 yet. Their encoding is fixed here so that later additions cannot conflict, but an
 implementation need not accept them until a corresponding type exists and can be
 tested. Codes 12–15 extend the standard set; codes 16–23 are the integers whose
-**byte** width is not a power of two, up to 7 bytes — each stored little-endian in
+byte width is not a power of two, up to 7 bytes — each stored little-endian in
 its full byte width (no packing).
 
 | code | type   | width (bytes) | encoding                        |
@@ -108,11 +108,16 @@ variant. Carries:
 - `name`: UTF-8 string, diagnostics only (not fingerprinted);
 - `discriminant_width`: the number of bytes the discriminant occupies (1, 2, 4,
   or 8);
-- `variants`: an ordered list, each
+- `variants`: a list — canonically ordered by ascending `discriminant_value`
+  (§3.2) — each
   `(discriminant_value: u64, variant_name: string, fields: [(field_name: string, type: reference)])`.
 
-Variant order, each `discriminant_value`, each `variant_name`, and each variant's
-field list are all significant.
+Each `discriminant_value`, each `variant_name`, and each variant's field list is
+significant. Variant *declaration* order is **not**: because a value's byte layout
+is selected by the stored discriminant (not by a variant's position), variants are
+canonicalized into ascending `discriminant_value` order, so reordering them in the
+source — without changing their discriminants — changes neither the representation
+nor the fingerprint.
 
 ### 2.4 Opaque
 
@@ -187,18 +192,35 @@ kind and partitions the tag space:
 - `0..=127` — a **Primitive**. The tag byte *is* the primitive code (§2.1); the
   descriptor has **no further content**.
 - `128..=255` — a non-primitive kind, followed by kind-specific content:
-  - **Struct** (`128`): `string(name)`, `varint(field_count)`, then for each field
-    `string(field_name) reference(type)`.
-  - **Enum** (`129`): `string(name)`, `byte(discriminant_width)`,
-    `varint(variant_count)`, then for each variant `varint(discriminant_value)
-    string(variant_name) varint(field_count)` then for each variant field
-    `string(field_name) reference(type)`.
-  - **Opaque** (`130`): `string(library_name) string(type_name) varint(major)
-    varint(minor) varint(patch) varint(inline_size) varint(param_count)` then for
-    each parameter `reference(type)`.
-  - **Array** (`131`, reserved — §2.5): `reference(element) varint(count)`.
+    - **Struct** (`128`): `string(name)`, `varint(field_count)`, then for each field
+      `string(field_name) reference(type)`.
+    - **Enum** (`129`): `string(name)`, `byte(discriminant_width)`,
+      `varint(variant_count)`, then each variant **in ascending `discriminant_value`
+      order** (see canonical order below) as `varint(discriminant_value)
+      string(variant_name) varint(field_count)` then for each variant field
+      `string(field_name) reference(type)`.
+    - **Opaque** (`130`): `string(library_name) string(type_name) varint(major)
+      varint(minor) varint(patch) varint(inline_size) varint(param_count)` then for
+      each parameter `reference(type)`.
+    - **Array** (`131`, reserved — §2.5): `reference(element) varint(count)`.
+    - **Pointer** (`132`, reserved): a kind tag reserved for a future revision; its
+      content and semantics are not yet defined.
 
-Tags `132..=255` are unassigned, reserved for future kinds.
+Tags `133..=255` are unassigned, reserved for future kinds.
+
+**Canonical order.** Within a descriptor, the order in which sub-elements are
+emitted is fixed, so the encoding (and the fingerprint of §4) is fully determined:
+
+- **Struct fields** are emitted in **declaration order**, which is their on-disk
+  layout order — a field's position determines its byte offset, so this order is
+  part of the type's representation and is never re-sorted.
+- **Enum variants** are emitted in **ascending `discriminant_value`** order. A
+  variant's position does *not* affect any value's layout (the stored discriminant
+  selects the variant), so declaration order is discarded in favor of this canonical
+  order; two enums that differ only in the source order of their variants encode and
+  fingerprint identically.
+- **Opaque parameters** and an **Array**'s element keep their given order (positional
+  type arguments).
 
 ### 3.3 Table encoding
 
