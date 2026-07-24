@@ -279,9 +279,12 @@ type graph from `R`, using the standard three-color marking:
 - **black** — fully visited (its fingerprint is known and memoized).
 
 Maintain: `color[·]` (all white initially), a stack-depth counter, `depth[·]` for
-gray nodes, and a **memo** mapping each black node to its `(fingerprint, cyclic)`
+gray nodes, and a **memo** mapping each black node to its `(fingerprint, cyclic flag)`
 pair. Memoization makes each node's hash input built exactly once, so the whole
-computation is **linear** in the size of the reachable graph.
+computation is **linear** in the size of the reachable graph. Each node's
+computation also **returns a lowlink minimum** used to decide its flag (§4.6); that
+minimum is a transient of the current traversal and is *not* memoized — only the
+`(fingerprint, flag)` pair is.
 
 The fingerprint of `R` is a pure function of `R`'s reachable subgraph; each
 computation begins from an all-white state. (An implementation *may* cache results
@@ -317,16 +320,37 @@ cleared.
 
 ### 4.6 Cyclic flag
 
-`N`'s **cyclic flag** is the logical OR of:
+The cyclic flag records whether `N` is **itself part of a cycle** — whether `N` can
+reach itself in the type graph. It is computed by a Tarjan-style **lowlink** that
+runs alongside the traversal, over absolute stack depths.
 
-- `true` for every reference token that was a de Bruijn back-reference (§4.5, gray
-  case); and
-- the cyclic flag carried by every child fingerprint incorporated (§4.5, white and
-  black cases).
+While building `N`'s hash input (§4.5), track a running minimum `m` — the shallowest
+absolute depth `N`'s subtree reaches back to — as the minimum of:
 
-Equivalently, the flag is set iff **any cycle occurs anywhere in `N`'s reachable
-subgraph.** `N`'s fingerprint packs `N`'s 127-bit hash with this flag in the top
-bit. Record `(fingerprint, cyclic)` in the memo and color `N` black.
+- `depth[C]` for **every de Bruijn back-reference** `N` emits (§4.5, gray case); and
+- the minimum `m` **returned by each recursive child computation** (§4.5, white
+  case).
+
+A reference to a **black** child (§4.5, black case — a memo hit) contributes
+**nothing** to `m`. This is sound, not a shortcut: a completed node lies in a
+finished strongly-connected component and cannot close a cycle through `N` (were they
+in one cycle they would share an SCC, and the node could not be black while `N` is
+still gray). Every cycle is first traversed through *white* recursion hitting a *gray*
+back-edge, so no cycle's evidence is ever hidden behind a memo hit. If `N` has no
+contributions, `m = +∞`.
+
+`N`'s cyclic flag is set iff **`m ≤ depth[N]`** — i.e. `N`'s subtree reaches back to
+`N` itself or to an ancestor of `N`. `N`'s fingerprint packs `N`'s 127-bit hash with
+this flag in the top bit; record `(fingerprint, flag)` in the memo, color `N` black,
+and **return `m`** to the caller (which folds it into its own running minimum).
+
+The flag is therefore an **exact** property of `N`: set precisely when `N` belongs to
+a nontrivial strongly-connected component (or references itself), and clear for every
+type that is not itself recursive — **including a type that merely *contains* a
+recursive type** without being reachable from it (see example (d) in §5). Because the
+flag is intrinsic to the node's position in the type graph — not to the traversal's
+entry point — it is safe to memoize and reuse; the running minimum `m`, an absolute
+stack coordinate meaningful only within one computation, must never be.
 
 ### 4.7 Equality semantics
 
@@ -336,13 +360,19 @@ bit. Record `(fingerprint, cyclic)` in the memo and color `N` black.
   have **structurally identical representations in every context**. Such a
   fingerprint is a **context-free identity**: it is valid for deduplication, for
   cross-file comparison, and as a cache key, wherever the type appears.
-- If the cyclic flag is **set**, the fingerprint is a sound identity **only for the
-  whole start type it was computed from** — e.g., two independently-computed
-  fingerprints of the same recursive root type are equal. It must **not** be used
-  to identify a *nested* type lifted out of a larger traversal, because a recursive
-  node's fingerprint depends on the traversal's entry point: a de Bruijn
-  back-reference encodes a position relative to the traversal, and the same
-  recursive node reached via a different entry unfolds to different bytes.
+- If the cyclic flag is **set** — which, per §4.6, happens exactly when the type is
+  *itself* part of a cycle — the fingerprint is a sound identity **only for the whole
+  start type it was computed from** — e.g., two independently-computed fingerprints of
+  the same recursive root type are equal. It must **not** be used to identify a
+  *nested* type lifted out of a larger traversal, because a recursive node's
+  fingerprint depends on the traversal's entry point: a de Bruijn back-reference
+  encodes a position relative to the traversal, and the same recursive node reached
+  via a different entry unfolds to different bytes.
+
+Because the flag is set only for types that are *themselves* recursive (§4.6), the
+context-free case is as broad as it soundly can be: a type that merely *contains* a
+recursive type — but is not reachable from it — has a **clear** flag and thus a
+context-free identity, even though a cycle appears somewhere in its subgraph.
 
 ### 4.8 Determinism
 
@@ -406,17 +436,30 @@ fingerprint is a context-free identity.
 Hashing `List` colors `List` gray at depth 0, then serializes its two variants;
 inside `Cons` the second field references `List`, which is gray at depth 0. The
 current node emitting that edge is `List` itself (depth 0), so the token is
-`byte(0x01) varint(0)` — a self back-reference. The cyclic flag is **set**.
+`byte(0x01) varint(0)` — a self back-reference, contributing `depth = 0` to the
+running minimum. `m = 0 ≤ depth[List] = 0`, so the cyclic flag is **set**.
 `List`'s fingerprint is still a sound identity for `List` as a whole (recomputing
 it from `List` yields the same value), but the flag warns that it must not be
 reused to identify some nested recursive type reached from elsewhere.
 
 **(c) Mutual recursion.** `struct A { b: B }`, `struct B { a: A }`.
 Hashing `A` (depth 0) recurses into `B` (depth 1); `B`'s field references `A`,
-which is gray at depth 0, so `B` emits `byte(0x01) varint(1)`. `B`'s hash and
-flag (set) are memoized, then folded into `A`'s hash; `A`'s flag is set too.
-`hash(A)` and `hash(B)` differ (their kind/field content and the depth of the
-back-reference differ), correctly reflecting that `A` and `B` are different types.
+which is gray at depth 0, so `B` emits `byte(0x01) varint(1)` and returns `m = 0`.
+`B`'s hash and flag (`0 ≤ depth[B] = 1`, set) are memoized; `A` folds in `B`'s
+returned `m = 0`, and `0 ≤ depth[A] = 0`, so `A`'s flag is set too. `hash(A)` and
+`hash(B)` differ (their kind/field content and the depth of the back-reference
+differ), correctly reflecting that `A` and `B` are different types.
+
+**(d) Contains a cycle but is not part of one.** `struct A(B)`, `struct B(A)`,
+`struct C(A)`. `A` and `B` form a cycle; `C` merely references it. Hashing `C`
+(depth 0) recurses into `A` (depth 1) then `B` (depth 2); `B`'s reference to `A`
+is a gray back-reference to depth 1, so `B` returns `m = 1` and `A` returns
+`m = 1`. Both are flagged (`1 ≤ depth[B] = 2` and `1 ≤ depth[A] = 1`). `C` folds
+in `A`'s returned `m = 1`, but `1 ≤ depth[C] = 0` is **false**, so **`C`'s flag is
+clear**: nothing reaches back to `C`. `C`'s fingerprint is a context-free identity
+even though its subgraph contains a cycle — the back-reference inside the `A`/`B`
+cycle is a depth *internal* to `C`'s subtree, hence invariant to wherever `C`
+itself appears.
 
 ## 6. Conformance
 

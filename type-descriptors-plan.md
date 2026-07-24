@@ -18,7 +18,8 @@ From [`schema-evolution.md`](schema-evolution.md):
 - **Descriptor model** ≈ the `Type` enum of *Idea 1*, with the agreed refinements:
   `Manual` → **`Opaque`** and "descriptor = representation, not Rust type" (see the
   *Conclusions* → "Design decisions to lock in now"); field/variant identity **by
-  name** (*Idea 4*); and Opaque folds only the **major** version component (the
+  name** (*Idea 4*); and Opaque folds `version` to its **compatibility component** —
+  the stability flag plus the leading nonzero component (spec §2.4, refining the
   *Idea 2* note). The spec's §2 is the frozen form of this model.
 - **Fingerprint** = the memoized white/gray/black DFS with de Bruijn back-references
   and a **cyclic flag** — the scheme settled in the *Idea 2* discussion, specified
@@ -57,8 +58,10 @@ on `Persistable` yet.
   encoding, table framing). Round-trip tests.
 - `Fingerprint` (16 bytes; top bit = cyclic flag; §4.1) and the fingerprint
   algorithm, spec §4: white/gray/black DFS, memo of `(fingerprint, cyclic)`,
-  reference tokens (inline child fingerprint vs. de Bruijn back-reference), cyclic
-  flag propagation, SHA-256-truncated-to-128-bits with the top-bit-cleared packing.
+  reference tokens (inline child fingerprint vs. de Bruijn back-reference), the
+  lowlink-based cyclic flag (§4.6 — each call returns a min-depth; flag set iff
+  `m ≤ depth`; memo hits contribute nothing), SHA-256-truncated-to-128-bits with the
+  top-bit-cleared packing.
 - **Compile-time fingerprints (bonus, not a requirement).** The goal is to bake the
   root type's fingerprint into the binary so the load fast-path just compares it
   against the file's stored fingerprint. Keep the fingerprint logic **separable from
@@ -94,11 +97,18 @@ on `Persistable` yet.
   - **structural sensitivity** — reorder a struct's fields → different; add a field →
     different; change a primitive code → different; rename a *field* → different;
     rename a *struct/enum type* → **same** (name excluded, §4.3);
-  - **Opaque version folding** — patch/minor bump → same; major bump → different;
+  - **Opaque version folding** — above `0.x`: patch/minor bump → same, major bump →
+    different; within `0.x`: patch bump → same, minor bump → **different** (minor is
+    the leading component); and crossing `0.y → 1.0` → different (the stability flag,
+    §2.4);
   - **recursion** — a linked list, a tree, and mutual recursion each fingerprint
     stably, with the **cyclic flag set**; every acyclic graph has the flag **clear**;
-  - **flag-propagation soundness** — the two-referrer cycle (a non-cyclic parent that
-    reuses a memoized cyclic child) has its flag set;
+  - **flag precision (lowlink)** — a type that merely *contains* a cycle but is not
+    itself on one (example (d) in spec §5: `C → A`, `A ↔ B`) has its flag **clear**;
+    the same holds when the cyclic child is reached via a memo hit (a non-cyclic
+    parent referencing an already-black cyclic node); only types on a cycle are
+    flagged, and a DAG whose two referrers differ in cyclicity flags them
+    independently;
   - **golden vectors** — a handful of fixed descriptor tables mapped to fixed
     hexadecimal fingerprints, committed to lock the encoding and seed a future
     cross-language conformance suite (spec §6).
@@ -173,4 +183,6 @@ Connect real types to Phase 1.
   encoding drift and seeding cross-language conformance.
 - Property test: fingerprint invariant under descriptor-table renumbering/reordering.
 - Determinism: any type hashed twice from fresh state yields an identical fingerprint.
-- Cyclic-flag correctness on the recursion and two-referrer cases above.
+- Cyclic-flag correctness: set for types on a cycle, clear for a type that only
+  *contains* one (the lowlink precision case, incl. cyclic children reached via memo
+  hits).
