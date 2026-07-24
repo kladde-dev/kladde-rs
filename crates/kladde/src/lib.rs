@@ -15,6 +15,14 @@ use kladde_traits::{Allocator, Location, Persistable, RawPointer, ResolvedPointe
 use std::cell::{Cell, RefCell};
 use std::num::NonZeroU32;
 
+// The schema/fingerprint surface, so an application that depends on `kladde`
+// for its root value can inspect that root type's schema
+// (`T::schema()`/`T::fingerprint()`) without naming `kladde-schema` or
+// `kladde-traits` directly.
+pub use kladde_traits::{
+    Field, Fingerprint, SchemaBuilder, TypeDescriptor, TypeRef, TypeTable, Variant, Version,
+};
+
 /// The five microoperations `spec.md`'s journal ever records -- nothing
 /// type-specific, purely a byte-level effect on the allocator. `Alloc`'s
 /// `index` is decided (by `DefaultBackend::alloc`'s own counter) at the
