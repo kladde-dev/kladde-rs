@@ -59,6 +59,35 @@ on `Persistable` yet.
   algorithm, spec §4: white/gray/black DFS, memo of `(fingerprint, cyclic)`,
   reference tokens (inline child fingerprint vs. de Bruijn back-reference), cyclic
   flag propagation, SHA-256-truncated-to-128-bits with the top-bit-cleared packing.
+- **Compile-time fingerprints (bonus, not a requirement).** The goal is to bake the
+  root type's fingerprint into the binary so the load fast-path just compares it
+  against the file's stored fingerprint. Keep the fingerprint logic **separable from
+  the index table** — the table is only a *serialization* device (needed to write
+  cyclic graphs to disk as a flat array); fingerprinting is a pure recursive
+  traversal `fp(node, gray_stack) -> (hash, cyclic)` that needs no global table. Three
+  routes, in increasing order of what they unlock and cost:
+  - **Runtime, computed once (do this — meets the goal).** A `LazyLock<Fingerprint>`
+    (or compute-on-open) gives the binary's root fingerprint with no `const` anything
+    and works for *all* types, recursion included. It is a few SHA-256s over a tiny
+    graph, dwarfed by the file I/O — the compile-time win over this is negligible for
+    the fast-path use case.
+  - **`const FINGERPRINT` for acyclic types (feasible on stable, optional).** For an
+    acyclic type the spec's DFS collapses to a bottom-up fold
+    `FP = hash(kind, names, [child FPs…])`, which maps onto an associated const:
+    `const FINGERPRINT: Fingerprint = fp_struct(b"…", &[<FieldTy as Describe>::FINGERPRINT, …])`.
+    Referencing an associated *const* of a generic parameter is stable (unlike calling
+    a trait *method* in const), and the hasher is a free `const fn` (a const SHA-256 is
+    easy to write/vendor — one reason §4.2 pins SHA-256). No table, no const traits,
+    bit-identical to the runtime path on acyclic graphs. It cannot be emitted
+    unconditionally (a recursive type's `const FINGERPRINT` is a const-eval cycle
+    error), so it must be opt-in / acyclic-only.
+  - **Full `const` incl. recursive types (needs nightly).** A recursive fingerprint is
+    context-dependent (§4.7), so it can't be a bottom-up const fold; it needs the
+    stateful DFS run from the root. A `const fn` DFS over a flat `[TypeDescriptor; N]`
+    handles cycles via indices with fixed-size memo/stack and *no* trait dispatch —
+    but *generating* that array from a generic `T` needs `const_trait_impl` (to recurse
+    across field types) and const heap / const-generic sizing. Both unstable; revisit
+    when they land. (This — not the index representation — is the real blocker.)
 - Tests:
   - **reproducibility** — same graph hashed twice (fresh state) → identical;
   - **index-invariance** — renumber/reorder the descriptor table → same fingerprint;
