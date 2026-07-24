@@ -68,7 +68,9 @@ is extensible — future revisions may append codes within `0..=127`.
 The following codes are reserved for primitives that no `Persistable` type uses
 yet. Their encoding is fixed here so that later additions cannot conflict, but an
 implementation need not accept them until a corresponding type exists and can be
-tested.
+tested. Codes 12–15 extend the standard set; codes 16–23 are the integers whose
+**byte** width is not a power of two, up to 7 bytes — each stored little-endian in
+its full byte width (no packing).
 
 | code | type   | width (bytes) | encoding                        |
 | ---- | ------ | ------------- | ------------------------------- |
@@ -76,13 +78,14 @@ tested.
 | 13   | `i128` | 16            | little-endian two's-complement  |
 | 14   | `f16`  | 2             | little-endian IEEE-754 binary16 |
 | 15   | `bf16` | 2             | little-endian bfloat16          |
-
-Codes `16..=23` are reserved for the sub-byte integers whose **bit** width is not a
-power of two, up to 7 bits — `u3`, `u5`, `u6`, `u7` (codes 16–19) and `i3`, `i5`,
-`i6`, `i7` (codes 20–23). These target tight packing of small, range-limited values
-(for example enum discriminants). Their exact storage — whether a lone value
-occupies a whole byte or several pack into one — is deferred to the revision that
-implements them; only the code assignments are reserved here.
+| 16   | `u24`  | 3             | little-endian                   |
+| 17   | `u40`  | 5             | little-endian                   |
+| 18   | `u48`  | 6             | little-endian                   |
+| 19   | `u56`  | 7             | little-endian                   |
+| 20   | `i24`  | 3             | little-endian two's-complement  |
+| 21   | `i40`  | 5             | little-endian two's-complement  |
+| 22   | `i48`  | 6             | little-endian two's-complement  |
+| 23   | `i56`  | 7             | little-endian two's-complement  |
 
 ### 2.2 Struct
 
