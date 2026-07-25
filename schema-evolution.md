@@ -398,6 +398,80 @@ data at open" (which segments exist to avoid) for "hold all schema metadata at o
 table is very likely the same mechanism as the file-level semantic-versioning slot and "type
 registry" `spec.md` defers — unify them.
 
+#### Capsules cut the fingerprint graph — erasure, and why fingerprinting stays cheap
+
+A capsule doesn't just *carry* its own schema; it **erases its inner type from every fingerprint
+computed outside it.** When the enclosing type's schema is fingerprinted (`type-descriptors.md`
+§4), the traversal treats a `Capsule<T>` as an opaque boundary and does **not** descend into `T`
+— it emits "a capsule sits here" (the capsule's table id/hash), not `T`'s structure. So the
+enclosing (**outer**) fingerprint is *independent of `T`'s internals*, and the two versioning axes
+decouple cleanly:
+
+- the **outer** structure — does `Root` still hold `PersistedVec<Capsule<_>>` in that shape? — is
+  tracked by the outer fingerprint;
+- each capsule's **inner** type is tracked by its own fingerprint in the schema table.
+
+Change `T` deep inside and the outer fingerprint doesn't move — only `T`'s table entry does. Add a
+field to `Root` and the outer fingerprint moves but the capsules' don't. This is what lets you
+detect a changed capsule *locally*, by comparing table fingerprints, instead of noticing only that
+some global root fingerprint changed and not knowing where.
+
+Erasure is also what keeps fingerprinting **linear**. Under the de Bruijn scheme
+(`type-descriptors.md` §4.7) a *nested* type's fingerprint is entry-relative — only a type
+fingerprinted **as its own root** ("canonical") is a context-free, collision-free identity.
+Producing a canonical fingerprint for *every* node would be superlinear (rooting a traversal at
+each member of a strongly-connected component is quadratic in the SCC's size). But you never need
+every node's canonical fingerprint — only the ones referenced *across* a boundary, i.e. the **entry
+points**, and **capsule boundaries are exactly those entry points**, declared by the application.
+So the rule is:
+
+- fingerprint the **root** as one canonical traversal that *stops* at each capsule (emitting the
+  capsule's table id/hash, not the inner type); and
+- fingerprint **each capsule type** as its own canonical root, likewise stopping at any nested
+  capsules (reusing their already-computed fingerprints).
+
+Each is one linear traversal of the region *between* boundaries, so the whole file's schema
+fingerprints in `O(total schema size)` whenever capsules partition it — no all-node SCC
+canonicalization ever runs. (A cycle threaded *through* two capsule boundaries would place them in
+one SCC and need de Bruijn between them, but nested capsules normally form a DAG.) Until capsules
+exist, the fingerprint code stays whole-root (which is already canonical and sound for whole-type
+comparison); per-boundary canonicalization is added only when `Capsule<T>` lands.
+
+#### Worked example: detecting a changed capsule in `PersistedVec<Capsule<T>>`
+
+Take `struct Root { items: PersistedVec<Capsule<T>> }` with `T = struct { a: i32, b:
+PersistedString }`. On disk:
+
+- the resident **schema table** holds, deduplicated, `(id → serialized descriptor + canonical
+  fingerprint)` — e.g. `0 → FP_outer` (`Root` with the capsule erased), `1 → FP_T_v1` (`T` as
+  written), and, *only if the file was partly migrated before*, `2 → FP_T_v2`;
+- the vec holds N capsule *instances*; each stores a data pointer plus a small **`schema_id`**
+  (`1` or `2`) in its header. A homogeneous, never-migrated file has every element → `1`; a
+  partly-migrated file is mixed.
+
+The running binary's code now has `T` = v3. **On open:**
+
+1. Read the table's fingerprint array `[FP_outer, FP_T_v1, FP_T_v2]`.
+2. Compute the build's *expected* fingerprints — only two canonical roots: `FP_outer'` (its `Root`
+   shape) and `FP_T_v3` (its current `T`).
+3. Compare, `O(table size)`, 16 bytes each: `FP_outer' == FP_outer` → the vec/capsule scaffolding
+   reads natively; `FP_T_v3` matches neither `1` nor `2` → both are **stale** (stale set `{1, 2}`).
+   **No descriptor table was parsed.**
+4. If the stale set were empty → whole-file fast path, done. It isn't, so **which capsules?** Walk
+   the vec reading only each element's `schema_id` (a cheap integer, no schema parse) and test
+   membership in the stale set. All are stale here → all need migration; in a mixed file only the
+   `→1`/`→2` elements flag, any `→3` reads natively.
+5. **Resolve once per stale schema, not per instance** (the table rule above): parse `FP_T_v1` /
+   `FP_T_v2` once each to build the old→v3 read/migration plan, then rewrite each stale capsule
+   lazily (as its segment pages in), flipping its `schema_id → 3` and refcounting the old entries
+   down so they can be reclaimed.
+
+So the fast path is a scan of the table's fingerprint array; the only per-instance cost is an
+integer read and a set test; and full-schema parsing happens once per distinct stale version, never
+per element. That "iterate an array of fingerprint ids, don't compare full schemas" detection falls
+straight out of (a) erasure decoupling the outer fingerprint from inner schemas and (b) the
+deduplicated table keyed by canonical fingerprint.
+
 #### Representing capsules and segments in code
 
 Both are **wrapper types written directly at the field** — `Capsule<T>` and `Segment<T>`, the same
