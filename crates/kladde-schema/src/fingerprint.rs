@@ -59,6 +59,17 @@ impl TypeTable {
     pub fn fingerprint(&self) -> Fingerprint {
         Traversal::new(self).visit(self.root().0, 0).0
     }
+
+    /// Fingerprints of every node reached in a single traversal from the
+    /// root, indexed by descriptor position (`None` for unreachable nodes).
+    /// A test hook for asserting the cyclic flag of *nested* nodes, which
+    /// the root-only [`fingerprint`](TypeTable::fingerprint) cannot expose.
+    #[cfg(test)]
+    pub(crate) fn node_fingerprints(&self) -> Vec<Option<Fingerprint>> {
+        let mut traversal = Traversal::new(self);
+        traversal.visit(self.root().0, 0);
+        traversal.memo
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -218,6 +229,95 @@ mod tests {
 
     fn primitive(p: Primitive) -> TypeDescriptor {
         TypeDescriptor::Primitive(p)
+    }
+
+    fn field(name: &str, ty: usize) -> Field {
+        Field {
+            name: name.into(),
+            ty: TypeRef(ty),
+        }
+    }
+
+    fn strukt(name: &str, fields: Vec<Field>) -> TypeDescriptor {
+        TypeDescriptor::Struct {
+            name: name.into(),
+            fields,
+        }
+    }
+
+    /// `struct A { b: B }`, `struct B { a: A }` — a two-node cycle.
+    fn mutual_pair() -> TypeTable {
+        TypeTable::new(vec![
+            strukt("A", vec![field("b", 1)]),
+            strukt("B", vec![field("a", 0)]),
+        ])
+    }
+
+    /// `enum Rec { Stop, Go(Rec) }` — a self-recursive enum.
+    fn rec_enum() -> TypeTable {
+        TypeTable::new(vec![TypeDescriptor::Enum {
+            name: "Rec".into(),
+            discriminant_width: 4,
+            variants: vec![
+                Variant {
+                    discriminant: 0,
+                    name: "Stop".into(),
+                    fields: vec![],
+                },
+                Variant {
+                    discriminant: 1,
+                    name: "Go".into(),
+                    fields: vec![field("0", 0)],
+                },
+            ],
+        }])
+    }
+
+    /// An outer cycle — either a self-referential struct or a mutual
+    /// `A <-> B` pair — one of whose members also references a *non-trivial,
+    /// non-cyclic* inner subtree (`Inner { mid: Mid, count: i32 }`,
+    /// `Mid { a: i32, b: i32 }`). `inner_first` controls whether the cycle
+    /// member visits its inner-subtree field before or after its cycle
+    /// field. Returns the table plus the indices of the cycle nodes and of
+    /// the inner-subtree nodes.
+    fn outer_cycle_with_inner(
+        mutual: bool,
+        inner_first: bool,
+    ) -> (TypeTable, Vec<usize>, Vec<usize>) {
+        if mutual {
+            // 0:A, 1:B, 2:Inner, 3:Mid, 4:i32.
+            let cycle_field = field("b", 1);
+            let inner_field = field("inner", 2);
+            let a_fields = if inner_first {
+                vec![inner_field, cycle_field]
+            } else {
+                vec![cycle_field, inner_field]
+            };
+            let table = TypeTable::new(vec![
+                strukt("A", a_fields),
+                strukt("B", vec![field("a", 0)]),
+                strukt("Inner", vec![field("mid", 3), field("count", 4)]),
+                strukt("Mid", vec![field("a", 4), field("b", 4)]),
+                primitive(Primitive::I32),
+            ]);
+            (table, vec![0, 1], vec![2, 3])
+        } else {
+            // 0:Outer, 1:Inner, 2:Mid, 3:i32.
+            let cycle_field = field("next", 0);
+            let inner_field = field("inner", 1);
+            let outer_fields = if inner_first {
+                vec![inner_field, cycle_field]
+            } else {
+                vec![cycle_field, inner_field]
+            };
+            let table = TypeTable::new(vec![
+                strukt("Outer", outer_fields),
+                strukt("Inner", vec![field("mid", 2), field("count", 3)]),
+                strukt("Mid", vec![field("a", 3), field("b", 3)]),
+                primitive(Primitive::I32),
+            ]);
+            (table, vec![0], vec![1, 2])
+        }
     }
 
     /// `struct Point { x: i32, y: i32 }` (i32 = code 6).
@@ -441,24 +541,7 @@ mod tests {
     fn recursion_sets_the_flag() {
         assert!(list().fingerprint().is_cyclic());
         assert!(!point().fingerprint().is_cyclic());
-        // Mutual recursion: struct A { b: B }, struct B { a: A }.
-        let mutual = TypeTable::new(vec![
-            TypeDescriptor::Struct {
-                name: "A".into(),
-                fields: vec![Field {
-                    name: "b".into(),
-                    ty: TypeRef(1),
-                }],
-            },
-            TypeDescriptor::Struct {
-                name: "B".into(),
-                fields: vec![Field {
-                    name: "a".into(),
-                    ty: TypeRef(0),
-                }],
-            },
-        ]);
-        assert!(mutual.fingerprint().is_cyclic());
+        assert!(mutual_pair().fingerprint().is_cyclic());
     }
 
     #[test]
@@ -540,26 +623,78 @@ mod tests {
         ]);
         assert!(!table.fingerprint().is_cyclic());
         // The recursive Rec type on its own is cyclic.
-        let rec_only = TypeTable::new(vec![TypeDescriptor::Enum {
-            name: "Rec".into(),
-            discriminant_width: 4,
-            variants: vec![
-                Variant {
-                    discriminant: 0,
-                    name: "Stop".into(),
-                    fields: vec![],
-                },
-                Variant {
-                    discriminant: 1,
-                    name: "Go".into(),
-                    fields: vec![Field {
-                        name: "0".into(),
-                        ty: TypeRef(0),
-                    }],
-                },
-            ],
-        }]);
-        assert!(rec_only.fingerprint().is_cyclic());
+        assert!(rec_enum().fingerprint().is_cyclic());
+    }
+
+    #[test]
+    fn cyclic_outer_leaves_inner_subtree_noncyclic() {
+        // The dual of `contains_a_cycle_but_is_not_on_one`: an outer cycle
+        // that references a non-cyclic subtree must not contaminate that
+        // subtree's flag. Exercised across a 2x2 matrix -- self-referential
+        // vs. mutual outer cycle, cycle field visited first vs. inner
+        // subtree first -- since a lowlink bug could depend on either axis.
+        for mutual in [false, true] {
+            for inner_first in [false, true] {
+                let (table, cycle_nodes, inner_nodes) = outer_cycle_with_inner(mutual, inner_first);
+                let label = format!("mutual={mutual}, inner_first={inner_first}");
+                let fingerprints = table.node_fingerprints();
+
+                // The root is on the cycle, so it is flagged cyclic.
+                assert!(table.fingerprint().is_cyclic(), "{label}: root");
+                // Every node on the outer cycle is cyclic...
+                for &node in &cycle_nodes {
+                    assert!(
+                        fingerprints[node].unwrap().is_cyclic(),
+                        "{label}: cycle node {node} should be cyclic",
+                    );
+                }
+                // ...while every node of the inner non-cyclic subtree is not,
+                // even though it was discovered inside the cyclic traversal.
+                for &node in &inner_nodes {
+                    assert!(
+                        !fingerprints[node].unwrap().is_cyclic(),
+                        "{label}: inner node {node} should be non-cyclic",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn distinct_cyclic_structures_have_distinct_fingerprints() {
+        // A hash cannot *guarantee* injectivity, but distinct type graphs
+        // must not collide by construction (only by an astronomically
+        // unlikely hash collision). This guards against an encoding bug that
+        // fails to distinguish two different cyclic structures -- including
+        // ones differing only in the field order of a cycle member.
+        let (selfref_cycle_first, ..) = outer_cycle_with_inner(false, false);
+        let (selfref_inner_first, ..) = outer_cycle_with_inner(false, true);
+        let (mutual_cycle_first, ..) = outer_cycle_with_inner(true, false);
+        let (mutual_inner_first, ..) = outer_cycle_with_inner(true, true);
+        let structures = [
+            ("list", list()),
+            ("mutual_pair", mutual_pair()),
+            ("rec_enum", rec_enum()),
+            ("selfref_cycle_first", selfref_cycle_first),
+            ("selfref_inner_first", selfref_inner_first),
+            ("mutual_cycle_first", mutual_cycle_first),
+            ("mutual_inner_first", mutual_inner_first),
+        ];
+
+        // Every structure here is genuinely cyclic.
+        for (name, table) in &structures {
+            assert!(table.fingerprint().is_cyclic(), "{name} should be cyclic");
+        }
+        // ...and all of their fingerprints are pairwise distinct.
+        for (i, (name_i, table_i)) in structures.iter().enumerate() {
+            for (name_j, table_j) in &structures[i + 1..] {
+                assert_ne!(
+                    table_i.fingerprint(),
+                    table_j.fingerprint(),
+                    "{name_i} and {name_j} must not collide",
+                );
+            }
+        }
     }
 
     #[test]
