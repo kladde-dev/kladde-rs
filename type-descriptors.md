@@ -234,23 +234,20 @@ file-format specification and is out of scope here.
 
 ### 4.1 The fingerprint value
 
-A **fingerprint** is 128 bits (16 bytes). The **most-significant bit of byte 0** is
-the **cyclic flag**; the remaining 127 bits are the **hash**. Two fingerprints are
-equal iff all 128 bits are equal (flag included).
+A **fingerprint** is a 128-bit (16-byte) hash. Two fingerprints are equal iff all
+128 bits are equal. It carries no flags or reserved bits — every bit is hash output.
 
 ### 4.2 Hash function
 
-The hash is **SHA-256 truncated to its leading 128 bits** (the first 16 bytes of
-the digest, byte 0 first). Where a 127-bit hash is required, take those 16 bytes
-and clear the most-significant bit of byte 0; that bit position instead carries the
-cyclic flag (§4.6). The one-bit reduction is negligible.
+The hash is **SHA-256 truncated to its leading 128 bits** — the first 16 bytes of
+the digest, byte 0 first.
 
 SHA-256 is chosen for **exact cross-language reproducibility**: it is present in
 every mainstream language's standard library with universal test vectors, and
 "compute SHA-256, keep the first 16 bytes" is trivial to reimplement identically.
 128 bits gives an astronomically small accidental-collision probability for any
 realistic number of distinct schemas (birthday bound ≈ N²/2¹²⁸); cryptographic
-strength is deliberately *not* relied upon (see §4.9). A future format revision may
+strength is deliberately *not* relied upon (see §4.8). A future format revision may
 substitute another hash or width; the choice is a format-version property.
 
 ### 4.3 What is and isn't fingerprinted
@@ -272,24 +269,34 @@ type**, encoded as in §4.5. The encoding deliberately:
 ### 4.4 Traversal: white/gray/black DFS with memoization
 
 The fingerprint of a start type `R` is computed by a depth-first search over the
-type graph from `R`, using the standard three-color marking:
+type graph from `R`, using the standard three-color marking of **nodes**:
 
 - **white** — not yet visited;
 - **gray** — on the current DFS stack (its fingerprint is in progress);
 - **black** — fully visited (its fingerprint is known and memoized).
 
 Maintain: `color[·]` (all white initially), a stack-depth counter, `depth[·]` for
-gray nodes, and a **memo** mapping each black node to its `(fingerprint, cyclic flag)`
-pair. Memoization makes each node's hash input built exactly once, so the whole
-computation is **linear** in the size of the reachable graph. Each node's
-computation also **returns a lowlink minimum** used to decide its flag (§4.6); that
-minimum is a transient of the current traversal and is *not* memoized — only the
-`(fingerprint, flag)` pair is.
+gray nodes, and a **memo** mapping each black node to its fingerprint. Memoization
+makes each node's hash input built exactly once, so the whole computation is
+**linear** in the size of the reachable graph. The fingerprint of `R` is a pure
+function of `R`'s reachable subgraph; each computation begins from an all-white
+state.
 
-The fingerprint of `R` is a pure function of `R`'s reachable subgraph; each
-computation begins from an all-white state. (An implementation *may* cache results
-across different start types, but only for results whose cyclic flag is clear —
-see §4.7.)
+**What this does, in one picture.** Classify each *edge* by the color of the node it
+points to when it is first followed. The **white** edges (to not-yet-visited nodes)
+form a spanning tree of the subgraph reachable from `R`. The **gray** edges (to a
+node still on the stack) are exactly the back-edges: each points to the current node
+itself or to one of its ancestors in that spanning tree. Removing them leaves the white plus
+**black** edges (black = to an already-finished node), which form a DAG. The
+fingerprint **merkle-hashes that DAG** — each node's hash is built from its
+children's hashes, and a black edge simply reuses the child's already-computed hash,
+so a subtree reached more than once is hashed only once — while each gray back-edge
+is encoded not by a hash (which would recurse forever) but by a small integer, its
+**de Bruijn index**: how many levels up the tree it points, `0` meaning the node
+itself (§4.5). That relative encoding is what lets a cyclic graph be hashed as if it
+were a finite tree, and — because neither the merkle hashes nor the de Bruijn
+integers mention table positions — what makes the fingerprint independent of how the
+descriptor table is numbered, ordered, or shared/deduplicated.
 
 ### 4.5 Per-node hash input
 
@@ -315,73 +322,49 @@ To compute the fingerprint of a node `N` — colored gray on entry at the curren
      number of stack levels from `N` up to the in-progress ancestor `C` (`0`
      denotes `N` itself). Absolute depths never appear; only this difference does.
 
-`N`'s **hash** is the leading 128 bits of the SHA-256 of this byte string, top bit
-cleared.
+`N`'s **fingerprint** is the leading 128 bits of the SHA-256 of this byte string.
+Record it in the memo and color `N` black.
 
-### 4.6 Cyclic flag
+### 4.6 Identity semantics
 
-The cyclic flag records whether `N` is **itself part of a cycle** — whether `N` can
-reach itself in the type graph. It is computed by a Tarjan-style **lowlink** that
-runs alongside the traversal, over absolute stack depths.
+A fingerprint is always computed for a **start type, rooted at itself** (§4.4, from
+an all-white state). Read that way it is a clean identity:
 
-While building `N`'s hash input (§4.5), track a running minimum `m` — the shallowest
-absolute depth `N`'s subtree reaches back to — as the minimum of:
+- **A root fingerprint identifies its whole type.** Two independent computations of
+  the same start type yield the same fingerprint, and two structurally different
+  start types yield different fingerprints (up to the 128-bit hash's collision
+  resistance, §4.8). It is invariant to how the descriptor table is numbered,
+  ordered, or shared (§4.4), so it is safe to compare across files and
+  implementations. This — comparing whole types by their root fingerprint — is the
+  intended use.
 
-- `depth[C]` for **every de Bruijn back-reference** `N` emits (§4.5, gray case); and
-- the minimum `m` **returned by each recursive child computation** (§4.5, white
-  case).
+A fingerprint is **not** an identity for a type as it sits *nested inside another
+type's* traversal. Two things go wrong if you lift such a nested value out and reuse
+it:
 
-A reference to a **black** child (§4.5, black case — a memo hit) contributes
-**nothing** to `m`. This is sound, not a shortcut: a completed node lies in a
-finished strongly-connected component and cannot close a cycle through `N` (were they
-in one cycle they would share an SCC, and the node could not be black while `N` is
-still gray). Every cycle is first traversed through *white* recursion hitting a *gray*
-back-edge, so no cycle's evidence is ever hidden behind a memo hit. If `N` has no
-contributions, `m = +∞`.
+- **Entry-relativity (a recursive node is context-dependent).** A gray back-edge is
+  encoded relative to the current traversal (§4.5), so a recursive node reached via a
+  different entry point unfolds to different bytes. The same nested recursive type can
+  therefore have *different* fingerprints in different surroundings.
+- **Non-injectivity (a back-edge hides its target).** A de Bruijn index records only
+  *how far up* an ancestor sits, never *which* ancestor. So two structurally
+  different nested nodes whose back-edges happen to point the same number of levels up
+  can share a fingerprint.
 
-`N`'s cyclic flag is set iff **`m ≤ depth[N]`** — i.e. `N`'s subtree reaches back to
-`N` itself or to an ancestor of `N`. `N`'s fingerprint packs `N`'s 127-bit hash with
-this flag in the top bit; record `(fingerprint, flag)` in the memo, color `N` black,
-and **return `m`** to the caller (which folds it into its own running minimum).
+Both failure modes vanish when a type is fingerprinted **as its own root** (no
+enclosing traversal, so no gray edge escapes it): that computation is the type's
+canonical identity. So to identify a nested type — e.g. to deduplicate sub-schemas or
+give a capsule its own version tag — do not reuse its fingerprint as it appeared
+inside a parent; recompute it rooted at that type.
 
-The flag is therefore an **exact** property of `N`: set precisely when `N` belongs to
-a nontrivial strongly-connected component (or references itself), and clear for every
-type that is not itself recursive — **including a type that merely *contains* a
-recursive type** without being reachable from it (see example (d) in §5). Because the
-flag is intrinsic to the node's position in the type graph — not to the traversal's
-entry point — it is safe to memoize and reuse; the running minimum `m`, an absolute
-stack coordinate meaningful only within one computation, must never be.
-
-### 4.7 Equality semantics
-
-- Two fingerprints that are **fully equal** were produced by structurally identical
-  inputs (up to the 128-bit hash's collision resistance; see §4.9).
-- If two fingerprints are equal **and their cyclic flag is clear**, the two types
-  have **structurally identical representations in every context**. Such a
-  fingerprint is a **context-free identity**: it is valid for deduplication, for
-  cross-file comparison, and as a cache key, wherever the type appears.
-- If the cyclic flag is **set** — which, per §4.6, happens exactly when the type is
-  *itself* part of a cycle — the fingerprint is a sound identity **only for the whole
-  start type it was computed from** — e.g., two independently-computed fingerprints of
-  the same recursive root type are equal. It must **not** be used to identify a
-  *nested* type lifted out of a larger traversal, because a recursive node's
-  fingerprint depends on the traversal's entry point: a de Bruijn back-reference
-  encodes a position relative to the traversal, and the same recursive node reached
-  via a different entry unfolds to different bytes.
-
-Because the flag is set only for types that are *themselves* recursive (§4.6), the
-context-free case is as broad as it soundly can be: a type that merely *contains* a
-recursive type — but is not reachable from it — has a **clear** flag and thus a
-context-free identity, even though a cycle appears somewhere in its subgraph.
-
-### 4.8 Determinism
+### 4.7 Determinism
 
 Given a type graph, the fingerprint is fully determined: all encodings are
 byte-exact and endian-fixed; traversal order follows the canonical field/variant
 order; and no table indices, table order, timestamps, or random seeds participate.
 Two conforming implementations, in any language, produce identical fingerprints.
 
-### 4.9 Security considerations
+### 4.8 Security considerations
 
 A fingerprint is an **identity and detection** mechanism, not an **authenticity**
 one. Two properties matter here, and they are different:
@@ -426,45 +409,41 @@ to a full-length cryptographic digest (a format-version change); nothing else in
 ## 5. Worked examples
 
 **(a) A flat struct.** `struct Point { x: i32, y: i32 }`.
-The graph is `Point → i32` (shared) with no cycle. Hashing `Point` builds
+The graph is `Point → i32` with no cycle. Hashing `Point` builds
 `[tag=Struct] varint(2) string("x") <i32 fingerprint> string("y") <i32
 fingerprint>` (the struct's own name omitted). Both field references are `0x00`
-tokens carrying `i32`'s fingerprint. The cyclic flag is **clear**, so `Point`'s
-fingerprint is a context-free identity.
+tokens carrying `i32`'s fingerprint — every edge is a white/black merkle edge, none
+is a back-edge.
 
 **(b) A singly-linked list.** `enum List { Nil, Cons(i32, List) }`.
 Hashing `List` colors `List` gray at depth 0, then serializes its two variants;
-inside `Cons` the second field references `List`, which is gray at depth 0. The
-current node emitting that edge is `List` itself (depth 0), so the token is
-`byte(0x01) varint(0)` — a self back-reference, contributing `depth = 0` to the
-running minimum. `m = 0 ≤ depth[List] = 0`, so the cyclic flag is **set**.
-`List`'s fingerprint is still a sound identity for `List` as a whole (recomputing
-it from `List` yields the same value), but the flag warns that it must not be
-reused to identify some nested recursive type reached from elsewhere.
+inside `Cons` the second field references `List`, which is gray at depth 0. The node
+emitting that edge is `List` itself (depth 0), so the token is `byte(0x01) varint(0)`
+— a de Bruijn self back-reference. Rooted at `List` this is `List`'s canonical
+identity; recomputing it from `List` yields the same value.
 
 **(c) Mutual recursion.** `struct A { b: B }`, `struct B { a: A }`.
-Hashing `A` (depth 0) recurses into `B` (depth 1); `B`'s field references `A`,
-which is gray at depth 0, so `B` emits `byte(0x01) varint(1)` and returns `m = 0`.
-`B`'s hash and flag (`0 ≤ depth[B] = 1`, set) are memoized; `A` folds in `B`'s
-returned `m = 0`, and `0 ≤ depth[A] = 0`, so `A`'s flag is set too. `hash(A)` and
-`hash(B)` differ (their kind/field content and the depth of the back-reference
-differ), correctly reflecting that `A` and `B` are different types.
+Hashing `A` (depth 0) recurses into `B` (depth 1); `B`'s field references `A`, which
+is gray at depth 0, so `B` emits `byte(0x01) varint(1)`. `fingerprint(A)` and
+`fingerprint(B)` differ — different kind/field content, and the back-edge sits at a
+different level — correctly reflecting that `A` and `B` are different types. (Note
+these are the fingerprints *rooted at `A`* and *rooted at `B`* respectively; `B`'s
+value as it appears nested inside `A`'s traversal is a different, entry-relative
+thing — §4.6.)
 
-**(d) Contains a cycle but is not part of one.** `struct A(B)`, `struct B(A)`,
-`struct C(A)`. `A` and `B` form a cycle; `C` merely references it. Hashing `C`
-(depth 0) recurses into `A` (depth 1) then `B` (depth 2); `B`'s reference to `A`
-is a gray back-reference to depth 1, so `B` returns `m = 1` and `A` returns
-`m = 1`. Both are flagged (`1 ≤ depth[B] = 2` and `1 ≤ depth[A] = 1`). `C` folds
-in `A`'s returned `m = 1`, but `1 ≤ depth[C] = 0` is **false**, so **`C`'s flag is
-clear**: nothing reaches back to `C`. `C`'s fingerprint is a context-free identity
-even though its subgraph contains a cycle — the back-reference inside the `A`/`B`
-cycle is a depth *internal* to `C`'s subtree, hence invariant to wherever `C`
-itself appears.
+**(d) A shared subtree (a DAG).** `struct Pair { first: Inner, second: Inner }` for
+some non-trivial `Inner`. Hashing `Pair` follows `first` to `Inner`, which is white,
+so it is visited and hashed once (a white edge) and its fingerprint memoized; the
+`second` edge finds `Inner` **black** and simply reuses that memoized fingerprint (a
+black edge). So `Inner` is hashed once and referenced twice. Because the reuse is by
+*content* (`Inner`'s fingerprint), `Pair`'s fingerprint is identical whether the two
+fields share one `Inner` descriptor or point at two byte-identical ones — the
+fingerprint depends on structure, not on how the table represents sharing.
 
 ## 6. Conformance
 
 An implementation conforms if, for every type graph, it produces (a) the §3
-serialization byte-for-byte and (b) the §4 fingerprint bit-for-bit, including the
-cyclic flag and the equality semantics of §4.7. A shared suite of
-**golden vectors** (fixed descriptor tables mapped to fixed hexadecimal
-fingerprints) is the recommended cross-language conformance test.
+serialization byte-for-byte and (b) the §4 fingerprint bit-for-bit, with the identity
+semantics of §4.6. A shared suite of **golden vectors** (fixed descriptor tables
+mapped to fixed hexadecimal fingerprints) is the recommended cross-language
+conformance test.

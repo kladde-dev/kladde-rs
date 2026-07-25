@@ -27,7 +27,6 @@ fn main() {
 fn dump<T: Persistable + 'static>(label: &str) {
     let table = T::schema();
     println!("{label}: fingerprint = {}", T::fingerprint());
-    println!("  (cyclic flag: {})", T::fingerprint().is_cyclic());
     println!("  descriptors ({}):", table.descriptors().len());
     for (index, descriptor) in table.descriptors().iter().enumerate() {
         println!("    [{index}] {}", describe_one(descriptor));

@@ -63,13 +63,12 @@ enum Shape {
 }
 
 #[test]
-fn enum_fingerprint_is_stable_and_acyclic() {
+fn enum_fingerprint_is_stable() {
     assert_eq!(Shape::fingerprint(), Shape::fingerprint());
-    assert!(!Shape::fingerprint().is_cyclic());
 }
 
 // A recursive type: a tree whose children are more trees. `Tree` reaches
-// itself through `PersistedVec<Tree>`, so it is on a cycle.
+// itself through `PersistedVec<Tree>`, exercising the de Bruijn back-edge.
 #[derive(kladde_types::Persistable)]
 struct Tree {
     value: i32,
@@ -77,11 +76,11 @@ struct Tree {
 }
 
 #[test]
-fn recursive_type_sets_the_cyclic_flag() {
-    assert!(Tree::fingerprint().is_cyclic());
+fn recursive_type_fingerprints_reproducibly() {
+    // The cycle must terminate and hash deterministically.
     assert_eq!(Tree::fingerprint(), Tree::fingerprint());
-    // `Point`, which contains no recursion, does not.
-    assert!(!Point::fingerprint().is_cyclic());
+    // A recursive type and a non-recursive one are different types.
+    assert_ne!(Tree::fingerprint(), Point::fingerprint());
 }
 
 #[test]
