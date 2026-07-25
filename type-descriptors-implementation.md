@@ -70,31 +70,29 @@ flat array — it is deliberately **not** on the fingerprint path.
 The heart of the design, and where the subtle logic is. Entry point:
 `TypeTable::fingerprint()`.
 
-- `Fingerprint([u8; 16])` — 16 bytes, top bit of byte 0 = cyclic flag.
-  `is_cyclic()`, `to_hex()`, `as_bytes()`, and the private `pack(hash, cyclic)`
-  that clears the top bit and stamps in the flag.
+- `Fingerprint([u8; 16])` — a plain 128-bit hash, no flags or reserved bits.
+  `to_hex()`, `as_bytes()`.
 - `Traversal` — the DFS state: `color[]` (white/gray/black), `depth[]`, and
   `memo[]` of computed fingerprints, all `Vec`s indexed by table index.
 - `visit(node, depth)` — colors the node gray, builds its hash input, SHA-256s it,
-  truncates to 16 bytes, packs the cyclic flag, memoizes, colors black, and
-  returns `(fingerprint, m)`. `m` is the **lowlink minimum** (§4.6); it is
-  *returned but never memoized*, exactly as the spec demands.
+  truncates to 16 bytes, memoizes, colors black, and returns the fingerprint.
 - `encode_local` — item 1 of §4.5: the §3.2 encoding with Struct/Enum **names
   omitted** and the Opaque version **folded** to `stability_flag + leading_nonzero`.
 - `emit_reference` — item 2 of §4.5, the crux. Three branches on child color:
-  - **white** → recurse (`visit`), emit `0x00` + child's 16-byte fingerprint, fold
-    child's `m` into ours;
-  - **black** → memo hit: emit `0x00` + memoized fingerprint, contribute
-    **nothing** to `m` (the soundness argument is in spec §4.6 / tests);
-  - **gray** → emit `0x01` + `varint(depth[N] − depth[C])` de Bruijn back-ref,
-    fold `depth[C]` into `m`.
-- The cyclic flag is set iff `m ≤ depth` (`NO_BACKREF = usize::MAX` is the "reaches
-  back to nothing" sentinel).
+  - **white** → recurse (`visit`), emit `0x00` + child's 16-byte fingerprint;
+  - **black** → memo hit: emit `0x00` + the memoized fingerprint (a subtree reached
+    more than once is hashed once, referenced by content);
+  - **gray** → emit `0x01` + `varint(depth[N] − depth[C])`, a de Bruijn back-edge.
 
-**If you're changing what's fingerprinted, the flag semantics, or the token
-encoding, it's all here.** The in-module test suite is the spec's worked examples
-(a)–(d) turned into assertions, including the tricky "contains a cycle but isn't
-on one" and "cyclic child reached via a memo hit" cases — plus the **golden
+  In graph terms (§4.4): the white edges form the DFS spanning tree, white + black
+  edges form a DAG that gets merkle-hashed, and gray edges are the back-edges,
+  encoded by relative depth so a cyclic graph hashes as a finite tree.
+
+**If you're changing what's fingerprinted or the token encoding, it's all here.**
+The in-module tests cover reproducibility (including recursive graphs terminating
+and hashing deterministically), index-invariance, structural sensitivity, Opaque
+version folding, **sharing-invariance** (a shared vs. a duplicated subtree hash
+identically — spec §5(d)), distinct structures staying distinct, and the **golden
 vectors** (`GOLDEN_POINT`, `GOLDEN_LIST`, `GOLDEN_OPAQUE_1_2_3`) that lock the
 byte-exact hash output.
 
@@ -148,7 +146,7 @@ pipeline, but changes to the spec itself don't reach this far.
 | Implement a **reserved kind** (Array/Pointer) | add an enum variant in `descriptor.rs`, wire `references()`; encode/decode in `serialize.rs` (currently returns `ReservedKind`); hash input in `fingerprint.rs::encode_local` |
 | Change **canonical ordering** | `descriptor.rs`: `references()` + `canonical_variants()` (both paths follow them) |
 | Change the **on-disk byte format** | `serialize.rs` (and update golden-vector bytes) |
-| Change **what's fingerprinted** or the **flag logic** | `fingerprint.rs`: `encode_local` (content) / `emit_reference` (tokens + lowlink) / `visit` (flag decision) — then re-bless the golden vectors |
+| Change **what's fingerprinted** or the **token encoding** | `fingerprint.rs`: `encode_local` (per-node content) / `emit_reference` (reference tokens) / `visit` (hashing) — then re-bless the golden vectors |
 | Swap the **hash function / width** | `sha256.rs` + the truncation/`pack` in `fingerprint.rs` (a format-version change) |
 | Change **Rust → model mapping** (new derive behavior, container modeling, discriminant sourcing) | layer 2: `kladde-derive`, the hand impls, `SchemaBuilder` |
 
@@ -160,10 +158,12 @@ pipeline, but changes to the spec itself don't reach this far.
 - **Indices are serialization-only.** The fingerprint never sees table indices —
   it encodes references structurally (inline child hash or de Bruijn back-ref).
   The `index_invariant` test guards this.
-- **The lowlink `m` is transient; the `(fingerprint, flag)` pair is memoized.**
-  Conflating the two would make a nested recursive type's fingerprint leak its
-  traversal entry point. The memo-hit-contributes-nothing rule is load-bearing,
-  not an optimization.
+- **A fingerprint identifies a type only when rooted at that type.** A root
+  fingerprint is a canonical, layout-invariant identity — schema-evolution
+  detection compares these. A type's fingerprint *as it appears nested inside
+  another traversal* is entry-relative, and even non-injective (a de Bruijn
+  back-edge records only how far up an ancestor sits, not which one), so it must
+  never be lifted out and reused; recompute rooted at the type instead (spec §4.6).
 - **Golden vectors are the tripwire.** Any accidental change to encoding or hashing
   trips `golden_vectors` in `fingerprint.rs`; deliberate format changes mean
   re-blessing those constants on purpose.
