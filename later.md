@@ -37,6 +37,7 @@
 - Related, narrower gap `PersistedString` surfaced (see its `store`/`push_str`/`set` implementation): `push_str`/`set` mutate one byte at a time through `PersistedVecGuard::push`/`remove`, which is simple but not O(1) for a whole-value replace. A bulk "replace all content in one write" primitive on `PersistedVec`/`PersistedVecGuard` (skipping the per-element `store` calls when `T` is a plain byte, or more generally writing a whole contiguous span at once) would make `set` cheaper without changing its observable behavior.
 - Allow introducing custom `Op`s that call back into either the type or the instance (if providing a ref to the instance is possible without changes to the rest of the system). Example use case: an included PNG image is edited, and we can describe the edit exactly (e.g., "draw a black line of width 1 from point X to point Y" or also: "compress this PNG more aggressively / scale it by 50%"). The type could then implement decoding the old PNG blob (if it's not already in memory), apply the edit, and encode it again, when the Op gets replayed.
 - When adding pointer type to the schema, maybe also add unsized types (slices `[T]`, `str`). This would allow generic tools to understand data better and inspect more out-of-the-box.
+- Should we really support `char` as a primitive type? If so, how are `char`s serialized? Valid unicode scalar values seem to be <= 0x10FFFF, so they'd fit into 3 bytes. How future proof do we expect this restriction to be?
 
 ## Things to check later
 
