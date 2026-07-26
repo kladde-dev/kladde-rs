@@ -98,11 +98,16 @@ byte-exact hash output.
 
 ### [`sha256.rs`](crates/kladde-schema/src/sha256.rs) — the hash primitive (spec §4.2)
 
-A vendored, textbook FIPS 180-4 SHA-256 (`sha256(&[u8]) -> [u8; 32]`). Vendored
-*on purpose*: it keeps the crate dependency-free and the fingerprint exactly
-reproducible from the published algorithm. Not perf-tuned (runs once per schema
-over a few hundred bytes). Tested against standard NIST vectors. You'd only touch
-this if the format-version ever changed the hash function.
+A vendored, textbook FIPS 180-4 SHA-256, exposed as `Sha256Hasher` — a
+**streaming** hasher (`new` / `update` / `finalize`) that buffers one 64-byte
+block at a time and compresses as it fills. `fingerprint.rs` feeds each node's
+hash input straight in (bytes, `s.as_bytes()`, child digests, and — via the
+hasher's `impl Extend<u8>` — `kladde_varint::encode`), so a node is hashed
+without ever materializing its input in a `Vec`. Vendored *on purpose*: it keeps
+the crate dependency-free and the fingerprint exactly reproducible from the
+published algorithm. Not perf-tuned (runs once per schema over a few hundred
+bytes). Tested against standard NIST vectors plus a streaming-equals-one-shot
+check. You'd only touch this if the format-version ever changed the hash function.
 
 ## Layer 2: the Rust binding (where types meet the model)
 
@@ -147,7 +152,7 @@ pipeline, but changes to the spec itself don't reach this far.
 | Change **canonical ordering** | `descriptor.rs`: `references()` + `canonical_variants()` (both paths follow them) |
 | Change the **on-disk byte format** | `serialize.rs` (and update golden-vector bytes) |
 | Change **what's fingerprinted** or the **token encoding** | `fingerprint.rs`: `encode_local` (per-node content) / `emit_reference` (reference tokens) / `visit` (hashing) — then re-bless the golden vectors |
-| Swap the **hash function / width** | `sha256.rs` + the truncation/`pack` in `fingerprint.rs` (a format-version change) |
+| Swap the **hash function / width** | `sha256.rs` + the 16-byte truncation in `fingerprint.rs::visit` (a format-version change) |
 | Change **Rust → model mapping** (new derive behavior, container modeling, discriminant sourcing) | layer 2: `kladde-derive`, the hand impls, `SchemaBuilder` |
 
 ## Design invariants worth keeping in mind

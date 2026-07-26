@@ -47,16 +47,21 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Appends the LEB128 encoding of `value` to `out`.
-pub fn encode(value: u64, out: &mut Vec<u8>) {
+///
+/// `out` is any byte sink (`impl Extend<u8>`): a `Vec<u8>` is the common
+/// case, but a streaming hasher or other accumulator works just as well, so
+/// the encoding can be fed somewhere without first collecting it into a
+/// buffer.
+pub fn encode(value: u64, out: &mut impl Extend<u8>) {
     let mut value = value;
     loop {
         let byte = (value & 0x7f) as u8;
         value >>= 7;
         if value == 0 {
-            out.push(byte);
+            out.extend([byte]);
             break;
         }
-        out.push(byte | 0x80);
+        out.extend([byte | 0x80]);
     }
 }
 

@@ -4,7 +4,7 @@
 //! encodes each back-edge as a de Bruijn index.
 
 use crate::descriptor::{canonical_variants, TypeDescriptor, TypeRef, TypeTable};
-use crate::sha256::sha256;
+use crate::sha256::Sha256Hasher;
 
 /// A 128-bit schema fingerprint — a plain hash, no flags or reserved bits.
 /// Two fingerprints are equal iff all 128 bits match.
@@ -78,11 +78,11 @@ impl<'a> Traversal<'a> {
 
         let table = self.table;
         let descriptor = &table.descriptors()[node];
-        let mut input = Vec::new();
+        let mut hasher = Sha256Hasher::new();
 
-        self.encode_local(descriptor, depth, &mut input);
+        self.encode_local(descriptor, depth, &mut hasher);
 
-        let hash = sha256(&input);
+        let hash = hasher.finalize();
         let fingerprint = Fingerprint(hash[..16].try_into().unwrap());
 
         self.memo[node] = Some(fingerprint);
@@ -93,15 +93,20 @@ impl<'a> Traversal<'a> {
     /// Emits `node`'s per-kind hash input (§4.5 item 1): the §3.2 encoding
     /// with Struct/Enum names omitted, an Opaque version reduced to its
     /// compatibility component, and every reference replaced by a token.
-    fn encode_local(&mut self, descriptor: &TypeDescriptor, depth: usize, input: &mut Vec<u8>) {
+    fn encode_local(
+        &mut self,
+        descriptor: &TypeDescriptor,
+        depth: usize,
+        hasher: &mut Sha256Hasher,
+    ) {
         match descriptor {
-            TypeDescriptor::Primitive(primitive) => input.push(primitive.code()),
+            TypeDescriptor::Primitive(primitive) => hasher.update([primitive.code()]),
             TypeDescriptor::Struct { fields, .. } => {
-                input.push(crate::descriptor::TAG_STRUCT);
-                kladde_varint::encode(fields.len() as u64, input);
+                hasher.update([crate::descriptor::TAG_STRUCT]);
+                kladde_varint::encode(fields.len() as u64, hasher);
                 for field in fields {
-                    push_string(&field.name, input);
-                    self.emit_reference(field.ty, depth, input);
+                    push_string(&field.name, hasher);
+                    self.emit_reference(field.ty, depth, hasher);
                 }
             }
             TypeDescriptor::Enum {
@@ -109,16 +114,16 @@ impl<'a> Traversal<'a> {
                 variants,
                 ..
             } => {
-                input.push(crate::descriptor::TAG_ENUM);
-                input.push(*discriminant_width);
-                kladde_varint::encode(variants.len() as u64, input);
+                hasher.update([crate::descriptor::TAG_ENUM]);
+                hasher.update([*discriminant_width]);
+                kladde_varint::encode(variants.len() as u64, hasher);
                 for variant in canonical_variants(variants) {
-                    kladde_varint::encode(variant.discriminant, input);
-                    push_string(&variant.name, input);
-                    kladde_varint::encode(variant.fields.len() as u64, input);
+                    kladde_varint::encode(variant.discriminant, hasher);
+                    push_string(&variant.name, hasher);
+                    kladde_varint::encode(variant.fields.len() as u64, hasher);
                     for field in &variant.fields {
-                        push_string(&field.name, input);
-                        self.emit_reference(field.ty, depth, input);
+                        push_string(&field.name, hasher);
+                        self.emit_reference(field.ty, depth, hasher);
                     }
                 }
             }
@@ -129,15 +134,15 @@ impl<'a> Traversal<'a> {
                 inline_size,
                 parameters,
             } => {
-                input.push(crate::descriptor::TAG_OPAQUE);
-                push_string(library_name, input);
-                push_string(type_name, input);
-                input.push(version.stability_flag() as u8);
-                kladde_varint::encode(version.leading_nonzero(), input);
-                kladde_varint::encode(*inline_size, input);
-                kladde_varint::encode(parameters.len() as u64, input);
+                hasher.update([crate::descriptor::TAG_OPAQUE]);
+                push_string(library_name, hasher);
+                push_string(type_name, hasher);
+                hasher.update([version.stability_flag() as u8]);
+                kladde_varint::encode(version.leading_nonzero(), hasher);
+                kladde_varint::encode(*inline_size, hasher);
+                kladde_varint::encode(parameters.len() as u64, hasher);
                 for parameter in parameters {
-                    self.emit_reference(*parameter, depth, input);
+                    self.emit_reference(*parameter, depth, hasher);
                 }
             }
         }
@@ -147,30 +152,31 @@ impl<'a> Traversal<'a> {
     /// to `child` (§4.5 item 2): an inline child fingerprint for a white
     /// (recurse) or black (memo hit) edge, or a de Bruijn back-reference for
     /// a gray (already-on-stack) edge.
-    fn emit_reference(&mut self, child: TypeRef, parent_depth: usize, input: &mut Vec<u8>) {
+    fn emit_reference(&mut self, child: TypeRef, parent_depth: usize, hasher: &mut Sha256Hasher) {
         let child = child.0;
         match self.color[child] {
             Color::White => {
                 let child_fp = self.visit(child, parent_depth + 1);
-                input.push(0x00);
-                input.extend_from_slice(child_fp.as_bytes());
+                hasher.update([0x00]);
+                hasher.update(child_fp.as_bytes());
             }
             Color::Black => {
-                input.push(0x00);
-                input.extend_from_slice(self.memo[child].unwrap().as_bytes());
+                let child_fp = self.memo[child].unwrap();
+                hasher.update([0x00]);
+                hasher.update(child_fp.as_bytes());
             }
             Color::Gray => {
-                input.push(0x01);
+                hasher.update([0x01]);
                 let back = parent_depth - self.depth[child];
-                kladde_varint::encode(back as u64, input);
+                kladde_varint::encode(back as u64, hasher);
             }
         }
     }
 }
 
-fn push_string(s: &str, out: &mut Vec<u8>) {
-    kladde_varint::encode(s.len() as u64, out);
-    out.extend_from_slice(s.as_bytes());
+fn push_string(s: &str, hasher: &mut Sha256Hasher) {
+    kladde_varint::encode(s.len() as u64, hasher);
+    hasher.update(s.as_bytes());
 }
 
 #[cfg(test)]
