@@ -254,6 +254,7 @@ impl<'s, T: serde::Serialize, B: Backend> PersistableBlobGuard<'s, T, B> {
                 match new_len.cmp(&old_len) {
                     std::cmp::Ordering::Greater => {
                         self.backend.resize(existing, new_len);
+                        // TODO: `write_header` overwrites `index` with itself, which is wasteful.
                         write_header(
                             self.backend,
                             self.location,
