@@ -159,19 +159,17 @@ where
     // `Persisted<Bar>`. This is a known limitation of the `serde` escape
     // hatch (and a reason to prefer a real `Persistable` type where the
     // distinction matters).
-    fn describe(builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeRef
+    fn describe_local(_builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeDescriptor
     where
         Self: 'static,
     {
-        builder.describe(std::any::TypeId::of::<Self>(), |_| {
-            kladde_traits::TypeDescriptor::Opaque {
-                library_name: "kladde-types".into(),
-                type_name: "Persisted".into(),
-                version: crate::library_version(),
-                inline_size: 8,
-                parameters: vec![],
-            }
-        })
+        kladde_traits::TypeDescriptor::Opaque {
+            library_name: "kladde-types".into(),
+            type_name: "Persisted".into(),
+            version: crate::library_version(),
+            inline_size: 8,
+            parameters: vec![],
+        }
     }
 }
 

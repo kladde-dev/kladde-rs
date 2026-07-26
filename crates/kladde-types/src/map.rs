@@ -210,22 +210,20 @@ where
         }
     }
 
-    fn describe(builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeRef
+    fn describe_local(builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeDescriptor
     where
         Self: 'static,
     {
-        builder.describe(std::any::TypeId::of::<Self>(), |b| {
-            kladde_traits::TypeDescriptor::Opaque {
-                library_name: "kladde-types".into(),
-                type_name: "PersistedHashMap".into(),
-                version: crate::library_version(),
-                inline_size: 8,
-                parameters: vec![
-                    <K as Persistable>::describe(b),
-                    <V as Persistable>::describe(b),
-                ],
-            }
-        })
+        kladde_traits::TypeDescriptor::Opaque {
+            library_name: "kladde-types".into(),
+            type_name: "PersistedHashMap".into(),
+            version: crate::library_version(),
+            inline_size: 8,
+            parameters: vec![
+                <K as Persistable>::describe(builder),
+                <V as Persistable>::describe(builder),
+            ],
+        }
     }
 }
 
@@ -571,9 +569,11 @@ mod tests {
             NonCloneKey(i32::load(backend, location))
         }
 
+        // Schema-transparent: this fixture shares `i32`'s descriptor rather
+        // than owning one, so it overrides `describe` and leaves
+        // `describe_local` as the (never-called) default -- the escape hatch
+        // the two-layer `describe`/`describe_local` split exists to keep open.
         fn describe(builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeRef {
-            // Same representation as `i32`; a test fixture needn't have its
-            // own descriptor.
             <i32 as Persistable>::describe(builder)
         }
     }

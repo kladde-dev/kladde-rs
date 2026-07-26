@@ -1,4 +1,3 @@
-//! `#[derive(Persistable)]` for application-level `struct`s and `enum`s
 //! composed from already-`Persistable` fields. See `spec.md`'s "The Trait
 //! Layer" and "Workspace Layout" for the pattern this generates:
 //!
@@ -248,26 +247,24 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::To
                 }
             }
 
-            fn describe(
-                builder: &mut ::kladde_traits::SchemaBuilder,
-            ) -> ::kladde_traits::TypeRef {
-                builder.describe(::std::any::TypeId::of::<Self>(), |__builder| {
-                    ::kladde_traits::TypeDescriptor::Struct {
-                        name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
-                        fields: ::std::vec![
-                            #(
-                                ::kladde_traits::Field {
-                                    name: ::std::string::ToString::to_string(
-                                        ::std::stringify!(#field_ident),
-                                    ),
-                                    ty: <#field_ty as ::kladde_traits::Persistable>::describe(
-                                        __builder,
-                                    ),
-                                },
-                            )*
-                        ],
-                    }
-                })
+            fn describe_local(
+                __builder: &mut ::kladde_traits::SchemaBuilder,
+            ) -> ::kladde_traits::TypeDescriptor {
+                ::kladde_traits::TypeDescriptor::Struct {
+                    name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
+                    fields: ::std::vec![
+                        #(
+                            ::kladde_traits::Field {
+                                name: ::std::string::ToString::to_string(
+                                    ::std::stringify!(#field_ident),
+                                ),
+                                ty: <#field_ty as ::kladde_traits::Persistable>::describe(
+                                    __builder,
+                                ),
+                            },
+                        )*
+                    ],
+                }
             }
         }
     }
@@ -344,15 +341,13 @@ fn derive_unit_like_struct(
                 #ident
             }
 
-            fn describe(
-                builder: &mut ::kladde_traits::SchemaBuilder,
-            ) -> ::kladde_traits::TypeRef {
-                builder.describe(::std::any::TypeId::of::<Self>(), |_| {
-                    ::kladde_traits::TypeDescriptor::Struct {
-                        name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
-                        fields: ::std::vec![],
-                    }
-                })
+            fn describe_local(
+                _builder: &mut ::kladde_traits::SchemaBuilder,
+            ) -> ::kladde_traits::TypeDescriptor {
+                ::kladde_traits::TypeDescriptor::Struct {
+                    name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
+                    fields: ::std::vec![],
+                }
             }
         }
     }
@@ -695,19 +690,17 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenS
                 );
             }
 
-            fn describe(
-                builder: &mut ::kladde_traits::SchemaBuilder,
-            ) -> ::kladde_traits::TypeRef {
+            fn describe_local(
+                __builder: &mut ::kladde_traits::SchemaBuilder,
+            ) -> ::kladde_traits::TypeDescriptor {
                 #discriminants
-                builder.describe(::std::any::TypeId::of::<Self>(), |__builder| {
-                    ::kladde_traits::TypeDescriptor::Enum {
-                        name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
-                        discriminant_width: 4,
-                        variants: ::std::vec![
-                            #(#variant_describe),*
-                        ],
-                    }
-                })
+                ::kladde_traits::TypeDescriptor::Enum {
+                    name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
+                    discriminant_width: 4,
+                    variants: ::std::vec![
+                        #(#variant_describe),*
+                    ],
+                }
             }
         }
     }

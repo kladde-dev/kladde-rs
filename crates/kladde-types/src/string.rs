@@ -164,16 +164,16 @@ impl Persistable for PersistedString {
         PersistedString(PersistedVec::load(backend, location))
     }
 
-    fn describe(builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeRef {
-        builder.describe(std::any::TypeId::of::<Self>(), |_| {
-            kladde_traits::TypeDescriptor::Opaque {
-                library_name: "kladde-types".into(),
-                type_name: "PersistedString".into(),
-                version: crate::library_version(),
-                inline_size: 8,
-                parameters: vec![],
-            }
-        })
+    fn describe_local(
+        _builder: &mut kladde_traits::SchemaBuilder,
+    ) -> kladde_traits::TypeDescriptor {
+        kladde_traits::TypeDescriptor::Opaque {
+            library_name: "kladde-types".into(),
+            type_name: "PersistedString".into(),
+            version: crate::library_version(),
+            inline_size: 8,
+            parameters: vec![],
+        }
     }
 }
 

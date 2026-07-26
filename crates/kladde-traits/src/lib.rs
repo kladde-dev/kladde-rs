@@ -279,19 +279,53 @@ pub trait Persistable: Sized {
     /// round-trip test and (eventually) by opening a file.
     fn load<B: Backend>(backend: &B, location: Location) -> Self;
 
+    /// Builds this type's own descriptor node — the common-case schema
+    /// hook. `#[derive(Persistable)]` generates this for you; a hand-written
+    /// impl returns a fresh [`TypeDescriptor`], obtaining references to its
+    /// field/element/parameter types by calling
+    /// [`describe`](Persistable::describe) on each of them (which honors
+    /// whatever registration policy *that* type has).
+    ///
+    /// The default [`describe`](Persistable::describe) registers whatever
+    /// this returns under `Self`'s own `TypeId`, deduplicated and
+    /// cycle-safe. A type that instead wants to be **schema-transparent** —
+    /// reusing another type's descriptor rather than owning one — overrides
+    /// [`describe`](Persistable::describe) directly and leaves this method
+    /// unimplemented (it is then never called). Implementing *neither*
+    /// panics: every `Persistable` must supply one or the other.
+    fn describe_local(builder: &mut SchemaBuilder) -> TypeDescriptor
+    where
+        Self: 'static,
+    {
+        let _ = builder;
+        panic!(
+            "{}: implement `describe_local` (the usual case) or override \
+             `describe` (for a schema-transparent type)",
+            std::any::type_name::<Self>(),
+        )
+    }
+
     /// Records this type's representation into `builder`, returning a
-    /// reference to its descriptor. `#[derive(Persistable)]` generates this
-    /// for you; hand-written impls call
-    /// [`SchemaBuilder::describe`] once (keyed on their own
-    /// `TypeId`) and describe their fields/parameters by recursing through
-    /// this method. You usually call the higher-level [`schema`] or
-    /// [`fingerprint`] instead of this directly.
+    /// reference to its descriptor. You usually call the higher-level
+    /// [`schema`] or [`fingerprint`] instead of this directly.
+    ///
+    /// The default registers a node built from
+    /// [`describe_local`](Persistable::describe_local), deduplicated by
+    /// `Self`'s `TypeId` and reserving the slot before recursing so cyclic
+    /// types terminate — this is what almost every type (all derived ones)
+    /// uses. Override it only to be **schema-transparent**, reusing another
+    /// type's descriptor: return e.g. `builder.describe::<Inner>()` (or
+    /// `<Inner as Persistable>::describe(builder)`) and skip
+    /// [`describe_local`](Persistable::describe_local) entirely.
     ///
     /// [`schema`]: Persistable::schema
     /// [`fingerprint`]: Persistable::fingerprint
     fn describe(builder: &mut SchemaBuilder) -> TypeRef
     where
-        Self: 'static;
+        Self: 'static,
+    {
+        builder.describe::<Self>()
+    }
 
     /// This type's full descriptor table (its schema) -- a language-neutral
     /// description of how it lays out and interprets its bytes, rooted at
@@ -392,10 +426,8 @@ mod tests {
                 Counter(u32::from_le_bytes(bytes.try_into().unwrap()))
             }
 
-            fn describe(builder: &mut SchemaBuilder) -> TypeRef {
-                builder.describe(std::any::TypeId::of::<Self>(), |_| {
-                    TypeDescriptor::Primitive(Primitive::U32)
-                })
+            fn describe_local(_builder: &mut SchemaBuilder) -> TypeDescriptor {
+                TypeDescriptor::Primitive(Primitive::U32)
             }
         }
 

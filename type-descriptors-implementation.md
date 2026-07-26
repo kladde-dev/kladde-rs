@@ -115,21 +115,30 @@ The spec engine hashes *tables you hand it*. Building those tables from live Rus
 types happens here. This is layer-2 context — read it to understand the whole
 pipeline, but changes to the spec itself don't reach this far.
 
-- **`Persistable::describe(builder: &mut SchemaBuilder) -> TypeRef`** in
-  [`kladde-traits/src/lib.rs`](crates/kladde-traits/src/lib.rs) — the hook each
-  type implements. Convenience methods `schema()` (drive a fresh builder) and
-  `fingerprint()` (fingerprint the built table's root) sit on the same trait.
+- **`Persistable::describe_local(builder) -> TypeDescriptor`** and
+  **`Persistable::describe(builder) -> TypeRef`** in
+  [`kladde-traits/src/lib.rs`](crates/kladde-traits/src/lib.rs) — a **two-layer
+  hook**. The common case implements only `describe_local`, returning its *own*
+  descriptor node and referencing field types via `<FieldTy>::describe`; the
+  provided `describe` default registers that node under `Self`'s `TypeId`
+  (`builder.describe::<Self>()`). A type wanting to be *schema-transparent* (reuse
+  another type's descriptor) instead overrides `describe` and leaves
+  `describe_local` as its panicking default. Convenience methods `schema()` (drive
+  a fresh builder) and `fingerprint()` (fingerprint the built table's root) sit on
+  the same trait.
 - **`SchemaBuilder`** in
   [`kladde-traits/src/schema.rs`](crates/kladde-traits/src/schema.rs) — the
-  **runtime analog of the gray/black DFS**. Its `describe(type_id, build)` reserves
-  a slot (`push(None)`) and records the `TypeId → TypeRef` mapping *before* calling
-  `build`, so a recursive type's nested `describe` call finds its own reserved
-  index instead of looping. Dedups shared types by `TypeId`. `finish(root)` asserts
-  the root landed at index 0 and unwraps every reserved slot. A runtime builder is
-  used rather than a `const` because const-eval can't yet express cyclic,
-  `TypeId`-keyed graphs.
+  **runtime analog of the gray/black DFS**, with a matching two-layer API.
+  `describe::<T>()` is the ergonomic entry point (key by `TypeId::of::<T>()`, build
+  from `T::describe_local`); it's sugar over the primitive `describe_with(type_id,
+  build)`, which reserves a slot (`push(None)`) and records the `TypeId → TypeRef`
+  mapping *before* calling `build`, so a recursive type's nested `describe` call
+  finds its own reserved index instead of looping. Dedups shared types by `TypeId`.
+  `finish(root)` asserts the root landed at index 0 and unwraps every reserved slot.
+  A runtime builder is used rather than a `const` because const-eval can't yet
+  express cyclic, `TypeId`-keyed graphs.
 - **`kladde-derive`** [`src/lib.rs`](crates/kladde-derive/src/lib.rs) — generates
-  `describe` bodies: structs → a `Struct` descriptor whose fields recurse via
+  `describe_local` bodies: structs → a `Struct` descriptor whose fields recurse via
   `<FieldTy as Persistable>::describe`; enums → an `Enum` descriptor where
   `discriminant_value` follows Rust's own discriminant rule (explicit value, else
   predecessor + 1), emitted as a `const` so it *coincides with the real Rust

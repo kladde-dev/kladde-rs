@@ -48,10 +48,10 @@ impl Persistable for Number {
         Number(i32::from_le_bytes(bytes.try_into().unwrap()))
     }
 
-    fn describe(builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeRef {
-        builder.describe(std::any::TypeId::of::<Self>(), |_| {
-            kladde_traits::TypeDescriptor::Primitive(kladde_traits::Primitive::I32)
-        })
+    fn describe_local(
+        _builder: &mut kladde_traits::SchemaBuilder,
+    ) -> kladde_traits::TypeDescriptor {
+        kladde_traits::TypeDescriptor::Primitive(kladde_traits::Primitive::I32)
     }
 }
 

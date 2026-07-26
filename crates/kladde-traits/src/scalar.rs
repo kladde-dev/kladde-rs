@@ -13,8 +13,7 @@
 //! `kladde-types` re-exports these names for convenience.
 
 use crate::{Backend, Guard, Location, Persistable, SchemaBuilder};
-use kladde_schema::{Primitive, TypeDescriptor, TypeRef};
-use std::any::TypeId;
+use kladde_schema::{Primitive, TypeDescriptor};
 
 /// Numeric scalars all have native `to_le_bytes`/`from_le_bytes` with a
 /// fixed-width array, so one macro covers them; `bool`/`char` don't fit
@@ -97,8 +96,8 @@ macro_rules! impl_persistable_numeric_scalar {
                 Self::from_le_bytes(bytes.try_into().unwrap())
             }
 
-            fn describe(builder: &mut SchemaBuilder) -> TypeRef {
-                builder.describe(TypeId::of::<Self>(), |_| TypeDescriptor::Primitive($code))
+            fn describe_local(_builder: &mut SchemaBuilder) -> TypeDescriptor {
+                TypeDescriptor::Primitive($code)
             }
         }
     };
@@ -197,8 +196,8 @@ macro_rules! impl_persistable_scalar_via {
                 from_repr(repr)
             }
 
-            fn describe(builder: &mut SchemaBuilder) -> TypeRef {
-                builder.describe(TypeId::of::<Self>(), |_| TypeDescriptor::Primitive($code))
+            fn describe_local(_builder: &mut SchemaBuilder) -> TypeDescriptor {
+                TypeDescriptor::Primitive($code)
             }
         }
     };
