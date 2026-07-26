@@ -12,7 +12,7 @@ full read of `spec.md`, `later.md`, and every crate. Ordered most-important-firs
 record every mutation as a small fixed set of *type-agnostic* byte-level microoperations
 (`Alloc`/`Free`/`Write`/`Copy`/`Resize`), so that flushing is pure replay that never calls
 back into any data type — is fully implemented and works through arbitrarily deep nesting
-(`PersistedHashMap<PersistedString, Contact{ PersistedString, PersistedVec<enum> }>`
+(`PersistableHashMap<PersistableString, Contact{ PersistableString, PersistableVec<enum> }>`
 round-trips through flush + reload). This de-risks the part most likely to have forced a
 redesign. Everything else in the vision is comparatively conventional engineering.
 
@@ -55,7 +55,7 @@ leak" convention that is otherwise trusted, not checked. Neither needs a real fi
   "where does a deeply-nested leaf write."
 - **Dropped the `T: Clone` requirement** that an earlier op-log design implied.
 - **Type-level leak safety.** `String` deliberately doesn't implement `Persistable` (a
-  compile-fail doctest enforces it); `PersistedString`/`Persisted<T>` give owning types the
+  compile-fail doctest enforces it); `PersistableString`/`PersistableBlob<T>` give owning types the
   cached `pointer` field they need. The `store(&mut self)` fix closed a real
   self-consistency bug (a `from_iter`/`from`-built value learning its pointer on first store).
 - **Test discipline.** Regression tests carry rationale and pin specific past bugs.
@@ -72,7 +72,7 @@ leak" convention that is otherwise trusted, not checked. Neither needs a real fi
 - **No flush optimization pass** (naive in-order replay).
 - **No Drop-based freeing.** Replacing or dropping an "owning" value currently orphans its
   content allocation. Harmless in-memory (dies with the process); a real leak against a file.
-- **Rope / real text** — promised in the intro; `PersistedString` is a byte-`Vec` placeholder
+- **Rope / real text** — promised in the intro; `PersistableString` is a byte-`Vec` placeholder
   with O(n) edits.
 
 ---
@@ -156,7 +156,7 @@ In rough priority order:
    checksums, and the `StartAtomic`/`EndAtomic` fallback for mutations whose microop sequence
    can't be made prefix-safe. The ordering *discipline* is testable now (§5).
 
-5. **Rope for text.** `PersistedString`'s byte-`Vec` won't serve the document-editor use case
+5. **Rope for text.** `PersistableString`'s byte-`Vec` won't serve the document-editor use case
    the intro gestures at. A chunked/rope representation is a substantial design in itself.
 
 ---
@@ -164,11 +164,11 @@ In rough priority order:
 ## 5. Obstacles / limitations foreseen for a full release
 
 - **Schema migration** (§4.1) — the defining challenge for this class of system; currently absent.
-- **Write amplification on growth.** `PersistedVec::push` resizes the whole content
-  allocation each time (O(n) copy per push → O(n²) to build); `PersistedString` edits
+- **Write amplification on growth.** `PersistableVec::push` resizes the whole content
+  allocation each time (O(n) copy per push → O(n²) to build); `PersistableString` edits
   byte-by-byte. Both are documented as awaiting chunked representations, but they're real
   cliffs the moment collections get large.
-- **Unbounded on-disk growth under churn.** `PersistedHashMap` tombstones are only reclaimed
+- **Unbounded on-disk growth under churn.** `PersistableHashMap` tombstones are only reclaimed
   by a compaction pass that doesn't exist; sustained insert/remove grows the file without
   bound. The `later.md` free-list middle ground is a cheap partial mitigation.
 - **4 GiB ceiling** (§3.1) until the width question is settled.

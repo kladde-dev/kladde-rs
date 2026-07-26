@@ -145,8 +145,8 @@ pipeline, but changes to the spec itself don't reach this far.
   discriminant*.
 - **Hand impls** — scalars → `Primitive` (in
   [`kladde-traits/src/scalar.rs`](crates/kladde-traits/src/scalar.rs)); the
-  built-in containers `PersistedVec` / `PersistedHashMap` / `Persisted` /
-  `PersistedString` → `Opaque` (nominal, `inline_size: 8`) in `kladde-types`.
+  built-in containers `PersistableVec` / `PersistableHashMap` / `PersistableBlob` /
+  `PersistableString` → `Opaque` (nominal, `inline_size: 8`) in `kladde-types`.
 - **Example / eyeballing tool**:
   [`kladde-types/examples/schema_dump.rs`](crates/kladde-types/examples/schema_dump.rs)
   dumps a type's descriptor table + fingerprint (`cargo run -p kladde-types

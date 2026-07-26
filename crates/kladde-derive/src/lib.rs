@@ -27,9 +27,9 @@
 //!
 //! **Field requirements:** every field of a derived `struct`/`enum` has
 //! to be a type that itself implements `Persistable`. Plain `String`
-//! doesn't (use `kladde_types::PersistedString` instead), but scalars
-//! (`i32`, `bool`, ...), `kladde-types` containers (`PersistedVec`,
-//! `PersistedHashMap`, `PersistedString`), and other
+//! doesn't (use `kladde_types::PersistableString` instead), but scalars
+//! (`i32`, `bool`, ...), `kladde-types` containers (`PersistableVec`,
+//! `PersistableHashMap`, `PersistableString`), and other
 //! `#[derive(Persistable)]` types all do. There's no special error
 //! message for this -- an unsuitable field type just fails to compile
 //! with an ordinary `` `Foo` doesn't implement `Persistable` `` error
@@ -45,12 +45,12 @@
 //! Swapping in any type that *does* implement `Persistable` compiles the
 //! same way -- a scalar like `i32` here, or in a real application a
 //! `kladde-types` container, another `#[derive(Persistable)]` type, or
-//! (for a `String`-like field specifically) `kladde_types::PersistedString`:
+//! (for a `String`-like field specifically) `kladde_types::PersistableString`:
 //!
 //! ```
 //! #[derive(kladde_derive::Persistable)]
 //! struct Contact {
-//!     name: i32, // more realistically, kladde_types::PersistedString in this case
+//!     name: i32, // more realistically, kladde_types::PersistableString in this case
 //! }
 //! ```
 //!

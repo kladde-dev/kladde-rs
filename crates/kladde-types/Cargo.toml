@@ -14,7 +14,7 @@ serde = { workspace = true, optional = true }
 postcard = { workspace = true, optional = true }
 
 [features]
-# Gates `Persisted<T>` -- the generic wrapper for foreign types that can't
-# otherwise satisfy `Persistable` without leaking (see `persisted.rs`'s
+# Gates `PersistableBlob<T>` -- the generic wrapper for foreign types that
+# can't otherwise satisfy `Persistable` without leaking (see `blob.rs`'s
 # module doc comment). Nothing else in this crate needs `serde`/`postcard`.
 serde = ["dep:serde", "dep:postcard"]

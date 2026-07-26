@@ -228,8 +228,8 @@ impl_persistable_scalar_via!(
 // way, unlike the in-memory mock). This absence *is* the enforcement
 // mechanism the derive macro relies on (see `spec.md`): a struct field
 // typed as plain `String` simply fails to compile, pointing application
-// authors at `kladde_types::PersistedString` -- a wrapper with its own
-// `pointer` field, the same shape `PersistedVec` already has -- instead.
+// authors at `kladde_types::PersistableString` -- a wrapper with its own
+// `pointer` field, the same shape `PersistableVec` already has -- instead.
 
 #[cfg(test)]
 mod tests {

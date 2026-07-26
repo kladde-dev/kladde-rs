@@ -112,8 +112,8 @@ pub struct Location {
 
 /// Writes an 8-byte `{ target: u32, len: u32 }` header at `location` --
 /// the fixed-size inline representation every "owning" [`Persistable`]
-/// type (one with a separate content allocation: `PersistedVec`,
-/// `PersistedHashMap`, `PersistedString`, `Persisted<T>`) uses. `target`
+/// type (one with a separate content allocation: `PersistableVec`,
+/// `PersistableHashMap`, `PersistableString`, `PersistableBlob<T>`) uses. `target`
 /// is `0` to mean "no allocation yet", the same convention the pointer
 /// registry uses (see `spec.md`'s Pointers and Memory Management).
 pub fn write_header<B: Backend>(backend: &B, location: Location, index: NonZeroU32, len: u32) {
@@ -202,7 +202,7 @@ pub trait Allocator {
 
     /// Copies `len` bytes from `src_offset` within `src` to `dst_offset`
     /// within `dst` (`src` and `dst` may be the same region, for an
-    /// in-place shift -- e.g. `PersistedVec::remove`'s tail memmove).
+    /// in-place shift -- e.g. `PersistableVec::remove`'s tail memmove).
     fn copy(&self, src: RawPointer, src_offset: u32, len: u32, dst: RawPointer, dst_offset: u32);
 
     /// Changes an existing allocation's size, in place if it still fits
@@ -230,8 +230,8 @@ pub trait Persistable: Sized {
     /// elsewhere. For a scalar it's the value's own bytes; for a derived
     /// struct, the sum of its fields'; for a derived enum, a 4-byte
     /// discriminant plus its largest variant; and for an "owning" type
-    /// with a separate content allocation (`PersistedVec`,
-    /// `PersistedString`, ...), a fixed 8-byte `{ target, len }` header.
+    /// with a separate content allocation (`PersistableVec`,
+    /// `PersistableString`, ...), a fixed 8-byte `{ target, len }` header.
     /// Having *some* fixed inline size is what makes sibling fields'
     /// offsets within a containing struct statically computable.
     const INLINE_SIZE: usize;
@@ -259,9 +259,9 @@ pub trait Persistable: Sized {
     /// before.
     ///
     /// Takes `&mut self`, not `&self`: a type with its own cached
-    /// allocation pointer (`PersistedVec`, `PersistedString`, ...) may
+    /// allocation pointer (`PersistableVec`, `PersistableString`, ...) may
     /// need to *learn* that pointer for the first time here -- e.g. a
-    /// value built via `PersistedVec::from_iter`/`PersistedString::from`
+    /// value built via `PersistableVec::from_iter`/`PersistableString::from`
     /// can hold real content while its pointer is still `None` (nothing
     /// has allocated for it yet), and `store` is exactly the place that
     /// allocation happens the first time such a value is written

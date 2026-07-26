@@ -1,11 +1,11 @@
-//! [`PersistedHashMap`] -- the backed variant of `HashMap<K, V>`.
+//! [`PersistableHashMap`] -- the backed variant of `HashMap<K, V>`.
 //!
 //! Snapshot layout: the on-disk representation doesn't need to support
 //! O(1) lookup by key at all -- that's already handled by the in-memory
 //! reconstruction. So the content allocation is a dense-*ish* array of
 //! fixed-size slots (a 1-byte liveness tag, then `K`, then `V` --
 //! `1 + K::INLINE_SIZE + V::INLINE_SIZE` bytes each), grown by `insert`
-//! exactly like `PersistedVec`, but *not* compacted by `remove`: removing
+//! exactly like `PersistableVec`, but *not* compacted by `remove`: removing
 //! an entry just clears its slot's liveness tag in place, leaving a
 //! tombstone, rather than swapping the last slot into its place. This
 //! means the on-disk array's length is really a *capacity* (the highest
@@ -38,16 +38,16 @@ use std::ops::{Deref, DerefMut};
 ///
 /// Behaves like `std::collections::HashMap<K, V>` for reads (`get`,
 /// `contains_key`, `iter`, `len`, ...), which touch only the in-memory
-/// copy. Mutation goes through a [`PersistedHashMapGuard`] obtained from
+/// copy. Mutation goes through a [`PersistableHashMapGuard`] obtained from
 /// [`Persistable::guard`] (or a derived parent's `_mut()` accessor):
 /// `insert`/`remove`/`get_mut` each update memory *and* record the change
 /// to the backend in one step. Both `K` and `V` need to implement
 /// [`Persistable`] (and `K: Eq + Hash`, as usual); notably `K` does *not*
 /// need `Clone`. Keys are not mutable in place -- no guard is ever handed
-/// out for a key -- so a `PersistedString` key, for instance, is written
+/// out for a key -- so a `PersistableString` key, for instance, is written
 /// once and thereafter only read.
 #[derive(Debug, PartialEq)]
-pub struct PersistedHashMap<K: Eq + Hash, V> {
+pub struct PersistableHashMap<K: Eq + Hash, V> {
     /// key -> (slot index into the on-disk array, value). Only ever
     /// holds *live* entries -- a removed key is gone from here
     /// entirely, its former slot surviving on disk only as a tombstone.
@@ -57,12 +57,12 @@ pub struct PersistedHashMap<K: Eq + Hash, V> {
     /// Always `>= entries.len()`; strictly greater once anything has
     /// ever been removed.
     capacity: usize,
-    pointer: Option<UniquePointer<PersistedHashMap<K, V>>>,
+    pointer: Option<UniquePointer<PersistableHashMap<K, V>>>,
 }
 
-impl<K: Eq + Hash, V> PersistedHashMap<K, V> {
+impl<K: Eq + Hash, V> PersistableHashMap<K, V> {
     pub fn new() -> Self {
-        PersistedHashMap {
+        PersistableHashMap {
             entries: HashMap::new(),
             capacity: 0,
             pointer: None,
@@ -90,7 +90,7 @@ impl<K: Eq + Hash, V> PersistedHashMap<K, V> {
     }
 }
 
-impl<K: Eq + Hash, V> Default for PersistedHashMap<K, V> {
+impl<K: Eq + Hash, V> Default for PersistableHashMap<K, V> {
     fn default() -> Self {
         Self::new()
     }
@@ -99,7 +99,7 @@ impl<K: Eq + Hash, V> Default for PersistedHashMap<K, V> {
 type EntriesIter<'a, K, V> = hash_map::Iter<'a, K, (usize, V)>;
 type EntriesMapFn<'a, K, V> = fn((&'a K, &'a (usize, V))) -> (&'a K, &'a V);
 
-impl<'a, K: Eq + Hash, V> IntoIterator for &'a PersistedHashMap<K, V> {
+impl<'a, K: Eq + Hash, V> IntoIterator for &'a PersistableHashMap<K, V> {
     type Item = (&'a K, &'a V);
     type IntoIter = std::iter::Map<EntriesIter<'a, K, V>, EntriesMapFn<'a, K, V>>;
 
@@ -108,18 +108,18 @@ impl<'a, K: Eq + Hash, V> IntoIterator for &'a PersistedHashMap<K, V> {
     }
 }
 
-impl<K, V> Persistable for PersistedHashMap<K, V>
+impl<K, V> Persistable for PersistableHashMap<K, V>
 where
     K: Eq + Hash + Persistable,
     V: Persistable,
 {
-    /// A fixed 8-byte `{ target, capacity }` header -- see `PersistedVec`'s
+    /// A fixed 8-byte `{ target, capacity }` header -- see `PersistableVec`'s
     /// identical layout note (the second field means slot *capacity*
     /// here, not live count -- see this module's doc comment).
     const INLINE_SIZE: usize = 8;
 
     type Guard<'s, B: Backend>
-        = PersistedHashMapGuard<'s, K, V, B>
+        = PersistableHashMapGuard<'s, K, V, B>
     where
         Self: 's,
         B: 's;
@@ -129,7 +129,7 @@ where
         backend: &'s B,
         location: Location,
     ) -> Self::Guard<'s, B> {
-        PersistedHashMapGuard {
+        PersistableHashMapGuard {
             inner: self,
             backend,
             location,
@@ -137,7 +137,7 @@ where
     }
 
     /// Publishes a header at `location` pointing at this map's content --
-    /// used when a whole `PersistedHashMap` is being written as a
+    /// used when a whole `PersistableHashMap` is being written as a
     /// brand-new value somewhere (e.g. a struct field being assembled)
     /// rather than via incremental `insert`/`remove`.
     ///
@@ -159,9 +159,9 @@ where
                 write_header(backend, location, existing.index(), self.capacity as u32);
             }
             None => {
-                // Unlike `PersistedVec` (which has a backend-free
+                // Unlike `PersistableVec` (which has a backend-free
                 // `FromIterator`), there's no way to construct a
-                // `PersistedHashMap` with entries but no pointer -- `new`
+                // `PersistableHashMap` with entries but no pointer -- `new`
                 // and `load` are the only constructors, and both keep the
                 // two in sync. So `pointer` being `None` here always does
                 // mean `entries`/`capacity` are genuinely empty too;
@@ -203,7 +203,7 @@ where
                 }
             }
         }
-        PersistedHashMap {
+        PersistableHashMap {
             entries,
             capacity: capacity as usize,
             pointer,
@@ -216,7 +216,7 @@ where
     {
         kladde_traits::TypeDescriptor::Opaque {
             library_name: "kladde-types".into(),
-            type_name: "PersistedHashMap".into(),
+            type_name: "PersistableHashMap".into(),
             version: crate::library_version(),
             inline_size: 8,
             parameters: vec![
@@ -256,8 +256,8 @@ fn write_entry<B: Backend, K: Persistable, V: Persistable>(
     );
 }
 
-pub struct PersistedHashMapGuard<'s, K: Eq + Hash, V, B = kladde::DefaultBackend> {
-    inner: &'s mut PersistedHashMap<K, V>,
+pub struct PersistableHashMapGuard<'s, K: Eq + Hash, V, B = kladde::DefaultBackend> {
+    inner: &'s mut PersistableHashMap<K, V>,
     backend: &'s B,
     location: Location,
 }
@@ -266,7 +266,7 @@ pub struct PersistedHashMapGuard<'s, K: Eq + Hash, V, B = kladde::DefaultBackend
 // in its own impl block so it stays available regardless of what
 // `insert`/`remove` additionally need.
 impl<'s, K: Eq + Hash + Persistable, V: Persistable, B: Backend>
-    PersistedHashMapGuard<'s, K, V, B>
+    PersistableHashMapGuard<'s, K, V, B>
 {
     pub fn get_mut(&mut self, key: &K) -> Option<V::Guard<'_, B>> {
         let slot = self.inner.entries.get(key)?.0;
@@ -281,7 +281,7 @@ impl<'s, K: Eq + Hash + Persistable, V: Persistable, B: Backend>
     }
 }
 
-impl<'s, K, V, B: Backend> PersistedHashMapGuard<'s, K, V, B>
+impl<'s, K, V, B: Backend> PersistableHashMapGuard<'s, K, V, B>
 where
     K: Eq + Hash + Persistable,
     V: Persistable,
@@ -290,7 +290,7 @@ where
     /// its value is overwritten in place (the key itself doesn't need
     /// rewriting -- it can't have changed) and the old value is
     /// returned; otherwise a brand-new slot is appended at the current
-    /// capacity, exactly like `PersistedVec::push` -- growing (or
+    /// capacity, exactly like `PersistableVec::push` -- growing (or
     /// creating) the content allocation to fit, writing the new entry,
     /// then publishing the updated header last.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
@@ -316,8 +316,10 @@ where
         match &self.inner.pointer {
             Some(pointer) => self.backend.resize(pointer, new_byte_size),
             None => {
-                self.inner.pointer =
-                    Some(self.backend.alloc::<PersistedHashMap<K, V>>(new_byte_size))
+                self.inner.pointer = Some(
+                    self.backend
+                        .alloc::<PersistableHashMap<K, V>>(new_byte_size),
+                )
             }
         }
         let pointer = self.inner.pointer.as_ref().unwrap();
@@ -361,18 +363,18 @@ where
     }
 }
 
-impl<'s, K, V, B: Backend> Guard for PersistedHashMapGuard<'s, K, V, B>
+impl<'s, K, V, B: Backend> Guard for PersistableHashMapGuard<'s, K, V, B>
 where
     K: Eq + Hash + Persistable,
     V: Persistable,
 {
-    type Persistable = PersistedHashMap<K, V>;
+    type Persistable = PersistableHashMap<K, V>;
     type Backend = B;
 
-    fn as_persistable(&self) -> &PersistedHashMap<K, V> {
+    fn as_persistable(&self) -> &PersistableHashMap<K, V> {
         self.inner
     }
-    fn as_persistable_mut(&mut self) -> &mut PersistedHashMap<K, V> {
+    fn as_persistable_mut(&mut self) -> &mut PersistableHashMap<K, V> {
         self.inner
     }
     fn backend(&self) -> &B {
@@ -380,15 +382,15 @@ where
     }
 }
 
-impl<'s, K: Eq + Hash, V, B> Deref for PersistedHashMapGuard<'s, K, V, B> {
-    type Target = PersistedHashMap<K, V>;
-    fn deref(&self) -> &PersistedHashMap<K, V> {
+impl<'s, K: Eq + Hash, V, B> Deref for PersistableHashMapGuard<'s, K, V, B> {
+    type Target = PersistableHashMap<K, V>;
+    fn deref(&self) -> &PersistableHashMap<K, V> {
         self.inner
     }
 }
 
-impl<'s, K: Eq + Hash, V, B> DerefMut for PersistedHashMapGuard<'s, K, V, B> {
-    fn deref_mut(&mut self) -> &mut PersistedHashMap<K, V> {
+impl<'s, K: Eq + Hash, V, B> DerefMut for PersistableHashMapGuard<'s, K, V, B> {
+    fn deref_mut(&mut self) -> &mut PersistableHashMap<K, V> {
         self.inner
     }
 }
@@ -397,11 +399,12 @@ impl<'s, K: Eq + Hash, V, B> DerefMut for PersistedHashMapGuard<'s, K, V, B> {
 mod tests {
     use super::*;
     use crate::test_support::MockBackend;
-    use crate::PersistedString;
+    use crate::PersistableString;
     use kladde_traits::Allocator;
 
     fn root_location(backend: &MockBackend) -> Location {
-        let pointer = backend.alloc::<()>(PersistedHashMap::<PersistedString, i32>::INLINE_SIZE);
+        let pointer =
+            backend.alloc::<()>(PersistableHashMap::<PersistableString, i32>::INLINE_SIZE);
         Location {
             anchor: pointer.raw(),
             offset: 0,
@@ -412,33 +415,33 @@ mod tests {
     fn insert_adds_in_memory() {
         let backend = MockBackend::default();
         let location = root_location(&backend);
-        let mut map = PersistedHashMap::<PersistedString, i32>::new();
+        let mut map = PersistableHashMap::<PersistableString, i32>::new();
 
         let mut guard = map.guard(&backend, location);
-        guard.insert(PersistedString::from("a"), 1);
-        guard.insert(PersistedString::from("b"), 2);
+        guard.insert(PersistableString::from("a"), 1);
+        guard.insert(PersistableString::from("b"), 2);
 
         assert_eq!(map.len(), 2);
-        assert_eq!(map.get(&PersistedString::from("a")), Some(&1));
-        assert_eq!(map.get(&PersistedString::from("b")), Some(&2));
+        assert_eq!(map.get(&PersistableString::from("a")), Some(&1));
+        assert_eq!(map.get(&PersistableString::from("b")), Some(&2));
     }
 
     #[test]
     fn insert_replacing_an_existing_key_returns_the_old_value() {
         let backend = MockBackend::default();
         let location = root_location(&backend);
-        let mut map = PersistedHashMap::<PersistedString, i32>::new();
+        let mut map = PersistableHashMap::<PersistableString, i32>::new();
         {
             let mut guard = map.guard(&backend, location);
-            guard.insert(PersistedString::from("a"), 1);
+            guard.insert(PersistableString::from("a"), 1);
         }
 
         let old = map
             .guard(&backend, location)
-            .insert(PersistedString::from("a"), 2);
+            .insert(PersistableString::from("a"), 2);
 
         assert_eq!(old, Some(1));
-        assert_eq!(map.get(&PersistedString::from("a")), Some(&2));
+        assert_eq!(map.get(&PersistableString::from("a")), Some(&2));
         assert_eq!(map.len(), 1);
     }
 
@@ -446,94 +449,97 @@ mod tests {
     fn get_mut_returns_a_nested_guard_for_persistable_values() {
         let backend = MockBackend::default();
         let location = root_location(&backend);
-        let mut map = PersistedHashMap::<PersistedString, i32>::new();
+        let mut map = PersistableHashMap::<PersistableString, i32>::new();
         {
             let mut guard = map.guard(&backend, location);
-            guard.insert(PersistedString::from("a"), 1);
+            guard.insert(PersistableString::from("a"), 1);
         }
 
         let mut guard = map.guard(&backend, location);
-        guard.get_mut(&PersistedString::from("a")).unwrap().set(99);
+        guard
+            .get_mut(&PersistableString::from("a"))
+            .unwrap()
+            .set(99);
 
-        assert_eq!(map.get(&PersistedString::from("a")), Some(&99));
+        assert_eq!(map.get(&PersistableString::from("a")), Some(&99));
     }
 
     #[test]
     fn remove_deletes_but_leaves_other_entries_untouched() {
         let backend = MockBackend::default();
         let location = root_location(&backend);
-        let mut map = PersistedHashMap::<PersistedString, i32>::new();
+        let mut map = PersistableHashMap::<PersistableString, i32>::new();
         {
             let mut guard = map.guard(&backend, location);
-            guard.insert(PersistedString::from("a"), 1);
-            guard.insert(PersistedString::from("b"), 2);
-            guard.insert(PersistedString::from("c"), 3);
+            guard.insert(PersistableString::from("a"), 1);
+            guard.insert(PersistableString::from("b"), 2);
+            guard.insert(PersistableString::from("c"), 3);
         }
 
         let removed = map
             .guard(&backend, location)
-            .remove(&PersistedString::from("a"));
+            .remove(&PersistableString::from("a"));
 
         assert_eq!(removed, Some(1));
-        assert!(map.get(&PersistedString::from("a")).is_none());
+        assert!(map.get(&PersistableString::from("a")).is_none());
         assert_eq!(map.len(), 2);
-        assert_eq!(map.get(&PersistedString::from("b")), Some(&2));
-        assert_eq!(map.get(&PersistedString::from("c")), Some(&3));
+        assert_eq!(map.get(&PersistableString::from("b")), Some(&2));
+        assert_eq!(map.get(&PersistableString::from("c")), Some(&3));
     }
 
     #[test]
     fn insert_after_remove_appends_past_capacity_rather_than_reusing_the_tombstone() {
         let backend = MockBackend::default();
         let location = root_location(&backend);
-        let mut map = PersistedHashMap::<PersistedString, i32>::new();
+        let mut map = PersistableHashMap::<PersistableString, i32>::new();
         {
             let mut guard = map.guard(&backend, location);
-            guard.insert(PersistedString::from("a"), 1);
-            guard.insert(PersistedString::from("b"), 2);
-            guard.remove(&PersistedString::from("a"));
-            guard.insert(PersistedString::from("c"), 3);
+            guard.insert(PersistableString::from("a"), 1);
+            guard.insert(PersistableString::from("b"), 2);
+            guard.remove(&PersistableString::from("a"));
+            guard.insert(PersistableString::from("c"), 3);
         }
 
         assert_eq!(map.len(), 2);
-        assert_eq!(map.get(&PersistedString::from("b")), Some(&2));
-        assert_eq!(map.get(&PersistedString::from("c")), Some(&3));
+        assert_eq!(map.get(&PersistableString::from("b")), Some(&2));
+        assert_eq!(map.get(&PersistableString::from("c")), Some(&3));
 
         backend.flush();
-        let reloaded = PersistedHashMap::<PersistedString, i32>::load(&backend, location);
+        let reloaded = PersistableHashMap::<PersistableString, i32>::load(&backend, location);
         assert_eq!(reloaded.len(), 2);
-        assert_eq!(reloaded.get(&PersistedString::from("b")), Some(&2));
-        assert_eq!(reloaded.get(&PersistedString::from("c")), Some(&3));
-        assert_eq!(reloaded.get(&PersistedString::from("a")), None);
+        assert_eq!(reloaded.get(&PersistableString::from("b")), Some(&2));
+        assert_eq!(reloaded.get(&PersistableString::from("c")), Some(&3));
+        assert_eq!(reloaded.get(&PersistableString::from("a")), None);
     }
 
     #[test]
     fn flushing_and_reloading_round_trips_the_content() {
         let backend = MockBackend::default();
         let location = root_location(&backend);
-        let mut map = PersistedHashMap::<PersistedString, i32>::new();
+        let mut map = PersistableHashMap::<PersistableString, i32>::new();
         {
             let mut guard = map.guard(&backend, location);
-            guard.insert(PersistedString::from("a"), 1);
-            guard.insert(PersistedString::from("b"), 2);
-            guard.insert(PersistedString::from("c"), 3);
+            guard.insert(PersistableString::from("a"), 1);
+            guard.insert(PersistableString::from("b"), 2);
+            guard.insert(PersistableString::from("c"), 3);
         }
         {
             map.guard(&backend, location)
-                .remove(&PersistedString::from("b"));
+                .remove(&PersistableString::from("b"));
         }
 
         backend.flush();
 
-        let reloaded = PersistedHashMap::<PersistedString, i32>::load(&backend, location);
-        assert_eq!(reloaded.get(&PersistedString::from("a")), Some(&1));
-        assert_eq!(reloaded.get(&PersistedString::from("b")), None);
-        assert_eq!(reloaded.get(&PersistedString::from("c")), Some(&3));
+        let reloaded = PersistableHashMap::<PersistableString, i32>::load(&backend, location);
+        assert_eq!(reloaded.get(&PersistableString::from("a")), Some(&1));
+        assert_eq!(reloaded.get(&PersistableString::from("b")), None);
+        assert_eq!(reloaded.get(&PersistableString::from("c")), Some(&3));
         assert_eq!(reloaded.len(), 2);
     }
 
     /// A key type that deliberately does *not* implement `Clone` --
     /// standing in for a future pointer-owning key type (e.g. a
-    /// `PersistedString`) that couldn't implement `Clone` even if it
+    /// `PersistableString`) that couldn't implement `Clone` even if it
     /// wanted to, since it'd own a `UniquePointer`. Proves the map never
     /// needed `Clone` in the first place with this layout, not just that
     /// it no longer happens to exercise it.
@@ -607,7 +613,7 @@ mod tests {
     fn non_clone_keys_work_end_to_end() {
         let backend = MockBackend::default();
         let location = root_location(&backend);
-        let mut map = PersistedHashMap::<NonCloneKey, i32>::new();
+        let mut map = PersistableHashMap::<NonCloneKey, i32>::new();
 
         {
             let mut guard = map.guard(&backend, location);
@@ -623,7 +629,7 @@ mod tests {
         assert_eq!(map.len(), 2);
 
         backend.flush();
-        let reloaded = PersistedHashMap::<NonCloneKey, i32>::load(&backend, location);
+        let reloaded = PersistableHashMap::<NonCloneKey, i32>::load(&backend, location);
         assert_eq!(reloaded.get(&NonCloneKey(2)), Some(&20));
         assert_eq!(reloaded.get(&NonCloneKey(3)), Some(&30));
     }
@@ -634,7 +640,7 @@ mod tests {
         let location_a = root_location(&backend);
         let location_b = root_location(&backend);
 
-        let mut map = PersistedHashMap::<i32, i32>::new();
+        let mut map = PersistableHashMap::<i32, i32>::new();
         {
             let mut guard = map.guard(&backend, location_a);
             guard.insert(1, 10);
@@ -656,7 +662,7 @@ mod tests {
             "store() should reuse the existing allocation, not leak a second one"
         );
 
-        let reloaded = PersistedHashMap::<i32, i32>::load(&backend, location_b);
+        let reloaded = PersistableHashMap::<i32, i32>::load(&backend, location_b);
         assert_eq!(reloaded.get(&1), Some(&10));
         assert_eq!(reloaded.get(&2), Some(&20));
     }
@@ -666,7 +672,7 @@ mod tests {
     /// dropped at the time because a plain `String` key's own leak (every
     /// `store` allocating fresh, having no room for a pointer of its own)
     /// conflated two different bugs, and switched to `i32` keys to
-    /// isolate what was actually being tested. Now that `PersistedString`
+    /// isolate what was actually being tested. Now that `PersistableString`
     /// exists (and doesn't have that problem), this closes the gap and
     /// should just pass.
     #[test]
@@ -675,11 +681,11 @@ mod tests {
         let location_a = root_location(&backend);
         let location_b = root_location(&backend);
 
-        let mut map = PersistedHashMap::<PersistedString, i32>::new();
+        let mut map = PersistableHashMap::<PersistableString, i32>::new();
         {
             let mut guard = map.guard(&backend, location_a);
-            guard.insert(PersistedString::from("a"), 10);
-            guard.insert(PersistedString::from("b"), 20);
+            guard.insert(PersistableString::from("a"), 10);
+            guard.insert(PersistableString::from("b"), 20);
         }
         backend.flush();
         let live_before = backend.live_count();
@@ -693,9 +699,9 @@ mod tests {
             "store() should reuse the existing allocation, not leak a second one"
         );
 
-        let reloaded = PersistedHashMap::<PersistedString, i32>::load(&backend, location_b);
-        assert_eq!(reloaded.get(&PersistedString::from("a")), Some(&10));
-        assert_eq!(reloaded.get(&PersistedString::from("b")), Some(&20));
+        let reloaded = PersistableHashMap::<PersistableString, i32>::load(&backend, location_b);
+        assert_eq!(reloaded.get(&PersistableString::from("a")), Some(&10));
+        assert_eq!(reloaded.get(&PersistableString::from("b")), Some(&20));
     }
 
     /// Proves the bug the *previous* version of `store` had, which this
@@ -713,16 +719,16 @@ mod tests {
         let location_a = root_location(&backend);
         let location_b = root_location(&backend);
 
-        let mut map = PersistedHashMap::<PersistedString, i32>::new();
+        let mut map = PersistableHashMap::<PersistableString, i32>::new();
         {
             let mut guard = map.guard(&backend, location_a);
-            guard.insert(PersistedString::from("a"), 1);
-            guard.insert(PersistedString::from("b"), 2);
-            guard.insert(PersistedString::from("c"), 3);
+            guard.insert(PersistableString::from("a"), 1);
+            guard.insert(PersistableString::from("b"), 2);
+            guard.insert(PersistableString::from("c"), 3);
             // Tombstones slot 0, leaving "b"/"c" at their original
             // slots (1, 2) with a gap before them -- capacity (3) now
             // exceeds the live count (2).
-            guard.remove(&PersistedString::from("a"));
+            guard.remove(&PersistableString::from("a"));
         }
 
         // Simulate writing this already-tombstone-laden map as a value
@@ -735,16 +741,19 @@ mod tests {
         // slots, which `store` must not have disturbed.
         {
             let mut guard = map.guard(&backend, location_a);
-            guard.get_mut(&PersistedString::from("b")).unwrap().set(20);
-            guard.remove(&PersistedString::from("c"));
+            guard
+                .get_mut(&PersistableString::from("b"))
+                .unwrap()
+                .set(20);
+            guard.remove(&PersistableString::from("c"));
         }
 
-        assert_eq!(map.get(&PersistedString::from("b")), Some(&20));
-        assert_eq!(map.get(&PersistedString::from("c")), None);
+        assert_eq!(map.get(&PersistableString::from("b")), Some(&20));
+        assert_eq!(map.get(&PersistableString::from("c")), None);
 
         backend.flush();
-        let reloaded_a = PersistedHashMap::<PersistedString, i32>::load(&backend, location_a);
-        assert_eq!(reloaded_a.get(&PersistedString::from("b")), Some(&20));
-        assert_eq!(reloaded_a.get(&PersistedString::from("c")), None);
+        let reloaded_a = PersistableHashMap::<PersistableString, i32>::load(&backend, location_a);
+        assert_eq!(reloaded_a.get(&PersistableString::from("b")), Some(&20));
+        assert_eq!(reloaded_a.get(&PersistableString::from("c")), None);
     }
 }

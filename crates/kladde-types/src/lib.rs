@@ -1,4 +1,4 @@
-//! The built-in backed container types (`PersistedVec`, `PersistedHashMap`
+//! The built-in backed container types (`PersistableVec`, `PersistableHashMap`
 //! -- a rope is deferred, see `spec.md`) and blanket [`Persistable`] impls
 //! for primitives.
 //!
@@ -10,20 +10,20 @@
 //! Also re-exports the [`Persistable`](kladde_derive::Persistable) derive
 //! macro for convenience, so application crates only need one dependency.
 
-mod map;
 #[cfg(feature = "serde")]
-mod persisted;
+mod blob;
+mod map;
 mod string;
 mod vec;
 
 #[cfg(test)]
 mod test_support;
 
-pub use map::{PersistedHashMap, PersistedHashMapGuard};
 #[cfg(feature = "serde")]
-pub use persisted::{Persisted, PersistedGuard};
-pub use string::{PersistedString, PersistedStringGuard};
-pub use vec::{PersistedVec, PersistedVecGuard};
+pub use blob::{PersistableBlob, PersistableBlobGuard};
+pub use map::{PersistableHashMap, PersistableHashMapGuard};
+pub use string::{PersistableString, PersistableStringGuard};
+pub use vec::{PersistableVec, PersistableVecGuard};
 
 // `Persistable` here names two different things in two different
 // namespaces -- the trait (from `kladde-traits`) and the derive macro

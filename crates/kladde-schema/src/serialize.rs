@@ -343,7 +343,7 @@ mod tests {
             TypeDescriptor::Primitive(Primitive::I64),
             TypeDescriptor::Opaque {
                 library_name: "kladde-types".into(),
-                type_name: "PersistedVec".into(),
+                type_name: "PersistableVec".into(),
                 version: Version {
                     major: 0,
                     minor: 1,

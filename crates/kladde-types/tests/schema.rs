@@ -1,7 +1,7 @@
 //! End-to-end `describe`/`schema`/`fingerprint` over real `Persistable`
 //! types: derived structs and enums, built-in containers, and recursion.
 
-use kladde_types::{Persistable, PersistedString, PersistedVec};
+use kladde_types::{Persistable, PersistableString, PersistableVec};
 
 #[derive(kladde_types::Persistable)]
 struct Point {
@@ -43,15 +43,15 @@ fn type_name_does_not_affect_fingerprint_but_field_name_and_order_do() {
 
 #[derive(kladde_types::Persistable)]
 struct WithContainers {
-    name: PersistedString,
-    scores: PersistedVec<i32>,
+    name: PersistableString,
+    scores: PersistableVec<i32>,
 }
 
 #[test]
 fn containers_fingerprint_stably() {
     assert_eq!(WithContainers::fingerprint(), WithContainers::fingerprint());
     // Its schema has the root struct plus one descriptor per distinct
-    // container/scalar type reached: PersistedString, PersistedVec, i32.
+    // container/scalar type reached: PersistableString, PersistableVec, i32.
     assert_eq!(WithContainers::schema().descriptors().len(), 4);
 }
 
@@ -68,11 +68,11 @@ fn enum_fingerprint_is_stable() {
 }
 
 // A recursive type: a tree whose children are more trees. `Tree` reaches
-// itself through `PersistedVec<Tree>`, exercising the de Bruijn back-edge.
+// itself through `PersistableVec<Tree>`, exercising the de Bruijn back-edge.
 #[derive(kladde_types::Persistable)]
 struct Tree {
     value: i32,
-    children: PersistedVec<Tree>,
+    children: PersistableVec<Tree>,
 }
 
 #[test]

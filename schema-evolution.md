@@ -50,7 +50,7 @@ the field names separately:
 - **The atoms of change** (any scheme should classify each as compatible / migratable / breaking):
   add field, remove field, rename field, reorder fields, resize/retype a field, add enum
   variant, remove variant, reorder variants, change a variant's payload, wrap/unwrap
-  (`T` → `Option<T>` / `Persisted<T>`). Reorder-field and reorder-variant *should* be no-ops but
+  (`T` → `Option<T>` / `PersistableBlob<T>`). Reorder-field and reorder-variant *should* be no-ops but
   today are silently breaking — that alone argues for decoupling identity from position.
 
 - **Who owns the schema** (this changes everything):
@@ -214,9 +214,9 @@ When opening a file, kladde first parses the types list into a `Vec<Type>`. It t
 - For `Struct` and `Enum`, we're essentially implementing structural typing. Two struct types with the same name and same fields will serialize to the same description even if they're different rust types. For derived types, I'm not sure if this is an issue: we need the type description only to check if the data representation in the file matches what the program's `Persistable` implementation of the type does, and for derived types, that's the case if the type is structurally identical. Note that the serialized type description does not affect which rust type will be used to actually handle the data structure. That's handled as implemented now, via rust's normal type system.
     - *(Claude, response — agreed, and it's not a problem.)* Your reasoning is right: the descriptor certifies **representation**, not **identity**. Because reconstruction always proceeds *top-down from the known root type*, you never ask "what Rust type is this anonymous blob?" — the parent field's declared type already tells you which `load` to call; the descriptor is only there to check "does the writer's byte layout for this field match what my `load` expects, and if not, how do I bridge it?" Two structurally-identical-but-semantically-different types (`{x:i32,y:i32}` as Point vs. as Complex) are indistinguishable, but that can only happen if one is substituted for the other at the *same position in the tree*, which is a type error the Rust side already prevents. So structural descriptors are exactly the right granularity.
 - Names of `Manual` can clash. The `(crate_name, name)` identification is not versatile (assumes globally known crate names, ...).
-    - *(Claude, response:)* Two sub-points. (i) `(crate_name, name, major_version)` is the same identity Cargo/semver already rely on; clashes are the same risk `cargo` already manages, so this is acceptable *if* you also allow a manual type to declare a **structural** descriptor for its content when it has one (e.g. `PersistedString` = "u32-length-prefixed UTF-8 blob"), and reserve opaque nominal identity only for genuinely opaque types (`Persisted<T>` = "postcard blob of T"). Then structural types get structural compatibility (robust), and only truly-opaque types depend on the fragile `(crate, name, version)` tuple. (ii) For the opaque ones, compatibility is the *type's own decision*: `load` sees the writer's `Manual{version}` and chooses whether to support it — which is your second advantage bullet, and it's the correct place to put foreign-type-evolution policy (with the foreign author, not with Kladde).
-- Some unclear cases: consider the type `struct Calculation { formula: PersistedString }` with a derived `Persistable` implementation. Its type description is `Type::Struct{ ... }`. Now assume that we want to cache the result of the calculation, but we don't want to store the result in the file (we'll redo the calculation when we open the file). Thus, we now have `struct Calculation { formula: PersistedString, cached_result: i32 }`. We don't want to derive `Persistable` for it because that would also persist the cached result. So we manually implement `Persistable` as if the field `cached_result` wasn't there. Should this type's description now be `Type::Manual` or should it be the same `Type::Struct` as we had before because the representaiton in the file remained unchanged?
-    - *(Claude, response — it should remain `Type::Struct`.)* This case actually *confirms* the guiding principle: **the descriptor describes the representation, not the Rust type.** The manual impl writes exactly the bytes of `Struct{ formula: PersistedString }`, so its descriptor should be exactly that. A reader must be able to interoperate with anyone who writes that representation, regardless of how many non-persisted fields sit in the author's Rust struct. Concretely: the derive macro emits the `Struct{…}` descriptor automatically; a manual impl emits **whatever descriptor matches the bytes it actually reads/writes** (here, hand-written to match `Struct{ formula }`). `Manual` is therefore *not* "any hand-written impl" — it's specifically "a type whose representation is not expressible as a plain field-sum / variant-set" (owning types, opaque blobs). So the answer falls straight out of "descriptor = representation." *(This suggests renaming `Manual` to something like `Opaque` to avoid exactly this confusion — "manual impl" and "opaque representation" are different axes.)*
+    - *(Claude, response:)* Two sub-points. (i) `(crate_name, name, major_version)` is the same identity Cargo/semver already rely on; clashes are the same risk `cargo` already manages, so this is acceptable *if* you also allow a manual type to declare a **structural** descriptor for its content when it has one (e.g. `PersistableString` = "u32-length-prefixed UTF-8 blob"), and reserve opaque nominal identity only for genuinely opaque types (`PersistableBlob<T>` = "postcard blob of T"). Then structural types get structural compatibility (robust), and only truly-opaque types depend on the fragile `(crate, name, version)` tuple. (ii) For the opaque ones, compatibility is the *type's own decision*: `load` sees the writer's `Manual{version}` and chooses whether to support it — which is your second advantage bullet, and it's the correct place to put foreign-type-evolution policy (with the foreign author, not with Kladde).
+- Some unclear cases: consider the type `struct Calculation { formula: PersistableString }` with a derived `Persistable` implementation. Its type description is `Type::Struct{ ... }`. Now assume that we want to cache the result of the calculation, but we don't want to store the result in the file (we'll redo the calculation when we open the file). Thus, we now have `struct Calculation { formula: PersistableString, cached_result: i32 }`. We don't want to derive `Persistable` for it because that would also persist the cached result. So we manually implement `Persistable` as if the field `cached_result` wasn't there. Should this type's description now be `Type::Manual` or should it be the same `Type::Struct` as we had before because the representaiton in the file remained unchanged?
+    - *(Claude, response — it should remain `Type::Struct`.)* This case actually *confirms* the guiding principle: **the descriptor describes the representation, not the Rust type.** The manual impl writes exactly the bytes of `Struct{ formula: PersistableString }`, so its descriptor should be exactly that. A reader must be able to interoperate with anyone who writes that representation, regardless of how many non-persisted fields sit in the author's Rust struct. Concretely: the derive macro emits the `Struct{…}` descriptor automatically; a manual impl emits **whatever descriptor matches the bytes it actually reads/writes** (here, hand-written to match `Struct{ formula }`). `Manual` is therefore *not* "any hand-written impl" — it's specifically "a type whose representation is not expressible as a plain field-sum / variant-set" (owning types, opaque blobs). So the answer falls straight out of "descriptor = representation." *(This suggests renaming `Manual` to something like `Opaque` to avoid exactly this confusion — "manual impl" and "opaque representation" are different axes.)*
 
 ### Idea 2: merkelize Idea 1
 
@@ -240,7 +240,7 @@ Think of the list of serialized data types as a vertices of a graph, where any `
 **Disadvantages:**
 
 - No cyclic dependencies allowed (i.e., no linked list) because only DAGs can be merkelized. Is this true? Is there a way out? Or do we have that limitation anyway somehow in the system?
-    - *(Claude, response:)* It's true of *naïve* Merkle hashing but **not fundamental**, and you'll need to solve it regardless because recursive Kladde types are legitimate (a tree node holding `PersistedVec<Node>`, any linked structure). The standard techniques: (1) **hash the whole cycle / strongly-connected component as one unit** — compute the SCCs of the type graph, and hash each SCC together, with intra-SCC `Index`es replaced by a canonical marker (their position within the component). This is exactly how **Unison** hashes mutually-recursive definitions. (2) Equivalently, replace a back-edge with a **de Bruijn-style relative reference** ("the k-th enclosing type currently being hashed") so the hash is still a pure function of structure. Either way the recursion limitation dissolves; it just needs cycle-aware canonicalization rather than a plain post-order fold. (Note this is *also* needed for Idea 1's descriptor *equality* check to terminate on recursive types, so it's shared work, not extra.)
+    - *(Claude, response:)* It's true of *naïve* Merkle hashing but **not fundamental**, and you'll need to solve it regardless because recursive Kladde types are legitimate (a tree node holding `PersistableVec<Node>`, any linked structure). The standard techniques: (1) **hash the whole cycle / strongly-connected component as one unit** — compute the SCCs of the type graph, and hash each SCC together, with intra-SCC `Index`es replaced by a canonical marker (their position within the component). This is exactly how **Unison** hashes mutually-recursive definitions. (2) Equivalently, replace a back-edge with a **de Bruijn-style relative reference** ("the k-th enclosing type currently being hashed") so the hash is still a pure function of structure. Either way the recursion limitation dissolves; it just needs cycle-aware canonicalization rather than a plain post-order fold. (Note this is *also* needed for Idea 1's descriptor *equality* check to terminate on recursive types, so it's shared work, not extra.)
 - Types that contain other (non-primitive) types can no longer detect whether a changed hash is due to their own update or an update of the contained types. Generic types can't use the hash at all.
     - *(Claude, response:)* Right, and this is the decisive limitation. A pure hash **conflates "I changed" with "my dependency changed,"** which is precisely the information a *tolerant/backward-compatible* reader needs to make a fine-grained decision ("my own layout is unchanged; only a nested opaque type bumped major — can I still read the rest?"). And generics are unusable as you say, because `Vec<Av1>` and `Vec<Av2>` hash differently with nothing shared. **Conclusion: a hash alone can implement level (a) detection but cannot implement (b)/(c).** It belongs *on top of* Idea 1, not instead of it.
 
@@ -407,7 +407,7 @@ computed outside it.** When the enclosing type's schema is fingerprinted (`type-
 enclosing (**outer**) fingerprint is *independent of `T`'s internals*, and the two versioning axes
 decouple cleanly:
 
-- the **outer** structure — does `Root` still hold `PersistedVec<Capsule<_>>` in that shape? — is
+- the **outer** structure — does `Root` still hold `PersistableVec<Capsule<_>>` in that shape? — is
   tracked by the outer fingerprint;
 - each capsule's **inner** type is tracked by its own fingerprint in the schema table.
 
@@ -437,10 +437,10 @@ one SCC and need de Bruijn between them, but nested capsules normally form a DAG
 exist, the fingerprint code stays whole-root (which is already canonical and sound for whole-type
 comparison); per-boundary canonicalization is added only when `Capsule<T>` lands.
 
-#### Worked example: detecting a changed capsule in `PersistedVec<Capsule<T>>`
+#### Worked example: detecting a changed capsule in `PersistableVec<Capsule<T>>`
 
-Take `struct Root { items: PersistedVec<Capsule<T>> }` with `T = struct { a: i32, b:
-PersistedString }`. On disk:
+Take `struct Root { items: PersistableVec<Capsule<T>> }` with `T = struct { a: i32, b:
+PersistableString }`. On disk:
 
 - the resident **schema table** holds, deduplicated, `(id → serialized descriptor + canonical
   fingerprint)` — e.g. `0 → FP_outer` (`Root` with the capsule erased), `1 → FP_T_v1` (`T` as
@@ -475,11 +475,11 @@ deduplicated table keyed by canonical fingerprint.
 #### Representing capsules and segments in code
 
 Both are **wrapper types written directly at the field** — `Capsule<T>` and `Segment<T>`, the same
-family as the existing `Persisted<T>` — *not* derive attributes:
+family as the existing `PersistableBlob<T>` — *not* derive attributes:
 
 ```rust
 struct Document {
-    body:  Segment<PersistedString>,   // load boundary: paged in on demand
+    body:  Segment<PersistableString>,   // load boundary: paged in on demand
     prefs: Capsule<Preferences>,       // schema boundary: versions independently
 }
 ```
