@@ -172,6 +172,83 @@ fn total_size(field_ty: &[syn::Type]) -> proc_macro2::TokenStream {
     }
 }
 
+/// The guard type shared by *every* derived `Persistable`: a
+/// `{ inner, backend, location }` struct plus its `Guard`/`Deref`/
+/// `DerefMut` impls. These are byte-identical across the struct, unit,
+/// enum, and transparent derives -- each of those differs only in the
+/// *accessor* `impl` block it adds on top (per-field `_mut()`, an enum's
+/// whole-value `set`, a transparent newtype's `get_mut`, ...) and in its
+/// `Persistable` body. Paired with [`guard_assoc`], which emits the
+/// matching items *inside* the `Persistable` impl.
+fn guard_scaffold(
+    ident: &syn::Ident,
+    vis: &syn::Visibility,
+    guard_ident: &syn::Ident,
+) -> proc_macro2::TokenStream {
+    quote! {
+        #[doc(hidden)]
+        #vis struct #guard_ident<'s, B> {
+            inner: &'s mut #ident,
+            backend: &'s B,
+            location: ::kladde_traits::Location,
+        }
+
+        impl<'s, B: ::kladde_traits::Backend> ::kladde_traits::Guard for #guard_ident<'s, B> {
+            type Persistable = #ident;
+            type Backend = B;
+
+            fn as_persistable(&self) -> &#ident {
+                self.inner
+            }
+            fn as_persistable_mut(&mut self) -> &mut #ident {
+                self.inner
+            }
+            fn backend(&self) -> &B {
+                self.backend
+            }
+        }
+
+        impl<'s, B> ::std::ops::Deref for #guard_ident<'s, B> {
+            type Target = #ident;
+            fn deref(&self) -> &#ident {
+                self.inner
+            }
+        }
+
+        impl<'s, B> ::std::ops::DerefMut for #guard_ident<'s, B> {
+            fn deref_mut(&mut self) -> &mut #ident {
+                self.inner
+            }
+        }
+    }
+}
+
+/// The `Guard` associated type and `guard()` constructor shared by every
+/// derived `Persistable` impl -- the in-impl counterpart of
+/// [`guard_scaffold`]'s out-of-impl items. Every derive kind builds the
+/// same `{ inner, backend, location }` guard the same way.
+fn guard_assoc(guard_ident: &syn::Ident) -> proc_macro2::TokenStream {
+    quote! {
+        type Guard<'s, B: ::kladde_traits::Backend>
+            = #guard_ident<'s, B>
+        where
+            Self: 's,
+            B: 's;
+
+        fn guard<'s, B: ::kladde_traits::Backend>(
+            &'s mut self,
+            backend: &'s B,
+            location: ::kladde_traits::Location,
+        ) -> Self::Guard<'s, B> {
+            #guard_ident {
+                inner: self,
+                backend,
+                location,
+            }
+        }
+    }
+}
+
 /// `#[kladde(transparent)]`, analogous to `#[serde(transparent)]`: a
 /// single-field newtype (tuple `struct S(T)` or braced `struct S { x: T }`)
 /// that is persisted *exactly* as its one field. The generated
@@ -235,13 +312,11 @@ fn derive_transparent(input: &DeriveInput) -> proc_macro2::TokenStream {
         ),
     };
 
+    let scaffold = guard_scaffold(ident, vis, &guard_ident);
+    let guard_assoc = guard_assoc(&guard_ident);
+
     quote! {
-        #[doc(hidden)]
-        #vis struct #guard_ident<'s, B> {
-            inner: &'s mut #ident,
-            backend: &'s B,
-            location: ::kladde_traits::Location,
-        }
+        #scaffold
 
         impl<'s, B: ::kladde_traits::Backend> #guard_ident<'s, B> {
             /// A mutable guard over the wrapped value. Since this is a
@@ -259,57 +334,13 @@ fn derive_transparent(input: &DeriveInput) -> proc_macro2::TokenStream {
             }
         }
 
-        impl<'s, B: ::kladde_traits::Backend> ::kladde_traits::Guard for #guard_ident<'s, B> {
-            type Persistable = #ident;
-            type Backend = B;
-
-            fn as_persistable(&self) -> &#ident {
-                self.inner
-            }
-            fn as_persistable_mut(&mut self) -> &mut #ident {
-                self.inner
-            }
-            fn backend(&self) -> &B {
-                self.backend
-            }
-        }
-
-        impl<'s, B> ::std::ops::Deref for #guard_ident<'s, B> {
-            type Target = #ident;
-            fn deref(&self) -> &#ident {
-                self.inner
-            }
-        }
-
-        impl<'s, B> ::std::ops::DerefMut for #guard_ident<'s, B> {
-            fn deref_mut(&mut self) -> &mut #ident {
-                self.inner
-            }
-        }
-
         impl ::kladde_traits::Persistable for #ident {
             // Transparent: the wrapper *is* its one field, so it owns no
             // storage of its own and forwards everything at offset 0.
             const INLINE_SIZE: usize =
                 <#field_ty as ::kladde_traits::Persistable>::INLINE_SIZE;
 
-            type Guard<'s, B: ::kladde_traits::Backend>
-                = #guard_ident<'s, B>
-            where
-                Self: 's,
-                B: 's;
-
-            fn guard<'s, B: ::kladde_traits::Backend>(
-                &'s mut self,
-                backend: &'s B,
-                location: ::kladde_traits::Location,
-            ) -> Self::Guard<'s, B> {
-                #guard_ident {
-                    inner: self,
-                    backend,
-                    location,
-                }
-            }
+            #guard_assoc
 
             fn store<B: ::kladde_traits::Backend>(&mut self, backend: &B, location: ::kladde_traits::Location) {
                 <#field_ty as ::kladde_traits::Persistable>::store(
@@ -365,13 +396,11 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::To
     let field_offset = field_offsets(&field_ty);
     let total_size = total_size(&field_ty);
 
+    let scaffold = guard_scaffold(ident, vis, &guard_ident);
+    let guard_assoc = guard_assoc(&guard_ident);
+
     quote! {
-        #[doc(hidden)]
-        #vis struct #guard_ident<'s, B> {
-            inner: &'s mut #ident,
-            backend: &'s B,
-            location: ::kladde_traits::Location,
-        }
+        #scaffold
 
         impl<'s, B: ::kladde_traits::Backend> #guard_ident<'s, B> {
             #(
@@ -390,57 +419,13 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::To
             )*
         }
 
-        impl<'s, B: ::kladde_traits::Backend> ::kladde_traits::Guard for #guard_ident<'s, B> {
-            type Persistable = #ident;
-            type Backend = B;
-
-            fn as_persistable(&self) -> &#ident {
-                self.inner
-            }
-            fn as_persistable_mut(&mut self) -> &mut #ident {
-                self.inner
-            }
-            fn backend(&self) -> &B {
-                self.backend
-            }
-        }
-
-        impl<'s, B> ::std::ops::Deref for #guard_ident<'s, B> {
-            type Target = #ident;
-            fn deref(&self) -> &#ident {
-                self.inner
-            }
-        }
-
-        impl<'s, B> ::std::ops::DerefMut for #guard_ident<'s, B> {
-            fn deref_mut(&mut self) -> &mut #ident {
-                self.inner
-            }
-        }
-
         impl ::kladde_traits::Persistable for #ident {
             // A struct never owns an allocation of its own -- it's just
             // the sum of its fields' inline representations, threaded
             // through at static offsets.
             const INLINE_SIZE: usize = #total_size;
 
-            type Guard<'s, B: ::kladde_traits::Backend>
-                = #guard_ident<'s, B>
-            where
-                Self: 's,
-                B: 's;
-
-            fn guard<'s, B: ::kladde_traits::Backend>(
-                &'s mut self,
-                backend: &'s B,
-                location: ::kladde_traits::Location,
-            ) -> Self::Guard<'s, B> {
-                #guard_ident {
-                    inner: self,
-                    backend,
-                    location,
-                }
-            }
+            #guard_assoc
 
             fn store<B: ::kladde_traits::Backend>(&mut self, backend: &B, location: ::kladde_traits::Location) {
                 #(
@@ -500,62 +485,16 @@ fn derive_unit_like_struct(
     vis: &syn::Visibility,
     guard_ident: &syn::Ident,
 ) -> proc_macro2::TokenStream {
+    let scaffold = guard_scaffold(ident, vis, guard_ident);
+    let guard_assoc = guard_assoc(guard_ident);
+
     quote! {
-        #[doc(hidden)]
-        #vis struct #guard_ident<'s, B> {
-            inner: &'s mut #ident,
-            backend: &'s B,
-            location: ::kladde_traits::Location,
-        }
-
-        impl<'s, B: ::kladde_traits::Backend> ::kladde_traits::Guard for #guard_ident<'s, B> {
-            type Persistable = #ident;
-            type Backend = B;
-
-            fn as_persistable(&self) -> &#ident {
-                self.inner
-            }
-            fn as_persistable_mut(&mut self) -> &mut #ident {
-                self.inner
-            }
-            fn backend(&self) -> &B {
-                self.backend
-            }
-        }
-
-        impl<'s, B> ::std::ops::Deref for #guard_ident<'s, B> {
-            type Target = #ident;
-            fn deref(&self) -> &#ident {
-                self.inner
-            }
-        }
-
-        impl<'s, B> ::std::ops::DerefMut for #guard_ident<'s, B> {
-            fn deref_mut(&mut self) -> &mut #ident {
-                self.inner
-            }
-        }
+        #scaffold
 
         impl ::kladde_traits::Persistable for #ident {
             const INLINE_SIZE: usize = 0;
 
-            type Guard<'s, B: ::kladde_traits::Backend>
-                = #guard_ident<'s, B>
-            where
-                Self: 's,
-                B: 's;
-
-            fn guard<'s, B: ::kladde_traits::Backend>(
-                &'s mut self,
-                backend: &'s B,
-                location: ::kladde_traits::Location,
-            ) -> Self::Guard<'s, B> {
-                #guard_ident {
-                    inner: self,
-                    backend,
-                    location,
-                }
-            }
+            #guard_assoc
 
             fn store<B: ::kladde_traits::Backend>(&mut self, _backend: &B, _location: ::kladde_traits::Location) {}
 
@@ -810,13 +749,11 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenS
         })
         .collect();
 
+    let scaffold = guard_scaffold(ident, vis, &guard_ident);
+    let guard_assoc = guard_assoc(&guard_ident);
+
     quote! {
-        #[doc(hidden)]
-        #vis struct #guard_ident<'s, B> {
-            inner: &'s mut #ident,
-            backend: &'s B,
-            location: ::kladde_traits::Location,
-        }
+        #scaffold
 
         impl<'s, B: ::kladde_traits::Backend> #guard_ident<'s, B> {
             /// Replaces the whole value with `value`. See `spec.md`'s
@@ -826,34 +763,6 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenS
             #vis fn set(&mut self, mut value: #ident) {
                 ::kladde_traits::Persistable::store(&mut value, self.backend, self.location);
                 *self.inner = value;
-            }
-        }
-
-        impl<'s, B: ::kladde_traits::Backend> ::kladde_traits::Guard for #guard_ident<'s, B> {
-            type Persistable = #ident;
-            type Backend = B;
-
-            fn as_persistable(&self) -> &#ident {
-                self.inner
-            }
-            fn as_persistable_mut(&mut self) -> &mut #ident {
-                self.inner
-            }
-            fn backend(&self) -> &B {
-                self.backend
-            }
-        }
-
-        impl<'s, B> ::std::ops::Deref for #guard_ident<'s, B> {
-            type Target = #ident;
-            fn deref(&self) -> &#ident {
-                self.inner
-            }
-        }
-
-        impl<'s, B> ::std::ops::DerefMut for #guard_ident<'s, B> {
-            fn deref_mut(&mut self) -> &mut #ident {
-                self.inner
             }
         }
 
@@ -871,23 +780,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenS
                 max
             };
 
-            type Guard<'s, B: ::kladde_traits::Backend>
-                = #guard_ident<'s, B>
-            where
-                Self: 's,
-                B: 's;
-
-            fn guard<'s, B: ::kladde_traits::Backend>(
-                &'s mut self,
-                backend: &'s B,
-                location: ::kladde_traits::Location,
-            ) -> Self::Guard<'s, B> {
-                #guard_ident {
-                    inner: self,
-                    backend,
-                    location,
-                }
-            }
+            #guard_assoc
 
             fn store<B: ::kladde_traits::Backend>(&mut self, backend: &B, location: ::kladde_traits::Location) {
                 #discriminants

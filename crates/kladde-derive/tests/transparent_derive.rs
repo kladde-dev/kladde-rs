@@ -1,11 +1,18 @@
 //! `#[kladde(transparent)]`: a single-field newtype persisted exactly as
 //! its one field -- same bytes, same fingerprint -- for both the tuple and
 //! the braced form.
+//!
+//! The *representation* half of that (identical `INLINE_SIZE` and byte
+//! layout) actually holds for **any** single-field struct, transparent or
+//! not -- a one-field struct is just its field, at offset 0. Transparency
+//! only changes the *schema* (shared descriptor / fingerprint) and the
+//! guard's accessor surface. Several tests below check both sides of that.
 
 mod support;
 
 use kladde_derive::Persistable;
 use kladde_traits::Persistable as _;
+use kladde_traits::{Allocator, Location};
 use support::{MockBackend, Number};
 
 #[derive(Persistable)]
@@ -15,6 +22,13 @@ struct Meters(Number);
 #[derive(Persistable)]
 #[kladde(transparent)]
 struct Label {
+    value: Number,
+}
+
+// A *non-transparent* single-field struct wrapping the same inner type.
+// Same representation as `Label`; different schema and guard.
+#[derive(Persistable)]
+struct PlainLabel {
     value: Number,
 }
 
@@ -59,18 +73,74 @@ fn transparent_braced_newtype_round_trips_as_its_field() {
 }
 
 #[test]
-fn transparent_shares_the_inner_types_fingerprint() {
-    // The whole point: a transparent wrapper is schema-identical to its
-    // field, so it fingerprints the same and owns no descriptor of its own.
+fn non_transparent_newtype_round_trips_the_same_way() {
+    // The very same round-trip as the transparent cases -- a plain
+    // single-field struct is representationally a newtype too; only its
+    // guard accessor (`value_mut`) and schema differ.
+    let backend = MockBackend::default();
+    let location = backend.root_location(PlainLabel::INLINE_SIZE);
+
+    let mut label = PlainLabel { value: Number(0) };
+    {
+        let mut guard = label.guard(&backend, location);
+        guard.value_mut().set(7);
+    }
+    assert_eq!(label.value, Number(7));
+
+    let reloaded = PlainLabel::load(&backend, location);
+    assert_eq!(reloaded.value, Number(7));
+}
+
+/// Stores something into a fresh root region and returns that region's raw
+/// bytes -- so two ways of storing the same value can be compared byte for
+/// byte.
+fn stored_region(size: usize, store: impl FnOnce(&MockBackend, Location)) -> Vec<u8> {
+    let backend = MockBackend::default();
+    let location = backend.root_location(size);
+    store(&backend, location);
+    backend.read(location.anchor, 0, size as u32)
+}
+
+#[test]
+fn newtypes_share_layout_regardless_of_transparency() {
+    // Same inline size across the inner type and both wrappers...
+    assert_eq!(Number::INLINE_SIZE, 4);
+    assert_eq!(Meters::INLINE_SIZE, Number::INLINE_SIZE);
+    assert_eq!(Label::INLINE_SIZE, Number::INLINE_SIZE);
+    assert_eq!(PlainLabel::INLINE_SIZE, Number::INLINE_SIZE);
+
+    // ...and identical *bytes*: storing the same inner value through the
+    // transparent wrapper, the non-transparent wrapper, or the bare inner
+    // type writes the same region. Memory layout is a property of the
+    // fields, not of `#[kladde(transparent)]`.
+    let via_inner = stored_region(Number::INLINE_SIZE, |b, loc| Number(42).store(b, loc));
+    let via_transparent = stored_region(Meters::INLINE_SIZE, |b, loc| {
+        Meters(Number(42)).store(b, loc)
+    });
+    let via_plain = stored_region(PlainLabel::INLINE_SIZE, |b, loc| {
+        PlainLabel { value: Number(42) }.store(b, loc)
+    });
+    assert_eq!(via_inner, via_transparent);
+    assert_eq!(via_inner, via_plain);
+}
+
+#[test]
+fn only_transparency_shares_the_inner_types_fingerprint() {
+    // Transparent: schema-identical to the field, so same fingerprint and
+    // no descriptor of its own.
     assert_eq!(Meters::fingerprint(), Number::fingerprint());
     assert_eq!(Label::fingerprint(), Number::fingerprint());
-
-    let table = Meters::schema();
     assert_eq!(
-        table.descriptors().len(),
+        Meters::schema().descriptors().len(),
         1,
         "a transparent wrapper adds no node -- just the inner type's",
     );
+
+    // Non-transparent: owns its own `Struct` descriptor, so a *different*
+    // fingerprint and an extra node. This is the one thing transparency
+    // changes about the schema.
+    assert_ne!(PlainLabel::fingerprint(), Number::fingerprint());
+    assert_eq!(PlainLabel::schema().descriptors().len(), 2);
 }
 
 #[derive(Persistable)]
