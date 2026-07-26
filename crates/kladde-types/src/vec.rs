@@ -269,11 +269,20 @@ impl<'s, T: Persistable, B: Backend> PersistableVecGuard<'s, T, B> {
     }
 
     /// Removes and returns the element at `index`, shifting every later
-    /// element down by one slot (`copy`) *before* shrinking the
-    /// allocation (`resize`) and publishing the new header -- shrinking
-    /// first would truncate live elements before they've been moved out
-    /// of the way. Panics if `index` is out of bounds (matches
-    /// `Vec::remove`).
+    /// element down by one slot (`copy`), then publishing the new (shorter)
+    /// header, then shrinking the allocation (`resize`) -- in that order.
+    /// The shift has to precede the header so the header never names more
+    /// live elements than are actually in place; the header has to precede
+    /// the shrink so a torn-journal prefix never leaves the header naming
+    /// more elements than the allocation can hold (an out-of-bounds read).
+    /// Panics if `index` is out of bounds (matches `Vec::remove`).
+    ///
+    /// One residual gap remains that reordering can't close: the `copy`
+    /// leaves a well-formed but transient state (the tail shifted, with the
+    /// old last element duplicated) that is neither the old nor the new
+    /// vector until the header publishes. Making the shift+shrink+publish a
+    /// single atomic step needs the `substitute`/atomic-move op sketched in
+    /// `later.md`, or a `Transaction` bracket.
     pub fn remove(&mut self, index: usize) -> T {
         let elem_size = T::INLINE_SIZE as u32;
         let old_len = self.inner.data.len();
@@ -297,8 +306,8 @@ impl<'s, T: Persistable, B: Backend> PersistableVecGuard<'s, T, B> {
                 index as u32 * elem_size,
             );
         }
-        self.backend.resize(pointer, new_len * T::INLINE_SIZE);
         write_header(self.backend, self.location, pointer.index(), new_len as u32);
+        self.backend.resize(pointer, new_len * T::INLINE_SIZE);
 
         self.inner.data.remove(index)
     }
