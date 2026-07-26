@@ -20,7 +20,7 @@ mod vec;
 mod test_support;
 
 #[cfg(feature = "serde")]
-pub use blob::{PersistableBlob, PersistableBlobGuard};
+pub use blob::{PersistableBlob, PersistableBlobEdit, PersistableBlobGuard};
 pub use map::{PersistableHashMap, PersistableHashMapGuard};
 pub use string::{PersistableString, PersistableStringGuard};
 pub use vec::{PersistableVec, PersistableVecGuard};
