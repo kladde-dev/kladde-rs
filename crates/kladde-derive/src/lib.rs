@@ -18,6 +18,11 @@
 //!   -- mutating a field within the current variant in place, and/or
 //!   matching directly on a generated `Guard`, is deferred (see
 //!   `spec.md`'s Future Work).
+//! - A single-field struct (tuple `struct S(T)` or braced `struct S { x: T }`)
+//!   marked `#[kladde(transparent)]` is persisted *exactly* as its one
+//!   field `T`, analogous to `#[serde(transparent)]`: same bytes, and the
+//!   same fingerprint (it reuses `T`'s schema descriptor instead of
+//!   registering its own).
 //! - Generic types and types with where-clauses are not yet supported.
 //!
 //! **Field requirements:** every field of a derived `struct`/`enum` has
@@ -49,6 +54,27 @@
 //! }
 //! ```
 //!
+//! **Transparent newtypes:** `#[kladde(transparent)]` requires exactly one
+//! field, so a multi-field struct is a compile error (as it is for
+//! `#[serde(transparent)]`):
+//!
+//! ```compile_fail
+//! #[derive(kladde_derive::Persistable)]
+//! #[kladde(transparent)]
+//! struct TwoFields {
+//!     a: i32,
+//!     b: i32, // error: #[kladde(transparent)] requires exactly one field
+//! }
+//! ```
+//!
+//! A one-field version compiles, and is persisted exactly as that field:
+//!
+//! ```
+//! #[derive(kladde_derive::Persistable)]
+//! #[kladde(transparent)]
+//! struct Meters(i32);
+//! ```
+//!
 //! **Dependency note:** generated code references `::kladde_traits::...`
 //! paths directly, so any crate using this macro needs `kladde-traits` as
 //! a *direct* dependency too -- re-exports (e.g. via `kladde-types`)
@@ -60,7 +86,7 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{parse_macro_input, Data, DeriveInput, Fields};
 
-#[proc_macro_derive(Persistable)]
+#[proc_macro_derive(Persistable, attributes(kladde))]
 pub fn derive_persistable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
@@ -74,17 +100,49 @@ pub fn derive_persistable(input: TokenStream) -> TokenStream {
         .into();
     }
 
-    let expanded = match &input.data {
-        Data::Struct(data) => derive_struct(&input, data),
-        Data::Enum(data) => derive_enum(&input, data),
-        Data::Union(data) => syn::Error::new_spanned(
-            data.union_token,
-            "#[derive(Persistable)] does not support unions",
-        )
-        .to_compile_error(),
+    let transparent = match transparent_attr(&input.attrs) {
+        Ok(transparent) => transparent,
+        Err(err) => return err.to_compile_error().into(),
+    };
+
+    let expanded = if transparent {
+        derive_transparent(&input)
+    } else {
+        match &input.data {
+            Data::Struct(data) => derive_struct(&input, data),
+            Data::Enum(data) => derive_enum(&input, data),
+            Data::Union(data) => syn::Error::new_spanned(
+                data.union_token,
+                "#[derive(Persistable)] does not support unions",
+            )
+            .to_compile_error(),
+        }
     };
 
     expanded.into()
+}
+
+/// Whether the type carries `#[kladde(transparent)]`. Errors on any other
+/// `#[kladde(...)]` contents, so a typo is a compile error rather than a
+/// silent no-op.
+fn transparent_attr(attrs: &[syn::Attribute]) -> syn::Result<bool> {
+    let mut transparent = false;
+    for attr in attrs {
+        if !attr.path().is_ident("kladde") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("transparent") {
+                transparent = true;
+                Ok(())
+            } else {
+                Err(meta.error(
+                    "unknown `#[kladde(...)]` option; the only one supported is `transparent`",
+                ))
+            }
+        })?;
+    }
+    Ok(transparent)
 }
 
 /// For a list of field types meant to be laid out contiguously, back to
@@ -111,6 +169,170 @@ fn field_offsets(field_ty: &[syn::Type]) -> Vec<proc_macro2::TokenStream> {
 fn total_size(field_ty: &[syn::Type]) -> proc_macro2::TokenStream {
     quote! {
         0usize #( + <#field_ty as ::kladde_traits::Persistable>::INLINE_SIZE )*
+    }
+}
+
+/// `#[kladde(transparent)]`, analogous to `#[serde(transparent)]`: a
+/// single-field newtype (tuple `struct S(T)` or braced `struct S { x: T }`)
+/// that is persisted *exactly* as its one field. The generated
+/// [`Persistable`](::kladde_traits::Persistable) impl delegates its whole
+/// representation to `T` -- same `INLINE_SIZE`, same bytes at the same
+/// location -- and, crucially, is **schema-transparent**: it overrides
+/// `describe` to reuse `T`'s descriptor rather than registering a node of
+/// its own (leaving `describe_local` at its panicking default), so `S` and
+/// `T` share one fingerprint. This is the derive-level front door to the
+/// escape hatch documented on `Persistable::describe`.
+///
+/// The wrapper's guard exposes a single `get_mut()` returning the inner
+/// type's own guard, so `T`'s full mutation API is reachable through it.
+fn derive_transparent(input: &DeriveInput) -> proc_macro2::TokenStream {
+    let ident = &input.ident;
+    let vis = &input.vis;
+    let guard_ident = format_ident!("{}Guard", ident);
+
+    let fields = match &input.data {
+        Data::Struct(data) => &data.fields,
+        Data::Enum(data) => {
+            return syn::Error::new_spanned(
+                data.enum_token,
+                "#[kladde(transparent)] is only for single-field structs, not enums",
+            )
+            .to_compile_error();
+        }
+        Data::Union(data) => {
+            return syn::Error::new_spanned(
+                data.union_token,
+                "#[kladde(transparent)] is only for single-field structs, not unions",
+            )
+            .to_compile_error();
+        }
+    };
+
+    let field = match fields {
+        Fields::Named(f) if f.named.len() == 1 => &f.named[0],
+        Fields::Unnamed(f) if f.unnamed.len() == 1 => &f.unnamed[0],
+        _ => {
+            return syn::Error::new_spanned(
+                fields,
+                "#[kladde(transparent)] requires exactly one field",
+            )
+            .to_compile_error();
+        }
+    };
+
+    let field_ty = &field.ty;
+    // How the single field is named on `self` (`.0` for a tuple newtype,
+    // the field ident for a braced one) and how the value is reassembled
+    // in `load`.
+    let (member, construct): (syn::Member, proc_macro2::TokenStream) = match &field.ident {
+        Some(name) => (
+            syn::Member::Named(name.clone()),
+            quote! { #ident { #name: __value } },
+        ),
+        None => (
+            syn::Member::Unnamed(syn::Index::from(0)),
+            quote! { #ident(__value) },
+        ),
+    };
+
+    quote! {
+        #[doc(hidden)]
+        #vis struct #guard_ident<'s, B> {
+            inner: &'s mut #ident,
+            backend: &'s B,
+            location: ::kladde_traits::Location,
+        }
+
+        impl<'s, B: ::kladde_traits::Backend> #guard_ident<'s, B> {
+            /// A mutable guard over the wrapped value. Since this is a
+            /// `#[kladde(transparent)]` newtype, the inner value lives at
+            /// the wrapper's own location, so this is a direct pass-through
+            /// to the inner type's full mutation API.
+            #vis fn get_mut(
+                &mut self,
+            ) -> <#field_ty as ::kladde_traits::Persistable>::Guard<'_, B> {
+                <#field_ty as ::kladde_traits::Persistable>::guard(
+                    &mut self.inner.#member,
+                    self.backend,
+                    self.location,
+                )
+            }
+        }
+
+        impl<'s, B: ::kladde_traits::Backend> ::kladde_traits::Guard for #guard_ident<'s, B> {
+            type Persistable = #ident;
+            type Backend = B;
+
+            fn as_persistable(&self) -> &#ident {
+                self.inner
+            }
+            fn as_persistable_mut(&mut self) -> &mut #ident {
+                self.inner
+            }
+            fn backend(&self) -> &B {
+                self.backend
+            }
+        }
+
+        impl<'s, B> ::std::ops::Deref for #guard_ident<'s, B> {
+            type Target = #ident;
+            fn deref(&self) -> &#ident {
+                self.inner
+            }
+        }
+
+        impl<'s, B> ::std::ops::DerefMut for #guard_ident<'s, B> {
+            fn deref_mut(&mut self) -> &mut #ident {
+                self.inner
+            }
+        }
+
+        impl ::kladde_traits::Persistable for #ident {
+            // Transparent: the wrapper *is* its one field, so it owns no
+            // storage of its own and forwards everything at offset 0.
+            const INLINE_SIZE: usize =
+                <#field_ty as ::kladde_traits::Persistable>::INLINE_SIZE;
+
+            type Guard<'s, B: ::kladde_traits::Backend>
+                = #guard_ident<'s, B>
+            where
+                Self: 's,
+                B: 's;
+
+            fn guard<'s, B: ::kladde_traits::Backend>(
+                &'s mut self,
+                backend: &'s B,
+                location: ::kladde_traits::Location,
+            ) -> Self::Guard<'s, B> {
+                #guard_ident {
+                    inner: self,
+                    backend,
+                    location,
+                }
+            }
+
+            fn store<B: ::kladde_traits::Backend>(&mut self, backend: &B, location: ::kladde_traits::Location) {
+                <#field_ty as ::kladde_traits::Persistable>::store(
+                    &mut self.#member,
+                    backend,
+                    location,
+                );
+            }
+
+            fn load<B: ::kladde_traits::Backend>(backend: &B, location: ::kladde_traits::Location) -> Self {
+                let __value = <#field_ty as ::kladde_traits::Persistable>::load(backend, location);
+                #construct
+            }
+
+            // Schema-transparent: reuse the inner type's descriptor instead
+            // of registering our own node, so `Self` and the field type
+            // share one fingerprint. Overriding `describe` (and leaving
+            // `describe_local` at its default) is exactly the transparency
+            // escape hatch documented on `Persistable::describe`.
+            fn describe(builder: &mut ::kladde_traits::SchemaBuilder) -> ::kladde_traits::TypeRef {
+                <#field_ty as ::kladde_traits::Persistable>::describe(builder)
+            }
+        }
     }
 }
 
