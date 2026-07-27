@@ -273,22 +273,25 @@ impl<'s, T: Persistable, B: Backend> PersistableVecGuard<'s, T, B> {
         self.inner.data.push(value);
     }
 
-    /// Removes and returns the element at `index`, deleting its slot's bytes
-    /// with a single [`splice`](kladde_traits::Allocator::splice) -- which
-    /// shifts every later element down and shrinks the allocation as one
-    /// atomic op -- then publishing the new (shorter) header. Panics if
-    /// `index` is out of bounds (matches `Vec::remove`).
+    /// Removes and returns the element at `index`, shifting every later
+    /// element down to close the gap.
     ///
-    /// The `splice` collapses the old `copy`-then-`resize` pair (whose
-    /// intermediate state duplicated the last element) into one entry, so
-    /// the content allocation is never observed mid-shift. What `splice`
-    /// alone can't close is the header: it lives in a *separate* region
-    /// (the parent anchor), so a torn journal that applied the `splice` but
-    /// not the header write would see the shorter content under the old,
-    /// longer count. Fully closing that needs the length to come from the
-    /// allocator's capacity rather than the header (plan decision 4, still
-    /// deferred -- see `array-pointer-problems.md`); until then this is the
-    /// tightest ordering.
+    /// Runs in `O(n)` in the number of elements after `index`. Panics if
+    /// `index` is out of bounds, matching [`Vec::remove`].
+    ///
+    /// ```
+    /// use kladde::Kladde;
+    /// use kladde_types::PersistableVec;
+    ///
+    /// let mut db = Kladde::new(PersistableVec::<i32>::new());
+    /// db.guard().push(10);
+    /// db.guard().push(20);
+    /// db.guard().push(30);
+    ///
+    /// assert_eq!(db.guard().remove(0), 10);
+    /// assert_eq!(db.get().len(), 2);
+    /// assert_eq!(db.get().get(0), Some(&20));
+    /// ```
     pub fn remove(&mut self, index: usize) -> T {
         let elem_size = T::INLINE_SIZE as u32;
         let old_len = self.inner.data.len();
@@ -320,21 +323,25 @@ impl<'s, B: Backend> PersistableVecGuard<'s, u8, B> {
     /// is deferred (freeing owning elements' sub-allocations needs a trait
     /// hook that doesn't exist yet -- see `array-pointer-problems.md`).
     ///
-    /// Replaces the whole content with one atomic
-    /// [`splice`](kladde_traits::Allocator::splice) (resize + overwrite in a
-    /// single journal entry), so the content allocation is never observed
-    /// half-updated -- no more grow/shrink ordering split or
-    /// trailing-slack-tolerance requirement. Every owning consumer
-    /// (`PersistableString`, `PersistableBlob`) inherits this by routing
-    /// through here rather than re-deriving its own ordering.
+    /// Replaces the entire byte content with `new` in a single bulk update.
     ///
-    /// **Residual window.** The `splice` makes the *content* atomic, but the
-    /// length still lives in a separate header region, published by a
-    /// distinct write: a torn journal that applied the `splice` but not the
-    /// header would see new content under the old length. Closing that last
-    /// gap needs the length to come from the allocator's capacity instead of
-    /// the header (plan decision 4, deferred -- see
-    /// `array-pointer-problems.md`).
+    /// Runs in `O(new.len())` regardless of the current length, so
+    /// replacing a whole value is far cheaper than clearing and re-pushing
+    /// one byte at a time. Passing an empty slice clears the vector and
+    /// releases its backing allocation.
+    ///
+    /// ```
+    /// use kladde::Kladde;
+    /// use kladde_types::PersistableVec;
+    ///
+    /// let mut db = Kladde::new(PersistableVec::<u8>::new());
+    /// db.guard().set_content(b"hello");
+    /// assert_eq!(db.get().len(), 5);
+    ///
+    /// db.guard().set_content(b"hi"); // shrink to a shorter value in one write
+    /// assert_eq!(db.get().len(), 2);
+    /// assert_eq!(db.get().get(0), Some(&b'h'));
+    /// ```
     pub fn set_content(&mut self, new: &[u8]) {
         let old_len = self.inner.data.len();
         let new_len = new.len();

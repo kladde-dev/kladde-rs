@@ -1,44 +1,55 @@
-//! [`PersistableBlob<T>`] -- a generic escape hatch for wrapping a plain, foreign
-//! `T` (one with no room of its own for a cached `pointer` field, so it
-//! can't safely implement [`Persistable`] directly without leaking on
-//! every `store` -- see `spec.md`'s notes on `String`/derived `enum`s)
-//! so it can be persisted anyway, by treating its postcard-serialized
-//! bytes as an opaque content allocation.
+//! [`PersistableBlob<T>`] -- persist any `serde`-serializable value as an
+//! opaque blob.
 //!
-//! Gated behind this crate's `serde` Cargo feature -- this is the only
-//! thing in the whole `kladde` workspace that needs `serde`/`postcard`.
+//! Use it to store a value whose type isn't itself one of the persistent
+//! containers -- a plain enum, a `serde`-derived struct, a `Vec`, and so
+//! on. The value is serialized (with `postcard`) on write and deserialized
+//! on read; `T` must implement `serde::Serialize +
+//! serde::de::DeserializeOwned + Default`.
 //!
-//! Built as a thin wrapper around [`PersistableVec<u8>`]: the wrapped
-//! `value`'s postcard bytes *are* the vec's content. That vec already
-//! hand-rolls (leak-free, crash-safely) every piece a blob needs -- the
-//! `{ target, len }` header, the lazy-until-first-write allocation, the
-//! grow/shrink/reuse ordering -- so `PersistableBlob` no longer carries any
-//! of that itself. `value: T` is kept alongside purely as an in-memory
-//! cache for cheap [`Deref`]/[`edit`](PersistableBlobGuard::edit) reads;
-//! the vec's own bytes are the source of truth on disk.
+//! Available only when this crate's `serde` feature is enabled.
 //!
-//! **Empty content <=> default value.** A never-mutated
-//! `PersistableBlob::default()` holds an *empty* `serialized` vec (no
-//! allocation, exactly `PersistableVec`'s lazy state), and `load` maps an
-//! empty vec back to `T::default()`. This relies on the assumption that no
-//! non-default value serializes to an empty byte string -- true for
-//! postcard, which gives any information-carrying value at least one byte,
-//! so an empty encoding implies a single-inhabitant (ZST-like) type whose
-//! one value is its `Default`. It would break only for a pathological
-//! hand-written `Serialize` mapping several distinct values to `[]`. This
-//! is the same assumption `PersistableVec`/`PersistableHashMap` already
-//! make for their own `empty <=> no allocation` states.
+//! ```
+//! use kladde::Kladde;
+//! use kladde_types::PersistableBlob;
 //!
-//! Note the `T: Default` bound on `Persistable`'s own impl below (not
-//! just on the separate `std::default::Default` impl): `load` has to be
-//! able to reconstruct the empty case as *some* value, and
-//! `Persistable::load`'s signature can't be conditional -- so every `T`
-//! used with `PersistableBlob<T>` needs to be `Default`.
+//! #[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
+//! struct Config {
+//!     retries: u32,
+//!     name: String,
+//! }
+//!
+//! let mut db = Kladde::new(PersistableBlob::new(Config::default()));
+//! db.guard().set(Config {
+//!     retries: 3,
+//!     name: "primary".into(),
+//! });
+//! assert_eq!(db.get().retries, 3); // read through the blob's Deref
+//! ```
 
 use crate::vec::PersistableVec;
 use kladde_traits::{Backend, Guard, Location, Persistable};
 use std::ops::{Deref, DerefMut};
 
+/// Persists an arbitrary `serde`-serializable `T` as an opaque blob.
+///
+/// Read the wrapped value through the blob's [`Deref`] (`&*blob`, or just
+/// `blob.field` / `blob.method()`); change it through a
+/// [`PersistableBlobGuard`], via [`set`](PersistableBlobGuard::set) or
+/// [`edit`](PersistableBlobGuard::edit). Construct one with
+/// [`new`](Self::new).
+///
+/// `T` must implement `serde::Serialize + serde::de::DeserializeOwned +
+/// Default`. Because the contents are opaque, every `PersistableBlob<_>`
+/// shares one schema fingerprint regardless of `T`; prefer a purpose-built
+/// persistent type when the schema needs to tell them apart.
+///
+/// ```
+/// use kladde_types::PersistableBlob;
+///
+/// let blob = PersistableBlob::new(vec![1u8, 2, 3]);
+/// assert_eq!(*blob, vec![1, 2, 3]); // Deref to the wrapped value
+/// ```
 #[derive(Debug, PartialEq)]
 pub struct PersistableBlob<T> {
     /// In-memory cache of the wrapped value, for cheap `Deref`/`edit`
@@ -52,10 +63,18 @@ pub struct PersistableBlob<T> {
 }
 
 impl<T: serde::Serialize> PersistableBlob<T> {
-    /// Wraps `value`, serializing it immediately into an (as-yet
-    /// unallocated) backed byte vec. Backend-free, like
-    /// `PersistableString::from`: the actual allocation happens lazily the
-    /// first time this blob is `store`d or mutated through a guard.
+    /// Wraps `value`, ready to be stored.
+    ///
+    /// Needs no backend and allocates nothing in the backing store: that
+    /// happens lazily the first time the blob is written. So a blob that
+    /// is only ever read costs nothing on disk.
+    ///
+    /// ```
+    /// use kladde_types::PersistableBlob;
+    ///
+    /// let blob = PersistableBlob::new(42u32);
+    /// assert_eq!(*blob, 42);
+    /// ```
     pub fn new(value: T) -> Self {
         let bytes = postcard::to_allocvec(&value)
             .expect("postcard serialization of an in-memory value should not fail");
@@ -147,9 +166,14 @@ where
     }
 }
 
-/// `B` defaults to [`kladde::DefaultBackend`](../../kladde/struct.DefaultBackend.html)
-/// so application code that only ever uses the default backend never has
-/// to name it.
+/// A handle for reading and modifying a [`PersistableBlob`]'s value.
+///
+/// Read the current value through [`Deref`] to the blob; replace it
+/// wholesale with [`set`](Self::set), change it in place with
+/// [`edit`](Self::edit), or reset it to `T::default()` with
+/// [`set_to_default`](Self::set_to_default). `B` defaults to
+/// [`kladde::DefaultBackend`](../../kladde/struct.DefaultBackend.html), so
+/// code using the default backend never has to name it.
 pub struct PersistableBlobGuard<'s, T, B = kladde::DefaultBackend> {
     inner: &'s mut PersistableBlob<T>,
     backend: &'s B,
@@ -157,22 +181,51 @@ pub struct PersistableBlobGuard<'s, T, B = kladde::DefaultBackend> {
 }
 
 impl<'s, T: serde::Serialize, B: Backend> PersistableBlobGuard<'s, T, B> {
-    /// Replaces the whole value and re-persists it. Prefer [`edit`] when
-    /// changing only part of a large value.
+    /// Replaces the wrapped value with `value` and persists it.
     ///
-    /// [`edit`]: Self::edit
+    /// To change only part of a large value, prefer [`edit`](Self::edit) so
+    /// the whole `T` needn't be rebuilt.
+    ///
+    /// ```
+    /// use kladde::Kladde;
+    /// use kladde_types::PersistableBlob;
+    ///
+    /// let mut db = Kladde::new(PersistableBlob::new(1u32));
+    /// db.guard().set(2);
+    /// assert_eq!(**db.get(), 2);
+    /// ```
     pub fn set(&mut self, value: T) {
         self.inner.value = value;
         self.persist();
     }
 
-    /// Returns a short-lived handle for mutating the wrapped value *in
-    /// place* (through `DerefMut<Target = T>`), re-persisting it when the
-    /// handle is dropped or [`commit`](PersistableBlobEdit::commit)ted --
-    /// so tweaking one nested field doesn't mean rebuilding the whole `T`
-    /// to hand to [`set`](Self::set). Read-only access should go through
-    /// the guard's own `Deref` instead: an edit always re-serializes on
-    /// drop, whether or not anything actually changed.
+    /// Returns a handle for modifying the wrapped value in place.
+    ///
+    /// The returned [`PersistableBlobEdit`] derefs (mutably) to `T`; mutate
+    /// it and the change is persisted when that handle is dropped or
+    /// [`commit`](PersistableBlobEdit::commit)ted. Use this to tweak one
+    /// field of a large value without rebuilding it for [`set`](Self::set).
+    /// The value is re-serialized on drop whether or not it actually
+    /// changed, so use the blob's own `Deref` for read-only access.
+    ///
+    /// ```
+    /// use kladde::Kladde;
+    /// use kladde_types::PersistableBlob;
+    ///
+    /// #[derive(serde::Serialize, serde::Deserialize, Default)]
+    /// struct Point {
+    ///     x: i32,
+    ///     y: i32,
+    /// }
+    ///
+    /// let mut db = Kladde::new(PersistableBlob::new(Point::default()));
+    /// {
+    ///     let mut guard = db.guard();
+    ///     let mut edit = guard.edit();
+    ///     edit.x = 5; // change one field
+    /// } // persisted when `edit` drops
+    /// assert_eq!(db.get().x, 5);
+    /// ```
     pub fn edit(&mut self) -> PersistableBlobEdit<'_, 's, T, B> {
         PersistableBlobEdit { guard: self }
     }
@@ -194,9 +247,17 @@ impl<'s, T: serde::Serialize, B: Backend> PersistableBlobGuard<'s, T, B> {
 }
 
 impl<'s, T: serde::Serialize + Default, B: Backend> PersistableBlobGuard<'s, T, B> {
-    /// Resets the value to `T::default()`, freeing the content allocation
-    /// and returning to the lazy empty state. Crash-safe (empty header
-    /// published before the free) courtesy of `set_content(b"")`.
+    /// Resets the wrapped value to `T::default()`, releasing its backing
+    /// allocation.
+    ///
+    /// ```
+    /// use kladde::Kladde;
+    /// use kladde_types::PersistableBlob;
+    ///
+    /// let mut db = Kladde::new(PersistableBlob::new(99u32));
+    /// db.guard().set_to_default();
+    /// assert_eq!(**db.get(), 0);
+    /// ```
     pub fn set_to_default(&mut self) {
         self.inner.value = T::default();
         self.inner
@@ -237,24 +298,24 @@ impl<'s, T, B> DerefMut for PersistableBlobGuard<'s, T, B> {
     }
 }
 
-/// An in-place editing handle for a [`PersistableBlob`]'s wrapped value,
-/// obtained from [`PersistableBlobGuard::edit`]. Deref-mutates the value
-/// directly (`edit.some_field = x`); the change is re-serialized and
-/// persisted when the handle is dropped or [`commit`](Self::commit)ted.
+/// An in-place editing handle for a [`PersistableBlob`]'s value, returned
+/// by [`PersistableBlobGuard::edit`].
 ///
-/// Deliberately a separate, short-lived type rather than folding the
-/// behavior into the guard: the guard is often held only for reads (via
-/// its `Deref`), and shouldn't re-serialize-and-write on every drop.
+/// Derefs (mutably) to the wrapped `T`, so you can mutate the value
+/// directly (`edit.some_field = x`). The edited value is persisted when the
+/// handle is dropped or [`commit`](Self::commit)ted -- always re-serialized
+/// on drop, whether or not it changed, so reach for it only when you intend
+/// to write.
 #[must_use = "an edit persists on drop; bind it or call .commit()"]
 pub struct PersistableBlobEdit<'g, 's, T: serde::Serialize, B: Backend = kladde::DefaultBackend> {
     guard: &'g mut PersistableBlobGuard<'s, T, B>,
 }
 
 impl<'g, 's, T: serde::Serialize, B: Backend> PersistableBlobEdit<'g, 's, T, B> {
-    /// Persists the edited value and consumes the handle. Equivalent to
-    /// letting it drop; kept as an explicit method both to make the commit
-    /// point obvious at a call site and because it will grow a `Result`
-    /// return once error handling lands (today it cannot fail).
+    /// Persists the edited value and consumes the handle.
+    ///
+    /// Equivalent to letting the handle drop; call it to make the commit
+    /// point explicit at a call site.
     pub fn commit(self) {
         // The `Drop` impl below does the persisting.
     }

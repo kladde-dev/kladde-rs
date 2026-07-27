@@ -44,11 +44,19 @@ impl MockAllocator {
         self.regions.borrow().contains_key(&index).then_some(index)
     }
 
-    /// The current byte size of the region at `index`, or `None` if it
-    /// isn't materialized. For an array allocation this *is* its persisted
-    /// byte capacity (the mock keeps each region as a right-sized
-    /// `Box<[u8]>`, so there's no separate metadata field to track); a
-    /// real backend would read it out of the block header instead.
+    /// Returns the current byte size of the region at `index`, or `None`
+    /// if no such region is materialized.
+    ///
+    /// ```
+    /// use kladde_alloc::MockAllocator;
+    /// use std::num::NonZeroU32;
+    ///
+    /// let alloc = MockAllocator::new();
+    /// let index = NonZeroU32::new(1).unwrap();
+    /// assert_eq!(alloc.capacity(index), None);
+    /// alloc.materialize_alloc(index, 8);
+    /// assert_eq!(alloc.capacity(index), Some(8));
+    /// ```
     pub fn capacity(&self, index: NonZeroU32) -> Option<usize> {
         self.regions.borrow().get(&index).map(|region| region.len())
     }
@@ -124,11 +132,23 @@ impl MockAllocator {
         }
     }
 
-    /// Replaces the byte range `[offset, offset + old_len)` in the region
-    /// at `index` with `new`, shifting the trailing bytes and changing the
-    /// region's size by `new.len() - old_len` -- the materialization of one
-    /// [`kladde_traits::Allocator::splice`] entry (`Vec::splice` does
-    /// exactly this). `index` itself never changes.
+    /// Replaces the `old_len` bytes at `offset` in the region at `index`
+    /// with `new`, shifting the trailing bytes and resizing the region by
+    /// `new.len() - old_len`.
+    ///
+    /// The region's identity (`index`) is unchanged.
+    ///
+    /// ```
+    /// use kladde_alloc::MockAllocator;
+    /// use std::num::NonZeroU32;
+    ///
+    /// let alloc = MockAllocator::new();
+    /// let index = NonZeroU32::new(1).unwrap();
+    /// alloc.materialize_alloc(index, 4);
+    /// alloc.materialize_write(index, 0, &[1, 2, 3, 4]);
+    /// alloc.materialize_splice(index, 1, 2, &[9, 9, 9]); // replace 2 bytes with 3
+    /// assert_eq!(alloc.read(index, 0, 5), vec![1, 9, 9, 9, 4]);
+    /// ```
     pub fn materialize_splice(&self, index: NonZeroU32, offset: u32, old_len: u32, new: &[u8]) {
         let mut regions = self.regions.borrow_mut();
         let region = regions

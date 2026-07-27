@@ -31,24 +31,19 @@ pub type Target = NonZeroU32;
 /// The size, in bytes, of an allocated region.
 pub type Size = NonZeroU32;
 
-/// A stable, in-memory-only handle to an allocated region, assigned by an
-/// [`Allocator`]. Deliberately small and opaque: it does *not* hold a
-/// reference to any [`Backend`], so it can't free itself in `Drop` -- see
-/// the "Freeing" section of `spec.md` for why that's fine (generated
-/// [`Guard`] wrapper types are responsible for freeing the
-/// `UniquePointer`s they own).
+/// An owning handle to a fixed-size allocation in the backed heap.
 ///
-/// `index` is a stable identity assigned once by `Allocator` and never
-/// changes for the lifetime of this pointer -- even though the region it
-/// (eventually) refers to may move around during compaction or a
-/// [`Allocator::resize_array`] relocation, and even though this pointer may not
-/// have been flushed to the snapshot at all yet.
+/// The persistent analog of `Box<T>`: it uniquely owns one region holding
+/// a single `T` whose size is fixed and known from `T` alone. Obtain one
+/// from [`Allocator::alloc`] and release it with [`Allocator::free`]; for a
+/// variable-length run of values, reach for [`UniqueArrayPointer`] instead.
 ///
-/// Deliberately *not* `Clone`/`Copy` (so double-freeing is a compile-time
-/// impossibility, matching the single-owner design) and *not*
-/// `Serialize`/`Deserialize` (`index` is meaningless outside the process
-/// that assigned it) -- see [`ResolvedPointer`] for how a `UniquePointer`
-/// embedded in some other value actually gets written out.
+/// The handle is a stable identity — it keeps naming the same logical
+/// allocation even if the underlying bytes are relocated later, and even
+/// before anything has been flushed. It is neither `Clone` nor `Copy`, so
+/// the single-owner invariant (and freedom from double-frees) is enforced
+/// at compile time. To write into the region or hand its address to a
+/// nested value, use [`raw`](Self::raw).
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct UniquePointer<T> {
     index: NonZeroU32,
@@ -56,8 +51,11 @@ pub struct UniquePointer<T> {
 }
 
 impl<T> UniquePointer<T> {
-    /// Only [`Allocator`] implementations are expected to call this --
-    /// `index` should always come from an allocator's own counter.
+    /// Rebuilds a handle from a raw allocation identity.
+    ///
+    /// Intended for [`Allocator`] implementations, which mint identities
+    /// from their own counter; ordinary code obtains handles from
+    /// [`Allocator::alloc`] rather than calling this.
     pub fn from_index(index: NonZeroU32) -> Self {
         UniquePointer {
             index,
@@ -65,39 +63,37 @@ impl<T> UniquePointer<T> {
         }
     }
 
+    /// Returns this allocation's stable raw identity.
     pub fn index(&self) -> NonZeroU32 {
         self.index
     }
 
-    /// Erases `T`, for use as the `anchor` of a [`Location`] or as the
-    /// target of [`Allocator::write`]/`copy`/`read` -- a deeply nested
-    /// leaf writing into some ancestor's allocation doesn't know or care
-    /// what concrete type that ancestor's own pointer was created as.
+    /// Returns a type-erased [`RawPointer`] naming the same region.
+    ///
+    /// Use it as the `anchor` of a [`Location`] or as the target of
+    /// [`Allocator::read`]/[`write`](Allocator::write)/[`copy`](Allocator::copy),
+    /// where the concrete `T` is irrelevant.
     pub fn raw(&self) -> RawPointer {
         RawPointer(self.index)
     }
 }
 
-/// The `Box<[T]>` analog to [`UniquePointer`]'s `Box<T>`: a single-owner
-/// handle to a **variable-capacity** array allocation -- a contiguous run
-/// of `T`-sized slots whose count is decided at runtime, not statically.
+/// An owning handle to a variable-capacity array allocation in the backed heap.
 ///
-/// The distinction from [`UniquePointer`] is where the region's byte size
-/// comes from. A `UniquePointer<T>` names a fixed-size `T`, so its size is
-/// re-derivable from `T` alone and nothing about it needs persisting. A
-/// `UniqueArrayPointer<T>`'s capacity *isn't* derivable, so the
-/// [`Allocator`] persists it in the allocation's own block metadata and
-/// owns it: [`alloc_array`](Allocator::alloc_array) sets it,
-/// [`resize_array`](Allocator::resize_array) changes it, and
-/// [`array_capacity`](Allocator::array_capacity) reads it back on load.
-/// This is what lets an owning type keep only its *logical length* (element
-/// count) inline while the allocator keeps the *byte capacity* -- the two
-/// coincide today (resize-to-exact) but diverge once amortized growth
-/// lands (see `array-pointer-plan.md`).
+/// The persistent analog of `Box<[T]>`: it uniquely owns a contiguous run
+/// of `T`-sized slots whose count is chosen at runtime. Obtain one from
+/// [`Allocator::alloc_array`], grow or shrink it with
+/// [`resize_array`](Allocator::resize_array) or
+/// [`splice`](Allocator::splice), query its current byte capacity with
+/// [`array_capacity`](Allocator::array_capacity), and release it with
+/// [`Allocator::free_array`]. For a single fixed-size value, use
+/// [`UniquePointer`] instead.
 ///
-/// Like [`UniquePointer`], deliberately not `Clone`/`Copy` (single owner,
-/// so double-free is a compile-time impossibility) and not
-/// `Serialize`/`Deserialize` (`index` is process-local).
+/// The allocator owns and remembers the region's capacity, so a value
+/// backed by one need only track its own logical element count. Like
+/// [`UniquePointer`], the handle is a stable identity and is neither
+/// `Clone` nor `Copy`, enforcing single ownership at compile time. Use
+/// [`raw`](Self::raw) to read or write the region's bytes.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct UniqueArrayPointer<T> {
     index: NonZeroU32,
@@ -105,7 +101,10 @@ pub struct UniqueArrayPointer<T> {
 }
 
 impl<T> UniqueArrayPointer<T> {
-    /// Only [`Allocator`] implementations are expected to call this.
+    /// Rebuilds a handle from a raw allocation identity.
+    ///
+    /// Intended for [`Allocator`] implementations; ordinary code obtains
+    /// handles from [`Allocator::alloc_array`].
     pub fn from_index(index: NonZeroU32) -> Self {
         UniqueArrayPointer {
             index,
@@ -113,15 +112,17 @@ impl<T> UniqueArrayPointer<T> {
         }
     }
 
+    /// Returns this allocation's stable raw identity.
     pub fn index(&self) -> NonZeroU32 {
         self.index
     }
 
-    /// Erases `T`, for use as the `anchor` of a [`Location`] (array
-    /// elements are written into this allocation) or as a
+    /// Returns a type-erased [`RawPointer`] naming the same region.
+    ///
+    /// Use it as the `anchor` of a [`Location`] (array elements live inside
+    /// this region) or as a
     /// [`read`](Allocator::read)/[`write`](Allocator::write)/[`copy`](Allocator::copy)
-    /// target -- the same type-erased byte view [`UniquePointer::raw`]
-    /// yields.
+    /// target.
     pub fn raw(&self) -> RawPointer {
         RawPointer(self.index)
     }
@@ -216,93 +217,100 @@ impl<'a, T> ResolvedPointer<'a, T> {
     }
 }
 
-/// Allocates, frees, resizes, and reads/writes bytes in the backed heap.
-/// This is the *only* thing a [`Guard`] ever calls to make a mutation
-/// durable: every recorded change is one of these type-agnostic
-/// primitives, so there's no separate journal/recording abstraction and
-/// nothing type-specific ever reaches the file. See `spec.md`'s "The
-/// Trait Layer" for the full rationale.
+/// The low-level, type-agnostic byte storage interface behind the backed heap.
+///
+/// Implement this to store the persistent types on a storage medium of
+/// your own; most application code uses those types (and
+/// [`kladde::Kladde`](../kladde/struct.Kladde.html)) and never calls these
+/// methods directly. Every method works on plain byte ranges within
+/// allocations named by [`UniquePointer`]/[`UniqueArrayPointer`].
+///
+/// Mutating methods (`alloc`, `free`, `alloc_array`, `free_array`,
+/// `write`, `copy`, `resize_array`, `splice`) are recorded and become
+/// visible to the reading methods (`read`, `resolve`, `array_capacity`)
+/// only after the next flush.
 pub trait Allocator {
-    /// Allocates a fresh **fixed-size** region of `size` bytes (the
-    /// [`UniquePointer`]/`Box<T>` case), returning a pointer that uniquely
-    /// identifies it. The index is assigned immediately; the underlying
-    /// bytes aren't necessarily materialized until the next flush -- see
-    /// `spec.md`'s Pointers and Memory Management section.
+    /// Reserves a fixed-size region of `size` bytes and returns an owning
+    /// [`UniquePointer`] to it.
+    ///
+    /// The handle is usable immediately; the region's bytes become
+    /// readable only after the next flush.
     fn alloc<T>(&self, size: usize) -> UniquePointer<T>;
 
-    /// Frees the fixed-size region `pointer` identifies. See the "Freeing"
-    /// section of `spec.md`: this doesn't necessarily touch live allocator
-    /// state synchronously -- a real, file-backed `Allocator` would journal
-    /// the free and apply it at the next flush.
+    /// Releases a fixed-size region, consuming its handle.
+    ///
+    /// Takes effect at the next flush.
     fn free<T>(&self, pointer: UniquePointer<T>);
 
-    /// Allocates a fresh **variable-capacity** array region of `byte_size`
-    /// bytes (the [`UniqueArrayPointer`]/`Box<[T]>` case). Distinct from
-    /// [`alloc`](Allocator::alloc) only in the pointer type it yields: the
-    /// allocator is expected to persist this region's byte capacity as
-    /// block metadata (so [`array_capacity`](Allocator::array_capacity) can
-    /// read it back), rather than treating the size as re-derivable from
-    /// `T`.
+    /// Reserves a variable-capacity array region of `byte_size` bytes and
+    /// returns an owning [`UniqueArrayPointer`] to it.
+    ///
+    /// The allocator remembers the region's capacity; change it later with
+    /// [`resize_array`](Allocator::resize_array) or
+    /// [`splice`](Allocator::splice), and read it back with
+    /// [`array_capacity`](Allocator::array_capacity). The handle is usable
+    /// immediately; the bytes become readable after the next flush.
     fn alloc_array<T>(&self, byte_size: usize) -> UniqueArrayPointer<T>;
 
-    /// Frees the array region `pointer` identifies -- the
-    /// [`UniqueArrayPointer`] counterpart of [`free`](Allocator::free).
+    /// Releases an array region, consuming its handle.
+    ///
+    /// Takes effect at the next flush.
     fn free_array<T>(&self, pointer: UniqueArrayPointer<T>);
 
-    /// `None` if `pointer` hasn't been flushed yet (no target exists to
-    /// resolve to).
+    /// Resolves a handle to its current on-disk location, or `None` if it
+    /// has not been flushed yet.
     fn resolve<'a, T>(&'a self, pointer: &UniquePointer<T>) -> Option<ResolvedPointer<'a, T>>;
 
     /// Reads `len` bytes starting at `offset` within the region `target`
-    /// identifies. Reflects only already-flushed (materialized) state --
-    /// unlike `write`/`copy`/`resize`/`alloc`/`free`, this isn't itself a
-    /// journaled mutation, just a query.
+    /// names.
+    ///
+    /// Reflects only already-flushed state; changes recorded since the
+    /// last flush are not visible here.
     fn read(&self, target: RawPointer, offset: u32, len: u32) -> Vec<u8>;
 
-    /// Overwrites the span `offset..offset + bytes.len()` within the
-    /// region `target` identifies with `bytes`.
+    /// Overwrites the span `offset..offset + bytes.len()` within the region
+    /// `target` names with `bytes`.
+    ///
+    /// Takes effect at the next flush.
     fn write(&self, target: RawPointer, offset: u32, bytes: &[u8]);
 
     /// Copies `len` bytes from `src_offset` within `src` to `dst_offset`
-    /// within `dst` (`src` and `dst` may be the same region, for an
-    /// in-place shift -- e.g. `PersistableVec::remove`'s tail memmove).
+    /// within `dst`.
+    ///
+    /// `src` and `dst` may name the same region, in which case the source
+    /// and destination spans may overlap (an in-place shift). Takes effect
+    /// at the next flush.
     fn copy(&self, src: RawPointer, src_offset: u32, len: u32, dst: RawPointer, dst_offset: u32);
 
-    /// Changes an existing array allocation's byte capacity, in place if it
-    /// still fits at its current position, or by relocating (copying over
-    /// `min(old_size, new_size)` bytes and freeing the old region)
-    /// otherwise. The pointer's `index` never changes either way -- only
-    /// `alloc_array`/`free_array` mint or retire an index; `resize_array`
-    /// never does. Only array allocations are resizable: a fixed-size
-    /// [`UniquePointer`] region is exactly `T`-sized by construction.
+    /// Changes an array region's byte capacity to `new_byte_size`,
+    /// preserving the bytes the old and new sizes share.
+    ///
+    /// The handle keeps its identity whether the region is resized in place
+    /// or relocated. Growing zero-fills the new tail; shrinking drops the
+    /// excess. Takes effect at the next flush.
     fn resize_array<T>(&self, pointer: &UniqueArrayPointer<T>, new_byte_size: usize);
 
-    /// Reads back an array allocation's current byte capacity (the value
-    /// last set by [`alloc_array`](Allocator::alloc_array)/
-    /// [`resize_array`](Allocator::resize_array)), or `None` if it hasn't
-    /// been materialized yet -- the read-side counterpart used on `load` to
-    /// recover the allocator-owned capacity that the type no longer keeps
-    /// inline. Reflects only already-flushed state, like
-    /// [`read`](Allocator::read)/[`resolve`](Allocator::resolve).
+    /// Returns an array region's current byte capacity, or `None` if it has
+    /// not been flushed yet.
+    ///
+    /// Like [`read`](Allocator::read), this reflects only already-flushed
+    /// state.
     fn array_capacity<T>(&self, pointer: &UniqueArrayPointer<T>) -> Option<usize>;
 
-    /// Replaces the byte range `[offset, offset + old_len)` inside an array
-    /// allocation with `new`, shifting the trailing bytes and adjusting the
-    /// allocation's capacity by `new.len() - old_len` -- all as **one**
-    /// operation. This bundles what would otherwise be a separate
-    /// [`resize_array`](Allocator::resize_array), tail [`copy`](Allocator::copy),
-    /// and content [`write`](Allocator::write) into a single journal entry, so
-    /// a torn journal append can never stop partway through a content shift
-    /// (a truncated `splice` entry is simply un-applied). `offset`,
-    /// `old_len`, and `new` are all in **bytes**; the typed layer converts
-    /// element indices, keeping the allocator type-agnostic. Takes the array
-    /// pointer (like `resize_array`) because it changes the allocation's
-    /// capacity.
+    /// Replaces the `old_len` bytes at `offset` in an array region with
+    /// `new`, shifting the trailing bytes and adjusting the region's
+    /// capacity, as a single atomic operation.
     ///
-    /// The exact-fit special cases are the useful ones: `splice(p, off, k,
-    /// &[])` deletes `k` bytes (`PersistableVec::remove`), `splice(p, 0,
-    /// old, new)` replaces the whole content (`set_content`), and
-    /// `splice(p, off, 0, ins)` opens a gap and fills it.
+    /// `offset`, `old_len`, and `new` are all measured in bytes. Because
+    /// the entire shift is one recorded operation, a crash can never leave
+    /// the region half-updated: on recovery it is either fully spliced or
+    /// untouched. Common shapes:
+    ///
+    /// - `splice(p, off, k, &[])` deletes `k` bytes at `off`;
+    /// - `splice(p, off, 0, ins)` inserts `ins` at `off`;
+    /// - `splice(p, 0, old, new)` replaces the entire content.
+    ///
+    /// Takes effect at the next flush.
     fn splice<T>(&self, pointer: &UniqueArrayPointer<T>, offset: u32, old_len: u32, new: &[u8]);
 }
 

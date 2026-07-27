@@ -205,10 +205,21 @@ impl<'s, B: Backend> PersistableStringGuard<'s, B> {
         }
     }
 
-    /// Replaces the whole content with `new` in one crash-safe bulk write,
-    /// via [`PersistableVecGuard::set_content`](crate::PersistableVec). Not
-    /// yet a single *atomic* op -- see that method's residual-window note
-    /// (closed by Step 4's `splice`).
+    /// Replaces the entire string with `new` in a single bulk update.
+    ///
+    /// Runs in `O(new.len())`, independent of the current length.
+    ///
+    /// ```
+    /// use kladde::Kladde;
+    /// use kladde_types::PersistableString;
+    ///
+    /// let mut db = Kladde::new(PersistableString::new());
+    /// db.guard().set("hello");
+    /// assert_eq!(db.get().to_string(), "hello");
+    ///
+    /// db.guard().set("hi");
+    /// assert_eq!(db.get().to_string(), "hi");
+    /// ```
     pub fn set(&mut self, new: impl AsRef<str>) {
         self.inner
             .0
