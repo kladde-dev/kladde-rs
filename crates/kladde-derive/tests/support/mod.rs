@@ -9,7 +9,8 @@
 #![allow(dead_code)]
 
 use kladde_traits::{
-    Allocator, Guard, Location, Persistable, RawPointer, ResolvedPointer, UniquePointer,
+    Allocator, Guard, Location, Persistable, RawPointer, ResolvedPointer, UniqueArrayPointer,
+    UniquePointer,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -119,6 +120,18 @@ impl Allocator for MockBackend {
     fn free<T>(&self, pointer: UniquePointer<T>) {
         self.regions.borrow_mut().remove(&pointer.index());
     }
+    fn alloc_array<T>(&self, byte_size: usize) -> UniqueArrayPointer<T> {
+        let raw = self.next_index.get() + 1;
+        self.next_index.set(raw);
+        let index = NonZeroU32::new(raw).unwrap();
+        self.regions
+            .borrow_mut()
+            .insert(index, vec![0u8; byte_size]);
+        UniqueArrayPointer::from_index(index)
+    }
+    fn free_array<T>(&self, pointer: UniqueArrayPointer<T>) {
+        self.regions.borrow_mut().remove(&pointer.index());
+    }
     fn resolve<'a, T>(&'a self, pointer: &UniquePointer<T>) -> Option<ResolvedPointer<'a, T>> {
         self.regions
             .borrow()
@@ -143,9 +156,12 @@ impl Allocator for MockBackend {
         let bytes = self.read(src, src_offset, len);
         self.write(dst, dst_offset, &bytes);
     }
-    fn resize<T>(&self, pointer: &UniquePointer<T>, new_size: usize) {
+    fn resize_array<T>(&self, pointer: &UniqueArrayPointer<T>, new_byte_size: usize) {
         let mut regions = self.regions.borrow_mut();
         let region = regions.get_mut(&pointer.index()).unwrap();
-        region.resize(new_size, 0);
+        region.resize(new_byte_size, 0);
+    }
+    fn array_capacity<T>(&self, pointer: &UniqueArrayPointer<T>) -> Option<usize> {
+        self.regions.borrow().get(&pointer.index()).map(Vec::len)
     }
 }

@@ -11,7 +11,10 @@
 //! lives only as long as the process does.
 
 use kladde_alloc::MockAllocator;
-use kladde_traits::{Allocator, Location, Persistable, RawPointer, ResolvedPointer, UniquePointer};
+use kladde_traits::{
+    Allocator, Location, Persistable, RawPointer, ResolvedPointer, UniqueArrayPointer,
+    UniquePointer,
+};
 use std::cell::{Cell, RefCell};
 use std::num::NonZeroU32;
 
@@ -155,6 +158,27 @@ impl Allocator for DefaultBackend {
         });
     }
 
+    fn alloc_array<T>(&self, byte_size: usize) -> UniqueArrayPointer<T> {
+        let raw = self
+            .next_index
+            .get()
+            .checked_add(1)
+            .expect("DefaultBackend index space exhausted");
+        self.next_index.set(raw);
+        let index = NonZeroU32::new(raw).unwrap();
+        self.journal.borrow_mut().push(Microop::Alloc {
+            index,
+            size: byte_size,
+        });
+        UniqueArrayPointer::from_index(index)
+    }
+
+    fn free_array<T>(&self, pointer: UniqueArrayPointer<T>) {
+        self.journal.borrow_mut().push(Microop::Free {
+            index: pointer.index(),
+        });
+    }
+
     fn resolve<'a, T>(&'a self, pointer: &UniquePointer<T>) -> Option<ResolvedPointer<'a, T>> {
         self.allocator
             .resolve(pointer.index())
@@ -183,11 +207,15 @@ impl Allocator for DefaultBackend {
         });
     }
 
-    fn resize<T>(&self, pointer: &UniquePointer<T>, new_size: usize) {
+    fn resize_array<T>(&self, pointer: &UniqueArrayPointer<T>, new_byte_size: usize) {
         self.journal.borrow_mut().push(Microop::Resize {
             index: pointer.index(),
-            new_size,
+            new_size: new_byte_size,
         });
+    }
+
+    fn array_capacity<T>(&self, pointer: &UniqueArrayPointer<T>) -> Option<usize> {
+        self.allocator.capacity(pointer.index())
     }
 }
 
@@ -357,6 +385,38 @@ mod tests {
 
         assert_eq!(kladde.backend().journal_len(), 0);
         assert_eq!(kladde.load().0, 7);
+    }
+
+    #[test]
+    fn array_allocation_capacity_round_trips_through_flush() {
+        let backend = DefaultBackend::new();
+
+        let pointer = backend.alloc_array::<u8>(16);
+        assert_eq!(
+            backend.array_capacity(&pointer),
+            None,
+            "capacity is unreadable until the alloc is materialized (flushed)"
+        );
+
+        backend.flush();
+        assert_eq!(backend.array_capacity(&pointer), Some(16));
+
+        backend.resize_array(&pointer, 40);
+        backend.flush();
+        assert_eq!(
+            backend.array_capacity(&pointer),
+            Some(40),
+            "capacity tracks resize_array"
+        );
+
+        let live = backend.live_count();
+        backend.free_array(pointer);
+        backend.flush();
+        assert_eq!(
+            backend.live_count(),
+            live - 1,
+            "free_array reclaims the region"
+        );
     }
 
     #[test]

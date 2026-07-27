@@ -44,6 +44,15 @@ impl MockAllocator {
         self.regions.borrow().contains_key(&index).then_some(index)
     }
 
+    /// The current byte size of the region at `index`, or `None` if it
+    /// isn't materialized. For an array allocation this *is* its persisted
+    /// byte capacity (the mock keeps each region as a right-sized
+    /// `Box<[u8]>`, so there's no separate metadata field to track); a
+    /// real backend would read it out of the block header instead.
+    pub fn capacity(&self, index: NonZeroU32) -> Option<usize> {
+        self.regions.borrow().get(&index).map(|region| region.len())
+    }
+
     pub fn read(&self, index: NonZeroU32, offset: u32, len: u32) -> Vec<u8> {
         let regions = self.regions.borrow();
         let region = regions

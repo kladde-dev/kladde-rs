@@ -27,7 +27,8 @@
 //! real compaction exists.
 
 use kladde_traits::{
-    read_header, write_header, Backend, Guard, Location, Persistable, RawPointer, UniquePointer,
+    read_header, write_header, Backend, Guard, Location, Persistable, RawPointer,
+    UniqueArrayPointer,
 };
 use std::collections::hash_map;
 use std::collections::HashMap;
@@ -57,7 +58,11 @@ pub struct PersistableHashMap<K: Eq + Hash, V> {
     /// Always `>= entries.len()`; strictly greater once anything has
     /// ever been removed.
     capacity: usize,
-    pointer: Option<UniquePointer<PersistableHashMap<K, V>>>,
+    /// The variable-capacity slot array holding this map's entries -- a
+    /// [`UniqueArrayPointer`] (`Box<[slot]>`). Its byte capacity is
+    /// allocator-owned; the type keeps only the logical slot count
+    /// (`capacity`, published as the header's second field).
+    pointer: Option<UniqueArrayPointer<PersistableHashMap<K, V>>>,
 }
 
 impl<K: Eq + Hash, V> PersistableHashMap<K, V> {
@@ -176,7 +181,7 @@ where
 
     fn load<B: Backend>(backend: &B, location: Location) -> Self {
         let (target, capacity) = read_header(backend, location);
-        let pointer = target.map(UniquePointer::from_index);
+        let pointer = target.map(UniqueArrayPointer::from_index);
         let mut entries = HashMap::new();
         if let Some(target) = target {
             let anchor = RawPointer::from_index(target);
@@ -314,11 +319,11 @@ where
         let new_capacity = slot + 1;
         let new_byte_size = new_capacity * entry_size as usize;
         match &self.inner.pointer {
-            Some(pointer) => self.backend.resize(pointer, new_byte_size),
+            Some(pointer) => self.backend.resize_array(pointer, new_byte_size),
             None => {
                 self.inner.pointer = Some(
                     self.backend
-                        .alloc::<PersistableHashMap<K, V>>(new_byte_size),
+                        .alloc_array::<PersistableHashMap<K, V>>(new_byte_size),
                 )
             }
         }

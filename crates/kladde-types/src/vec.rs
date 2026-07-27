@@ -10,7 +10,8 @@
 //! is meant to be replaced with a chunked-list representation eventually.
 
 use kladde_traits::{
-    read_header, write_header, Backend, Guard, Location, Persistable, RawPointer, UniquePointer,
+    read_header, write_header, Backend, Guard, Location, Persistable, RawPointer,
+    UniqueArrayPointer,
 };
 use std::ops::{Deref, DerefMut};
 
@@ -27,11 +28,14 @@ use std::ops::{Deref, DerefMut};
 #[derive(Debug, PartialEq)]
 pub struct PersistableVec<T> {
     data: Vec<T>,
-    /// The content allocation holding this vec's elements -- `None`
-    /// until the first `push` (or a `store` of a `from_iter`-built vec)
-    /// ever needs one. Lazily created rather than eager, since
-    /// `PersistableVec::new()` takes no `Backend` to create one with.
-    pointer: Option<UniquePointer<PersistableVec<T>>>,
+    /// The variable-capacity content allocation holding this vec's elements
+    /// -- `None` until the first `push` (or a `store` of a
+    /// `from_iter`-built vec) ever needs one. Lazily created rather than
+    /// eager, since `PersistableVec::new()` takes no `Backend` to create
+    /// one with. A [`UniqueArrayPointer`] (the `Box<[T]>` analog): its byte
+    /// capacity is owned by the allocator, while this vec keeps only the
+    /// logical element count (in `data`, published as the header `len`).
+    pointer: Option<UniqueArrayPointer<PersistableVec<T>>>,
 }
 
 impl<T> PersistableVec<T> {
@@ -158,7 +162,7 @@ impl<T: Persistable> Persistable for PersistableVec<T> {
             None => {
                 let elem_size = T::INLINE_SIZE as u32;
                 let byte_size = self.data.len() * T::INLINE_SIZE;
-                let pointer = backend.alloc::<PersistableVec<T>>(byte_size);
+                let pointer = backend.alloc_array::<PersistableVec<T>>(byte_size);
                 for (i, item) in self.data.iter_mut().enumerate() {
                     item.store(
                         backend,
@@ -176,7 +180,7 @@ impl<T: Persistable> Persistable for PersistableVec<T> {
 
     fn load<B: Backend>(backend: &B, location: Location) -> Self {
         let (target, len) = read_header(backend, location);
-        let pointer = target.map(UniquePointer::from_index);
+        let pointer = target.map(UniqueArrayPointer::from_index);
         let mut data = Vec::with_capacity(len as usize);
         if let Some(target) = target {
             let anchor = RawPointer::from_index(target);
@@ -249,9 +253,10 @@ impl<'s, T: Persistable, B: Backend> PersistableVecGuard<'s, T, B> {
         let new_byte_size = new_len * T::INLINE_SIZE;
 
         match &self.inner.pointer {
-            Some(pointer) => self.backend.resize(pointer, new_byte_size),
+            Some(pointer) => self.backend.resize_array(pointer, new_byte_size),
             None => {
-                self.inner.pointer = Some(self.backend.alloc::<PersistableVec<T>>(new_byte_size))
+                self.inner.pointer =
+                    Some(self.backend.alloc_array::<PersistableVec<T>>(new_byte_size))
             }
         }
         let pointer = self.inner.pointer.as_ref().unwrap();
@@ -307,7 +312,7 @@ impl<'s, T: Persistable, B: Backend> PersistableVecGuard<'s, T, B> {
             );
         }
         write_header(self.backend, self.location, pointer.index(), new_len as u32);
-        self.backend.resize(pointer, new_len * T::INLINE_SIZE);
+        self.backend.resize_array(pointer, new_len * T::INLINE_SIZE);
 
         self.inner.data.remove(index)
     }
@@ -351,7 +356,7 @@ impl<'s, B: Backend> PersistableVecGuard<'s, u8, B> {
             if let Some(pointer) = self.inner.pointer.take() {
                 self.backend
                     .write(self.location.anchor, self.location.offset, &[0u8; 8]);
-                self.backend.free(pointer);
+                self.backend.free_array(pointer);
             }
             self.inner.data.clear();
             return;
@@ -359,21 +364,21 @@ impl<'s, B: Backend> PersistableVecGuard<'s, u8, B> {
 
         match &self.inner.pointer {
             None => {
-                let pointer = self.backend.alloc::<PersistableVec<u8>>(new_len);
+                let pointer = self.backend.alloc_array::<PersistableVec<u8>>(new_len);
                 self.backend.write(pointer.raw(), 0, new);
                 write_header(self.backend, self.location, pointer.index(), new_len as u32);
                 self.inner.pointer = Some(pointer);
             }
             Some(pointer) => match new_len.cmp(&old_len) {
                 std::cmp::Ordering::Greater => {
-                    self.backend.resize(pointer, new_len);
+                    self.backend.resize_array(pointer, new_len);
                     self.backend.write(pointer.raw(), 0, new);
                     write_header(self.backend, self.location, pointer.index(), new_len as u32);
                 }
                 std::cmp::Ordering::Less => {
                     self.backend.write(pointer.raw(), 0, new);
                     write_header(self.backend, self.location, pointer.index(), new_len as u32);
-                    self.backend.resize(pointer, new_len);
+                    self.backend.resize_array(pointer, new_len);
                 }
                 std::cmp::Ordering::Equal => {
                     self.backend.write(pointer.raw(), 0, new);
