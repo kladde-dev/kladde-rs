@@ -23,7 +23,11 @@
 //!   field `T`, analogous to `#[serde(transparent)]`: same bytes, and the
 //!   same fingerprint (it reuses `T`'s schema descriptor instead of
 //!   registering its own).
-//! - Generic types and types with where-clauses are not yet supported.
+//! - **Generic types** are supported for type parameters: `#[derive(Persistable)]`
+//!   adds a `T: Persistable` bound to each type parameter (the same
+//!   heuristic `#[derive(Debug)]` uses), so a `struct List<T> { inner:
+//!   PersistableVec<T> }` derives an `impl<T: Persistable> Persistable for
+//!   List<T>`. Lifetime and const-generic parameters are not supported yet.
 //!
 //! **Field requirements:** every field of a derived `struct`/`enum` has
 //! to be a type that itself implements `Persistable`. Plain `String`
@@ -84,21 +88,16 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, Data, DeriveInput, Fields};
+use syn::{parse_macro_input, parse_quote, Data, DeriveInput, Fields, GenericParam};
 
 #[proc_macro_derive(Persistable, attributes(kladde))]
 pub fn derive_persistable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
-    if !input.generics.params.is_empty() || input.generics.where_clause.is_some() {
-        return syn::Error::new_spanned(
-            &input.generics,
-            "#[derive(Persistable)] does not yet support generic types or where-clauses \
-             (see spec.md's Open Questions)",
-        )
-        .to_compile_error()
-        .into();
-    }
+    let ctx = match Ctx::build(&input) {
+        Ok(ctx) => ctx,
+        Err(err) => return err.to_compile_error().into(),
+    };
 
     let transparent = match transparent_attr(&input.attrs) {
         Ok(transparent) => transparent,
@@ -106,11 +105,11 @@ pub fn derive_persistable(input: TokenStream) -> TokenStream {
     };
 
     let expanded = if transparent {
-        derive_transparent(&input)
+        derive_transparent(&input, &ctx)
     } else {
         match &input.data {
-            Data::Struct(data) => derive_struct(&input, data),
-            Data::Enum(data) => derive_enum(&input, data),
+            Data::Struct(data) => derive_struct(&input, data, &ctx),
+            Data::Enum(data) => derive_enum(&input, data, &ctx),
             Data::Union(data) => syn::Error::new_spanned(
                 data.union_token,
                 "#[derive(Persistable)] does not support unions",
@@ -120,6 +119,90 @@ pub fn derive_persistable(input: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+/// The generics plumbing every derive path shares, precomputed once from
+/// the input type's own generic parameters. The generated code has to
+/// name three related-but-distinct generic lists, so they're built here
+/// rather than re-derived in each `derive_*` function:
+///
+/// - the *type*'s own `impl`/type/where fragments (`impl_generics`,
+///   `type_generics`, `where_clause`), with a `T: Persistable` bound
+///   added to each type parameter (the `#[derive(Debug)]` heuristic); and
+/// - the generated *guard*'s generic lists, which extend the type's own
+///   parameters with a fresh lifetime `'__s` and backend `__B`. Those two
+///   are given deliberately underscore-prefixed, collision-proof names so
+///   a user type like `struct Foo<B> { .. }` (its own `B`) doesn't clash
+///   with the guard's backend parameter -- the same hygiene trick serde's
+///   derive uses.
+///
+/// Only type parameters are supported; lifetime and const parameters are
+/// rejected in [`build`](Ctx::build).
+struct Ctx {
+    /// The type's `impl` generics with `T: Persistable` bounds added,
+    /// e.g. `<T: Persistable>` (empty for a non-generic type).
+    impl_generics: proc_macro2::TokenStream,
+    /// The type's type generics, e.g. `<T>` (empty for a non-generic type).
+    type_generics: proc_macro2::TokenStream,
+    /// The type's own `where`-clause, verbatim (empty if none).
+    where_clause: proc_macro2::TokenStream,
+    /// Generic list for *declaring* the guard struct and for the generic
+    /// list of every `impl` block on it: `<'__s, T: Persistable, __B: Backend>`.
+    guard_impl_generics: proc_macro2::TokenStream,
+    /// Generic list for *naming* the guard type (bare parameter names, no
+    /// bounds): `<'__s, T, __B>`.
+    guard_use_generics: proc_macro2::TokenStream,
+}
+
+impl Ctx {
+    fn build(input: &DeriveInput) -> syn::Result<Ctx> {
+        for param in &input.generics.params {
+            match param {
+                GenericParam::Type(_) => {}
+                GenericParam::Lifetime(lt) => {
+                    return Err(syn::Error::new_spanned(
+                        lt,
+                        "#[derive(Persistable)] does not support lifetime parameters",
+                    ));
+                }
+                GenericParam::Const(c) => {
+                    return Err(syn::Error::new_spanned(
+                        c,
+                        "#[derive(Persistable)] does not support const generic parameters yet",
+                    ));
+                }
+            }
+        }
+
+        // Add a `T: Persistable` bound to every type parameter -- the same
+        // (slightly conservative) rule `#[derive(Debug)]` uses. A future
+        // `#[kladde(bound = "...")]` escape hatch could override this; see
+        // `later.md`.
+        let mut bounded = input.generics.clone();
+        for tp in bounded.type_params_mut() {
+            tp.bounds.push(parse_quote!(::kladde_traits::Persistable));
+        }
+        let (impl_generics, type_generics, where_clause) = bounded.split_for_impl();
+
+        // The guard's own generic lists: the type's (bounded) parameters,
+        // bracketed by a fresh lifetime and backend with collision-proof
+        // names. `bounded_params` render with their bounds
+        // (`T: ... + Persistable`); `param_idents` are the bare names.
+        let bounded_params: Vec<proc_macro2::TokenStream> =
+            bounded.type_params().map(|tp| quote!(#tp)).collect();
+        let param_idents: Vec<&syn::Ident> =
+            input.generics.type_params().map(|tp| &tp.ident).collect();
+
+        Ok(Ctx {
+            impl_generics: quote!(#impl_generics),
+            type_generics: quote!(#type_generics),
+            where_clause: quote!(#where_clause),
+            guard_impl_generics: quote! {
+                <'__s, #(#bounded_params,)* __B: ::kladde_traits::Backend>
+            },
+            guard_use_generics: quote! { <'__s, #(#param_idents,)* __B> },
+        })
+    }
 }
 
 /// Whether the type carries `#[kladde(transparent)]`. Errors on any other
@@ -174,49 +257,64 @@ fn total_size(field_ty: &[syn::Type]) -> proc_macro2::TokenStream {
 
 /// The guard type shared by *every* derived `Persistable`: a
 /// `{ inner, backend, location }` struct plus its `Guard`/`Deref`/
-/// `DerefMut` impls. These are byte-identical across the struct, unit,
-/// enum, and transparent derives -- each of those differs only in the
+/// `DerefMut` impls. These are structurally identical across the struct,
+/// unit, enum, and transparent derives -- each of those differs only in the
 /// *accessor* `impl` block it adds on top (per-field `_mut()`, an enum's
 /// whole-value `set`, a transparent newtype's `get_mut`, ...) and in its
 /// `Persistable` body. Paired with [`guard_assoc`], which emits the
 /// matching items *inside* the `Persistable` impl.
 fn guard_scaffold(
+    ctx: &Ctx,
     ident: &syn::Ident,
     vis: &syn::Visibility,
     guard_ident: &syn::Ident,
 ) -> proc_macro2::TokenStream {
+    let Ctx {
+        type_generics,
+        where_clause,
+        guard_impl_generics,
+        guard_use_generics,
+        ..
+    } = ctx;
+
     quote! {
         #[doc(hidden)]
-        #vis struct #guard_ident<'s, B> {
-            inner: &'s mut #ident,
-            backend: &'s B,
+        #vis struct #guard_ident #guard_use_generics #where_clause {
+            inner: &'__s mut #ident #type_generics,
+            backend: &'__s __B,
             location: ::kladde_traits::Location,
         }
 
-        impl<'s, B: ::kladde_traits::Backend> ::kladde_traits::Guard for #guard_ident<'s, B> {
-            type Persistable = #ident;
-            type Backend = B;
+        impl #guard_impl_generics ::kladde_traits::Guard
+            for #guard_ident #guard_use_generics #where_clause
+        {
+            type Persistable = #ident #type_generics;
+            type Backend = __B;
 
-            fn as_persistable(&self) -> &#ident {
+            fn as_persistable(&self) -> &#ident #type_generics {
                 self.inner
             }
-            fn as_persistable_mut(&mut self) -> &mut #ident {
+            fn as_persistable_mut(&mut self) -> &mut #ident #type_generics {
                 self.inner
             }
-            fn backend(&self) -> &B {
+            fn backend(&self) -> &__B {
                 self.backend
             }
         }
 
-        impl<'s, B> ::std::ops::Deref for #guard_ident<'s, B> {
-            type Target = #ident;
-            fn deref(&self) -> &#ident {
+        impl #guard_impl_generics ::std::ops::Deref
+            for #guard_ident #guard_use_generics #where_clause
+        {
+            type Target = #ident #type_generics;
+            fn deref(&self) -> &#ident #type_generics {
                 self.inner
             }
         }
 
-        impl<'s, B> ::std::ops::DerefMut for #guard_ident<'s, B> {
-            fn deref_mut(&mut self) -> &mut #ident {
+        impl #guard_impl_generics ::std::ops::DerefMut
+            for #guard_ident #guard_use_generics #where_clause
+        {
+            fn deref_mut(&mut self) -> &mut #ident #type_generics {
                 self.inner
             }
         }
@@ -227,19 +325,22 @@ fn guard_scaffold(
 /// derived `Persistable` impl -- the in-impl counterpart of
 /// [`guard_scaffold`]'s out-of-impl items. Every derive kind builds the
 /// same `{ inner, backend, location }` guard the same way.
-fn guard_assoc(guard_ident: &syn::Ident) -> proc_macro2::TokenStream {
+fn guard_assoc(ctx: &Ctx, guard_ident: &syn::Ident) -> proc_macro2::TokenStream {
+    let Ctx {
+        guard_use_generics, ..
+    } = ctx;
     quote! {
-        type Guard<'s, B: ::kladde_traits::Backend>
-            = #guard_ident<'s, B>
+        type Guard<'__s, __B: ::kladde_traits::Backend>
+            = #guard_ident #guard_use_generics
         where
-            Self: 's,
-            B: 's;
+            Self: '__s,
+            __B: '__s;
 
-        fn guard<'s, B: ::kladde_traits::Backend>(
-            &'s mut self,
-            backend: &'s B,
+        fn guard<'__s, __B: ::kladde_traits::Backend>(
+            &'__s mut self,
+            backend: &'__s __B,
             location: ::kladde_traits::Location,
-        ) -> Self::Guard<'s, B> {
+        ) -> Self::Guard<'__s, __B> {
             #guard_ident {
                 inner: self,
                 backend,
@@ -262,10 +363,18 @@ fn guard_assoc(guard_ident: &syn::Ident) -> proc_macro2::TokenStream {
 ///
 /// The wrapper's guard exposes a single `get_mut()` returning the inner
 /// type's own guard, so `T`'s full mutation API is reachable through it.
-fn derive_transparent(input: &DeriveInput) -> proc_macro2::TokenStream {
+fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> proc_macro2::TokenStream {
     let ident = &input.ident;
     let vis = &input.vis;
     let guard_ident = format_ident!("{}Guard", ident);
+    let Ctx {
+        impl_generics,
+        type_generics,
+        where_clause,
+        guard_impl_generics,
+        guard_use_generics,
+        ..
+    } = ctx;
 
     let fields = match &input.data {
         Data::Struct(data) => &data.fields,
@@ -312,20 +421,20 @@ fn derive_transparent(input: &DeriveInput) -> proc_macro2::TokenStream {
         ),
     };
 
-    let scaffold = guard_scaffold(ident, vis, &guard_ident);
-    let guard_assoc = guard_assoc(&guard_ident);
+    let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident);
+    let guard_assoc = guard_assoc(ctx, &guard_ident);
 
     quote! {
         #scaffold
 
-        impl<'s, B: ::kladde_traits::Backend> #guard_ident<'s, B> {
+        impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
             /// A mutable guard over the wrapped value. Since this is a
             /// `#[kladde(transparent)]` newtype, the inner value lives at
             /// the wrapper's own location, so this is a direct pass-through
             /// to the inner type's full mutation API.
             #vis fn get_mut(
                 &mut self,
-            ) -> <#field_ty as ::kladde_traits::Persistable>::Guard<'_, B> {
+            ) -> <#field_ty as ::kladde_traits::Persistable>::Guard<'_, __B> {
                 <#field_ty as ::kladde_traits::Persistable>::guard(
                     &mut self.inner.#member,
                     self.backend,
@@ -334,7 +443,7 @@ fn derive_transparent(input: &DeriveInput) -> proc_macro2::TokenStream {
             }
         }
 
-        impl ::kladde_traits::Persistable for #ident {
+        impl #impl_generics ::kladde_traits::Persistable for #ident #type_generics #where_clause {
             // Transparent: the wrapper *is* its one field, so it owns no
             // storage of its own and forwards everything at offset 0.
             const INLINE_SIZE: usize =
@@ -342,7 +451,7 @@ fn derive_transparent(input: &DeriveInput) -> proc_macro2::TokenStream {
 
             #guard_assoc
 
-            fn store<B: ::kladde_traits::Backend>(&mut self, backend: &B, location: ::kladde_traits::Location) {
+            fn store<__B: ::kladde_traits::Backend>(&mut self, backend: &__B, location: ::kladde_traits::Location) {
                 <#field_ty as ::kladde_traits::Persistable>::store(
                     &mut self.#member,
                     backend,
@@ -350,7 +459,7 @@ fn derive_transparent(input: &DeriveInput) -> proc_macro2::TokenStream {
                 );
             }
 
-            fn load<B: ::kladde_traits::Backend>(backend: &B, location: ::kladde_traits::Location) -> Self {
+            fn load<__B: ::kladde_traits::Backend>(backend: &__B, location: ::kladde_traits::Location) -> Self {
                 let __value = <#field_ty as ::kladde_traits::Persistable>::load(backend, location);
                 #construct
             }
@@ -360,55 +469,124 @@ fn derive_transparent(input: &DeriveInput) -> proc_macro2::TokenStream {
             // share one fingerprint. Overriding `describe` (and leaving
             // `describe_local` at its default) is exactly the transparency
             // escape hatch documented on `Persistable::describe`.
-            fn describe(builder: &mut ::kladde_traits::SchemaBuilder) -> ::kladde_traits::TypeRef {
+            fn describe(builder: &mut ::kladde_traits::SchemaBuilder) -> ::kladde_traits::TypeRef
+            where
+                Self: 'static,
+            {
                 <#field_ty as ::kladde_traits::Persistable>::describe(builder)
             }
         }
     }
 }
 
-fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::TokenStream {
+fn derive_struct(
+    input: &DeriveInput,
+    data: &syn::DataStruct,
+    ctx: &Ctx,
+) -> proc_macro2::TokenStream {
     let ident = &input.ident;
     let vis = &input.vis;
     let guard_ident = format_ident!("{}Guard", ident);
+    let Ctx {
+        impl_generics,
+        type_generics,
+        where_clause,
+        guard_impl_generics,
+        guard_use_generics,
+        ..
+    } = ctx;
 
-    let fields = match &data.fields {
-        Fields::Named(fields) => &fields.named,
+    // Both named (`struct S { x: T }`) and tuple (`struct S(T)`) structs
+    // are laid out identically -- fields back to back -- so they share
+    // this code path; only how each field is *named* differs (see
+    // `StructField`).
+    let fields: Vec<&syn::Field> = match &data.fields {
+        Fields::Named(fields) => fields.named.iter().collect(),
+        Fields::Unnamed(fields) => fields.unnamed.iter().collect(),
         Fields::Unit => {
-            return derive_unit_like_struct(ident, vis, &guard_ident);
-        }
-        Fields::Unnamed(fields) => {
-            return syn::Error::new_spanned(
-                fields,
-                "#[derive(Persistable)] does not yet support tuple structs, only named fields",
-            )
-            .to_compile_error();
+            return derive_unit_like_struct(ctx, ident, vis, &guard_ident);
         }
     };
 
-    let field_ident: Vec<_> = fields.iter().map(|f| f.ident.clone().unwrap()).collect();
-    let field_ty: Vec<_> = fields.iter().map(|f| f.ty.clone()).collect();
-    let accessor_ident: Vec<_> = field_ident
+    let field_ty: Vec<syn::Type> = fields.iter().map(|f| f.ty.clone()).collect();
+    // Per field: how it's accessed on `self` (`.name` or `.0`), the
+    // `_mut()` accessor name, and its schema field name.
+    let member: Vec<syn::Member> = fields
         .iter()
-        .map(|f| format_ident!("{}_mut", f))
+        .enumerate()
+        .map(|(i, f)| match &f.ident {
+            Some(name) => syn::Member::Named(name.clone()),
+            None => syn::Member::Unnamed(syn::Index::from(i)),
+        })
+        .collect();
+    let accessor_ident: Vec<syn::Ident> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| match &f.ident {
+            Some(name) => format_ident!("{}_mut", name),
+            None => format_ident!("field_{}_mut", i),
+        })
+        .collect();
+    let schema_name: Vec<String> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| match &f.ident {
+            Some(name) => name.to_string(),
+            None => i.to_string(),
+        })
         .collect();
 
     let field_offset = field_offsets(&field_ty);
     let total_size = total_size(&field_ty);
 
-    let scaffold = guard_scaffold(ident, vis, &guard_ident);
-    let guard_assoc = guard_assoc(&guard_ident);
+    // `load` reconstructs the value; the syntax differs between a braced
+    // struct (`S { name: .. }`) and a tuple struct (`S(..)`).
+    let is_tuple = matches!(&data.fields, Fields::Unnamed(_));
+    let load_body = if is_tuple {
+        quote! {
+            #ident(
+                #(
+                    <#field_ty as ::kladde_traits::Persistable>::load(
+                        backend,
+                        ::kladde_traits::Location {
+                            anchor: location.anchor,
+                            offset: location.offset + #field_offset,
+                        },
+                    ),
+                )*
+            )
+        }
+    } else {
+        let field_ident: Vec<&syn::Ident> =
+            fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+        quote! {
+            #ident {
+                #(
+                    #field_ident: <#field_ty as ::kladde_traits::Persistable>::load(
+                        backend,
+                        ::kladde_traits::Location {
+                            anchor: location.anchor,
+                            offset: location.offset + #field_offset,
+                        },
+                    ),
+                )*
+            }
+        }
+    };
+
+    let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident);
+    let guard_assoc = guard_assoc(ctx, &guard_ident);
 
     quote! {
         #scaffold
 
-        impl<'s, B: ::kladde_traits::Backend> #guard_ident<'s, B> {
+        impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
             #(
                 #vis fn #accessor_ident(
                     &mut self,
-                ) -> <#field_ty as ::kladde_traits::Persistable>::Guard<'_, B> {
+                ) -> <#field_ty as ::kladde_traits::Persistable>::Guard<'_, __B> {
                     <#field_ty as ::kladde_traits::Persistable>::guard(
-                        &mut self.inner.#field_ident,
+                        &mut self.inner.#member,
                         self.backend,
                         ::kladde_traits::Location {
                             anchor: self.location.anchor,
@@ -419,7 +597,7 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::To
             )*
         }
 
-        impl ::kladde_traits::Persistable for #ident {
+        impl #impl_generics ::kladde_traits::Persistable for #ident #type_generics #where_clause {
             // A struct never owns an allocation of its own -- it's just
             // the sum of its fields' inline representations, threaded
             // through at static offsets.
@@ -427,10 +605,10 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::To
 
             #guard_assoc
 
-            fn store<B: ::kladde_traits::Backend>(&mut self, backend: &B, location: ::kladde_traits::Location) {
+            fn store<__B: ::kladde_traits::Backend>(&mut self, backend: &__B, location: ::kladde_traits::Location) {
                 #(
                     ::kladde_traits::Persistable::store(
-                        &mut self.#field_ident,
+                        &mut self.#member,
                         backend,
                         ::kladde_traits::Location {
                             anchor: location.anchor,
@@ -440,31 +618,22 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::To
                 )*
             }
 
-            fn load<B: ::kladde_traits::Backend>(backend: &B, location: ::kladde_traits::Location) -> Self {
-                #ident {
-                    #(
-                        #field_ident: <#field_ty as ::kladde_traits::Persistable>::load(
-                            backend,
-                            ::kladde_traits::Location {
-                                anchor: location.anchor,
-                                offset: location.offset + #field_offset,
-                            },
-                        ),
-                    )*
-                }
+            fn load<__B: ::kladde_traits::Backend>(backend: &__B, location: ::kladde_traits::Location) -> Self {
+                #load_body
             }
 
             fn describe_local(
                 __builder: &mut ::kladde_traits::SchemaBuilder,
-            ) -> ::kladde_traits::TypeDescriptor {
+            ) -> ::kladde_traits::TypeDescriptor
+            where
+                Self: 'static,
+            {
                 ::kladde_traits::TypeDescriptor::Struct {
                     name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
                     fields: ::std::vec![
                         #(
                             ::kladde_traits::Field {
-                                name: ::std::string::ToString::to_string(
-                                    ::std::stringify!(#field_ident),
-                                ),
+                                name: ::std::string::ToString::to_string(#schema_name),
                                 ty: <#field_ty as ::kladde_traits::Persistable>::describe(
                                     __builder,
                                 ),
@@ -481,30 +650,40 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct) -> proc_macro2::To
 /// at all -- same shape as the struct case but with empty bodies
 /// everywhere and `INLINE_SIZE = 0`.
 fn derive_unit_like_struct(
+    ctx: &Ctx,
     ident: &syn::Ident,
     vis: &syn::Visibility,
     guard_ident: &syn::Ident,
 ) -> proc_macro2::TokenStream {
-    let scaffold = guard_scaffold(ident, vis, guard_ident);
-    let guard_assoc = guard_assoc(guard_ident);
+    let Ctx {
+        impl_generics,
+        type_generics,
+        where_clause,
+        ..
+    } = ctx;
+    let scaffold = guard_scaffold(ctx, ident, vis, guard_ident);
+    let guard_assoc = guard_assoc(ctx, guard_ident);
 
     quote! {
         #scaffold
 
-        impl ::kladde_traits::Persistable for #ident {
+        impl #impl_generics ::kladde_traits::Persistable for #ident #type_generics #where_clause {
             const INLINE_SIZE: usize = 0;
 
             #guard_assoc
 
-            fn store<B: ::kladde_traits::Backend>(&mut self, _backend: &B, _location: ::kladde_traits::Location) {}
+            fn store<__B: ::kladde_traits::Backend>(&mut self, _backend: &__B, _location: ::kladde_traits::Location) {}
 
-            fn load<B: ::kladde_traits::Backend>(_backend: &B, _location: ::kladde_traits::Location) -> Self {
+            fn load<__B: ::kladde_traits::Backend>(_backend: &__B, _location: ::kladde_traits::Location) -> Self {
                 #ident
             }
 
             fn describe_local(
                 _builder: &mut ::kladde_traits::SchemaBuilder,
-            ) -> ::kladde_traits::TypeDescriptor {
+            ) -> ::kladde_traits::TypeDescriptor
+            where
+                Self: 'static,
+            {
                 ::kladde_traits::TypeDescriptor::Struct {
                     name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
                     fields: ::std::vec![],
@@ -533,10 +712,18 @@ fn derive_unit_like_struct(
 /// all in the same enum. Positional (tuple) fields get synthetic
 /// `field_0`, `field_1`, ... bindings in generated match patterns, since
 /// they have no identifier of their own to reuse.
-fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenStream {
+fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_macro2::TokenStream {
     let ident = &input.ident;
     let vis = &input.vis;
     let guard_ident = format_ident!("{}Guard", ident);
+    let Ctx {
+        impl_generics,
+        type_generics,
+        where_clause,
+        guard_impl_generics,
+        guard_use_generics,
+        ..
+    } = ctx;
 
     if data.variants.is_empty() {
         return syn::Error::new_spanned(
@@ -630,8 +817,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenS
 
     // A match pattern binding a variant's own fields (if any) -- shared
     // by `store` (matched against `&mut Self`, so bindings come out as
-    // `&mut FieldTy` via match ergonomics) and, negated, doesn't apply to
-    // `load` (which reconstructs a value rather than matching one).
+    // `&mut FieldTy` via match ergonomics).
     let variant_pattern: Vec<proc_macro2::TokenStream> = data
         .variants
         .iter()
@@ -649,9 +835,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenS
     // `store`'s per-variant match arm: write the discriminant, then each
     // field at its static offset (base 4). Recurses into
     // `Persistable::store` on each field's `&mut` binding, same as
-    // `derive_struct`'s `store` -- see that trait method's own doc
-    // comment for why `&mut self` matters (a field may need to learn its
-    // own allocation pointer for the first time here).
+    // `derive_struct`'s `store`.
     let variant_store_arm: Vec<proc_macro2::TokenStream> = (0..data.variants.len())
         .map(|i| {
             let pattern = &variant_pattern[i];
@@ -749,24 +933,24 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenS
         })
         .collect();
 
-    let scaffold = guard_scaffold(ident, vis, &guard_ident);
-    let guard_assoc = guard_assoc(&guard_ident);
+    let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident);
+    let guard_assoc = guard_assoc(ctx, &guard_ident);
 
     quote! {
         #scaffold
 
-        impl<'s, B: ::kladde_traits::Backend> #guard_ident<'s, B> {
+        impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
             /// Replaces the whole value with `value`. See `spec.md`'s
             /// Future Work for the deferred fine-grained alternative
             /// (mutating a field within the current variant in place,
             /// and/or matching directly on this guard).
-            #vis fn set(&mut self, mut value: #ident) {
+            #vis fn set(&mut self, mut value: #ident #type_generics) {
                 ::kladde_traits::Persistable::store(&mut value, self.backend, self.location);
                 *self.inner = value;
             }
         }
 
-        impl ::kladde_traits::Persistable for #ident {
+        impl #impl_generics ::kladde_traits::Persistable for #ident #type_generics #where_clause {
             const INLINE_SIZE: usize = 4 + {
                 let variant_sizes = [#(#variant_size),*];
                 let mut max = 0usize;
@@ -782,14 +966,14 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenS
 
             #guard_assoc
 
-            fn store<B: ::kladde_traits::Backend>(&mut self, backend: &B, location: ::kladde_traits::Location) {
+            fn store<__B: ::kladde_traits::Backend>(&mut self, backend: &__B, location: ::kladde_traits::Location) {
                 #discriminants
                 match self {
                     #(#variant_store_arm)*
                 }
             }
 
-            fn load<B: ::kladde_traits::Backend>(backend: &B, location: ::kladde_traits::Location) -> Self {
+            fn load<__B: ::kladde_traits::Backend>(backend: &__B, location: ::kladde_traits::Location) -> Self {
                 #discriminants
                 let discriminant_bytes = ::kladde_traits::Allocator::read(backend, location.anchor, location.offset, 4);
                 let discriminant = u32::from_le_bytes(discriminant_bytes.try_into().unwrap());
@@ -807,7 +991,10 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum) -> proc_macro2::TokenS
 
             fn describe_local(
                 __builder: &mut ::kladde_traits::SchemaBuilder,
-            ) -> ::kladde_traits::TypeDescriptor {
+            ) -> ::kladde_traits::TypeDescriptor
+            where
+                Self: 'static,
+            {
                 #discriminants
                 ::kladde_traits::TypeDescriptor::Enum {
                     name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
