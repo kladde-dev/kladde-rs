@@ -124,6 +124,22 @@ impl MockAllocator {
         }
     }
 
+    /// Replaces the byte range `[offset, offset + old_len)` in the region
+    /// at `index` with `new`, shifting the trailing bytes and changing the
+    /// region's size by `new.len() - old_len` -- the materialization of one
+    /// [`kladde_traits::Allocator::splice`] entry (`Vec::splice` does
+    /// exactly this). `index` itself never changes.
+    pub fn materialize_splice(&self, index: NonZeroU32, offset: u32, old_len: u32, new: &[u8]) {
+        let mut regions = self.regions.borrow_mut();
+        let region = regions
+            .get_mut(&index)
+            .unwrap_or_else(|| panic!("MockAllocator: splice of unmaterialized index {index}"));
+        let mut bytes = std::mem::take(region).into_vec();
+        let start = offset as usize;
+        bytes.splice(start..start + old_len as usize, new.iter().copied());
+        *region = bytes.into_boxed_slice();
+    }
+
     /// Grows or shrinks the region at `index` in place, preserving
     /// `min(old_size, new_size)` bytes from the start -- `index` itself
     /// never changes, only how much storage it identifies.
@@ -232,6 +248,29 @@ mod tests {
         // shift elements 1..4 down into slots 0..3.
         alloc.materialize_copy(index, 2, 6, index, 0);
         assert_eq!(alloc.read(index, 0, 6), vec![3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn splice_deletes_inserts_and_replaces_adjusting_size() {
+        let alloc = MockAllocator::new();
+        let index = NonZeroU32::new(1).unwrap();
+        alloc.materialize_alloc(index, 6);
+        alloc.materialize_write(index, 0, &[1, 2, 3, 4, 5, 6]);
+
+        // Delete the 2 bytes at offset 1 (shifts the tail, shrinks to 4).
+        alloc.materialize_splice(index, 1, 2, &[]);
+        assert_eq!(alloc.capacity(index), Some(4));
+        assert_eq!(alloc.read(index, 0, 4), vec![1, 4, 5, 6]);
+
+        // Insert 3 bytes at offset 2 (no removal, grows to 7).
+        alloc.materialize_splice(index, 2, 0, &[7, 8, 9]);
+        assert_eq!(alloc.capacity(index), Some(7));
+        assert_eq!(alloc.read(index, 0, 7), vec![1, 4, 7, 8, 9, 5, 6]);
+
+        // Replace 7 bytes at offset 0 with 2 (whole-content replace).
+        alloc.materialize_splice(index, 0, 7, &[42, 43]);
+        assert_eq!(alloc.capacity(index), Some(2));
+        assert_eq!(alloc.read(index, 0, 2), vec![42, 43]);
     }
 
     #[test]

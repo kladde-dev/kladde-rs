@@ -273,21 +273,22 @@ impl<'s, T: Persistable, B: Backend> PersistableVecGuard<'s, T, B> {
         self.inner.data.push(value);
     }
 
-    /// Removes and returns the element at `index`, shifting every later
-    /// element down by one slot (`copy`), then publishing the new (shorter)
-    /// header, then shrinking the allocation (`resize`) -- in that order.
-    /// The shift has to precede the header so the header never names more
-    /// live elements than are actually in place; the header has to precede
-    /// the shrink so a torn-journal prefix never leaves the header naming
-    /// more elements than the allocation can hold (an out-of-bounds read).
-    /// Panics if `index` is out of bounds (matches `Vec::remove`).
+    /// Removes and returns the element at `index`, deleting its slot's bytes
+    /// with a single [`splice`](kladde_traits::Allocator::splice) -- which
+    /// shifts every later element down and shrinks the allocation as one
+    /// atomic op -- then publishing the new (shorter) header. Panics if
+    /// `index` is out of bounds (matches `Vec::remove`).
     ///
-    /// One residual gap remains that reordering can't close: the `copy`
-    /// leaves a well-formed but transient state (the tail shifted, with the
-    /// old last element duplicated) that is neither the old nor the new
-    /// vector until the header publishes. Making the shift+shrink+publish a
-    /// single atomic step needs the `substitute`/atomic-move op sketched in
-    /// `later.md`, or a `Transaction` bracket.
+    /// The `splice` collapses the old `copy`-then-`resize` pair (whose
+    /// intermediate state duplicated the last element) into one entry, so
+    /// the content allocation is never observed mid-shift. What `splice`
+    /// alone can't close is the header: it lives in a *separate* region
+    /// (the parent anchor), so a torn journal that applied the `splice` but
+    /// not the header write would see the shorter content under the old,
+    /// longer count. Fully closing that needs the length to come from the
+    /// allocator's capacity rather than the header (plan decision 4, still
+    /// deferred -- see `array-pointer-problems.md`); until then this is the
+    /// tightest ordering.
     pub fn remove(&mut self, index: usize) -> T {
         let elem_size = T::INLINE_SIZE as u32;
         let old_len = self.inner.data.len();
@@ -302,17 +303,9 @@ impl<'s, T: Persistable, B: Backend> PersistableVecGuard<'s, T, B> {
             .as_ref()
             .expect("PersistableVec::remove called but no content allocation exists");
 
-        if index < new_len {
-            self.backend.copy(
-                pointer.raw(),
-                (index as u32 + 1) * elem_size,
-                (new_len - index) as u32 * elem_size,
-                pointer.raw(),
-                index as u32 * elem_size,
-            );
-        }
+        self.backend
+            .splice(pointer, index as u32 * elem_size, elem_size, &[]);
         write_header(self.backend, self.location, pointer.index(), new_len as u32);
-        self.backend.resize_array(pointer, new_len * T::INLINE_SIZE);
 
         self.inner.data.remove(index)
     }
@@ -327,20 +320,21 @@ impl<'s, B: Backend> PersistableVecGuard<'s, u8, B> {
     /// is deferred (freeing owning elements' sub-allocations needs a trait
     /// hook that doesn't exist yet -- see `array-pointer-problems.md`).
     ///
-    /// Crash-safe ordering, mirroring `push`/`remove`: a grow enlarges the
-    /// allocation first and publishes the header last; a shrink publishes
-    /// the header before it shrinks the allocation, so a torn-journal
-    /// prefix never names more bytes than the allocation holds.
+    /// Replaces the whole content with one atomic
+    /// [`splice`](kladde_traits::Allocator::splice) (resize + overwrite in a
+    /// single journal entry), so the content allocation is never observed
+    /// half-updated -- no more grow/shrink ordering split or
+    /// trailing-slack-tolerance requirement. Every owning consumer
+    /// (`PersistableString`, `PersistableBlob`) inherits this by routing
+    /// through here rather than re-deriving its own ordering.
     ///
-    /// **Residual window.** The byte content here is read back exactly
-    /// (`len` bytes, no trailing-slack tolerance), so the content write
-    /// can't be deferred past the header: between overwriting the content
-    /// and publishing the header, a torn prefix reads a mix of old and new
-    /// bytes -- neither the old nor the new value. Collapsing this into a
-    /// single atomic op is Step 4's `splice`; until then this is the safest
-    /// ordering available. (Every owning consumer -- `PersistableString`,
-    /// `PersistableBlob` -- inherits this ordering by routing through here,
-    /// rather than each re-deriving its own.)
+    /// **Residual window.** The `splice` makes the *content* atomic, but the
+    /// length still lives in a separate header region, published by a
+    /// distinct write: a torn journal that applied the `splice` but not the
+    /// header would see new content under the old length. Closing that last
+    /// gap needs the length to come from the allocator's capacity instead of
+    /// the header (plan decision 4, deferred -- see
+    /// `array-pointer-problems.md`).
     pub fn set_content(&mut self, new: &[u8]) {
         let old_len = self.inner.data.len();
         let new_len = new.len();
@@ -364,26 +358,19 @@ impl<'s, B: Backend> PersistableVecGuard<'s, u8, B> {
 
         match &self.inner.pointer {
             None => {
+                // No allocation yet -- alloc then publish (append-then-
+                // publish; there's no old content to splice against).
                 let pointer = self.backend.alloc_array::<PersistableVec<u8>>(new_len);
                 self.backend.write(pointer.raw(), 0, new);
                 write_header(self.backend, self.location, pointer.index(), new_len as u32);
                 self.inner.pointer = Some(pointer);
             }
-            Some(pointer) => match new_len.cmp(&old_len) {
-                std::cmp::Ordering::Greater => {
-                    self.backend.resize_array(pointer, new_len);
-                    self.backend.write(pointer.raw(), 0, new);
-                    write_header(self.backend, self.location, pointer.index(), new_len as u32);
-                }
-                std::cmp::Ordering::Less => {
-                    self.backend.write(pointer.raw(), 0, new);
-                    write_header(self.backend, self.location, pointer.index(), new_len as u32);
-                    self.backend.resize_array(pointer, new_len);
-                }
-                std::cmp::Ordering::Equal => {
-                    self.backend.write(pointer.raw(), 0, new);
-                }
-            },
+            Some(pointer) => {
+                // Replace the entire old content in one atomic op, then
+                // republish the (possibly changed) length.
+                self.backend.splice(pointer, 0, old_len as u32, new);
+                write_header(self.backend, self.location, pointer.index(), new_len as u32);
+            }
         }
         self.inner.data = new.to_vec();
     }

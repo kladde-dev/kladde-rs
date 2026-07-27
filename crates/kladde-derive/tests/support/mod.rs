@@ -164,4 +164,10 @@ impl Allocator for MockBackend {
     fn array_capacity<T>(&self, pointer: &UniqueArrayPointer<T>) -> Option<usize> {
         self.regions.borrow().get(&pointer.index()).map(Vec::len)
     }
+    fn splice<T>(&self, pointer: &UniqueArrayPointer<T>, offset: u32, old_len: u32, new: &[u8]) {
+        let mut regions = self.regions.borrow_mut();
+        let region = regions.get_mut(&pointer.index()).unwrap();
+        let start = offset as usize;
+        region.splice(start..start + old_len as usize, new.iter().copied());
+    }
 }

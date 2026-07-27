@@ -285,6 +285,25 @@ pub trait Allocator {
     /// inline. Reflects only already-flushed state, like
     /// [`read`](Allocator::read)/[`resolve`](Allocator::resolve).
     fn array_capacity<T>(&self, pointer: &UniqueArrayPointer<T>) -> Option<usize>;
+
+    /// Replaces the byte range `[offset, offset + old_len)` inside an array
+    /// allocation with `new`, shifting the trailing bytes and adjusting the
+    /// allocation's capacity by `new.len() - old_len` -- all as **one**
+    /// operation. This bundles what would otherwise be a separate
+    /// [`resize_array`](Allocator::resize_array), tail [`copy`](Allocator::copy),
+    /// and content [`write`](Allocator::write) into a single journal entry, so
+    /// a torn journal append can never stop partway through a content shift
+    /// (a truncated `splice` entry is simply un-applied). `offset`,
+    /// `old_len`, and `new` are all in **bytes**; the typed layer converts
+    /// element indices, keeping the allocator type-agnostic. Takes the array
+    /// pointer (like `resize_array`) because it changes the allocation's
+    /// capacity.
+    ///
+    /// The exact-fit special cases are the useful ones: `splice(p, off, k,
+    /// &[])` deletes `k` bytes (`PersistableVec::remove`), `splice(p, 0,
+    /// old, new)` replaces the whole content (`set_content`), and
+    /// `splice(p, off, 0, ins)` opens a gap and fills it.
+    fn splice<T>(&self, pointer: &UniqueArrayPointer<T>, offset: u32, old_len: u32, new: &[u8]);
 }
 
 /// The bound every [`Persistable`]/[`Guard`] is generic over. A thin,
@@ -604,6 +623,18 @@ mod tests {
             }
             fn array_capacity<T>(&self, pointer: &UniqueArrayPointer<T>) -> Option<usize> {
                 self.regions.borrow().get(&pointer.index()).map(Vec::len)
+            }
+            fn splice<T>(
+                &self,
+                pointer: &UniqueArrayPointer<T>,
+                offset: u32,
+                old_len: u32,
+                new: &[u8],
+            ) {
+                let mut regions = self.regions.borrow_mut();
+                let region = regions.get_mut(&pointer.index()).unwrap();
+                let start = offset as usize;
+                region.splice(start..start + old_len as usize, new.iter().copied());
             }
         }
 

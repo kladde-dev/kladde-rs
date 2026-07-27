@@ -26,11 +26,13 @@ pub use kladde_traits::{
     Field, Fingerprint, SchemaBuilder, TypeDescriptor, TypeRef, TypeTable, Variant, Version,
 };
 
-/// The five microoperations `spec.md`'s journal ever records -- nothing
+/// The microoperations `spec.md`'s journal ever records -- nothing
 /// type-specific, purely a byte-level effect on the allocator. `Alloc`'s
 /// `index` is decided (by `DefaultBackend::alloc`'s own counter) at the
 /// moment the entry is created, not during replay -- see the "which
-/// instance" discussion this design is built on.
+/// instance" discussion this design is built on. `Splice` is the atomic
+/// content-shift op (see [`Allocator::splice`]): it exists precisely so a
+/// resize-plus-tail-move-plus-write is a *single* entry rather than three.
 #[derive(Debug, Clone, PartialEq)]
 enum Microop {
     Alloc {
@@ -55,6 +57,12 @@ enum Microop {
     Resize {
         index: NonZeroU32,
         new_size: usize,
+    },
+    Splice {
+        index: NonZeroU32,
+        offset: u32,
+        old_len: u32,
+        new: Vec<u8>,
     },
 }
 
@@ -126,6 +134,14 @@ impl DefaultBackend {
                 Microop::Resize { index, new_size } => {
                     self.allocator.materialize_resize(index, new_size)
                 }
+                Microop::Splice {
+                    index,
+                    offset,
+                    old_len,
+                    new,
+                } => self
+                    .allocator
+                    .materialize_splice(index, offset, old_len, &new),
             }
         }
     }
@@ -216,6 +232,15 @@ impl Allocator for DefaultBackend {
 
     fn array_capacity<T>(&self, pointer: &UniqueArrayPointer<T>) -> Option<usize> {
         self.allocator.capacity(pointer.index())
+    }
+
+    fn splice<T>(&self, pointer: &UniqueArrayPointer<T>, offset: u32, old_len: u32, new: &[u8]) {
+        self.journal.borrow_mut().push(Microop::Splice {
+            index: pointer.index(),
+            offset,
+            old_len,
+            new: new.to_vec(),
+        });
     }
 }
 
@@ -417,6 +442,23 @@ mod tests {
             live - 1,
             "free_array reclaims the region"
         );
+    }
+
+    #[test]
+    fn splice_is_journaled_and_replayed_as_one_entry() {
+        let backend = DefaultBackend::new();
+        let pointer = backend.alloc_array::<u8>(4);
+        backend.write(pointer.raw(), 0, &[1, 2, 3, 4]);
+        backend.flush();
+
+        // A single splice call is one journal entry (unlike the
+        // resize+copy+write trio it replaces).
+        backend.splice(&pointer, 1, 2, &[9, 9, 9]);
+        assert_eq!(backend.journal_len(), 1);
+        backend.flush();
+
+        assert_eq!(backend.array_capacity(&pointer), Some(5));
+        assert_eq!(backend.read(pointer.raw(), 0, 5), vec![1, 9, 9, 9, 4]);
     }
 
     #[test]
