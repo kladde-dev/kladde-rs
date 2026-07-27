@@ -205,20 +205,15 @@ impl<'s, B: Backend> PersistableStringGuard<'s, B> {
         }
     }
 
-    /// Replaces the whole content with `new`: clears the existing bytes
-    /// (popping from the end, which -- unlike popping from the front --
-    /// never triggers `PersistableVec::remove`'s tail-shift, so this is
-    /// `O(old_len)`, not `O(old_len^2)`) then appends `new`. Not a single
-    /// atomic write -- see `push_str`'s note.
+    /// Replaces the whole content with `new` in one crash-safe bulk write,
+    /// via [`PersistableVecGuard::set_content`](crate::PersistableVec). Not
+    /// yet a single *atomic* op -- see that method's residual-window note
+    /// (closed by Step 4's `splice`).
     pub fn set(&mut self, new: impl AsRef<str>) {
-        {
-            let mut guard = self.inner.0.guard(self.backend, self.location);
-            while !guard.is_empty() {
-                let last = guard.len() - 1;
-                guard.remove(last);
-            }
-        }
-        self.push_str(new.as_ref());
+        self.inner
+            .0
+            .guard(self.backend, self.location)
+            .set_content(new.as_ref().as_bytes());
     }
 }
 

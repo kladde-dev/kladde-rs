@@ -313,6 +313,61 @@ impl<'s, T: Persistable, B: Backend> PersistableVecGuard<'s, T, B> {
     }
 }
 
+impl<'s, B: Backend> PersistableVecGuard<'s, u8, B> {
+    /// Replaces the entire byte content with `new` in one bulk write,
+    /// instead of the `O(n^2)` pop-then-repush a whole-value replace would
+    /// otherwise be (see [`crate::PersistableStringGuard::set`], its first
+    /// consumer). Specialized to `u8` so the content is a single `write`
+    /// rather than a per-element `store`; the generic whole-array replace
+    /// is deferred (freeing owning elements' sub-allocations needs a trait
+    /// hook that doesn't exist yet -- see `array-pointer-problems.md`).
+    ///
+    /// Crash-safe ordering, mirroring `push`/`remove`: a grow enlarges the
+    /// allocation first and publishes the header last; a shrink publishes
+    /// the header before it shrinks the allocation, so a torn-journal
+    /// prefix never names more bytes than the allocation holds.
+    ///
+    /// **Residual window.** Unlike `PersistableBlob`'s postcard consumer,
+    /// the byte content here has no trailing-slack tolerance, so the
+    /// content write can't be deferred past the header the way blob's grow
+    /// does: between overwriting the content and publishing the header, a
+    /// torn prefix reads a mix of old and new bytes -- neither the old nor
+    /// the new value. Collapsing this into a single atomic op is Step 4's
+    /// `splice`; until then this is the safest ordering available.
+    pub fn set_content(&mut self, new: &[u8]) {
+        let old_len = self.inner.data.len();
+        let new_len = new.len();
+
+        match &self.inner.pointer {
+            // Already empty and unallocated -- the on-disk header is
+            // already the all-zero "no allocation" marker, nothing to do.
+            None if new_len == 0 => return,
+            None => {
+                let pointer = self.backend.alloc::<PersistableVec<u8>>(new_len);
+                self.backend.write(pointer.raw(), 0, new);
+                write_header(self.backend, self.location, pointer.index(), new_len as u32);
+                self.inner.pointer = Some(pointer);
+            }
+            Some(pointer) => match new_len.cmp(&old_len) {
+                std::cmp::Ordering::Greater => {
+                    self.backend.resize(pointer, new_len);
+                    self.backend.write(pointer.raw(), 0, new);
+                    write_header(self.backend, self.location, pointer.index(), new_len as u32);
+                }
+                std::cmp::Ordering::Less => {
+                    self.backend.write(pointer.raw(), 0, new);
+                    write_header(self.backend, self.location, pointer.index(), new_len as u32);
+                    self.backend.resize(pointer, new_len);
+                }
+                std::cmp::Ordering::Equal => {
+                    self.backend.write(pointer.raw(), 0, new);
+                }
+            },
+        }
+        self.inner.data = new.to_vec();
+    }
+}
+
 impl<'s, T: Persistable, B: Backend> Guard for PersistableVecGuard<'s, T, B> {
     type Persistable = PersistableVec<T>;
     type Backend = B;
@@ -427,6 +482,54 @@ mod tests {
         let reloaded = PersistableVec::<i32>::load(&backend, location);
         assert_eq!(reloaded.data, vec![10, 30]);
         assert_eq!(reloaded, vec);
+    }
+
+    #[test]
+    fn set_content_grows_shrinks_and_empties_reusing_one_allocation() {
+        let backend = MockBackend::default();
+        let location = root_location(&backend);
+        let mut vec = PersistableVec::<u8>::new();
+
+        vec.guard(&backend, location).set_content(b"start");
+        backend.flush();
+        let live = backend.live_count();
+
+        for content in [
+            &b"a much longer byte string"[..],
+            &b"x"[..],
+            &b"equalize!"[..],
+            &b""[..],
+            &b"back again"[..],
+        ] {
+            vec.guard(&backend, location).set_content(content);
+            backend.flush();
+            assert_eq!(vec.as_slice(), content);
+            assert_eq!(
+                backend.live_count(),
+                live,
+                "set_content must reuse the one allocation, not leak"
+            );
+            let reloaded = PersistableVec::<u8>::load(&backend, location);
+            assert_eq!(reloaded.as_slice(), content);
+        }
+    }
+
+    #[test]
+    fn set_content_on_a_fresh_empty_vec_stays_lazy() {
+        let backend = MockBackend::default();
+        let location = root_location(&backend);
+        backend.flush(); // materialize the root anchor itself
+        let live_before = backend.live_count();
+
+        let mut vec = PersistableVec::<u8>::new();
+        vec.guard(&backend, location).set_content(b"");
+        backend.flush();
+
+        assert_eq!(
+            backend.live_count(),
+            live_before,
+            "replacing an empty vec with empty content shouldn't allocate"
+        );
     }
 
     #[test]
