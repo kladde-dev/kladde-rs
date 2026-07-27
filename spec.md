@@ -26,10 +26,15 @@ The journal can additionally contain non-owning pointers ("references"), which d
 The in-memory representation of a complex backed data structure (e.g. a container type) also holds pointers into the snapshot as part of its own metadata, to track where things are laid out. To simplify memory management, the collection of all live backed data structures holds exactly one in-memory pointer per allocated memory region. In-memory pointers are small, opaque handles:
 
 ```rust
-struct UniquePointer<T> {
-    index: NonZeroU32,
-    _marker: PhantomData<*const T>,
-}
+// The owned handles are a stable, type-erased allocation index. Two
+// variants differ only in which operations they permit -- a resizable one
+// (grow/shrink/splice) and a fixed-size one (never resizes) -- and a typed
+// `Box<T>` wrapper adds a phantom `T` over the fixed one. See
+// `allocator-spec.md` for the full four-type design (including the `Copy`
+// `RawPointer` address and why size lives only on the owned handles).
+struct UniquePointerResizable { index: NonZeroU32 }
+struct UniquePointerFixedSize { index: NonZeroU32 }
+struct UniquePointer<T> { inner: UniquePointerFixedSize, _marker: PhantomData<*const T> }
 ```
 
 `index` is a stable identity assigned once by `Allocator` and never changes for the lifetime of the pointer — even though the region it (eventually) refers to may move during compaction, and even though the pointer may not have been flushed to the snapshot at all yet. (An earlier design used the pointer's own serialized `position` as its identity; that breaks the moment a block containing embedded pointers is relocated, since `position` changes but nothing else about the pointer does — `index` fixes that.) `PhantomData<*const T>` gives covariance in `T` (sound here, since mutation only ever happens through an exclusive `Guard`, never through a shared reference the way `Cell<T>`'s interior mutability does) without the "may drop a `T`" drop-check obligation `PhantomData<T>` would impose — `UniquePointer` never actually runs `T::drop`; see [Freeing](#freeing).
@@ -39,7 +44,7 @@ struct UniquePointer<T> {
 - A primary structure (a dense table/slab, keyed by `index`) mapping each pointer's `index` to its current, mutable `(position, target, size)` — each represented as `Option<NonZeroU32>`, `None` before the pointer's allocation and its own serialization have actually been flushed. Real positions/targets are never zero (the file starts with a fixed-size header region), so `None` costs nothing extra via niche optimization. `Position`/`Size` are their own type aliases rather than bare integers, so widening them later (to `u64`, or to a variable-length encoding) only touches one definition. Supports point lookup: given an `index`, resolve its current target.
 - An auxiliary structure ordered by `position` (e.g. a `BTreeMap<Position, Index>`), kept in sync whenever a `position` changes, supporting range queries: given a byte range being relocated, find every `index` whose current `position` falls inside it. Needed whenever `Allocator` moves a block that has `UniquePointer`s embedded in its own serialized bytes (e.g. a hash map's bucket array), so their `position`s can be updated. Because this structure is purely an internal lookup aid — never treated as identity by anything outside `Allocator` — keeping it in sync with a moving key isn't a problem.
 
-`UniquePointer` itself is never `Serialize`/`Deserialize` — its `index` is meaningless outside the process that assigned it, and exposing it to serde directly would invite accidentally serializing that meaningless value. Instead, `Allocator::resolve` borrows both the allocator and the pointer to produce a `ResolvedPointer<'a, T>`, which *is* serializable — it holds the pointer's current on-disk `target` (the offset of the region it points *at*, which is what a pointer's serialized value actually is; `position` is a separate concept, the offset of the pointer's *own* serialized bytes, tracked by `Allocator` as internal bookkeeping once this value has actually landed somewhere in the file — not something `ResolvedPointer` itself knows). Borrowing `Allocator` for `'a` is deliberate: it prevents, at compile time, any `Allocator` operation that could invalidate that snapshot (most importantly, compaction moving the target) for as long as a `ResolvedPointer` derived from it is still alive — the borrow checker enforces that a serialized `target` was still current when it was written. Deserializing goes the other way without needing serde's stateful-deserialization machinery: the raw `target` is read back as an ordinary integer, and a fresh `UniquePointer` (with a newly assigned `index`) is minted for it via a plain `Allocator` method call, not via `Deserialize`.
+`UniquePointer` itself is never `Serialize`/`Deserialize` — its `index` is meaningless outside the process that assigned it, and exposing it to serde directly would invite accidentally serializing that meaningless value. Instead, `Allocator::resolve` borrows the allocator and takes an owned handle's `RawPointer` to produce a `ResolvedPointer<'a>`, which *is* serializable — it holds the pointer's current on-disk `target` (the offset of the region it points *at*, which is what a pointer's serialized value actually is; `position` is a separate concept, the offset of the pointer's *own* serialized bytes, tracked by `Allocator` as internal bookkeeping once this value has actually landed somewhere in the file — not something `ResolvedPointer` itself knows). Borrowing `Allocator` for `'a` is deliberate: it prevents, at compile time, any `Allocator` operation that could invalidate that snapshot (most importantly, compaction moving the target) for as long as a `ResolvedPointer` derived from it is still alive — the borrow checker enforces that a serialized `target` was still current when it was written. Deserializing goes the other way without needing serde's stateful-deserialization machinery: the raw `target` is read back as an ordinary integer, and a fresh `UniquePointer` (with a newly assigned `index`) is minted for it via a plain `Allocator` method call, not via `Deserialize`.
 
 Each block's own allocation metadata additionally records the identity of its single owning pointer, so that when a block's *content* moves, updating the one pointer that targets it is an O(1) lookup rather than a search. Whether this extra bookkeeping actually pays for itself — versus always already having a pointer in hand whenever a block needs to move — is left open until the higher-level system has been built against a mock `Allocator` and shows what's actually required.
 
@@ -47,7 +52,7 @@ Together, these let `Allocator` relocate and compact memory — including blocks
 
 ### Freeing
 
-`Allocator::free::<T>(pointer)` (see [The Trait Layer](#the-trait-layer)) doesn't touch `Allocator`'s live registry directly — it just appends a `Free` microoperation to the journal, applied when that entry is replayed at the next flush (subject to the same microop-log optimization as everything else). Allocation is only half-deferred, though: `Allocator::alloc` assigns a real `index` and creates a registry entry (initially unresolved, `target: None`) *immediately*, at mutation time, because an index has to be a stable identity from the moment anything might reference it. So a value created and deleted within one not-yet-flushed epoch does consume and release an index. What's genuinely free is *materialization*: if a matching `Alloc`/`Free` pair cancels during flush optimization, no file space is ever reserved and no bytes are ever written for it.
+An `Allocator` free (`free_resizable`/`free_fixed`, see [The Trait Layer](#the-trait-layer)) doesn't touch `Allocator`'s live registry directly — it just appends a `Free` microoperation to the journal, applied when that entry is replayed at the next flush (subject to the same microop-log optimization as everything else). Allocation is only half-deferred, though: an `Allocator` alloc assigns a real `index` and creates a registry entry (initially unresolved, `target: None`) *immediately*, at mutation time, because an index has to be a stable identity from the moment anything might reference it. So a value created and deleted within one not-yet-flushed epoch does consume and release an index. What's genuinely free is *materialization*: if a matching `Alloc`/`Free` pair cancels during flush optimization, no file space is ever reserved and no bytes are ever written for it.
 
 **Who calls `free` (intended design; not implemented in v1).** `UniquePointer` is deliberately *not* self-freeing: it holds no reference to the backend, to stay small, so it can't call `Allocator::free` from its own `Drop`. Instead, freeing is meant to be the responsibility of the types that own pointers — a container's (or generated guard's) `Drop` impl calls `Allocator::free` on the `UniquePointer`s it directly owns. Ownership transfers rather than duplicating: e.g. taking the value out of a backed `Option<PersistableString>` would move the string's `UniquePointer` to the returned value without freeing it, so at every point exactly one live value owns the pointer and the transfer can neither double-free nor leak. Application code never constructs or holds a bare `UniquePointer` — only library code does (the `kladde-types` containers, and eventually generated `Drop` impls) — so this is an invariant of a handful of library types, not a convention every mutating method has to remember. A debug-only outstanding-pointer leak check would be a cheap optional addition, but the design doesn't depend on it.
 
@@ -120,20 +125,29 @@ trait Guard {
     fn backend(&self) -> &Self::Backend;
 }
 
+// The *required* surface is all type-erased and deals in resizable regions
+// -- the weakest thing an allocator can be asked to support. Fixed-size
+// regions are a defaulted refinement (`alloc_fixed`/`free_fixed`, omitted
+// here), and typed conveniences (`alloc_boxed`, `alloc_array`) live in a
+// blanket `AllocatorExt`. See `allocator-spec.md` for the full layering and
+// the four pointer types.
 trait Allocator {
-    // Pointer lifecycle.
-    fn alloc<T>(&self, size: usize) -> UniquePointer<T>;
-    fn free<T>(&self, pointer: UniquePointer<T>);
-    fn resolve<'a, T>(&'a self, pointer: &UniquePointer<T>) -> Option<ResolvedPointer<'a, T>>;
-
-    // Type-agnostic content microoperations -- the only things the
-    // journal ever records; see On-Disk Layout. `read` is the one
-    // exception -- a query against already-flushed state, not itself a
-    // recorded mutation.
+    // Address-based byte I/O -- the only things the journal records, apart
+    // from alloc/free/resize/splice; see On-Disk Layout. `read` is a query
+    // against already-flushed state, not itself a recorded mutation.
     fn read(&self, target: RawPointer, offset: u32, len: u32) -> Vec<u8>;
     fn write(&self, target: RawPointer, offset: u32, bytes: &[u8]);
     fn copy(&self, src: RawPointer, src_offset: u32, len: u32, dst: RawPointer, dst_offset: u32);
-    fn resize<T>(&self, pointer: &UniquePointer<T>, new_size: usize);
+
+    // Resizable-region lifecycle.
+    fn alloc_resizable(&self, byte_size: usize) -> UniquePointerResizable;
+    fn free_resizable(&self, pointer: UniquePointerResizable);
+    fn resize(&self, pointer: &UniquePointerResizable, new_byte_size: usize);
+    fn splice(&self, pointer: &UniquePointerResizable, off: u32, old_len: u32, new: &[u8]);
+    fn capacity(&self, pointer: &UniquePointerResizable) -> Option<usize>;
+
+    // A size-agnostic query over any owned handle's address.
+    fn resolve(&self, pointer: RawPointer) -> Option<ResolvedPointer<'_>>;
 }
 
 trait Backend: Allocator {}
