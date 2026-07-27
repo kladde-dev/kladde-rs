@@ -315,71 +315,84 @@ impl<'s, T: Persistable, B: Backend> PersistableVecGuard<'s, T, B> {
 }
 
 impl<'s, B: Backend> PersistableVecGuard<'s, u8, B> {
-    /// Replaces the entire byte content with `new` in one bulk write,
-    /// instead of the `O(n^2)` pop-then-repush a whole-value replace would
-    /// otherwise be (see [`crate::PersistableStringGuard::set`], its first
-    /// consumer). Specialized to `u8` so the content is a single `write`
-    /// rather than a per-element `store`; the generic whole-array replace
-    /// is deferred (freeing owning elements' sub-allocations needs a trait
-    /// hook that doesn't exist yet -- see `array-pointer-problems.md`).
+    /// Replaces the entire contents with `new` in a single bulk update.
     ///
-    /// Replaces the entire byte content with `new` in a single bulk update.
+    /// Runs in `O(n)` in the new length, regardless of the current length,
+    /// so replacing a whole value is far cheaper than clearing and
+    /// re-pushing one byte at a time. Accepts anything convertible into a
+    /// `Vec<u8>`; an owned `Vec<u8>` is moved in without copying, while a
+    /// slice or byte-string literal is copied. Passing an empty value
+    /// clears the contents and releases the backing allocation.
     ///
-    /// Runs in `O(new.len())` regardless of the current length, so
-    /// replacing a whole value is far cheaper than clearing and re-pushing
-    /// one byte at a time. Passing an empty slice clears the vector and
-    /// releases its backing allocation.
+    /// Only available for byte vectors (`PersistableVec<u8>`), for which a
+    /// whole-buffer replacement is a single contiguous write.
     ///
     /// ```
     /// use kladde::Kladde;
     /// use kladde_types::PersistableVec;
     ///
     /// let mut db = Kladde::new(PersistableVec::<u8>::new());
-    /// db.guard().set_content(b"hello");
+    /// db.guard().set(b"hello"); // a literal is accepted directly
     /// assert_eq!(db.get().len(), 5);
     ///
-    /// db.guard().set_content(b"hi"); // shrink to a shorter value in one write
+    /// db.guard().set(vec![b'h', b'i']); // an owned Vec is moved in, no copy
     /// assert_eq!(db.get().len(), 2);
     /// assert_eq!(db.get().get(0), Some(&b'h'));
     /// ```
-    pub fn set_content(&mut self, new: &[u8]) {
-        let old_len = self.inner.data.len();
-        let new_len = new.len();
+    pub fn set(&mut self, new: impl Into<Vec<u8>>) {
+        // Non-generic inner fn: the real body compiles once per backend,
+        // rather than being re-monomorphized for every `Into` argument type.
+        fn inner<B: Backend>(guard: &mut PersistableVecGuard<'_, u8, B>, new: Vec<u8>) {
+            let old_len = guard.inner.data.len();
+            let new_len = new.len();
 
-        // Empty content returns to the lazy no-allocation state (empty
-        // <=> no allocation, the invariant `PersistableBlob` relies on),
-        // freeing any existing region. The empty header is published
-        // *before* the free, so a torn-journal prefix leaves the value
-        // already empty with the old region merely unreferenced (reclaimed
-        // at the next flush), never dangling -- the same shape blob's old
-        // `set_to_default` used.
-        if new_len == 0 {
-            if let Some(pointer) = self.inner.pointer.take() {
-                self.backend
-                    .write(self.location.anchor, self.location.offset, &[0u8; 8]);
-                self.backend.free_array(pointer);
+            // Empty content returns to the lazy no-allocation state (empty
+            // <=> no allocation, the invariant `PersistableBlob` relies on),
+            // freeing any existing region. The empty header is published
+            // *before* the free, so a torn-journal prefix leaves the value
+            // already empty with the old region merely unreferenced
+            // (reclaimed at the next flush), never dangling.
+            if new_len == 0 {
+                if let Some(pointer) = guard.inner.pointer.take() {
+                    guard
+                        .backend
+                        .write(guard.location.anchor, guard.location.offset, &[0u8; 8]);
+                    guard.backend.free_array(pointer);
+                }
+                guard.inner.data.clear();
+                return;
             }
-            self.inner.data.clear();
-            return;
+
+            match &guard.inner.pointer {
+                None => {
+                    // No allocation yet -- alloc then publish (append-then-
+                    // publish; there's no old content to splice against).
+                    let pointer = guard.backend.alloc_array::<PersistableVec<u8>>(new_len);
+                    guard.backend.write(pointer.raw(), 0, &new);
+                    write_header(
+                        guard.backend,
+                        guard.location,
+                        pointer.index(),
+                        new_len as u32,
+                    );
+                    guard.inner.pointer = Some(pointer);
+                }
+                Some(pointer) => {
+                    // Replace the entire old content in one atomic op, then
+                    // republish the (possibly changed) length.
+                    guard.backend.splice(pointer, 0, old_len as u32, &new);
+                    write_header(
+                        guard.backend,
+                        guard.location,
+                        pointer.index(),
+                        new_len as u32,
+                    );
+                }
+            }
+            guard.inner.data = new;
         }
 
-        match &self.inner.pointer {
-            None => {
-                // No allocation yet -- alloc then publish (append-then-
-                // publish; there's no old content to splice against).
-                let pointer = self.backend.alloc_array::<PersistableVec<u8>>(new_len);
-                self.backend.write(pointer.raw(), 0, new);
-                write_header(self.backend, self.location, pointer.index(), new_len as u32);
-                self.inner.pointer = Some(pointer);
-            }
-            Some(pointer) => {
-                // Replace the entire old content in one atomic op, then
-                // republish the (possibly changed) length.
-                self.backend.splice(pointer, 0, old_len as u32, new);
-                write_header(self.backend, self.location, pointer.index(), new_len as u32);
-            }
-        }
-        self.inner.data = new.to_vec();
+        inner(self, new.into())
     }
 }
 
@@ -500,12 +513,12 @@ mod tests {
     }
 
     #[test]
-    fn set_content_grows_and_shrinks_reusing_one_allocation() {
+    fn set_grows_and_shrinks_reusing_one_allocation() {
         let backend = MockBackend::default();
         let location = root_location(&backend);
         let mut vec = PersistableVec::<u8>::new();
 
-        vec.guard(&backend, location).set_content(b"start");
+        vec.guard(&backend, location).set(b"start");
         backend.flush();
         let live = backend.live_count();
 
@@ -515,13 +528,13 @@ mod tests {
             &b"equalize!"[..],
             &b"back again"[..],
         ] {
-            vec.guard(&backend, location).set_content(content);
+            vec.guard(&backend, location).set(content);
             backend.flush();
             assert_eq!(vec.as_slice(), content);
             assert_eq!(
                 backend.live_count(),
                 live,
-                "set_content must reuse the one allocation, not leak"
+                "set must reuse the one allocation, not leak"
             );
             let reloaded = PersistableVec::<u8>::load(&backend, location);
             assert_eq!(reloaded.as_slice(), content);
@@ -529,17 +542,17 @@ mod tests {
     }
 
     #[test]
-    fn set_content_to_empty_frees_and_returns_to_lazy() {
+    fn set_to_empty_frees_and_returns_to_lazy() {
         let backend = MockBackend::default();
         let location = root_location(&backend);
         let mut vec = PersistableVec::<u8>::new();
 
-        vec.guard(&backend, location).set_content(b"some content");
+        vec.guard(&backend, location).set(b"some content");
         backend.flush();
         let live = backend.live_count();
         assert!(live > 0);
 
-        vec.guard(&backend, location).set_content(b"");
+        vec.guard(&backend, location).set(b"");
         backend.flush();
         assert_eq!(
             backend.live_count(),
@@ -550,7 +563,7 @@ mod tests {
         assert!(PersistableVec::<u8>::load(&backend, location).is_empty());
 
         // Re-populating after emptying allocates a fresh region and works.
-        vec.guard(&backend, location).set_content(b"again");
+        vec.guard(&backend, location).set(b"again");
         backend.flush();
         assert_eq!(vec.as_slice(), b"again");
         assert_eq!(
@@ -560,14 +573,14 @@ mod tests {
     }
 
     #[test]
-    fn set_content_on_a_fresh_empty_vec_stays_lazy() {
+    fn set_on_a_fresh_empty_vec_stays_lazy() {
         let backend = MockBackend::default();
         let location = root_location(&backend);
         backend.flush(); // materialize the root anchor itself
         let live_before = backend.live_count();
 
         let mut vec = PersistableVec::<u8>::new();
-        vec.guard(&backend, location).set_content(b"");
+        vec.guard(&backend, location).set(b"");
         backend.flush();
 
         assert_eq!(

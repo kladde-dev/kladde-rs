@@ -207,24 +207,32 @@ impl<'s, B: Backend> PersistableStringGuard<'s, B> {
 
     /// Replaces the entire string with `new` in a single bulk update.
     ///
-    /// Runs in `O(new.len())`, independent of the current length.
+    /// Runs in `O(n)` in the new length, independent of the current length.
+    /// Accepts anything convertible into a `String`; an owned `String` is
+    /// consumed without copying, while a `&str` is copied.
     ///
     /// ```
     /// use kladde::Kladde;
     /// use kladde_types::PersistableString;
     ///
     /// let mut db = Kladde::new(PersistableString::new());
-    /// db.guard().set("hello");
+    /// db.guard().set("hello"); // a &str is accepted directly
     /// assert_eq!(db.get().to_string(), "hello");
     ///
-    /// db.guard().set("hi");
+    /// db.guard().set(String::from("hi")); // an owned String is moved in, no copy
     /// assert_eq!(db.get().to_string(), "hi");
     /// ```
-    pub fn set(&mut self, new: impl AsRef<str>) {
-        self.inner
-            .0
-            .guard(self.backend, self.location)
-            .set_content(new.as_ref().as_bytes());
+    pub fn set(&mut self, new: impl Into<String>) {
+        // Non-generic inner fn: the real body compiles once per backend,
+        // rather than being re-monomorphized for every `Into` argument type.
+        fn inner<B: Backend>(guard: &mut PersistableStringGuard<'_, B>, new: String) {
+            guard
+                .inner
+                .0
+                .guard(guard.backend, guard.location)
+                .set(new.into_bytes());
+        }
+        inner(self, new.into())
     }
 }
 

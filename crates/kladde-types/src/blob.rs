@@ -231,18 +231,16 @@ impl<'s, T: serde::Serialize, B: Backend> PersistableBlobGuard<'s, T, B> {
     }
 
     /// Serializes the current in-memory `value` and writes it into the
-    /// wrapped byte vec via its crash-safe bulk
-    /// [`set_content`](crate::PersistableVec) -- which handles the
-    /// grow/shrink/reuse/free ordering (and its residual window, closed by
-    /// Step 4's `splice`) once, for every owning type, rather than blob
-    /// re-deriving it.
+    /// wrapped byte vec via its crash-safe bulk `set` -- which handles the
+    /// grow/shrink/reuse/free ordering once, for every owning type, rather
+    /// than blob re-deriving it.
     fn persist(&mut self) {
         let bytes = postcard::to_allocvec(&self.inner.value)
             .expect("postcard serialization of an in-memory value should not fail");
         self.inner
             .serialized
             .guard(self.backend, self.location)
-            .set_content(&bytes);
+            .set(bytes);
     }
 }
 
@@ -263,7 +261,7 @@ impl<'s, T: serde::Serialize + Default, B: Backend> PersistableBlobGuard<'s, T, 
         self.inner
             .serialized
             .guard(self.backend, self.location)
-            .set_content(b"");
+            .set(Vec::new());
     }
 }
 
@@ -437,7 +435,7 @@ mod tests {
     fn set_grows_and_shrinks_the_content_and_reuses_the_allocation() {
         // A `String` payload whose serialization length actually changes,
         // exercising the grow / shrink / same-length branches of the
-        // wrapped vec's `set_content`.
+        // wrapped vec's `set`.
         let backend = MockBackend::default();
         let location = root_location(&backend);
 
@@ -536,7 +534,7 @@ mod tests {
     fn postcard_from_bytes_ignores_trailing_bytes() {
         // Historically the crash-safe grow/shrink ordering relied on this
         // (a mid-mutation reader over-reading a complete value plus slack).
-        // Now that ordering lives in `PersistableVec::set_content` and no
+        // Now that ordering lives in `PersistableVec`'s bulk `set` and no
         // longer leans on trailing tolerance, but the property is still
         // worth pinning: `load` reads exactly the vec's `len` bytes, so a
         // format that rejected trailing bytes would still be fine here --
