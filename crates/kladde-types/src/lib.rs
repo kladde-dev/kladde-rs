@@ -49,7 +49,8 @@ pub(crate) fn library_version() -> kladde_traits::Version {
     }
 }
 pub use kladde_traits::{
-    Allocator, Backend, Guard, Location, Persistable, RawPointer, ResolvedPointer, UniquePointer,
+    Allocator, AllocatorExt, Backend, Guard, Location, Persistable, RawPointer, ResolvedPointer,
+    UniquePointer, UniquePointerFixedSize, UniquePointerResizable,
 };
 pub use kladde_traits::{
     BoolGuard, CharGuard, F32Guard, F64Guard, I16Guard, I32Guard, I64Guard, I8Guard, TupleGuard,

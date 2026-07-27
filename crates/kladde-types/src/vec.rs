@@ -10,8 +10,8 @@
 //! is meant to be replaced with a chunked-list representation eventually.
 
 use kladde_traits::{
-    read_header, write_header, Backend, Guard, Location, Persistable, RawPointer,
-    UniqueArrayPointer,
+    read_header, write_header, AllocatorExt, Backend, Guard, Location, Persistable, RawPointer,
+    UniquePointerResizable,
 };
 use std::ops::{Deref, DerefMut};
 
@@ -32,10 +32,10 @@ pub struct PersistableVec<T> {
     /// -- `None` until the first `push` (or a `store` of a
     /// `from_iter`-built vec) ever needs one. Lazily created rather than
     /// eager, since `PersistableVec::new()` takes no `Backend` to create
-    /// one with. A [`UniqueArrayPointer`] (the `Box<[T]>` analog): its byte
-    /// capacity is owned by the allocator, while this vec keeps only the
-    /// logical element count (in `data`, published as the header `len`).
-    pointer: Option<UniqueArrayPointer<PersistableVec<T>>>,
+    /// one with. A [`UniquePointerResizable`] (the `Box<[u8]>`-like handle):
+    /// its byte capacity is owned by the allocator, while this vec keeps only
+    /// the logical element count (in `data`, published as the header `len`).
+    pointer: Option<UniquePointerResizable>,
 }
 
 impl<T> PersistableVec<T> {
@@ -161,8 +161,7 @@ impl<T: Persistable> Persistable for PersistableVec<T> {
             }
             None => {
                 let elem_size = T::INLINE_SIZE as u32;
-                let byte_size = self.data.len() * T::INLINE_SIZE;
-                let pointer = backend.alloc_array::<PersistableVec<T>>(byte_size);
+                let pointer = backend.alloc_array::<T>(self.data.len());
                 for (i, item) in self.data.iter_mut().enumerate() {
                     item.store(
                         backend,
@@ -180,7 +179,7 @@ impl<T: Persistable> Persistable for PersistableVec<T> {
 
     fn load<B: Backend>(backend: &B, location: Location) -> Self {
         let (target, len) = read_header(backend, location);
-        let pointer = target.map(UniqueArrayPointer::from_index);
+        let pointer = target.map(UniquePointerResizable::from_index);
         let mut data = Vec::with_capacity(len as usize);
         if let Some(target) = target {
             let anchor = RawPointer::from_index(target);
@@ -253,11 +252,8 @@ impl<'s, T: Persistable, B: Backend> PersistableVecGuard<'s, T, B> {
         let new_byte_size = new_len * T::INLINE_SIZE;
 
         match &self.inner.pointer {
-            Some(pointer) => self.backend.resize_array(pointer, new_byte_size),
-            None => {
-                self.inner.pointer =
-                    Some(self.backend.alloc_array::<PersistableVec<T>>(new_byte_size))
-            }
+            Some(pointer) => self.backend.resize(pointer, new_byte_size),
+            None => self.inner.pointer = Some(self.backend.alloc_array::<T>(new_len)),
         }
         let pointer = self.inner.pointer.as_ref().unwrap();
 
@@ -357,7 +353,7 @@ impl<'s, B: Backend> PersistableVecGuard<'s, u8, B> {
                     guard
                         .backend
                         .write(guard.location.anchor, guard.location.offset, &[0u8; 8]);
-                    guard.backend.free_array(pointer);
+                    guard.backend.free_resizable(pointer);
                 }
                 guard.inner.data.clear();
                 return;
@@ -367,7 +363,7 @@ impl<'s, B: Backend> PersistableVecGuard<'s, u8, B> {
                 None => {
                     // No allocation yet -- alloc then publish (append-then-
                     // publish; there's no old content to splice against).
-                    let pointer = guard.backend.alloc_array::<PersistableVec<u8>>(new_len);
+                    let pointer = guard.backend.alloc_array::<u8>(new_len);
                     guard.backend.write(pointer.raw(), 0, &new);
                     write_header(
                         guard.backend,
@@ -431,7 +427,7 @@ mod tests {
     use kladde_traits::Allocator;
 
     fn root_location(backend: &MockBackend) -> Location {
-        let pointer = backend.alloc::<()>(PersistableVec::<i32>::INLINE_SIZE);
+        let pointer = backend.alloc_fixed(PersistableVec::<i32>::INLINE_SIZE);
         Location {
             anchor: pointer.raw(),
             offset: 0,

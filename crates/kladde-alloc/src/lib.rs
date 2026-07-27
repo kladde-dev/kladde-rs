@@ -14,9 +14,10 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 
 /// Each allocation is a `Box<[u8]>`, keyed by an index that's assigned
-/// *elsewhere* (by `DefaultBackend`, at the moment a `Guard` calls
-/// `Allocator::alloc`) -- this type only ever materializes an index it's
-/// told to use, it never generates one itself. See `spec.md`'s Pointers
+/// *elsewhere* (by `DefaultBackend`, at the moment a `Guard` calls an
+/// `Allocator` allocation method) -- this type only ever materializes an
+/// index it's told to use, it never generates one itself. See `spec.md`'s
+/// Pointers
 /// and Memory Management for why index generation (eager, so an index is
 /// a stable identity from the moment anything might reference it) and
 /// content materialization (deferred to flush, here) are split this way.

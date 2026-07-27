@@ -345,7 +345,7 @@ mod tests {
     use kladde_traits::Allocator;
 
     fn root_location(backend: &MockBackend) -> Location {
-        let pointer = backend.alloc::<()>(PersistableBlob::<i32>::INLINE_SIZE);
+        let pointer = backend.alloc_fixed(PersistableBlob::<i32>::INLINE_SIZE);
         Location {
             anchor: pointer.raw(),
             offset: 0,

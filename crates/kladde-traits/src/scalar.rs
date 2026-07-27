@@ -234,7 +234,7 @@ impl_persistable_scalar_via!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Allocator, RawPointer, ResolvedPointer, UniqueArrayPointer, UniquePointer};
+    use crate::{Allocator, RawPointer, ResolvedPointer, UniquePointerResizable};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::num::NonZeroU32;
@@ -246,34 +246,6 @@ mod tests {
     }
 
     impl Allocator for MockBackend {
-        fn alloc<T>(&self, size: usize) -> UniquePointer<T> {
-            let raw = self.next_index.get() + 1;
-            self.next_index.set(raw);
-            let index = NonZeroU32::new(raw).unwrap();
-            self.regions.borrow_mut().insert(index, vec![0u8; size]);
-            UniquePointer::from_index(index)
-        }
-        fn free<T>(&self, pointer: UniquePointer<T>) {
-            self.regions.borrow_mut().remove(&pointer.index());
-        }
-        fn alloc_array<T>(&self, byte_size: usize) -> UniqueArrayPointer<T> {
-            let raw = self.next_index.get() + 1;
-            self.next_index.set(raw);
-            let index = NonZeroU32::new(raw).unwrap();
-            self.regions
-                .borrow_mut()
-                .insert(index, vec![0u8; byte_size]);
-            UniqueArrayPointer::from_index(index)
-        }
-        fn free_array<T>(&self, pointer: UniqueArrayPointer<T>) {
-            self.regions.borrow_mut().remove(&pointer.index());
-        }
-        fn resolve<'a, T>(&'a self, pointer: &UniquePointer<T>) -> Option<ResolvedPointer<'a, T>> {
-            self.regions
-                .borrow()
-                .contains_key(&pointer.index())
-                .then(|| ResolvedPointer::from_target(pointer.index()))
-        }
         fn read(&self, target: RawPointer, offset: u32, len: u32) -> Vec<u8> {
             let regions = self.regions.borrow();
             let region = &regions[&target.index()];
@@ -299,30 +271,48 @@ mod tests {
             let bytes = self.read(src, src_offset, len);
             self.write(dst, dst_offset, &bytes);
         }
-        fn resize_array<T>(&self, pointer: &UniqueArrayPointer<T>, new_byte_size: usize) {
+        fn alloc_resizable(&self, byte_size: usize) -> UniquePointerResizable {
+            let raw = self.next_index.get() + 1;
+            self.next_index.set(raw);
+            let index = NonZeroU32::new(raw).unwrap();
+            self.regions
+                .borrow_mut()
+                .insert(index, vec![0u8; byte_size]);
+            UniquePointerResizable::from_index(index)
+        }
+        fn free_resizable(&self, pointer: UniquePointerResizable) {
+            self.regions.borrow_mut().remove(&pointer.index());
+        }
+        fn resize(&self, pointer: &UniquePointerResizable, new_byte_size: usize) {
             let mut regions = self.regions.borrow_mut();
             let region = regions.get_mut(&pointer.index()).unwrap();
             region.resize(new_byte_size, 0);
         }
-        fn array_capacity<T>(&self, pointer: &UniqueArrayPointer<T>) -> Option<usize> {
-            self.regions.borrow().get(&pointer.index()).map(Vec::len)
-        }
-        fn splice<T>(
+        fn splice(
             &self,
-            pointer: &UniqueArrayPointer<T>,
-            offset: u32,
-            old_len: u32,
+            pointer: &UniquePointerResizable,
+            byte_offset: u32,
+            old_byte_len: u32,
             new: &[u8],
         ) {
             let mut regions = self.regions.borrow_mut();
             let region = regions.get_mut(&pointer.index()).unwrap();
-            let start = offset as usize;
-            region.splice(start..start + old_len as usize, new.iter().copied());
+            let start = byte_offset as usize;
+            region.splice(start..start + old_byte_len as usize, new.iter().copied());
+        }
+        fn capacity(&self, pointer: &UniquePointerResizable) -> Option<usize> {
+            self.regions.borrow().get(&pointer.index()).map(Vec::len)
+        }
+        fn resolve(&self, pointer: RawPointer) -> Option<ResolvedPointer<'_>> {
+            self.regions
+                .borrow()
+                .contains_key(&pointer.index())
+                .then(|| ResolvedPointer::from_target(pointer.index()))
         }
     }
 
     fn root_location(backend: &MockBackend, size: usize) -> Location {
-        let pointer = backend.alloc::<()>(size);
+        let pointer = backend.alloc_fixed(size);
         Location {
             anchor: pointer.raw(),
             offset: 0,

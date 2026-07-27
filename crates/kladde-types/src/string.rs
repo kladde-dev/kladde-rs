@@ -266,7 +266,7 @@ mod tests {
     use kladde_traits::Allocator;
 
     fn root_location(backend: &MockBackend) -> Location {
-        let pointer = backend.alloc::<()>(PersistableString::INLINE_SIZE);
+        let pointer = backend.alloc_fixed(PersistableString::INLINE_SIZE);
         Location {
             anchor: pointer.raw(),
             offset: 0,
@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(names.get(0).unwrap(), "ada");
 
         let map_pointer =
-            backend.alloc::<()>(PersistableHashMap::<PersistableString, i32>::INLINE_SIZE);
+            backend.alloc_fixed(PersistableHashMap::<PersistableString, i32>::INLINE_SIZE);
         let map_location = Location {
             anchor: map_pointer.raw(),
             offset: 0,

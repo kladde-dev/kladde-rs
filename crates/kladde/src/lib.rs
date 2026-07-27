@@ -12,8 +12,8 @@
 
 use kladde_alloc::MockAllocator;
 use kladde_traits::{
-    Allocator, Location, Persistable, RawPointer, ResolvedPointer, UniqueArrayPointer,
-    UniquePointer,
+    Allocator, AllocatorExt, Location, Persistable, RawPointer, ResolvedPointer, UniquePointer,
+    UniquePointerResizable,
 };
 use std::cell::{Cell, RefCell};
 use std::num::NonZeroU32;
@@ -28,7 +28,7 @@ pub use kladde_traits::{
 
 /// The microoperations `spec.md`'s journal ever records -- nothing
 /// type-specific, purely a byte-level effect on the allocator. `Alloc`'s
-/// `index` is decided (by `DefaultBackend::alloc`'s own counter) at the
+/// `index` is decided (by `DefaultBackend`'s own index counter) at the
 /// moment the entry is created, not during replay -- see the "which
 /// instance" discussion this design is built on. `Splice` is the atomic
 /// content-shift op (see [`Allocator::splice`]): it exists precisely so a
@@ -72,7 +72,7 @@ enum Microop {
 /// [`DefaultBackend::flush`] replays the journal into it -- calling
 /// `Allocator`'s methods on a `DefaultBackend` never touches the
 /// `MockAllocator` directly, it only ever appends to the journal (plus,
-/// for `alloc`, minting a fresh index immediately).
+/// for an allocation, minting a fresh index immediately).
 pub struct DefaultBackend {
     journal: RefCell<Vec<Microop>>,
     next_index: Cell<u32>,
@@ -153,28 +153,12 @@ impl Default for DefaultBackend {
     }
 }
 
-impl Allocator for DefaultBackend {
-    fn alloc<T>(&self, size: usize) -> UniquePointer<T> {
-        let raw = self
-            .next_index
-            .get()
-            .checked_add(1)
-            .expect("DefaultBackend index space exhausted");
-        self.next_index.set(raw);
-        let index = NonZeroU32::new(raw).unwrap();
-        self.journal
-            .borrow_mut()
-            .push(Microop::Alloc { index, size });
-        UniquePointer::from_index(index)
-    }
-
-    fn free<T>(&self, pointer: UniquePointer<T>) {
-        self.journal.borrow_mut().push(Microop::Free {
-            index: pointer.index(),
-        });
-    }
-
-    fn alloc_array<T>(&self, byte_size: usize) -> UniqueArrayPointer<T> {
+impl DefaultBackend {
+    /// Mints a fresh, never-before-used allocation index and journals an
+    /// `Alloc` for it. Shared by every allocation entry point (fixed regions
+    /// come through the trait's default `alloc_fixed`, which calls
+    /// `alloc_resizable`).
+    fn mint_alloc(&self, byte_size: usize) -> NonZeroU32 {
         let raw = self
             .next_index
             .get()
@@ -186,21 +170,11 @@ impl Allocator for DefaultBackend {
             index,
             size: byte_size,
         });
-        UniqueArrayPointer::from_index(index)
+        index
     }
+}
 
-    fn free_array<T>(&self, pointer: UniqueArrayPointer<T>) {
-        self.journal.borrow_mut().push(Microop::Free {
-            index: pointer.index(),
-        });
-    }
-
-    fn resolve<'a, T>(&'a self, pointer: &UniquePointer<T>) -> Option<ResolvedPointer<'a, T>> {
-        self.allocator
-            .resolve(pointer.index())
-            .map(ResolvedPointer::from_target)
-    }
-
+impl Allocator for DefaultBackend {
     fn read(&self, target: RawPointer, offset: u32, len: u32) -> Vec<u8> {
         self.allocator.read(target.index(), offset, len)
     }
@@ -223,24 +197,46 @@ impl Allocator for DefaultBackend {
         });
     }
 
-    fn resize_array<T>(&self, pointer: &UniqueArrayPointer<T>, new_byte_size: usize) {
+    fn alloc_resizable(&self, byte_size: usize) -> UniquePointerResizable {
+        UniquePointerResizable::from_index(self.mint_alloc(byte_size))
+    }
+
+    fn free_resizable(&self, pointer: UniquePointerResizable) {
+        self.journal.borrow_mut().push(Microop::Free {
+            index: pointer.index(),
+        });
+    }
+
+    fn resize(&self, pointer: &UniquePointerResizable, new_byte_size: usize) {
         self.journal.borrow_mut().push(Microop::Resize {
             index: pointer.index(),
             new_size: new_byte_size,
         });
     }
 
-    fn array_capacity<T>(&self, pointer: &UniqueArrayPointer<T>) -> Option<usize> {
+    fn splice(
+        &self,
+        pointer: &UniquePointerResizable,
+        byte_offset: u32,
+        old_byte_len: u32,
+        new: &[u8],
+    ) {
+        self.journal.borrow_mut().push(Microop::Splice {
+            index: pointer.index(),
+            offset: byte_offset,
+            old_len: old_byte_len,
+            new: new.to_vec(),
+        });
+    }
+
+    fn capacity(&self, pointer: &UniquePointerResizable) -> Option<usize> {
         self.allocator.capacity(pointer.index())
     }
 
-    fn splice<T>(&self, pointer: &UniqueArrayPointer<T>, offset: u32, old_len: u32, new: &[u8]) {
-        self.journal.borrow_mut().push(Microop::Splice {
-            index: pointer.index(),
-            offset,
-            old_len,
-            new: new.to_vec(),
-        });
+    fn resolve(&self, pointer: RawPointer) -> Option<ResolvedPointer<'_>> {
+        self.allocator
+            .resolve(pointer.index())
+            .map(ResolvedPointer::from_target)
     }
 }
 
@@ -264,7 +260,7 @@ impl<T: Persistable> Kladde<T> {
     /// root's own storage immediately.
     pub fn new(root: T) -> Self {
         let backend = DefaultBackend::new();
-        let root_pointer = backend.alloc::<T>(T::INLINE_SIZE);
+        let root_pointer = backend.alloc_boxed::<T>();
         Kladde {
             root,
             backend,
@@ -413,34 +409,34 @@ mod tests {
     }
 
     #[test]
-    fn array_allocation_capacity_round_trips_through_flush() {
+    fn resizable_allocation_capacity_round_trips_through_flush() {
         let backend = DefaultBackend::new();
 
         let pointer = backend.alloc_array::<u8>(16);
         assert_eq!(
-            backend.array_capacity(&pointer),
+            backend.capacity(&pointer),
             None,
             "capacity is unreadable until the alloc is materialized (flushed)"
         );
 
         backend.flush();
-        assert_eq!(backend.array_capacity(&pointer), Some(16));
+        assert_eq!(backend.capacity(&pointer), Some(16));
 
-        backend.resize_array(&pointer, 40);
+        backend.resize(&pointer, 40);
         backend.flush();
         assert_eq!(
-            backend.array_capacity(&pointer),
+            backend.capacity(&pointer),
             Some(40),
-            "capacity tracks resize_array"
+            "capacity tracks resize"
         );
 
         let live = backend.live_count();
-        backend.free_array(pointer);
+        backend.free_resizable(pointer);
         backend.flush();
         assert_eq!(
             backend.live_count(),
             live - 1,
-            "free_array reclaims the region"
+            "free_resizable reclaims the region"
         );
     }
 
@@ -457,7 +453,7 @@ mod tests {
         assert_eq!(backend.journal_len(), 1);
         backend.flush();
 
-        assert_eq!(backend.array_capacity(&pointer), Some(5));
+        assert_eq!(backend.capacity(&pointer), Some(5));
         assert_eq!(backend.read(pointer.raw(), 0, 5), vec![1, 9, 9, 9, 4]);
     }
 
