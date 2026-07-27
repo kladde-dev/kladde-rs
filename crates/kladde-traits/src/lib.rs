@@ -10,8 +10,10 @@ use std::num::NonZeroU32;
 
 mod scalar;
 mod schema;
+mod tuple;
 pub use scalar::*;
 pub use schema::SchemaBuilder;
+pub use tuple::TupleGuard;
 
 // Re-exported so `#[derive(Persistable)]` output and hand-written
 // `describe` impls can name every schema type through `kladde_traits`

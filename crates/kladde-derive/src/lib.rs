@@ -1,9 +1,13 @@
 //! composed from already-`Persistable` fields. See `spec.md`'s "The Trait
 //! Layer" and "Workspace Layout" for the pattern this generates:
 //!
-//! - Every field is treated uniformly (including primitives, via blanket
-//!   `Persistable` impls in `kladde-traits`) -- no special-cased scalar
-//!   setters, just a `{field}_mut()` accessor per field.
+//! - Both named structs (`struct S { x: T }`) and tuple structs
+//!   (`struct S(T, U)`) are supported, laid out identically. Every field is
+//!   treated uniformly (including primitives, via blanket `Persistable`
+//!   impls in `kladde-traits`) -- no special-cased scalar setters, just a
+//!   `{field}_mut()` accessor per field (`field_{i}_mut()` for a tuple
+//!   struct's positional fields). Tuples of `Persistable` types, `(T, U)`,
+//!   are `Persistable` too (see `kladde-traits`), laid out the same way.
 //! - A derived struct's own `INLINE_SIZE` is the sum of its fields'
 //!   (each field's offset within it is therefore static, computable at
 //!   compile time), and it never owns an allocation of its own -- it just

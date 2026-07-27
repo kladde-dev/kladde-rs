@@ -52,8 +52,8 @@ pub use kladde_traits::{
     Allocator, Backend, Guard, Location, Persistable, RawPointer, ResolvedPointer, UniquePointer,
 };
 pub use kladde_traits::{
-    BoolGuard, CharGuard, F32Guard, F64Guard, I16Guard, I32Guard, I64Guard, I8Guard, U16Guard,
-    U32Guard, U64Guard, U8Guard,
+    BoolGuard, CharGuard, F32Guard, F64Guard, I16Guard, I32Guard, I64Guard, I8Guard, TupleGuard,
+    U16Guard, U32Guard, U64Guard, U8Guard,
 };
 
 // Schema/fingerprint surface (originally from `kladde-schema`, re-exported
