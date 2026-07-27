@@ -327,21 +327,37 @@ impl<'s, B: Backend> PersistableVecGuard<'s, u8, B> {
     /// the header before it shrinks the allocation, so a torn-journal
     /// prefix never names more bytes than the allocation holds.
     ///
-    /// **Residual window.** Unlike `PersistableBlob`'s postcard consumer,
-    /// the byte content here has no trailing-slack tolerance, so the
-    /// content write can't be deferred past the header the way blob's grow
-    /// does: between overwriting the content and publishing the header, a
-    /// torn prefix reads a mix of old and new bytes -- neither the old nor
-    /// the new value. Collapsing this into a single atomic op is Step 4's
-    /// `splice`; until then this is the safest ordering available.
+    /// **Residual window.** The byte content here is read back exactly
+    /// (`len` bytes, no trailing-slack tolerance), so the content write
+    /// can't be deferred past the header: between overwriting the content
+    /// and publishing the header, a torn prefix reads a mix of old and new
+    /// bytes -- neither the old nor the new value. Collapsing this into a
+    /// single atomic op is Step 4's `splice`; until then this is the safest
+    /// ordering available. (Every owning consumer -- `PersistableString`,
+    /// `PersistableBlob` -- inherits this ordering by routing through here,
+    /// rather than each re-deriving its own.)
     pub fn set_content(&mut self, new: &[u8]) {
         let old_len = self.inner.data.len();
         let new_len = new.len();
 
+        // Empty content returns to the lazy no-allocation state (empty
+        // <=> no allocation, the invariant `PersistableBlob` relies on),
+        // freeing any existing region. The empty header is published
+        // *before* the free, so a torn-journal prefix leaves the value
+        // already empty with the old region merely unreferenced (reclaimed
+        // at the next flush), never dangling -- the same shape blob's old
+        // `set_to_default` used.
+        if new_len == 0 {
+            if let Some(pointer) = self.inner.pointer.take() {
+                self.backend
+                    .write(self.location.anchor, self.location.offset, &[0u8; 8]);
+                self.backend.free(pointer);
+            }
+            self.inner.data.clear();
+            return;
+        }
+
         match &self.inner.pointer {
-            // Already empty and unallocated -- the on-disk header is
-            // already the all-zero "no allocation" marker, nothing to do.
-            None if new_len == 0 => return,
             None => {
                 let pointer = self.backend.alloc::<PersistableVec<u8>>(new_len);
                 self.backend.write(pointer.raw(), 0, new);
@@ -485,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn set_content_grows_shrinks_and_empties_reusing_one_allocation() {
+    fn set_content_grows_and_shrinks_reusing_one_allocation() {
         let backend = MockBackend::default();
         let location = root_location(&backend);
         let mut vec = PersistableVec::<u8>::new();
@@ -498,7 +514,6 @@ mod tests {
             &b"a much longer byte string"[..],
             &b"x"[..],
             &b"equalize!"[..],
-            &b""[..],
             &b"back again"[..],
         ] {
             vec.guard(&backend, location).set_content(content);
@@ -512,6 +527,37 @@ mod tests {
             let reloaded = PersistableVec::<u8>::load(&backend, location);
             assert_eq!(reloaded.as_slice(), content);
         }
+    }
+
+    #[test]
+    fn set_content_to_empty_frees_and_returns_to_lazy() {
+        let backend = MockBackend::default();
+        let location = root_location(&backend);
+        let mut vec = PersistableVec::<u8>::new();
+
+        vec.guard(&backend, location).set_content(b"some content");
+        backend.flush();
+        let live = backend.live_count();
+        assert!(live > 0);
+
+        vec.guard(&backend, location).set_content(b"");
+        backend.flush();
+        assert_eq!(
+            backend.live_count(),
+            live - 1,
+            "emptying should free the content allocation"
+        );
+        assert!(vec.is_empty());
+        assert!(PersistableVec::<u8>::load(&backend, location).is_empty());
+
+        // Re-populating after emptying allocates a fresh region and works.
+        vec.guard(&backend, location).set_content(b"again");
+        backend.flush();
+        assert_eq!(vec.as_slice(), b"again");
+        assert_eq!(
+            PersistableVec::<u8>::load(&backend, location).as_slice(),
+            b"again"
+        );
     }
 
     #[test]

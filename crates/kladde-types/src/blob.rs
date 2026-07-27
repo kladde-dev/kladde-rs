@@ -3,72 +3,65 @@
 //! can't safely implement [`Persistable`] directly without leaking on
 //! every `store` -- see `spec.md`'s notes on `String`/derived `enum`s)
 //! so it can be persisted anyway, by treating its postcard-serialized
-//! bytes as an opaque content allocation and keeping the allocation
-//! identity here instead.
+//! bytes as an opaque content allocation.
 //!
 //! Gated behind this crate's `serde` Cargo feature -- this is the only
 //! thing in the whole `kladde` workspace that needs `serde`/`postcard`.
 //!
-//! Two ways to construct one:
-//! - [`PersistableBlob::new`] -- eager: always allocates immediately, so
-//!   `pointer` is always `Some`. The general-purpose constructor.
-//! - `PersistableBlob::default()`, via `impl<T: Default> Default for
-//!   PersistableBlob<T>` -- lazy: `pointer` starts `None`, paired with the
-//!   invariant `value == T::default()`. This carries no leak risk, for
-//!   the same reason `PersistableVec::new()`/`PersistableHashMap::new()`
-//!   don't: a freshly-defaulted, never-mutated value legitimately has
-//!   nothing to allocate yet. [`PersistableBlobGuard::set`] promotes
-//!   `None -> Some` the first time it's actually mutated;
-//!   [`PersistableBlobGuard::set_to_default`] explicitly frees whatever
-//!   allocation existed and resets back to the lazy `None` state.
+//! Built as a thin wrapper around [`PersistableVec<u8>`]: the wrapped
+//! `value`'s postcard bytes *are* the vec's content. That vec already
+//! hand-rolls (leak-free, crash-safely) every piece a blob needs -- the
+//! `{ target, len }` header, the lazy-until-first-write allocation, the
+//! grow/shrink/reuse ordering -- so `PersistableBlob` no longer carries any
+//! of that itself. `value: T` is kept alongside purely as an in-memory
+//! cache for cheap [`Deref`]/[`edit`](PersistableBlobGuard::edit) reads;
+//! the vec's own bytes are the source of truth on disk.
+//!
+//! **Empty content <=> default value.** A never-mutated
+//! `PersistableBlob::default()` holds an *empty* `serialized` vec (no
+//! allocation, exactly `PersistableVec`'s lazy state), and `load` maps an
+//! empty vec back to `T::default()`. This relies on the assumption that no
+//! non-default value serializes to an empty byte string -- true for
+//! postcard, which gives any information-carrying value at least one byte,
+//! so an empty encoding implies a single-inhabitant (ZST-like) type whose
+//! one value is its `Default`. It would break only for a pathological
+//! hand-written `Serialize` mapping several distinct values to `[]`. This
+//! is the same assumption `PersistableVec`/`PersistableHashMap` already
+//! make for their own `empty <=> no allocation` states.
 //!
 //! Note the `T: Default` bound on `Persistable`'s own impl below (not
 //! just on the separate `std::default::Default` impl): `load` has to be
-//! able to reconstruct the lazy (`pointer: None`) case somehow, and
-//! `Persistable::load`'s signature can't be conditional on which
-//! constructor originally produced the value -- so every `T` used with
-//! `PersistableBlob<T>` needs to be `Default`, even if an application only
-//! ever calls `new()` and never touches the lazy path.
+//! able to reconstruct the empty case as *some* value, and
+//! `Persistable::load`'s signature can't be conditional -- so every `T`
+//! used with `PersistableBlob<T>` needs to be `Default`.
 
-use kladde_traits::{
-    read_header, write_header, Backend, Guard, Location, Persistable, UniquePointer,
-};
+use crate::vec::PersistableVec;
+use kladde_traits::{Backend, Guard, Location, Persistable};
 use std::ops::{Deref, DerefMut};
 
 #[derive(Debug, PartialEq)]
 pub struct PersistableBlob<T> {
+    /// In-memory cache of the wrapped value, for cheap `Deref`/`edit`
+    /// reads. The persisted source of truth is `serialized`'s bytes.
     value: T,
-    /// The content allocation holding `value`'s postcard-serialized bytes
-    /// -- `None` only while `value` is still exactly `T::default()`,
-    /// courtesy of the `Default` impl below. See the module doc comment.
-    pointer: Option<UniquePointer<PersistableBlob<T>>>,
-    /// A cache of the postcard serialization currently written to that
-    /// allocation (empty exactly when `pointer` is `None`). Kept in sync by
-    /// `new`/`load` and every guard mutation. It earns its extra memory
-    /// three ways: `store` reads the content length off it instead of
-    /// re-serializing; a mutation compares the new serialization's length
-    /// against it to learn whether the content grew or shrank (which
-    /// decides the crash-safe op order in `PersistableBlobGuard::persist`);
-    /// and an unchanged serialization is detected and skips the write
-    /// entirely. See that method and `later.md` for the diffing this cache
-    /// is also the groundwork for.
-    bytes: Vec<u8>,
+    /// The wrapped value's postcard serialization, held as a backed byte
+    /// vec. Empty exactly when `value == T::default()` (see the module
+    /// doc comment); non-empty vecs own a content allocation, which
+    /// `PersistableVec` creates/reuses/frees crash-safely.
+    serialized: PersistableVec<u8>,
 }
 
 impl<T: serde::Serialize> PersistableBlob<T> {
-    /// Allocates immediately: writes `value`'s postcard-serialized bytes
-    /// to a fresh allocation and remembers the pointer, so a later
-    /// `store` can reuse (not leak) it -- see `vec.rs`'s identical
-    /// reasoning for `PersistableVec`.
-    pub fn new<B: Backend>(value: T, backend: &B) -> Self {
+    /// Wraps `value`, serializing it immediately into an (as-yet
+    /// unallocated) backed byte vec. Backend-free, like
+    /// `PersistableString::from`: the actual allocation happens lazily the
+    /// first time this blob is `store`d or mutated through a guard.
+    pub fn new(value: T) -> Self {
         let bytes = postcard::to_allocvec(&value)
             .expect("postcard serialization of an in-memory value should not fail");
-        let pointer = backend.alloc::<PersistableBlob<T>>(bytes.len());
-        backend.write(pointer.raw(), 0, &bytes);
         PersistableBlob {
             value,
-            pointer: Some(pointer),
-            bytes,
+            serialized: PersistableVec::from_iter(bytes),
         }
     }
 }
@@ -77,8 +70,7 @@ impl<T: Default> Default for PersistableBlob<T> {
     fn default() -> Self {
         PersistableBlob {
             value: T::default(),
-            pointer: None,
-            bytes: Vec::new(),
+            serialized: PersistableVec::new(),
         }
     }
 }
@@ -94,11 +86,9 @@ impl<T> Persistable for PersistableBlob<T>
 where
     T: serde::Serialize + serde::de::DeserializeOwned + Default,
 {
-    /// A fixed 8-byte `{ target, len }` header -- see `String`/
-    /// `PersistableVec`'s identical layout note. `len` here is the
-    /// postcard-serialized content's byte length (there's no static
-    /// per-element size to derive it from, unlike `PersistableVec`).
-    const INLINE_SIZE: usize = 8;
+    /// Delegated straight to the wrapped `PersistableVec<u8>`'s 8-byte
+    /// `{ target, len }` header -- a blob *is* that vec, representationally.
+    const INLINE_SIZE: usize = <PersistableVec<u8> as Persistable>::INLINE_SIZE;
 
     type Guard<'s, B: Backend>
         = PersistableBlobGuard<'s, T, B>
@@ -118,50 +108,21 @@ where
         }
     }
 
-    /// Deliberately doesn't rewrite content when `pointer` is already
-    /// `Some`: `PersistableBlobGuard`'s mutators always write a value's
-    /// postcard bytes to its allocation immediately, so by the time `store`
-    /// runs separately (e.g. assembling a struct field from an
-    /// already-complete `PersistableBlob<T>`) the existing allocation's
-    /// content is already correct -- only a fresh header needs publishing.
-    /// The content length comes off the cached `bytes`, so `store` never
-    /// re-serializes.
     fn store<B: Backend>(&mut self, backend: &B, location: Location) {
-        match &self.pointer {
-            Some(existing) => {
-                write_header(backend, location, existing.index(), self.bytes.len() as u32);
-            }
-            None => {
-                // `pointer` is only ever `None` when this value was
-                // constructed via `Default` and never mutated -- `value`
-                // is exactly `T::default()` by construction, the same
-                // "no allocation yet" state `PersistableVec`/
-                // `PersistableHashMap` use for their own legitimately-empty
-                // case.
-                backend.write(location.anchor, location.offset, &[0u8; 8]);
-            }
-        }
+        self.serialized.store(backend, location);
     }
 
     fn load<B: Backend>(backend: &B, location: Location) -> Self {
-        let (target, len) = read_header(backend, location);
-        match target {
-            Some(target) => {
-                let pointer = UniquePointer::from_index(target);
-                let bytes = backend.read(pointer.raw(), 0, len);
-                let value = postcard::from_bytes(&bytes).expect("corrupt persisted value bytes");
-                PersistableBlob {
-                    value,
-                    pointer: Some(pointer),
-                    bytes,
-                }
-            }
-            None => PersistableBlob {
-                value: T::default(),
-                pointer: None,
-                bytes: Vec::new(),
-            },
-        }
+        let serialized = PersistableVec::<u8>::load(backend, location);
+        let value = if serialized.is_empty() {
+            // Empty content is the canonical on-disk encoding of the
+            // default value -- see the module doc comment's `empty <=>
+            // default` note.
+            T::default()
+        } else {
+            postcard::from_bytes(serialized.as_slice()).expect("corrupt persisted value bytes")
+        };
+        PersistableBlob { value, serialized }
     }
 
     // `T` here is a foreign, `serde`-serialized type that is *not* itself
@@ -216,102 +177,32 @@ impl<'s, T: serde::Serialize, B: Backend> PersistableBlobGuard<'s, T, B> {
         PersistableBlobEdit { guard: self }
     }
 
-    /// Serializes the current in-memory `value` and writes it to the
-    /// content allocation, then publishes the header -- crash-safely, and
-    /// skipping the write entirely if the serialization is unchanged.
-    ///
-    /// The op order keeps *any* torn-journal prefix readable as either the
-    /// old or the new value (spec.md's Crash Consistency), and does so
-    /// relying on one property of postcard: `from_bytes` reads exactly a
-    /// value's bytes and ignores any trailing slack. That lets a reader
-    /// mid-mutation over-read a stale-but-complete value:
-    ///
-    /// - **grow**: enlarge, publish the new (longer) length while the
-    ///   content is still the old (shorter) value -- an over-read there
-    ///   deserializes to the *old* value -- then overwrite with the new
-    ///   content (the single atomic commit point);
-    /// - **shrink**: overwrite the content first (a reader still on the old
-    ///   longer length over-reads past the new value into stale tail bytes,
-    ///   yielding the *new* value -- this write is the commit), then publish
-    ///   the shorter length, then shrink;
-    /// - **same length**: a single content write is the atomic commit.
-    ///
-    /// (If the serialization format were ever changed to one that rejects
-    /// trailing bytes, the grow/shrink cases would need a `Transaction`
-    /// bracket or per-`set` copy-on-write instead -- see `later.md`.)
-    /// Reuses the existing allocation rather than leaking it, exactly like
-    /// `PersistableVec`.
+    /// Serializes the current in-memory `value` and writes it into the
+    /// wrapped byte vec via its crash-safe bulk
+    /// [`set_content`](crate::PersistableVec) -- which handles the
+    /// grow/shrink/reuse/free ordering (and its residual window, closed by
+    /// Step 4's `splice`) once, for every owning type, rather than blob
+    /// re-deriving it.
     fn persist(&mut self) {
-        let new_bytes = postcard::to_allocvec(&self.inner.value)
+        let bytes = postcard::to_allocvec(&self.inner.value)
             .expect("postcard serialization of an in-memory value should not fail");
-        match &self.inner.pointer {
-            Some(existing) => {
-                if new_bytes == self.inner.bytes {
-                    return; // content already on disk; nothing to write
-                }
-                let old_len = self.inner.bytes.len();
-                let new_len = new_bytes.len();
-                match new_len.cmp(&old_len) {
-                    std::cmp::Ordering::Greater => {
-                        self.backend.resize(existing, new_len);
-                        // TODO: `write_header` overwrites `index` with itself, which is wasteful.
-                        write_header(
-                            self.backend,
-                            self.location,
-                            existing.index(),
-                            new_len as u32,
-                        );
-                        self.backend.write(existing.raw(), 0, &new_bytes);
-                    }
-                    std::cmp::Ordering::Less => {
-                        self.backend.write(existing.raw(), 0, &new_bytes);
-                        write_header(
-                            self.backend,
-                            self.location,
-                            existing.index(),
-                            new_len as u32,
-                        );
-                        self.backend.resize(existing, new_len);
-                    }
-                    std::cmp::Ordering::Equal => {
-                        self.backend.write(existing.raw(), 0, &new_bytes);
-                    }
-                }
-            }
-            None => {
-                // Promoting the lazy `None`/default state: allocate, fill
-                // the (still unreferenced) region, then publish the header
-                // last -- the same append-then-publish shape as
-                // `PersistableVec::push`.
-                let pointer = self.backend.alloc::<PersistableBlob<T>>(new_bytes.len());
-                self.backend.write(pointer.raw(), 0, &new_bytes);
-                write_header(
-                    self.backend,
-                    self.location,
-                    pointer.index(),
-                    new_bytes.len() as u32,
-                );
-                self.inner.pointer = Some(pointer);
-            }
-        }
-        self.inner.bytes = new_bytes;
+        self.inner
+            .serialized
+            .guard(self.backend, self.location)
+            .set_content(&bytes);
     }
 }
 
-impl<'s, T: Default, B: Backend> PersistableBlobGuard<'s, T, B> {
-    /// Frees the existing content allocation (if any) and resets back to
-    /// the lazy `None`/`T::default()` state. Publishes the empty header
-    /// *before* freeing, so a torn-journal prefix leaves the value already
-    /// at its default with the old region merely unreferenced (reclaimed at
-    /// the next flush), never dangling.
+impl<'s, T: serde::Serialize + Default, B: Backend> PersistableBlobGuard<'s, T, B> {
+    /// Resets the value to `T::default()`, freeing the content allocation
+    /// and returning to the lazy empty state. Crash-safe (empty header
+    /// published before the free) courtesy of `set_content(b"")`.
     pub fn set_to_default(&mut self) {
-        self.backend
-            .write(self.location.anchor, self.location.offset, &[0u8; 8]);
-        if let Some(existing) = self.inner.pointer.take() {
-            self.backend.free(existing);
-        }
         self.inner.value = T::default();
-        self.inner.bytes.clear();
+        self.inner
+            .serialized
+            .guard(self.backend, self.location)
+            .set_content(b"");
     }
 }
 
@@ -407,7 +298,7 @@ mod tests {
         let backend = MockBackend::default();
         let location = root_location(&backend);
 
-        let mut value = PersistableBlob::new(42i32, &backend);
+        let mut value = PersistableBlob::new(42i32);
         value.store(&backend, location);
         backend.flush();
 
@@ -441,7 +332,7 @@ mod tests {
         let backend = MockBackend::default();
         let location = root_location(&backend);
 
-        let mut value = PersistableBlob::new(1i32, &backend);
+        let mut value = PersistableBlob::new(1i32);
         value.store(&backend, location);
         backend.flush();
         let live_before = backend.live_count();
@@ -465,7 +356,7 @@ mod tests {
         let backend = MockBackend::default();
         let location = root_location(&backend);
 
-        let mut value = PersistableBlob::new(5i32, &backend);
+        let mut value = PersistableBlob::new(5i32);
         value.store(&backend, location);
         backend.flush();
         let live_before = backend.live_count();
@@ -484,11 +375,12 @@ mod tests {
     #[test]
     fn set_grows_and_shrinks_the_content_and_reuses_the_allocation() {
         // A `String` payload whose serialization length actually changes,
-        // exercising the grow / shrink / same-length branches of `persist`.
+        // exercising the grow / shrink / same-length branches of the
+        // wrapped vec's `set_content`.
         let backend = MockBackend::default();
         let location = root_location(&backend);
 
-        let mut value = PersistableBlob::new(String::from("hi"), &backend);
+        let mut value = PersistableBlob::new(String::from("hi"));
         value.store(&backend, location);
         backend.flush();
         let live = backend.live_count();
@@ -518,13 +410,10 @@ mod tests {
         let backend = MockBackend::default();
         let location = root_location(&backend);
 
-        let mut value = PersistableBlob::new(
-            Rec {
-                a: 1,
-                b: "one".into(),
-            },
-            &backend,
-        );
+        let mut value = PersistableBlob::new(Rec {
+            a: 1,
+            b: "one".into(),
+        });
         value.store(&backend, location);
         backend.flush();
 
@@ -546,13 +435,10 @@ mod tests {
         let backend = MockBackend::default();
         let location = root_location(&backend);
 
-        let mut value = PersistableBlob::new(
-            Rec {
-                a: 1,
-                b: "one".into(),
-            },
-            &backend,
-        );
+        let mut value = PersistableBlob::new(Rec {
+            a: 1,
+            b: "one".into(),
+        });
         value.store(&backend, location);
         backend.flush();
 
@@ -572,7 +458,7 @@ mod tests {
         let backend = MockBackend::default();
         let location = root_location(&backend);
 
-        let mut value = PersistableBlob::new(String::from("stable"), &backend);
+        let mut value = PersistableBlob::new(String::from("stable"));
         value.store(&backend, location);
         backend.flush();
         let live = backend.live_count();
@@ -587,11 +473,13 @@ mod tests {
 
     #[test]
     fn postcard_from_bytes_ignores_trailing_bytes() {
-        // The crash-safe op order in `persist` relies on this: a reader
-        // mid-mutation over-reads a complete value plus some slack, and
-        // must still deserialize to that value. If this ever fails (a
-        // serialization-format change), `persist`'s grow/shrink ordering is
-        // no longer safe and needs a Transaction/CoW instead.
+        // Historically the crash-safe grow/shrink ordering relied on this
+        // (a mid-mutation reader over-reading a complete value plus slack).
+        // Now that ordering lives in `PersistableVec::set_content` and no
+        // longer leans on trailing tolerance, but the property is still
+        // worth pinning: `load` reads exactly the vec's `len` bytes, so a
+        // format that rejected trailing bytes would still be fine here --
+        // this documents the postcard behavior either way.
         let value = Rec {
             a: 7,
             b: "hi".into(),
