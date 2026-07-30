@@ -144,6 +144,50 @@ fn main() {
                 }
                 _ => println!("usage: add-phone <name> mobile|landline <number>"),
             },
+            "set-email-and-add-phone" => match words.as_slice() {
+                [_, name, email, kind, number] => {
+                    let phone = match *kind {
+                        "mobile" => PhoneNumber::Mobile(PersistableString::from(*number)),
+                        "landline" => PhoneNumber::Landline(PersistableString::from(*number)),
+                        other => {
+                            println!("unknown phone kind {other:?}, expected mobile|landline");
+                            continue;
+                        }
+                    };
+                    let found = {
+                        let mut guard = book.guard();
+                        match guard
+                            .contacts_mut()
+                            .get_mut(&PersistableString::from(*name))
+                        {
+                            Some(mut contact) => {
+                                // Illustrates destructuring the guards for all
+                                // fields at once via `.parts()`: `email` and
+                                // `phones` are two field guards, live together.
+                                let ContactParts {
+                                    email: mut email_guard,
+                                    mut phones,
+                                } = contact.parts();
+                                email_guard.set(*email);
+                                phones.push(phone);
+                                true
+                            }
+                            None => false,
+                        }
+                    };
+                    if found {
+                        println!(
+                            "updated email and added phone (journal entries: {})",
+                            journal_len(&book)
+                        );
+                    } else {
+                        println!("no such contact: {name}");
+                    }
+                }
+                _ => println!(
+                    "usage: set-email-and-add-phone <name> <email> mobile|landline <number>"
+                ),
+            },
             "remove" => match words.as_slice() {
                 [_, name] => match book
                     .guard()
@@ -195,6 +239,8 @@ fn print_help() {
     println!("add <name> <email>                       -- add a new contact");
     println!("set-email <name> <email>                  -- change a contact's email");
     println!("add-phone <name> mobile|landline <number> -- add a phone number");
+    println!("set-email-and-add-phone <name> <email> mobile|landline <number>");
+    println!("                                          -- both at once, via .parts()");
     println!("show <name>                               -- show a contact's details");
     println!("list                                      -- list all contacts");
     println!("remove <name>                             -- remove a contact");

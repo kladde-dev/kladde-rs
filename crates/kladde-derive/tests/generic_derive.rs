@@ -79,6 +79,46 @@ fn generic_tuple_struct_round_trips() {
     assert_eq!((reloaded.1).0, 22);
 }
 
+#[test]
+fn parts_gives_simultaneous_guards_for_all_fields() {
+    let backend = MockBackend::default();
+    let location = backend.root_location(<Pair<Number, Number>>::INLINE_SIZE);
+    let mut pair = Pair {
+        a: Number(0),
+        b: Number(0),
+    };
+    {
+        let mut guard = pair.guard(&backend, location);
+        // Both field guards are live at once -- `a` is used *after* `b` was
+        // created and used, which only compiles because they borrow
+        // disjoint parts of the guard.
+        let PairParts { mut a, mut b } = guard.parts();
+        b.set(22);
+        a.set(11);
+    }
+    assert_eq!(pair.a.0, 11);
+    assert_eq!(pair.b.0, 22);
+
+    let reloaded = <Pair<Number, Number>>::load(&backend, location);
+    assert_eq!(reloaded.a.0, 11);
+    assert_eq!(reloaded.b.0, 22);
+}
+
+#[test]
+fn tuple_struct_parts_is_a_tuple_struct_of_guards() {
+    let backend = MockBackend::default();
+    let location = backend.root_location(<TuplePair<Number>>::INLINE_SIZE);
+    let mut tp = TuplePair(Number(0), Number(0));
+    {
+        let mut guard = tp.guard(&backend, location);
+        let TuplePairParts(mut f0, mut f1) = guard.parts();
+        f1.set(22);
+        f0.set(11);
+    }
+    assert_eq!((tp.0).0, 11);
+    assert_eq!((tp.1).0, 22);
+}
+
 #[derive(Persistable)]
 enum Either<A, B> {
     Left(A),

@@ -156,6 +156,12 @@ struct Ctx {
     /// Generic list for *naming* the guard type (bare parameter names, no
     /// bounds): `<'__s, T, __B>`.
     guard_use_generics: proc_macro2::TokenStream,
+    /// The type's type parameters rendered with their bounds (`T: ... +
+    /// Persistable`), for building further generic lists (e.g. the `Parts`
+    /// struct) that need a different bracketing lifetime than the guard's.
+    bounded_params: Vec<proc_macro2::TokenStream>,
+    /// The type's type parameters as bare idents (`T`), for naming.
+    param_idents: Vec<syn::Ident>,
 }
 
 impl Ctx {
@@ -194,8 +200,11 @@ impl Ctx {
         // (`T: ... + Persistable`); `param_idents` are the bare names.
         let bounded_params: Vec<proc_macro2::TokenStream> =
             bounded.type_params().map(|tp| quote!(#tp)).collect();
-        let param_idents: Vec<&syn::Ident> =
-            input.generics.type_params().map(|tp| &tp.ident).collect();
+        let param_idents: Vec<syn::Ident> = input
+            .generics
+            .type_params()
+            .map(|tp| tp.ident.clone())
+            .collect();
 
         Ok(Ctx {
             impl_generics: quote!(#impl_generics),
@@ -205,6 +214,8 @@ impl Ctx {
                 <'__s, #(#bounded_params,)* __B: ::kladde_traits::Backend>
             },
             guard_use_generics: quote! { <'__s, #(#param_idents,)* __B> },
+            bounded_params,
+            param_idents,
         })
     }
 }
@@ -578,11 +589,91 @@ fn derive_struct(
         }
     };
 
+    // A `{Ident}Parts` struct plus a `parts()` method that hands out a
+    // guard for *every* field at once. Each field guard borrows a disjoint
+    // part of `self.inner`, so all fields can be mutated simultaneously --
+    // the guard analog of splitting `&mut Pair` into `&mut pair.a` and
+    // `&mut pair.b` (which per-field `_mut()` accessors, each borrowing the
+    // whole guard, can't do). Mirrors the struct's own shape: a braced
+    // struct for a named struct, a tuple struct for a tuple struct.
+    let parts_ident = format_ident!("{}Parts", ident);
+    let bounded_params = &ctx.bounded_params;
+    let param_idents = &ctx.param_idents;
+    let parts_decl_generics = quote! {
+        <'__f, #(#bounded_params,)* __B: ::kladde_traits::Backend>
+    };
+    let parts_ret_generics = quote! { <'_, #(#param_idents,)* __B> };
+    // The `Parts` struct holds `Guard<'__f, __B>` associated types, whose
+    // GAT bound (`where Self: 's, B: 's`) means each needs `Param: '__f` and
+    // `__B: '__f`. Combine those outlives bounds with the user's own
+    // `where`-clause predicates.
+    let user_where_preds = input.generics.where_clause.as_ref().map(|w| {
+        let preds = &w.predicates;
+        quote!(#preds,)
+    });
+    let parts_where = quote! {
+        where #user_where_preds #(#param_idents: '__f,)* __B: '__f
+    };
+    let (parts_struct, parts_ctor) = if is_tuple {
+        let struct_def = quote! {
+            #[doc(hidden)]
+            #vis struct #parts_ident #parts_decl_generics (
+                #(
+                    #vis <#field_ty as ::kladde_traits::Persistable>::Guard<'__f, __B>,
+                )*
+            ) #parts_where;
+        };
+        let ctor = quote! {
+            #parts_ident(
+                #(
+                    <#field_ty as ::kladde_traits::Persistable>::guard(
+                        &mut self.inner.#member,
+                        self.backend,
+                        ::kladde_traits::Location {
+                            anchor: self.location.anchor,
+                            offset: self.location.offset + #field_offset,
+                        },
+                    ),
+                )*
+            )
+        };
+        (struct_def, ctor)
+    } else {
+        let field_ident: Vec<&syn::Ident> =
+            fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+        let struct_def = quote! {
+            #[doc(hidden)]
+            #vis struct #parts_ident #parts_decl_generics #parts_where {
+                #(
+                    #vis #field_ident:
+                        <#field_ty as ::kladde_traits::Persistable>::Guard<'__f, __B>,
+                )*
+            }
+        };
+        let ctor = quote! {
+            #parts_ident {
+                #(
+                    #field_ident: <#field_ty as ::kladde_traits::Persistable>::guard(
+                        &mut self.inner.#member,
+                        self.backend,
+                        ::kladde_traits::Location {
+                            anchor: self.location.anchor,
+                            offset: self.location.offset + #field_offset,
+                        },
+                    ),
+                )*
+            }
+        };
+        (struct_def, ctor)
+    };
+
     let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident);
     let guard_assoc = guard_assoc(ctx, &guard_ident);
 
     quote! {
         #scaffold
+
+        #parts_struct
 
         impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
             #(
@@ -599,6 +690,13 @@ fn derive_struct(
                     )
                 }
             )*
+
+            /// Returns a guard for every field at once, so all fields can be
+            /// mutated simultaneously. Destructure the returned struct:
+            /// `let #parts_ident { .. } = guard.parts();`.
+            #vis fn parts(&mut self) -> #parts_ident #parts_ret_generics {
+                #parts_ctor
+            }
         }
 
         impl #impl_generics ::kladde_traits::Persistable for #ident #type_generics #where_clause {

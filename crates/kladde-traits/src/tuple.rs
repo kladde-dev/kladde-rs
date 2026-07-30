@@ -155,6 +155,38 @@ macro_rules! impl_persistable_tuple {
                 }
             }
         }
+
+        // A per-arity inherent impl (distinct concrete tuple type each
+        // time) adding `parts()` alongside the blanket `set`.
+        impl<'s, $($T: Persistable,)* __B: Backend> TupleGuard<'s, ($($T,)*), __B> {
+            /// Returns a guard for every component at once, so all components
+            /// can be mutated simultaneously (the tuple analog of splitting
+            /// `&mut (A, B)` into `&mut x.0` and `&mut x.1`).
+            #[allow(
+                unused_variables,
+                unused_mut,
+                unused_assignments,
+                non_snake_case,
+                clippy::unused_unit
+            )]
+            pub fn parts(&mut self) -> ( $(<$T as Persistable>::Guard<'_, __B>,)* ) {
+                let anchor = self.location.anchor;
+                let mut offset = self.location.offset;
+                $(
+                    // Each component guard borrows a disjoint `&mut self.inner.$idx`.
+                    let $T = {
+                        let __g = <$T as Persistable>::guard(
+                            &mut self.inner.$idx,
+                            self.backend,
+                            Location { anchor, offset },
+                        );
+                        offset += <$T as Persistable>::INLINE_SIZE as u32;
+                        __g
+                    };
+                )*
+                ( $($T,)* )
+            }
+        }
     };
 }
 
@@ -290,6 +322,25 @@ mod tests {
 
         let reloaded = <(i32, u8)>::load(&backend, location);
         assert_eq!(reloaded, (30, 40));
+    }
+
+    #[test]
+    fn parts_gives_simultaneous_component_guards() {
+        let backend = MockBackend::default();
+        let location = backend.root(<(i32, u8)>::INLINE_SIZE);
+
+        let mut value = (0i32, 0u8);
+        {
+            let mut guard = value.guard(&backend, location);
+            // Both component guards live at once (a is used after b).
+            let (mut a, mut b) = guard.parts();
+            b.set(9);
+            a.set(7);
+        }
+        assert_eq!(value, (7, 9));
+
+        let reloaded = <(i32, u8)>::load(&backend, location);
+        assert_eq!(reloaded, (7, 9));
     }
 
     #[test]
