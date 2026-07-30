@@ -145,6 +145,7 @@ impl Persistable for PersistableString {
         Self: 's,
         B: 's;
 
+    #[inline]
     fn guard<'s, B: Backend>(
         &'s mut self,
         backend: &'s B,

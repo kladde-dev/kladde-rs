@@ -88,6 +88,7 @@ macro_rules! impl_persistable_tuple {
                 Self: 's,
                 __B: 's;
 
+            #[inline]
             fn guard<'s, __B: Backend>(
                 &'s mut self,
                 backend: &'s __B,
@@ -155,6 +156,7 @@ macro_rules! impl_persistable_tuple {
             /// Returns a guard for every component at once, so all components
             /// can be mutated simultaneously (the tuple analog of splitting
             /// `&mut (A, B)` into `&mut x.0` and `&mut x.1`).
+            #[inline]
             #[allow(
                 unused_variables,
                 unused_mut,

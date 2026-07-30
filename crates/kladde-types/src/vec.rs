@@ -115,6 +115,7 @@ impl<T: Persistable> Persistable for PersistableVec<T> {
         Self: 's,
         B: 's;
 
+    #[inline]
     fn guard<'s, B: Backend>(
         &'s mut self,
         backend: &'s B,
@@ -224,6 +225,7 @@ pub struct PersistableVecGuard<'s, T, B = kladde::DefaultBackend> {
 // kept in its own impl block, as before, so it stays available
 // regardless of what other bounds `push`/`remove` need.
 impl<'s, T: Persistable, B: Backend> PersistableVecGuard<'s, T, B> {
+    #[inline]
     pub fn get_mut(&mut self, index: usize) -> Option<T::Guard<'_, B>> {
         let elem_size = T::INLINE_SIZE as u32;
         let pointer = self.inner.pointer.as_ref()?;

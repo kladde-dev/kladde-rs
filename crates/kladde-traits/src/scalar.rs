@@ -74,6 +74,7 @@ macro_rules! impl_persistable_numeric_scalar {
                 Self: 's,
                 B: 's;
 
+            #[inline]
             fn guard<'s, B: Backend>(
                 &'s mut self,
                 backend: &'s B,
@@ -170,6 +171,7 @@ macro_rules! impl_persistable_scalar_via {
                 Self: 's,
                 B: 's;
 
+            #[inline]
             fn guard<'s, B: Backend>(
                 &'s mut self,
                 backend: &'s B,

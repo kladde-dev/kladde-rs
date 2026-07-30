@@ -351,6 +351,7 @@ fn guard_assoc(ctx: &Ctx, guard_ident: &syn::Ident) -> proc_macro2::TokenStream 
             Self: '__s,
             __B: '__s;
 
+        #[inline]
         fn guard<'__s, __B: ::kladde_traits::Backend>(
             &'__s mut self,
             backend: &'__s __B,
@@ -447,6 +448,7 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> proc_macro2::TokenStrea
             /// `#[kladde(transparent)]` newtype, the inner value lives at
             /// the wrapper's own location, so this is a direct pass-through
             /// to the inner type's full mutation API.
+            #[inline]
             #vis fn get_mut(
                 &mut self,
             ) -> <#field_ty as ::kladde_traits::Persistable>::Guard<'_, __B> {
@@ -665,6 +667,7 @@ fn derive_struct(
 
         impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
             #(
+                #[inline]
                 #vis fn #accessor_ident(
                     &mut self,
                 ) -> <#field_ty as ::kladde_traits::Persistable>::Guard<'_, __B> {
@@ -679,6 +682,7 @@ fn derive_struct(
             /// Returns a guard for every field at once, so all fields can be
             /// mutated simultaneously. Destructure the returned struct:
             /// `let #parts_ident { .. } = guard.parts();`.
+            #[inline]
             #vis fn parts(&mut self) -> #parts_ident #parts_ret_generics {
                 #parts_ctor
             }

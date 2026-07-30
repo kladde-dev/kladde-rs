@@ -129,6 +129,7 @@ where
         Self: 's,
         B: 's;
 
+    #[inline]
     fn guard<'s, B: Backend>(
         &'s mut self,
         backend: &'s B,
@@ -273,6 +274,7 @@ pub struct PersistableHashMapGuard<'s, K: Eq + Hash, V, B = kladde::DefaultBacke
 impl<'s, K: Eq + Hash + Persistable, V: Persistable, B: Backend>
     PersistableHashMapGuard<'s, K, V, B>
 {
+    #[inline]
     pub fn get_mut(&mut self, key: &K) -> Option<V::Guard<'_, B>> {
         let slot = self.inner.entries.get(key)?.0;
         let entry_size = entry_size::<K, V>() as u32;
