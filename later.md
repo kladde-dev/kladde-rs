@@ -11,6 +11,13 @@
 
 - While I'm focusing on a rust implementation here, I don't want the kladde _file format_ to be tied to rust or "feel" overly rust influenced. It should be possible to implement kladde libraries for other languages that read and write the same files, and the APIs of those libraries should feel idiomatic for other languages as well. Eventually, I'll want to write a technical specification for the file format, consisting of both (1) what's _required_ for kladde files (i.e., how files have to be layed out so that kladde can load them) and (2) what's _allowed_ in kladde files (i.e., what any implementation of kladde has to be able to read).
 
+## Simple deferred work
+
+- Support const generics in derive macro.
+- Guards for tuples: add `field_{i}_mut` methods analogous to tuple structs with derived Persistable impl.
+    - Probably requires the `paste` crate. Could also be done by making `kladde-traits` depend on `kladde-derive`, but I don't want that.
+    - Guards for tuple structs already have `field_{i}_mut` methods, but do they also have a `set` method to replace the whole tuple struct?
+
 ## Miscellaneous ideas
 
 - I expect that most `Op`s will have a small payload because we record them at such a fine modularity.
@@ -30,7 +37,7 @@
     - Two more combined content ops, both motivated by the crash-safe-ordering comments in `PersistableBlobGuard::persist` and `PersistableVecGuard::remove`:
         - A `resize_uninit` op that is like `resize` but does *not* promise to preserve the `min(old, new)` leading bytes, for when the allocation is about to be fully overwritten anyway. Saves the copy that a relocating grow would otherwise perform.
         - A `splice` op: like `write` but also taking an `old_len`, atomically bundling the `resize`, the content `write`, and the tail `move` in the correct order for a grow or a shrink. This is what would make `PersistableBlob::set` and `PersistableVec::remove` a *single* atomic op — closing the residual torn-journal windows those methods currently document (a mid-shrink out-of-bounds read is already avoided by ordering, but the transient shifted/duplicated state during `remove`'s `copy`, and the grow/shrink windows in `persist`, only fully collapse with one atomic op). It's also the natural primitive for the blob-diffing idea below, and likely useful well beyond the blob.
-- Figure out how the derived guards for `struct`s and `enum`s can be used ergonomically in application code.
+- Figure out how the derived guards for `enum`s can be used ergonomically in application code.
     - For `struct` guards, it might be worth implementing `set_<field>(value)` convenience methods for each field so that one doesn't have to the dance to get a guard for the field and write to it.
     - For `enum` guards: can we support pattern matching somehow?
 - Two `#[derive(Persistable)]` escape hatches, both modeled on `serde`'s equivalents:
@@ -46,10 +53,8 @@
 - Allow introducing custom `Op`s that call back into either the type or the instance (if providing a ref to the instance is possible without changes to the rest of the system). Example use case: an included PNG image is edited, and we can describe the edit exactly (e.g., "draw a black line of width 1 from point X to point Y" or also: "compress this PNG more aggressively / scale it by 50%"). The type could then implement decoding the old PNG blob (if it's not already in memory), apply the edit, and encode it again, when the Op gets replayed.
 - When adding pointer type to the schema, maybe also add unsized types (slices `[T]`, `str`). This would allow generic tools to understand data better and inspect more out-of-the-box.
 - Should we really support `char` as a primitive type? If so, how are `char`s serialized? Valid unicode scalar values seem to be <= 0x10FFFF, so they'd fit into 3 bytes. How future proof do we expect this restriction to be?
+- `Allocator::read` should probably return an `impl Read`. Analogously, `Allocator::write` should either return an `impl Write` or take an `impl Read` as argument. Returning an `impl Write` would simplify the caller's sites but is likely more complicated to implement on the callee's side.
 
-## Things to check later
-
-- Is the `copy` operation dangerous? It copies serializes pointers, so they're no longer unique. Should we instead introduce `move` and consider any pointers in the old position renedered moot?
 
 ## Regarding write-ahead-logging discipline
 
@@ -57,3 +62,8 @@ Memory operations must be recorded in a carefully thought-out order so that even
 
 - Worth turning into an explicit test strategy: for a given multi-microop mutation, truncate the journal at every possible prefix length and assert replay always leaves a valid (possibly stale, possibly slightly leaky) snapshot — same idea SQLite's WAL recovery tests use.
 - For cases where it's not (easily) satisfiable: Maybe introduce two additional `Op` variants: `StartAtomic` and `EndAtomic`. If the journal of an opened file has a dangling `StartAtomic`, truncate it from that point. This might require us to hold off triggering a flush until `EndAtomic` is reached.
+
+## Allocator
+
+- In `TypeDescriptor`, maybe make `inline_size` a field for all kinds (i.e., turn `TypeDescriptor` into a struct with fields `inline_size` and `kind`). When serializing or fingerprinting, ignore `inline_size` for everything where `kind` is not `Opaque` or maybe `Capsule`. It can be reconstructed recursively when reading serialized type schemas. But we might need the `inline_size` as a cache when doing schema resolution (although, this probably means we only need it then, not for schemas that we don't need to resolve, so we may decide to hold off and annotate the schema with `inline_sizes` once we need them).
+- Pointer types should be associated types of `Allocator`, and the concrete types should be defined in `kladde-alloc`. This will also allow application authors to chose between 32-bit and 64-bit pointers.
