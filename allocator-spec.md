@@ -24,12 +24,12 @@ and even before anything is flushed (see `spec.md`, "Pointers and Memory
 Management"). The four types differ only in what *operations* they permit and in
 whether they carry a static type.
 
-| Type | Owned? | `Copy`? | Type-erased? | Size | Resizable? |
-|---|---|---|---|---|---|
-| `UniquePointerResizable` | yes | no | yes | variable, stored by the allocator | **yes** |
-| `UniquePointerFixedSize` | yes | no | yes | fixed, recoverable without per-block storage | no |
-| `UniquePointer<T>` | yes | no | no (`T`) | fixed = `T::INLINE_SIZE` | no |
-| `RawPointer` | no (borrowed address) | **yes** | yes | — (address only) | — |
+| Type                     | Owned?                | `Copy`? | Type-erased? | Size                                         | Resizable? |
+| ------------------------ | --------------------- | ------- | ------------ | -------------------------------------------- | ---------- |
+| `UniquePointerResizable` | yes                   | no      | yes          | variable, stored by the allocator            | **yes**    |
+| `UniquePointerFixedSize` | yes                   | no      | yes          | fixed, recoverable without per-block storage | no         |
+| `UniquePointer<T>`       | yes                   | no      | no (`T`)     | fixed = `T::INLINE_SIZE`                     | no         |
+| `RawPointer`             | no (borrowed address) | **yes** | yes          | — (address only)                             | —          |
 
 ### 1.1 `UniquePointerResizable` — owned, erased, variable-capacity
 
@@ -158,15 +158,15 @@ fixed region must still be reclaimable (the root, boxed values, and future
 chunks are all freed eventually). Only the *size-changing* operations are gated;
 freeing, `raw()`, and `resolve` apply uniformly. Availability by handle:
 
-| operation | `Resizable` | `FixedSize` | `UniquePointer<T>` | `RawPointer` |
-|---|---|---|---|---|
-| `free` / `free_fixed` / `free_boxed` | ✓ | ✓ | ✓ | — |
-| `resize` | ✓ | ✗ (compile error) | ✗ (compile error) | — |
-| `splice` | ✓ | ✗ (compile error) | ✗ (compile error) | — |
-| `capacity` | ✓ | — (size known, not stored) | — (size = `INLINE_SIZE`) | — |
-| `raw()` | ✓ | ✓ | ✓ | (is one) |
-| `read`/`write`/`copy` | via `raw()` | via `raw()` | via `raw()` | ✓ |
-| `resolve` | ✓ | ✓ | ✓ | — |
+| operation                            | `Resizable` | `FixedSize`                | `UniquePointer<T>`       | `RawPointer` |
+| ------------------------------------ | ----------- | -------------------------- | ------------------------ | ------------ |
+| `free` / `free_fixed` / `free_boxed` | ✓           | ✓                          | ✓                        | —            |
+| `resize`                             | ✓           | ✗ (compile error)          | ✗ (compile error)        | —            |
+| `splice`                             | ✓           | ✗ (compile error)          | ✗ (compile error)        | —            |
+| `capacity`                           | ✓           | — (size known, not stored) | — (size = `INLINE_SIZE`) | —            |
+| `raw()`                              | ✓           | ✓                          | ✓                        | (is one)     |
+| `read`/`write`/`copy`                | via `raw()` | via `raw()`                | via `raw()`              | ✓            |
+| `resolve`                            | ✓           | ✓                          | ✓                        | —            |
 
 **Consequence (this is the point).** Type-enforcement upgrades "fixed" from a
 *hint* to a *guarantee*: an allocator may assume a fixed region never resizes,
@@ -326,7 +326,7 @@ version is unaffected.
 
 ---
 
-## 6. The hashmap element type (normative)
+## 6. The hashmap element type (normative, not yet implemented -- TODO)
 
 To satisfy the "never parameterize by container type" rule
 ([§4.3](#43-typed-convenience-extension-trait-normative)),
@@ -364,15 +364,15 @@ Caveats to enter with eyes open:
 This overhaul renames and re-types; it does not touch the journal microops or
 crash-consistency model. Approximate mapping from the current surface:
 
-| Current | This spec |
-|---|---|
-| `UniqueArrayPointer<T>` (content pointer, container-typed) | `UniquePointerResizable` (erased) |
-| `UniquePointer<T>` (typed fixed) | `UniquePointer<T>` (unchanged role; now `UniquePointerFixedSize` + phantom) |
-| — | `UniquePointerFixedSize` (new: erased fixed) |
-| `RawPointer` | `RawPointer` (unchanged) |
-| `Allocator::alloc_array` / `free_array` / `resize_array` / `array_capacity` / `splice` | `alloc_resizable` / `free_resizable` / `resize` / `capacity` / `splice` |
-| `Allocator::alloc` / `free` (typed fixed) | `AllocatorExt::alloc_boxed` / `free_boxed` (typed) + `alloc_fixed` / `free_fixed` (erased, defaulted) |
-| `PersistableHashMap` hand-rolled `1 + K + V` slot | array of `Entry<K, V>` |
+| Current                                                                                | This spec                                                                                            |
+| -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `UniqueArrayPointer<T>` (content pointer, container-typed)                             | `UniquePointerResizable` (erased)                                                                    |
+| `UniquePointer<T>` (typed fixed)                                                       | `UniquePointer<T>` (unchanged role; now `UniquePointerFixedSize` + phantom)                          |
+| —                                                                                      | `UniquePointerFixedSize` (new: erased fixed)                                                         |
+| `RawPointer`                                                                           | `RawPointer` (unchanged)                                                                             |
+| `Allocator::alloc_array` / `free_array` / `resize_array` / `array_capacity` / `splice` | `alloc_resizable` / `free_resizable` / `resize` / `capacity` / `splice`                              |
+| `Allocator::alloc` / `free` (typed fixed)                                              | `AllocatorExt::alloc_boxed` / `free_boxed` (typed) + `alloc_fixed` / `free_fixed` (erased, defaulted) |
+| `PersistableHashMap` hand-rolled `1 + K + V` slot                                      | array of `Entry<K, V>`                                                                               |
 
 Migration is contained: the resizable/erased handle is already nearly
 encapsulated inside `PersistableVec`/`PersistableHashMap`, and `UniquePointer<T>`
