@@ -102,13 +102,9 @@ macro_rules! impl_persistable_tuple {
 
             #[allow(unused_variables, unused_mut, unused_assignments)]
             fn store<__B: Backend>(&mut self, backend: &__B, location: Location) {
-                let mut offset = location.offset;
+                let mut offset = 0u32;
                 $(
-                    Persistable::store(
-                        &mut self.$idx,
-                        backend,
-                        Location { anchor: location.anchor, offset },
-                    );
+                    Persistable::store(&mut self.$idx, backend, location + offset);
                     offset += <$T as Persistable>::INLINE_SIZE as u32;
                 )*
             }
@@ -124,14 +120,11 @@ macro_rules! impl_persistable_tuple {
                 clippy::unused_unit
             )]
             fn load<__B: Backend>(backend: &__B, location: Location) -> Self {
-                let mut offset = location.offset;
+                let mut offset = 0u32;
                 $(
                     // Bind the component to a local named after its own
                     // type parameter (value/type namespaces don't clash).
-                    let $T = <$T as Persistable>::load(
-                        backend,
-                        Location { anchor: location.anchor, offset },
-                    );
+                    let $T = <$T as Persistable>::load(backend, location + offset);
                     offset += <$T as Persistable>::INLINE_SIZE as u32;
                 )*
                 ($($T,)*)
@@ -170,15 +163,14 @@ macro_rules! impl_persistable_tuple {
                 clippy::unused_unit
             )]
             pub fn parts(&mut self) -> ( $(<$T as Persistable>::Guard<'_, __B>,)* ) {
-                let anchor = self.location.anchor;
-                let mut offset = self.location.offset;
+                let mut offset = 0u32;
                 $(
                     // Each component guard borrows a disjoint `&mut self.inner.$idx`.
                     let $T = {
                         let __g = <$T as Persistable>::guard(
                             &mut self.inner.$idx,
                             self.backend,
-                            Location { anchor, offset },
+                            self.location + offset,
                         );
                         offset += <$T as Persistable>::INLINE_SIZE as u32;
                         __g

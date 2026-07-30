@@ -205,6 +205,20 @@ pub struct Location {
     pub offset: u32,
 }
 
+impl std::ops::Add<u32> for Location {
+    type Output = Location;
+
+    /// Advances the location by `offset` bytes within the same anchor --
+    /// how an inline value reaches a field/element at a static offset
+    /// (`location + field_offset`).
+    fn add(self, offset: u32) -> Location {
+        Location {
+            anchor: self.anchor,
+            offset: self.offset + offset,
+        }
+    }
+}
+
 /// Writes an 8-byte `{ target: u32, len: u32 }` header at `location` --
 /// the fixed-size inline representation every "owning" [`Persistable`]
 /// type (one with a separate content allocation: `PersistableVec`,

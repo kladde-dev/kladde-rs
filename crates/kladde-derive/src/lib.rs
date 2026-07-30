@@ -563,10 +563,7 @@ fn derive_struct(
                 #(
                     <#field_ty as ::kladde_traits::Persistable>::load(
                         backend,
-                        ::kladde_traits::Location {
-                            anchor: location.anchor,
-                            offset: location.offset + #field_offset,
-                        },
+                        location + #field_offset,
                     ),
                 )*
             )
@@ -579,10 +576,7 @@ fn derive_struct(
                 #(
                     #field_ident: <#field_ty as ::kladde_traits::Persistable>::load(
                         backend,
-                        ::kladde_traits::Location {
-                            anchor: location.anchor,
-                            offset: location.offset + #field_offset,
-                        },
+                        location + #field_offset,
                     ),
                 )*
             }
@@ -629,10 +623,7 @@ fn derive_struct(
                     <#field_ty as ::kladde_traits::Persistable>::guard(
                         &mut self.inner.#member,
                         self.backend,
-                        ::kladde_traits::Location {
-                            anchor: self.location.anchor,
-                            offset: self.location.offset + #field_offset,
-                        },
+                        self.location + #field_offset,
                     ),
                 )*
             )
@@ -656,10 +647,7 @@ fn derive_struct(
                     #field_ident: <#field_ty as ::kladde_traits::Persistable>::guard(
                         &mut self.inner.#member,
                         self.backend,
-                        ::kladde_traits::Location {
-                            anchor: self.location.anchor,
-                            offset: self.location.offset + #field_offset,
-                        },
+                        self.location + #field_offset,
                     ),
                 )*
             }
@@ -683,10 +671,7 @@ fn derive_struct(
                     <#field_ty as ::kladde_traits::Persistable>::guard(
                         &mut self.inner.#member,
                         self.backend,
-                        ::kladde_traits::Location {
-                            anchor: self.location.anchor,
-                            offset: self.location.offset + #field_offset,
-                        },
+                        self.location + #field_offset,
                     )
                 }
             )*
@@ -712,10 +697,7 @@ fn derive_struct(
                     ::kladde_traits::Persistable::store(
                         &mut self.#member,
                         backend,
-                        ::kladde_traits::Location {
-                            anchor: location.anchor,
-                            offset: location.offset + #field_offset,
-                        },
+                        location + #field_offset,
                     );
                 )*
             }
@@ -955,10 +937,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
                         ::kladde_traits::Persistable::store(
                             #bindings,
                             backend,
-                            ::kladde_traits::Location {
-                                anchor: location.anchor,
-                                offset: location.offset + 4 + #field_offset,
-                            },
+                            location + 4 + #field_offset,
                         );
                     )*
                 }
@@ -982,10 +961,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
                             #(
                                 #field_ident: <#field_ty as ::kladde_traits::Persistable>::load(
                                     backend,
-                                    ::kladde_traits::Location {
-                                        anchor: location.anchor,
-                                        offset: location.offset + 4 + #field_offset,
-                                    },
+                                    location + 4 + #field_offset,
                                 ),
                             )*
                         }
@@ -996,10 +972,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
                         #(
                             <#field_ty as ::kladde_traits::Persistable>::load(
                                 backend,
-                                ::kladde_traits::Location {
-                                    anchor: location.anchor,
-                                    offset: location.offset + 4 + #field_offset,
-                                },
+                                location + 4 + #field_offset,
                             ),
                         )*
                     )
