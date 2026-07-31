@@ -13,7 +13,7 @@ This document summarizes ideas for making the allocator part of Kladde more modu
 
 ## Core idea: separate allocator into a re-usable standalone project
 
-See [`assessment.md`]:
+See [`assessment.md`](assessment.md):
 > **`kladde-alloc` as a standalone product.** The type-agnostic relocatable persistent heap is reusable well beyond this library; the [`spec.md`](spec.md) Automerge comparison already hints at this. Worth keeping the crate boundary clean with that option in mind.
 
 A few design decisions follow from this that currently don't hold:
@@ -30,8 +30,10 @@ A few design decisions follow from this that currently don't hold:
 
 ## Detailed consequences
 
-- The default allocator implemented in `kladde-alloc` should be parameterized by its address type (the actual memory addresses used only internally by the backend and never exposed to user types), a `Size` type (used to express sizes of memory allocations, and exposed to user types), and its index/ID type (the stable identifier of pointers that survives compaction, and that is exposed to user types so they can serialize it). At least (NonZero) 32 and 64 bit integers should be supported for all of them. This makes the default allocator usable different situations from embedded to desktop, and puts the decision about pointer size on the actual format that uses the allocator.
+- The default allocator implemented in `kladde-alloc` should be parameterized by its address type (the actual memory addresses used only internally by the backend and never exposed to user types), a `Size` type (used to express sizes of memory allocations, and exposed to user types), and its index/ID type (the stable identifier of pointers that survives compaction, and that is exposed to user types so they can serialize it). At least (NonZero) 32 and 64 bit integers should be supported for all of them. This makes the default allocator usable in different situations from embedded to desktop, and puts the decision about pointer size on the actual format that uses the allocator.
 	- I think when used inside Kladde, the default configuration should be `Address=u64`, `Size=u32`, `Id=NonZeroU32` (nonzero because the ID is exposed to user types, who will serialize it to allocated memory of the containing data structures, and we'll eventually want to implement niche optimizations). Choosing 64-bit `Address`es allows for essentially arbitrarily large files, and limiting `Size` and `Id` to 32 bit only limits the size of *individual allocations* (to just below 4 GiB) and the *number of allocations* (to 4 billion), both of which seem fine (allocating an individual chunk of memory > 4 GiB would render the advantages of Kladde, i.e., its automatic memory management, moot anyway; and an application that creates > 4 billion allocations is probably doing something wrong because Kladde is designed to make inline memory layout the default, avoiding unnecessary indirections). The smaller `Size` and `Id` will hopefully reduce storage costs of data structures that hold a lot of pointers, and possibly reduces memory requirements of the allocator (which will likely have to store IDs more often than addresses, we'll see). Maybe we want to set the defaults of trait parameters (e.g., for `Allocator`) or define type aliases accordingly. Which one is better (default type parameters or type aliases)?
+> **Claude (defaults vs. type aliases):** These are not really alternatives, because `Id`/`Address`/`Size` are *associated* types (§`trait Allocator`), and associated types cannot carry caller-overridable defaults. So: put default *type parameters* on the concrete allocator **struct** (`struct DefaultAllocator<Id = NonZeroU32, Address = u64, Size = u32>`, which *can* default), and use a **type alias** to name the assembled Kladde backend (`type KladdeBackend = JournaledBackend<FileStorage, DefaultAllocator>;`). Defaults on the struct give ergonomics; the alias gives a single name to spell. Trait-level defaults don't enter into it.
+
 - Completely decouple `Allocator` from `Persistable` types (except maybe via an extension trait, defined in the crate where `Persistable` is defined). Allocators don't know anything about types and aren't allowed to do anything different depending on the type of the stored data. They only know the size of an allocation and whether it is fixed or dynamically sized.
 
 ## Layered architecture
@@ -43,7 +45,7 @@ Traits and structs build on each other. At the lowest level (`Allocator` and `St
 - The trait `Storage` is orthogonal to `Allocator` and its descendants. While `Allocator` models memory *management*, `Storage` models memory *access*. It provides unstructured random and sequential memory access to a large block of stored data (e.g., a file).
 - Concrete implementations of `WriteBackend` and `Backend` (`UnjournaledBackend` and `Journaled[Write]Backend`) are composed of a `TransparentAllocator` and a `Storage`, and they are generic over the concrete types of both of these. They perform two tasks:
 	- they translate the high-level read/write operations of the `Backend` trait ("read/write bytes `x..y` of memory allocation `p`") to low-level read/write operations in an encapsulated `Storage`; and
-	- they delegate `Allocator` calls to the encapsulated allocator, while replicating mutating `Allocator` calls (like `alloc_*`, `free_*`) to an in-`Store` representation of the allocator state from which the encapsulated `TransparentAllocator` can be recreated. The backend implementations use the encapsulated `TransparentAllocator` itself to manage memory allocations that hold allocator state in-`Storeage`. This way, allocator state and user data are automatically separated without having to define fixed regions in the file that are reserved for one or the other.
+	- they delegate `Allocator` calls to the encapsulated allocator, while replicating mutating `Allocator` calls (like `alloc_*`, `free_*`) to an in-`Storage` representation of the allocator state from which the encapsulated `TransparentAllocator` can be recreated. The backend implementations use the encapsulated `TransparentAllocator` itself to manage memory allocations that hold allocator state in-`Storage`. This way, allocator state and user data are automatically separated without having to define fixed regions in the file that are reserved for one or the other.
 - On top of `Backend`, the header, schema, and its fingerprint are stored in normal allocations, reachable from a pointer stored in some fixed-sized header. For the serialized schema, we might actually reuse `PersistableVec<u8>` once we have a good implementation of that and pin it to a given version there.
 
 ### `trait Allocator`
@@ -69,10 +71,77 @@ Traits and structs build on each other. At the lowest level (`Allocator` and `St
 	- We should also require methods to convert between fixed sized and resizable allocations. These consume the old pointer and return a new pointer (possibly with a new `Id` because some `Allocator`s might use a bit in the `Id` as a flag for fixed size vs resizable).
 	- Don't use the term `capacity` here when referring to allocation sizes. Always call it `size` (also not `byte_size`) because that's what it is *from the perspective of the allocator*. The implementation of a `Persistable` type might interpret the *size of the allocation* as a *capacity of a container* but that's at a higher level of abstraction.
 
+> **Claude:** Two things before the sketch.
+> - **Associated pointer types are the single most consequential choice in this document, and I'd reconsider them** — see [Problems and regressions](#problems-and-regressions), item 1. In brief: they force a backend type parameter through the entire `Persistable` stack (your Question at the bottom of the doc), and the `MetaData`/`lookup` table you already introduce makes the "cache sizedness/size *in the pointer*" motivation redundant (your own line notes those queries hit the table anyway). Keeping the pointers as concrete newtypes over `Id` (shared across allocators) preserves inherent `.raw()`/`.promote()` methods *and* keeps `Persistable` un-parameterized. The sketch below is the associated-type version you described; the concrete-`Id` alternative is spelled out in the problems section.
+> - `downcast` (returning an *owned* handle from a raw pointer) is really the operation `load` needs: deserialize an `Id`, reconstruct the single owner **of the correct kind**, learning sizedness on the way. I sketch it as `resolve_owned(Id) -> Option<Owned>` (an enum), which the chunked-vec test case uses to tell small-vec from linked-list. Caveat: like today's `from_index`, it can mint a *second* owner for an already-owned region, so it stays a load/allocator-internal method by convention, not something handed to application code.
+
+A sketch (this compiles in `crates/generic-alloc`; `Word` is a helper trait bounding the generic unsigned integers — see problems item 3):
+
+```rust
+pub trait Allocator {
+    type Id: Copy + Eq + Hash;              // stable, serializable (`Index` in allocator-spec.md)
+    type Address: Word;                     // internal only; never exposed above TransparentAllocator
+    type Size: Word + Into<Self::Address>;
+    type Meta: Default;                     // per-allocation, kept in the allocator's own table
+
+    type ResizablePointer;                  // owned, single-owner, impl-chosen representation
+    type FixedPointer;                      // owned, single-owner
+    type RawPointer: Copy;                  // Copy identity: carries no size and no sizedness
+
+    // --- lifecycle (deliberately no read/write/splice -- those are on Backends) ---
+    fn alloc_resizable(&self, size: Self::Size) -> Self::ResizablePointer;
+    fn alloc_fixed(&self, size: Self::Size) -> Self::FixedPointer;
+    fn free_resizable(&self, p: Self::ResizablePointer);
+    fn free_fixed(&self, p: Self::FixedPointer);
+    fn resize(&self, p: &Self::ResizablePointer, new_size: Self::Size);   // FixedPointer has no resize (the gate)
+
+    // --- reserve an Id now, assign an Address later (journaling) ---
+    fn reserve_resizable(&self, size: Self::Size) -> Self::ResizablePointer { self.alloc_resizable(size) }
+    fn reserve_fixed(&self, size: Self::Size) -> Self::FixedPointer { self.alloc_fixed(size) }
+    fn claim_resizable(&self, _p: &Self::ResizablePointer) {}
+    fn claim_fixed(&self, _p: &Self::FixedPointer) {}
+
+    // --- convert kinds: consume the old handle, may mint a new Id, must NOT move memory ---
+    fn make_resizable(&self, p: Self::FixedPointer) -> Self::ResizablePointer;
+    fn make_fixed(&self, p: Self::ResizablePointer) -> Self::FixedPointer;
+
+    // --- erase to a Copy identity / serialize + recover the Id ---
+    fn raw_resizable(&self, p: &Self::ResizablePointer) -> Self::RawPointer;
+    fn raw_fixed(&self, p: &Self::FixedPointer) -> Self::RawPointer;
+    fn id(&self, raw: Self::RawPointer) -> Self::Id;                       // serialize this
+    fn resolve_owned(&self, id: Self::Id) -> Option<Owned<Self>>;         // reconstruct owner on load
+
+    // --- query the table (NB: address is NOT here -- see TransparentAllocator) ---
+    fn lookup(&self, raw: Self::RawPointer) -> Option<Allocation<Self>>;  // id, size, sizedness, meta
+    fn size(&self, raw: Self::RawPointer) -> Option<Self::Size> { /* default: self.lookup(raw).map(..) */ }
+    fn meta(&self, raw: Self::RawPointer) -> Option<Self::Meta> { /* default: self.lookup(raw).map(..) */ }
+}
+
+pub enum Owned<A: Allocator + ?Sized> { Resizable(A::ResizablePointer), Fixed(A::FixedPointer) }
+pub enum Sizedness { Fixed, Resizable }
+pub struct Allocation<A: Allocator + ?Sized> {
+    pub id: A::Id, pub size: A::Size, pub sizedness: Sizedness, pub meta: A::Meta,
+}
+```
+
+(I renamed the `reserve_*` byte-size parameters from `usize` to `Self::Size`, applying your own "call it `size`, in `Size`, not `usize`" rule from the bullet above.)
+
 
 ### `trait TransparentAllocator: Allocator`
 - Adds a method to query for actual addresses of `RawPointer`s, and default-implemented methods for querying `UniquePointerResizable` and `UniquePointerFixedSize`. These methods *may* return `None` if the provided pointers were only reserved but never claimed.
 - Also adds a required `resize_transparently` method that is like `Allocator::resize` but returns a `Some(old_address, new_address)` if resizing requires moving data.
+
+```rust
+pub trait TransparentAllocator: Allocator {
+    /// `None` if `raw` was only reserved, never claimed.
+    fn address(&self, raw: Self::RawPointer) -> Option<Self::Address>;
+
+    /// Like `Allocator::resize`, but reports a relocation as `Some((old, new))`
+    /// so the enclosing `Backend` can move the bytes in `Storage`.
+    fn resize_transparently(&self, p: &Self::ResizablePointer, new_size: Self::Size)
+        -> Option<(Self::Address, Self::Address)>;
+}
+```
 
 ### `trait WriteBackend: Allocator`
 - Extends `Allocator` with write operations (+ splice, which combines writing with memory management).
@@ -82,16 +151,47 @@ Traits and structs build on each other. At the lowest level (`Allocator` and `St
 - Does however provide querying allocator methods (like `size` or the above `downcast`), which may seem like they are like `read` operations and should thus be forbidden, but that's OK: any `WriteBackend` implementation will have to hold an in-memory `Allocator` that is always up to date. Only reads from *allocated memory* are forbidden in `Guard` methods; querying the allocator state is OK and often unavoidable.
 - `write` should maybe take a `RawPointer` and a `size: Size`, and return an `impl Write` (`UnjournaledBackend` below simply hands out the `&mut Storage` after seeking to the position; for `JournaledBackend`, we should check if we can write the `Op` header and then simply return the `&mut Storage` to let the user fill in the rest of the op. It seems a bit dangerous because it would break not only if the user overwrites but even if they write less than promised). But it would be nice to allow users to write through a `Write` because implementations of `Persistable` types might realistically want to call `write_vectored`
 
+```rust
+pub trait WriteBackend: Allocator {
+    /// A writer positioned at `raw`, promising exactly `size` bytes.
+    fn write_at(&self, raw: Self::RawPointer, size: Self::Size) -> impl Write + '_;
+    /// Atomic resize + tail-shift + content overwrite of one region.
+    fn splice(&self, p: &Self::ResizablePointer, offset: Self::Size, old_len: Self::Size, new: &[u8]);
+}
+```
 
-### `trait Backend: WriteBackend`
+> **Claude:** You already sense the danger, and it's real: **handing out a bare `impl Write` for the *journaled* backend can corrupt the op frame.** The journal's crash-safety rests on each op being a length-prefixed, checksummed frame (see `spec.md`, "On-Disk Layout"). If you write the header promising `size` bytes and then the caller writes fewer (or more), the frame's length/checksum no longer match — recovery will (correctly) discard a torn frame and *silently lose the write*. So I'd keep "return `impl Write`" only for the **unjournaled** backend (no frame to corrupt), and make the **journaled** `write` take the bytes (it already knows `size`) or `&[IoSlice]` for the `write_vectored` case, writing header+payload+checksum itself. Separately, `write_at(&self) -> impl Write` collides with the single storage cursor and `&self` — see the `Backend` note below and problems items 4–5.
 - Adds a `read` method. It should take a `RawPointer` and an `offset: Size` and return an `impl Read + Seek` (the backends below will simply hand out the actual `&mut Storage`, after seeking to the appropriate position)
 - Still implements `write` (because it is also a `WriteBackend`) and mutating allocator methods (because it is also an `Allocator`, and `Allocator` isn't split into 2 traits for querying and modifying). But that's OK: if you want to prevent writing while reading is allowed, never hand out an owned `Backend`, only a shared reference `&impl Backend`.
 	- [ ] TODO: is this true? It seems like `write` and `alloc_*` only take `&self`. That's probably to make `Guard` implementations more ergonomic. But it will require some `Cell` or `RwLock` gymnastics -- can we elevate that to the `WriteBackend` level so that `Allocator` has a more normal API that takes `&mut self` for mutating methods?
+
+```rust
+pub trait Backend: WriteBackend {
+    /// A reader positioned at `raw + offset`.
+    fn read_at(&self, raw: Self::RawPointer, offset: Self::Size) -> impl Read + Seek + '_;
+}
+```
+
+> **Claude (answering the `&self`/`&mut self` TODO):** Keep the mutating methods `&self`. It is *not* gratuitous: the guard model relies on it. A parent guard holds `&B` and hands each nested field guard the *same* `&B` by reborrow; if mutating methods were `&mut self`, two sibling field guards would each need `&mut B` and conflict. Elevating to `&mut self` would break exactly the nested-guard ergonomics the whole design exists for, and the "`Cell`/`RwLock` gymnastics" is the contained price of that.
+> But `&self` collides with returning `impl Write`/`impl Read + Seek` over a *single* storage cursor: **`Seek::seek` takes `&mut self`, so a reader that seeks into the one backing cursor cannot be handed out from a `&self` method** (my prototype hit this and had to stub `read_at`). You can have any *two* of {`&self` mutating methods, returning `impl Write`/`impl Read`, a single storage cursor} but not all three. Cleanest reconciliation: `&self` + `RefCell<Storage>`, and have `read`/`write` *take* the bytes (or a `&mut dyn Write`/`&mut dyn Read` callback) instead of *returning* a long-lived `impl Write`/`impl Read`. That gives up the `write_vectored`-through-a-returned-`Write` convenience but keeps `&self` and (for the journaled backend) frame control. See problems items 4–5.
 
 ### `trait Storage: Read + Write + Seek`
 - Provides both random and sequential read and write access (via `Read` and `Write`, and `Seek` for random access), plus resizing (via a trait method), in some abstract storage. The storage could be a file but doesn't have to be.
 - A concrete implementation might reserve a tiny fixed-size header region that it manages itself by offsetting addresses accordingly (the header should only hold very basic information like a magic number and parameters of the allocator; any other header data should go into an allocated memory region so that the header size can evolve without having to rewrite the whole file).
 - A `#[cfg(test)] struct MockStorage(Vec<u8>)` should implement `Storage` in memory for tests. Don't make it public because I can't yet see a use case outside of tests for it. We'll eventually want to add a public in-memory storage for testing `Persistable` user types, but that should probably be a `MockBackend` that implements `Backend`, not a `MockStorage`.
+
+```rust
+pub trait Storage: Read + Write + Seek {
+    fn resize(&mut self, new_len: u64) -> io::Result<()>;
+    fn len(&self) -> io::Result<u64>;
+}
+
+// test-only, in-memory: a Cursor gives it the Seek that a bare Vec<u8> lacks.
+#[cfg(test)]
+struct MockStorage(std::io::Cursor<Vec<u8>>);
+```
+
+> **Claude:** small correction — `struct MockStorage(Vec<u8>)` can't implement `Storage` directly, because `Vec<u8>` implements `Write` but not `Seek`. Wrap it in `std::io::Cursor<Vec<u8>>` (which is `Read + Write + Seek`), as the prototype does. `resize` then goes through `cursor.get_mut().resize(..)`.
 
 ### `struct UnjournaledBackend<S: Storage, A: TransparentAllocator<Meta=...>>`
 - Implements `Backend` (and therefore `WriteBackend` and `Allocator`) but probably does not implement `TransparentAllocator` (because true addresses should never be exposed to the implementations of user types since they're not stable and users can't read from or write to arbitrary memory addresses anyway).
@@ -103,6 +203,19 @@ Traits and structs build on each other. At the lowest level (`Allocator` and `St
 - Holds its own immediate (inline fixed-size) state probably at a fixed address in the file (which it shifts away in all `Backend::{read, write, seek}` calls), but then all indirect parts of the state in memory allocations managed by the in-memory allocator. For the `Storage` representation of the allocator, the allocator-related allocations may have to be stored in a special bootstrapped way, different from how those allocations then contain the tables of allocations that hold user data.
 - Probably not really useful for Kladde, but a good test of the versatility of the allocator design, and probably a good first step before implementing `JournaledBackend`.
 
+```rust
+pub struct UnjournaledBackend<S: Storage, A: TransparentAllocator> {
+    storage: S,   // on-file bytes
+    alloc: A,     // in-memory allocation table
+}
+// impl Allocator      -> forwards to `alloc`
+// impl WriteBackend   -> alloc.address(raw) -> storage.seek(..) -> write
+// impl Backend        -> alloc.address(raw) -> storage.seek(..) -> read
+// does NOT impl TransparentAllocator (addresses stay hidden from user types)
+```
+
+(The prototype implements exactly this skeleton and it composes — modulo the `read_at`/`&self`/`Seek` snag above, which it stubs.)
+
 ### `struct JournaledBackend<S: Storage, A: TransparentAllocator<Meta=...>>` (and `JournaledWriteBackend`)
 - Similar to `UnjournaledBackend` except that only `JournaledBackend` provides read operations. The two types are probably newtype wrappers around a shared private inner type, and they should have methods to turn one into the other (e.g., `JournaledWriteBackend::flush(&mut self) -> &JournaledBackend`; never hand out an owned `JournaledBackend` because that would allow reading and writing).
 - Forwards any `Allocator` method calls to the in-memory allocator but only calls `reserve_*` instead of `alloc_*`.  Appends a corresponding `Op` to the journal. The `Op` for allocation encapsulates the index of the returned allocation, its size, and whether it's resizable, but not the actual address because that doesn't even get assigned by `reserve_*` and is deferred to journal replay (which calls `claim_*`). Deferring address assignments will allow us to grow the journal at the end of the file without bumping into any address regions that are already reserved for memory allocations by `Op`s that are earlier in the journal.
@@ -111,14 +224,71 @@ Traits and structs build on each other. At the lowest level (`Allocator` and `St
 - allocating on a `JournaledAllocator` doesn't actually pick an address yet. It only records a new index and the allocation size (and whether it's resizable) in the journal. True addresses get assigned on journal replay. 
 - Implements journal replay and calls it automatically when the journal overflows and we're not inside a transaction. Journal replay assigns actual addresses to new allocations, and resolves the addresses of any memory reads/writes on the journal.
 
+```rust
+struct JournaledInner<S: Storage, A: TransparentAllocator> {
+    storage: S,
+    alloc: A,
+    journal: /* append-only, framed Op log; see spec.md On-Disk Layout */,
+}
+pub struct JournaledWriteBackend<S, A>(JournaledInner<S, A>);  // impl WriteBackend only
+pub struct JournaledBackend<S, A>(JournaledInner<S, A>);       // impl Backend (read allowed post-flush)
+
+impl JournaledWriteBackend<S, A> {
+    fn flush(&mut self) -> &JournaledBackend<S, A> { /* replay, then reborrow as read-only */ }
+}
+// alloc_* -> alloc.reserve_*(size) + append Alloc-Op (id, size, sizedness; NO address)
+// replay  -> alloc.claim_*(..)     + apply pending writes at now-known addresses
+```
+
+> **Claude (re your Question "can the two backends share code?", and the compaction Question):** yes — journal **replay** is essentially "run the `UnjournaledBackend` immediate path over the buffered ops." Factor a single `fn apply(alloc: &mut A, storage: &mut S, op: Op)` that both call: `UnjournaledBackend` calls it inline per mutation, `JournaledBackend` calls it per op during replay. The prototype's `UnjournaledBackend` write path *is* that body. And compaction (Question 3) becomes markedly simpler under Id-serialization: the allocator computes a move plan `[(id, old_addr, new_addr)]`, the backend performs the `storage` moves and updates the table — and because serialized pointers are `Id`s, **no on-disk pointer needs rewriting** (contrast the current design, which must rewrite every serialized target address). That is the upside of the handle-table tradeoff flagged in problems item 2.
+
 ### `trait AllocatorExt: Allocator`
 
 Extension trait with a blanket implementation for every `Allocator`, but defined in the crate where `Persistable` is defined. See Section 4.3 in `allocator-spec.md` except for the following nitpicks:
 - Don't call methods `*_boxed`. Call them `*_typed` instead.
-- Add `promote<T>` and `demote` methods to convert between `UniquePointer<T>` and `FixedSizedPointer` (they should probably be on the pointer types themselves but that's only possible for `UniquePointer<T>::demote` but not for `FixedSizePointer::promote` since `FixedSizePointer` is defined externally).
+- Add `promote<T>` and `demote` methods to convert between `UniquePointer<T>` and `UniquePointerFixedSize` (they should probably be on the pointer types themselves but that's only possible for `UniquePointer<T>::demote` but not for `UniquePointerFixedSize::promote` since `UniquePointerFixedSize` is defined externally).
 - Split `alloc_array` into two methods:
 	- `alloc_fixed_size_array<T: Persistable>`, which returns a `UniquePointerFixedSize`; and
 	- `alloc_resizable_array<T: Persistable>`, which returns a `UniquePointerResizable`
+
+```rust
+// Defined in the `Persistable` crate; blanket-impl'd for every `Allocator`.
+pub trait AllocatorExt: Allocator {
+    fn alloc_typed<T: Persistable>(&self) -> UniquePointer<T>;               // Box<T>, size = T::INLINE_SIZE
+    fn free_typed<T>(&self, p: UniquePointer<T>);
+    fn alloc_fixed_size_array<T: Persistable>(&self, len: usize) -> Self::FixedPointer;
+    fn alloc_resizable_array<T: Persistable>(&self, len: usize) -> Self::ResizablePointer;
+    // promote/demote between `UniquePointer<T>` and `Self::FixedPointer`
+}
+impl<A: Allocator + ?Sized> AllocatorExt for A {}
+```
+
+> **Claude:** naming (`*_typed`, `alloc_{fixed_size,resizable}_array`) is fine. The catch is `UniquePointer<T>`: with associated pointer types it must wrap `Self::FixedPointer`, so it becomes `UniquePointer<T, A::FixedPointer>` (or must carry the allocator) — the same generics infection as your Persistable Question. `promote`/`demote` can only be inherent on `UniquePointer<T>` (local) → `demote` yes; `promote` from `FixedPointer` must be a trait method here since `FixedPointer` is foreign, exactly as you note. All of this evaporates if pointers stay concrete (problems item 1), where `UniquePointer<T>` is just `FixedPointer` + `PhantomData<T>` as in `allocator-spec.md`.
+
+## Problems and regressions
+
+Written by Claude. This section collects the problems this proposal may run into and the concrete regressions relative to what is implemented today (the `allocator-spec.md` overhaul, now landed) or planned there. Items 1–4 I confirmed against the throwaway prototype in `crates/generic-alloc`; the rest are design-level.
+
+1. **Associated pointer types infect the whole `Persistable` stack with a backend type parameter, and the ergonomic pointer methods are lost.** If `ResizablePointer`/`FixedPointer`/`RawPointer` are `Allocator` associated types, then every container that stores a pointer inline must name *which* allocator's pointer it holds. That is your Question at the bottom of the doc, and the answer propagates: `Persistable` gains a `B` (or `Id`) parameter, which spreads to every `#[derive(Persistable)]` type, every generated guard, and every application `struct` — a real ergonomics and compile-time cost for exactly the audience (application developers) the "Layered architecture" section says it wants to protect. Inherent methods (`p.raw()`, `p.into_fixed()`, `p.promote()`) also become impossible (you can't add inherent methods to an opaque associated type) and must move onto the allocator/`AllocatorExt` (`allocator.raw_resizable(&p)`), which is markedly clunkier than today's `p.raw()`.
+   - **The motivation is largely redundant with `MetaData`.** The stated reason for associated pointers (line ~57: let allocators "cache some metadata like whether it's fixed-size … in the pointer") is exactly what the `MetaData`/`lookup` table already provides — and you note yourself (line ~66) that sizedness/size queries hit that table anyway. So the table already buys the metadata; the pointer needn't.
+   - **Recommendation:** keep the pointers **concrete newtypes over `Id`** (`Resizable<Id>`, `Fixed<Id>`, `Raw<Id>`, `UniquePointer<T> = Fixed<Id> + PhantomData<T>`), shared across all allocators, exactly as `allocator-spec.md` has them but generic over `Id` (defaulting to `NonZeroU32`). Then inherent methods stay, `Persistable` needs no backend parameter (at most an `Id` parameter, defaulted), and allocators still differentiate behavior via the `Meta`/`lookup` table. This is your own third option, and I think it is clearly best. The only thing you give up is allocator-specific *bit-packing of sizedness into the `Id`* — an optimization that saves one table lookup you're doing anyway.
+   - The fixed/resizable **type gate** (allocator-spec §3: `resize`/`splice` only on the resizable handle) survives either way — good, no regression there.
+
+2. **Serializing `Id` instead of the on-disk target reinstates the handle-table design `spec.md` deliberately rejected.** Today a pointer serializes as its current on-disk *target address* (self-locating; compaction rewrites the single owning copy, tracked by a position index). Here it serializes as its `Id`, so the persisted `Id → Address` table becomes **load-bearing**: nothing on disk can be located on open without it. That is precisely the "dense on-disk handle table" that `spec.md`'s *Alternatives Considered* set aside for footprint reasons. The trade is legitimate and has real upsides — stable serialized pointers, **zero pointer rewrites on compaction** (see the compaction note above), cleaner decoupling — but it is a **reversal of a recorded decision** and should be made with eyes open: you now pay a persisted indirection table's footprint, and it is mandatory rather than a reconstructable optimization. (Per-access runtime cost is roughly a wash: both designs already do an in-memory `index → address` lookup.)
+
+3. **Generic integer associated types need an "unsigned word" bound that std doesn't provide.** Making `Address`/`Size` associated types means every offset/size computation needs `+`, `<`, `Into<Address>`, and `usize` conversions over a generic type. Rust has no single "unsigned integer" trait, so you need a helper trait (the prototype's `Word`) or a dependency like `num-traits`, and its bounds ride along on every generic function that does address arithmetic. Manageable, and `Size: Into<Address>` is the right core relation, but it is real bound-noise that the current concrete-`u32` code doesn't have. (You'll also want `TryFrom<usize>`/`to_usize`, because offsets from Rust collections arrive as `usize`.)
+
+4. **`read` returning `impl Read + Seek` cannot be a `&self` method over a single storage cursor.** `Seek::seek` takes `&mut self`; a reader that seeks into the one backing `Storage` cursor therefore needs `&mut` access to it, so `Backend::read(&self) -> impl Read + Seek` can't hand out the real cursor from `&self` — it needs `&mut self` or `RefCell<Storage>` (which then serializes readers, defeating handing out several). The prototype hit this and had to stub `read_at`. Combined with item 5, you can pick any **two** of {`&self` mutating methods, returning `impl Read`/`impl Write`, a single storage cursor}. Practical resolutions: `read(&mut self)` (giving up concurrent readers — fine for single-writer), or return an owned buffer (today's `Vec<u8>`, losing zero-copy), or a positioned-read API that borrows `&Storage` immutably and carries its own offset (`Read` but not `Seek`).
+
+5. **`&self` interior mutability vs. `&mut self` (your TODO).** Keep mutating methods `&self`. The guard model depends on it (nested field guards reborrow the same `&B`); `&mut self` would make sibling field guards conflict. So the "`Cell`/`RwLock` gymnastics" isn't gratuitous — it's the price of the guard ergonomics, and it's contained in the backend. But `&self` collides with returning `impl Write`/`impl Read` (item 4): the clean reconciliation is `&self` + `RefCell<Storage>` with `read`/`write` **taking** bytes / a `&mut dyn Write` callback rather than **returning** a long-lived writer. That costs the `write_vectored`-through-a-returned-`Write` convenience.
+
+6. **A journaled `write` that returns a bare `impl Write` can corrupt the op frame.** The journal's crash-safety rests on each op being a length-prefixed, checksummed frame (`spec.md`, On-Disk Layout). Hand out `&mut Storage` after a header promising `size` bytes and let a `Persistable` author write fewer/more, and the frame's length/checksum no longer agree — recovery discards the torn frame and *silently drops the write*. Keep "return `impl Write`" for the unjournaled backend only; make the journaled `write` take the bytes (or `&[IoSlice]`) and write header+payload+checksum itself.
+
+7. **`reserve`/`claim` adds a "valid but unclaimed" state whose full semantics need pinning down.** Allowing *every* `Allocator` method on reserved-but-unclaimed pointers (line ~63) means `free`, `resize`, `make_fixed`, … must each define their effect on a reservation. It's expressible (the prototype models a reservation as a table row with `address: None`), but write down the state machine (reserved → claimed → freed, and reserved → freed = cancel), and note that `WriteBackend`/`Backend` returning an error for I/O on unclaimed pointers turns every write path fallible where it wasn't before.
+
+8. **Self-hosting bootstrap is a genuine open problem, not a detail.** Storing the allocator's own state in allocations it manages, and its journal in memory it allocates, is circular (lines ~56, ~110): you can't journal the allocation of journal space, and you can't read the allocator table without first knowing where it lives. This needs a bootstrap anchor *outside* the general mechanism — the fixed `Storage` header holding the root address of the persisted allocator state, plus journal space managed specially. The current implementation avoids this entirely because the mock allocator is in-memory and never persists its state; making the allocator self-hosting is new, load-bearing work.
+
+9. **General over-generalization risk.** The document itself worries (twice) about generalizations hurting the Kladde common case. The associated-type pointers are the main instance, but the whole "generic over `Id`/`Address`/`Size`, pointers as associated types, `impl Write`/`impl Read` returns, reserve/claim, `MetaData`" surface is a large jump in API and monomorphization from the concrete, landed `allocator-spec.md`. Most of it is defensible for the "reusable standalone allocator" goal, but I'd gate each piece on a concrete need (the chunked-vec test case is a good forcing function) rather than adopting all of it up front. Concretely, the pieces I'd keep without hesitation: separating `Storage` from `Allocator`; the generic `Id`/`Address`/`Size` (as *struct* params with defaults); `reserve`/`claim`; `size` (not `capacity`); `Meta`/`lookup`. The pieces I'd defer or drop: pointers as *associated* types (item 1), returning `impl Write`/`impl Read` from `&self` (items 4–6), and segments (deferred already).
 
 ## Test case: chunked `PersistedVec` with small-vec optimization
 
@@ -136,17 +306,22 @@ TODO: build a chunked `PersistableVec` implementation for kladde onto the redesi
 	- Alternatively: maybe implement Segments as nested allocators: the outer allocator allocates a vector of pages for the `Segment`, and the inner allocator then manages both its state and its allocated memory inside those pages. Requires the outer allocator to translate addresses, or the inner allocator to respect page boundaries, and maybe requires some gluing when an allocation inside a `Segment` spans multiple pages.
 		- Advantage: this way, not only the memory of the `Segment` but also the allocator-bookkeeping for the `Segment` is loaded lazily (because all the bookkeeping is literally stored inside the `Segment`). Disadvantage: Keeping many segments in memory means we'll have to keep many allocators in memory. But segments are supposed to be large anyway, so the relative overhead might not be so bad.
 		- Unclear: can we statically ensure that the correct allocator is used for every user-space edit operation inside or outside segments?
+	- > **Claude:** agree — defer segments; capsules first. On the static-safety sub-question: with *nested* allocators, a pointer minted by the inner (segment) allocator is meaningless to the outer one, and nothing in the type system stops you from passing it to the wrong allocator unless the pointer *carries* its allocator's identity. The two ways to get that statically are (a) generativity/brand lifetimes (`GhostCell`-style invariant lifetime tokens tying a pointer to one allocator instance) — sound but viral and painful for application ergonomics, or (b) making the segment part of the pointer's *type* — which multiplies the pointer-type-parameter problem from item 1. Realistically you'll want a **runtime** check (the pointer's `Id`/high bits encode which segment; the wrong allocator returns `None` from `lookup`). So: defer, and when you do it, expect a runtime segment check rather than a compile-time guarantee. The lazy-bookkeeping advantage you note is real and attractive.
 - [ ] Can `UnjournaledBackend` and `JournaledBackend` reuse some code from each other? Journal replay should do similar operations to what `UnjournaledBackend` does immediately. 
 - [ ] How would compaction work in this setup? It's the allocator's job to figure out where everything should move, but the allocator needs access to the `Storage` to actually perform it. In addition, any changes to the allocator state would also have to be persisted and operations should probably be journaled, and this is `Backend` logic.
 - [ ] Making pointer types associated types of `Allocator` (and thus of `Backend`) makes the layout of `Opaque` types that store pointers dependent on it, in principle. It probably also means that `Persistable<B>` will need to get a type parameter for the backend. So we'll either have:
-	- `SimplePersistableVec<T, B: Backend> { in_memory: std::vec::Vec<T>, on_disk: B::UniquePointerResizable }` and `impl<T, B: Persistable> Persistable<B> for SimplePersistableVec<T, B>`;
-	- or: `SimplePersistableVec<T, P> { in_memory: std::vec::Vec<T>, on_disk: P }` and `impl<T, B: Persistable> Persistable<B> for SimplePersistableVec<T, B::UniquePointerResizable>`;
+	- `SimplePersistableVec<T, B: Backend> { in_memory: std::vec::Vec<T>, on_disk: B::UniquePointerResizable }` and `impl<T, B: Backend> Persistable<B> for SimplePersistableVec<T, B>`;
+	- or: `SimplePersistableVec<T, P> { in_memory: std::vec::Vec<T>, on_disk: P }` and `impl<T, B: Backend> Persistable<B> for SimplePersistableVec<T, B::UniquePointerResizable>`;
 	- or we'll keep it generic only at the low level, and specialize everything from the level of `Persistable` and upwards to the types actually used in kladde files. Maybe we could still make the trait definition of `Persistable` generic but set default parameters: `trait Persistable<B = JournaledBackend<...>>` if that's possible.
 	- Claude: what's the best choice here? Is there a simpler way?
+	- > **Claude:** The simpler way is to **not make the pointer types associated at all** — then this whole question disappears and `Persistable` needs no `B` parameter (this is [Problems and regressions](#problems-and-regressions) item 1). Keep the *serializable* pointer a concrete newtype over `Id` (e.g. `struct Pointer<Id = NonZeroU32>` / `Resizable<Id>` / `Fixed<Id>`), shared across all allocators, and let allocators keep any per-allocation metadata in the `Meta`/`lookup` table you already have. `SimplePersistableVec<T>` then just stores `Resizable<Id>` inline, no `B`.
+	>   If you insist on associated pointer types, your **third** option is the least-bad: keep it generic only at the very bottom and specialize from `Persistable` upward, and — yes — `trait Persistable<B = KladdeBackend>` with a default *does* work in Rust (default trait type parameters are allowed; only *associated* types can't default). Your first two options both spread `B` through every derived type and guard; the second (`impl Persistable<B> for Vec<T, B::ResizablePointer>`) reads slightly cleaner but is the same infection. Net recommendation: concrete `Id`-newtype pointers; make `Persistable` generic over `Id` only if you truly want 32/64-bit `Id` to be a per-file choice, and default it.
 
 ## Miscellaneous things to keep in mind
 
 These items are not so urgent, maybe defer until we've ironed out the main points.
 	
-- Maybe don't couple `UniquePoitner<T>` to `UniquePointerFixedSize` in general. Only do this by default but allow for optimizations.
+- Maybe don't couple `UniquePointer<T>` to `UniquePointerFixedSize` in general. Only do this by default but allow for optimizations.
+	- > **Claude:** this is another face of item 1 — decoupling `UniquePointer<T>` from a specific `FixedPointer` representation *is* the associated-type direction, with the same downstream cost. If you keep pointers concrete, `UniquePointer<T> = FixedPointer + PhantomData<T>` (as in `allocator-spec.md`) is the simple default and I'd not generalize it until a concrete optimization demands it.
 - In `Location`, use `Size` and not `Address` (and not `u32`) for `offset`.
+	- > **Claude:** agree. `offset` is a displacement *within* an allocation, so it's bounded by that allocation's `Size`; `Address` (absolute, `u64`) would be wrong-typed, and `u32` hard-codes what you're trying to parameterize. (`anchor` stays the erased pointer, not an `Address`, since user-level `Location`s never see addresses.)
