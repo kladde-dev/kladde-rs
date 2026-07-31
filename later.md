@@ -17,6 +17,7 @@
 - Guards for tuples: add `field_{i}_mut` methods analogous to tuple structs with derived Persistable impl.
     - Probably requires the `paste` crate. Could also be done by making `kladde-traits` depend on `kladde-derive`, but I don't want that.
     - Guards for tuple structs already have `field_{i}_mut` methods, but do they also have a `set` method to replace the whole tuple struct?
+- Rename `Edit::commit` to `Edit::apply` to avoid confusion with transactions.
 
 ## Miscellaneous ideas
 
