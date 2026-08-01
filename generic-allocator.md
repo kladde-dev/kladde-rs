@@ -287,7 +287,13 @@ impl<B: WriteBackend + ?Sized> WriteBackendExt for B {}
 
 ### `Persistable<P>` and `kladde-types`
 
-`Persistable` and the `kladde-types` containers are generic over the pointer type `P`, defaulted to `Pointer`, so the common case stays parameter-free while a file may opt into a wider `P`. A container that stores pointers sets the same default and implements `Persistable<P>` generically. Verified in `crates/generic-alloc`:
+`Persistable` and the `kladde-types` containers are generic over the pointer type `P`, defaulted to `Pointer`, so the common case stays parameter-free while a file may opt into a wider `P`. A container that stores pointers sets the same default and implements `Persistable<P>` generically. `Persistable` and `kladde-types` containers are *not* generic over the `Size` type, however, because `Size` is used only for allocation sizes and offsets, and
+- *allocation sizes belong to the allocator, not the container* (the `INLINE_SIZE` decision — containers don't store the size of allocated memory in the parent allocation; they query `backend.size(ptr)`, which returns `B::Size`); and
+- *offsets are transient* — computed at the moment of a read/write (`Word::from_usize(i * T::INLINE_SIZE)`), never stored.
+
+TODO: include the above two arguments in a doc comment on `trait Persistable`.
+
+Verified in `crates/generic-alloc`:
 
 ```rust
 pub trait Persistable<P = Pointer>: Sized {
