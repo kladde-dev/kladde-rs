@@ -41,7 +41,7 @@ A few design decisions follow from this that currently don't hold:
 Traits and structs build on each other. At the lowest level (`Allocator` and `Storage`, which are independent of each other), they are very generic and meant for reusability outside of the wider Kladde system. Subsequent layers specialize increasingly to the requirements of Kladde. However, Kladde is still the main intended use case, and I don't want to introduce any generalization that would hurt performance or ergonomics (especially for *application developers*) in the Kladde use case. For ergonomics, we should set defaults or define shorthand type aliases motivated by the Kladde use case where we can (TODO: which one is better)?
 
 - The trait `Allocator` is the foundation for memory management. It manages a dynamic collection of address regions but doesn't connect them to memory regions (i.e., it doesn't allow reading from or writing to any memory). Addresses **are** part of the `Allocator` contract (`address`, and `resize` reporting relocations) — they are *core* to management — but they are simply never surfaced *above* the backend layer, which hides them from `Persistable` types. Its mutating methods take a normal `&mut self` (it's a plain, reusable data structure; the interior-mutability gymnastics live in the backend adapter, not here).
-- The traits `ReadBackend` and `WriteBackend` are **composed of** (they hold) an `Allocator` — they do *not* extend it. `WriteBackend` equips it with methods to write to some associated memory at the allocated address ranges and to allocate/resize/free (address-hidden); `ReadBackend` provides read access. They are split like `std::io::Read`/`std::io::Write`: `ReadBackend` has *no* write or allocation surface at all, so `&mut impl ReadBackend` genuinely cannot mutate — which is how the write/read phases of a `JournaledBackend` are enforced (a shared `&Backend` couldn't, because it still had `&self` write methods). A blanket convenience `trait Backend<P>: ReadBackend<Pointer = P> + WriteBackend<Pointer = P>` names both halves at once. These are the traits against which manual implementations of `Persistable` data types are written: `store` gets `&impl WriteBackend`, `load` gets `&mut impl ReadBackend`.
+- The traits `ReadBackend` and `WriteBackend` are **composed of** (they hold) an `Allocator` — they do *not* extend it. `WriteBackend` equips it with methods to write to some associated memory at the allocated address ranges and to allocate/resize/free (address-hidden); `ReadBackend` provides read access. They are split like `std::io::Read`/`std::io::Write`: `ReadBackend` has *no* write or allocation surface at all, so `&mut impl ReadBackend` genuinely cannot mutate — which is how the write/read phases of a `JournaledBackend` are enforced (a shared `&Backend` couldn't, because it still had `&self` write methods). A blanket convenience `trait Backend<P, S>: ReadBackend<Pointer = P, Size = S> + WriteBackend<Pointer = P, Size = S>` names both halves at once (pinning both the pointer type `P` and the size type `S`). These are the traits against which manual implementations of `Persistable` data types are written: `store` gets `&impl WriteBackend`, `load` gets `&mut impl ReadBackend`.
 	- The two halves have a deliberate `&self`/`&mut self` **asymmetry**: **write = `&self`** (the guard model hands each nested field guard the *same* `&B` by reborrow, so sibling guards can't each hold `&mut B`), **read = `&mut self`** (`load` is *sequential* — one field/element after another — so a single `&mut` reborrowed down the recursion suffices, and this dissolves the `Seek`-takes-`&mut self` problem for reads and lets the read path hand out the real seekable cursor with no `RefCell`). As a free side effect the borrow checker forbids `load` (needs `&mut B`) while any guard (holds `&B`) is alive — exactly the "don't read stale data mid-write" rule.
 - The trait `Storage` is orthogonal to `Allocator` and the backends. While `Allocator` models memory *management*, `Storage` models memory *access*. It provides unstructured random and sequential memory access to a large block of stored data (e.g., a file).
 - Concrete backends (`UnjournaledBackend` and `Journaled[Write]Backend`) are **composed of** an `Allocator` and a `Storage`, generic over both. They perform two tasks:
@@ -67,8 +67,10 @@ pub struct UniquePointer<T, P = Pointer> {           // the typed Box<T>
     _marker: PhantomData<*const T>,
 }
 
-pub struct Location<P = Pointer> { pub anchor: P, pub offset: Size }
+pub struct Location<P = Pointer, S = u32> { pub anchor: P, pub offset: S }
 ```
+
+`Location` is parametric over **both** the pointer type `P` and the size type `S` (default `u32`): `anchor` is a `P`, and `offset` is a displacement *within* an allocation, so it is `Size`-typed, not `usize`. Crucially, `S` does **not** become a second `Persistable` type parameter — `Persistable<P>` stays single-parameter and names the size as `Location<P, B::Size>` in its method signatures, so `S` *flows from the backend* (verified in `crates/generic-alloc`). See the `Persistable<P>` section.
 
 Inherent methods on the owned handles: `.raw() -> P`, and `UniquePointer::{from_fixed, into_fixed}`. The fixed/resizable **gate** (`resize`/`splice` accept only `UniquePointerResizable`) is unchanged from `allocator-spec.md`.
 
@@ -84,8 +86,8 @@ Inherent methods on the owned handles: `.raw() -> P`, and `UniquePointer::{from_
 - Should probably be self-hosting. I.e., the `UnjournaledBackend` below  uses the Allocator itself to manage the memory regions where in-file representation of the Allocator is stored. It will probably need special logic to manage it in-file, but that's separate.
 - The pointer types (`UniquePointerResizable<P>`, `UniquePointerFixedSize<P>`, and the `Copy` `Pointer<W>`) are **concrete**, parameterized over `P`/`W` — *not* per-allocator associated types. (An earlier draft made them associated so an allocator could cache metadata like sizedness *in* the pointer; the `MetaData`/`lookup` table below already provides that, so the pointers stay concrete — which keeps inherent pointer methods and keeps `Persistable` free of a backend type parameter.)
 - Provides default-implemented methods that allow generating unique IDs and reserving them for later allocation of a given size (this will be used by `JournaledBackend` below, and it's also nice that this gets exposed to implementors of `Persistable` types because it may be useful for some of them, and it's easily implemented for the `JournaledBackend` itself):
-	- `fn reserve_resizable(&self, byte_size: usize) -> UniquePointerResizable;`
-	- `fn reserve_fixed(&self, byte_size: usize) -> UniquePointerFixedSize;`
+	- `fn reserve_resizable(&mut self, size: Self::Size) -> UniquePointerResizable;`
+	- `fn reserve_fixed(&mut self, size: Self::Size) -> UniquePointerFixedSize;`
 	- And methods that `claim` reservations (i.e., assign actual addresses)
 - Default implementations of `reserve_{resizable, fixed}` simply forward to `alloc_{resizable, fixed}`. Default implementations of `claim_{resizable, fixed}` are no-ops.
 - **The same reserve/claim deferral is needed for `resize`, not just `alloc`.** In a journaled backend, a live resize of an already-claimed region must not assign a new address on the spot (it could land past the current end of the journal and block the journal from growing). So there is a `reserve_resize` that records the intent now and defers the address assignment to journal replay's `claim`, exactly like `alloc`. This is a good sign that reserve/claim is the right primitive (it generalizes to any address-assigning op), but it does add a "reserved-resize" state on top of the "reserved-alloc" state (see [Problems and regressions](#problems-and-regressions)).
@@ -158,15 +160,16 @@ pub struct Allocation<A: Allocator + ?Sized> { pub size: A::Size, pub sizedness:
 ```rust
 pub trait WriteBackend {
     type Pointer: Copy;
-    fn alloc_resizable(&self, size: usize) -> UniquePointerResizable<Self::Pointer>;
-    fn alloc_fixed(&self, size: usize) -> UniquePointerFixedSize<Self::Pointer>;
+    type Size: Word;                                                                // re-exposed from the inner Allocator
+    fn alloc_resizable(&self, size: Self::Size) -> UniquePointerResizable<Self::Pointer>;
+    fn alloc_fixed(&self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer>;
     fn free_resizable(&self, p: UniquePointerResizable<Self::Pointer>);
     fn free_fixed(&self, p: UniquePointerFixedSize<Self::Pointer>);
-    fn resize(&self, p: &UniquePointerResizable<Self::Pointer>, new_size: usize);   // no addresses out
-    fn write(&self, anchor: Self::Pointer, offset: u32, bytes: &[u8]);              // takes bytes, not `impl Write`
+    fn resize(&self, p: &UniquePointerResizable<Self::Pointer>, new_size: Self::Size); // no addresses out
+    fn write(&self, anchor: Self::Pointer, offset: Self::Size, bytes: &[u8]);          // takes bytes, not `impl Write`
     /// Atomic resize + tail-shift + content overwrite of one region.
-    fn splice(&self, p: &UniquePointerResizable<Self::Pointer>, offset: u32, old_len: u32, new: &[u8]);
-    fn size(&self, p: Self::Pointer) -> Option<usize>;                              // querying is fine mid-write
+    fn splice(&self, p: &UniquePointerResizable<Self::Pointer>, offset: Self::Size, old_len: Self::Size, new: &[u8]);
+    fn size(&self, p: Self::Pointer) -> Option<Self::Size>;                            // querying is fine mid-write
 }
 ```
 
@@ -179,15 +182,16 @@ pub trait WriteBackend {
 ```rust
 pub trait ReadBackend {
     type Pointer: Copy;
+    type Size: Word;
     /// A reader positioned at `anchor + offset`. `&mut self` makes handing out a
     /// seekable cursor sound; the prototype returns the real `&mut Storage`.
-    fn read_at(&mut self, anchor: Self::Pointer, offset: u32) -> impl Read + Seek + '_;
-    fn size(&self, p: Self::Pointer) -> Option<usize>;
+    fn read_at(&mut self, anchor: Self::Pointer, offset: Self::Size) -> impl Read + Seek + '_;
+    fn size(&self, p: Self::Pointer) -> Option<Self::Size>;
 }
 
-/// Convenience: name both halves at once, over the same pointer type. Blanket.
-pub trait Backend<P>: ReadBackend<Pointer = P> + WriteBackend<Pointer = P> {}
-impl<P, B: ReadBackend<Pointer = P> + WriteBackend<Pointer = P>> Backend<P> for B {}
+/// Convenience: name both halves at once, over the same pointer type AND size.
+pub trait Backend<P, S>: ReadBackend<Pointer = P, Size = S> + WriteBackend<Pointer = P, Size = S> {}
+impl<P, S, B: ReadBackend<Pointer = P, Size = S> + WriteBackend<Pointer = P, Size = S>> Backend<P, S> for B {}
 ```
 
 > **Claude (the `&self`/`&mut self` asymmetry, verified in the prototype):** the natural split is **write = `&self`, read = `&mut self`**, and it falls out of *why* each exists. Writes go through guards that reborrow a shared `&B` (needs `&self`); reads happen during a sequential `load` that owns the backend exclusively for the duration (can take `&mut self`). A free side effect: the borrow checker then forbids `load` (needs `&mut B`) while any guard (holds `&B`) is alive — a correct, automatic enforcement of "don't read stale data mid-write". Because `ReadBackend` is `&mut self`, the whole `RefCell<Storage>`-on-the-read-path problem simply doesn't arise; interior mutability is confined to the *write* facade in the concrete backend.
@@ -211,7 +215,7 @@ struct MockStorage(std::io::Cursor<Vec<u8>>);
 > **Claude:** small correction — `struct MockStorage(Vec<u8>)` can't implement `Storage` directly, because `Vec<u8>` implements `Write` but not `Seek`. Wrap it in `std::io::Cursor<Vec<u8>>` (which is `Read + Write + Seek`), as the prototype does. `resize` then goes through `cursor.get_mut().resize(..)`.
 
 ### `struct UnjournaledBackend<S: Storage, A: Allocator<Meta=...>>`
-- **Composes** an `S` (on-file bytes) and an `A` (in-memory allocation table) — it does *not* extend `Allocator`. It implements `WriteBackend` and `ReadBackend` (hence the convenience `Backend<P>`). Addresses stay hidden from user types: they exist on the inner `A`, but the backend never returns one.
+- **Composes** an `S` (on-file bytes) and an `A` (in-memory allocation table) — it does *not* extend `Allocator`. It implements `WriteBackend` and `ReadBackend` (hence the convenience `Backend<P, S>`). Addresses stay hidden from user types: they exist on the inner `A`, but the backend never returns one.
 - Implements read/write by asking the inner `A` for a pointer's address and then reading from / writing to the `Storage`. For `WriteBackend::resize`, it *consumes* the inner allocator's `Some((old, new))` relocation report to move the bytes in `Storage`, and returns nothing.
 - Forwards mutating allocator calls to `A` but also immediately persists a compact version of the state (used only to recreate the in-memory `A` on open, not optimized for lookups). The allocator-state allocations are themselves managed by `A` (self-hosting; see the bootstrap problem).
 - The `&self` write facade is exactly the composition boundary: the struct wraps `(S, A)` in a `RefCell` so `WriteBackend`'s `&self` methods can borrow the `&mut self` `Allocator` through it. The `ReadBackend` methods take `&mut self` and reach the inner state via `RefCell::get_mut` — no runtime borrow, and the real seekable cursor comes straight out.
@@ -269,7 +273,8 @@ Extension trait with a blanket implementation, defined in the crate where `Persi
 // (methods are `&self`, matching `WriteBackend`).
 pub trait WriteBackendExt: WriteBackend {
     fn alloc_typed<T: Persistable<Self::Pointer>>(&self) -> UniquePointer<T, Self::Pointer> {
-        UniquePointer::from_fixed(self.alloc_fixed(T::INLINE_SIZE))
+        // T::INLINE_SIZE is a usize byte count -> convert to the backend's Size.
+        UniquePointer::from_fixed(self.alloc_fixed(Word::from_usize(T::INLINE_SIZE)))
     }
     fn free_typed<T>(&self, p: UniquePointer<T, Self::Pointer>) { self.free_fixed(p.into_fixed()) }
     fn alloc_fixed_size_array<T: Persistable<Self::Pointer>>(&self, len: usize) -> UniquePointerFixedSize<Self::Pointer>;
@@ -289,8 +294,10 @@ pub trait Persistable<P = Pointer>: Sized {
     const INLINE_SIZE: usize;   // just the inline pointer id; may depend on P's width
     // store gets a shared &WriteBackend (guard reborrow); load gets an exclusive
     // &mut ReadBackend (sequential reads). The asymmetry is the whole point.
-    fn store<B: WriteBackend<Pointer = P>>(&mut self, backend: &B, location: Location<P>);
-    fn load<B: ReadBackend<Pointer = P>>(backend: &mut B, location: Location<P>) -> Self;
+    // `Location<P, B::Size>`: the size type flows from the backend, so `S` is
+    // NOT a `Persistable` parameter -- only `P` is.
+    fn store<B: WriteBackend<Pointer = P>>(&mut self, backend: &B, location: Location<P, B::Size>);
+    fn load<B: ReadBackend<Pointer = P>>(backend: &mut B, location: Location<P, B::Size>) -> Self;
 }
 
 // kladde-types: default P = Pointer here too, and implement generically over P.
@@ -323,7 +330,7 @@ Written by Claude. This section collects the problems this proposal may run into
 
 2. **Generic integer associated types need an "unsigned word" bound that std doesn't provide.** Making `Address`/`Size` associated types means every offset/size computation needs `+`, `<`, `Into<Address>`, and `usize` conversions over a generic type. Rust has no single "unsigned integer" trait, so you need a helper trait (the prototype's `Word`) or a dependency like `num-traits`, and its bounds ride along on every generic function that does address arithmetic. Manageable, and `Size: Into<Address>` is the right core relation, but it is real bound-noise that the current concrete-`u32` code doesn't have. (You'll also want `TryFrom<usize>`/`to_usize`, because offsets from Rust collections arrive as `usize`.)
 
-3. **Duplicated surface: `alloc_*`/`free_*`/`resize`/`size` appear on both `Allocator` and the backends** *(new, from the composition-not-extension decision).* Because `Backend` no longer *is* an `Allocator`, each backend must forward-and-translate every management op: address-aware and `&mut self` on the `Allocator`, address-hidden and `&self` (write) / `&mut self` (read query) on the backend. That is real boilerplate — mostly mechanical, absorbable by a default-method layer or a small macro, but it exists where `Backend: Allocator` had none. It is the (worthwhile) price of letting the two layers choose their `&self`/`&mut self` and address-visibility independently. A related minor cost: `ReadBackend` and `WriteBackend` each carry their own `type Pointer`, so code wanting both over one pointer type must say `ReadBackend<Pointer = P> + WriteBackend<Pointer = P>` — the blanket `Backend<P>` convenience packages exactly that, but bare `R + W` bounds must repeat the pin.
+3. **Duplicated surface: `alloc_*`/`free_*`/`resize`/`size` appear on both `Allocator` and the backends** *(new, from the composition-not-extension decision).* Because `Backend` no longer *is* an `Allocator`, each backend must forward-and-translate every management op: address-aware and `&mut self` on the `Allocator`, address-hidden and `&self` (write) / `&mut self` (read query) on the backend. That is real boilerplate — mostly mechanical, absorbable by a default-method layer or a small macro, but it exists where `Backend: Allocator` had none. It is the (worthwhile) price of letting the two layers choose their `&self`/`&mut self` and address-visibility independently. A related minor cost: `ReadBackend` and `WriteBackend` each carry their own `type Pointer` *and* `type Size`, so code wanting both over one pointer/size pair must say `ReadBackend<Pointer = P, Size = S> + WriteBackend<Pointer = P, Size = S>` — the blanket `Backend<P, S>` convenience packages exactly that, but bare `R + W` bounds must repeat both pins.
 
 4. **`resize -> Option<(old, new)>` conflates two "no move" cases, and the in-place-*grow* case still needs backend work** *(new; confirmed in the prototype).* `None` means both *unclaimed* (no address yet) and *in-place claimed* (address unchanged) — fine for the byte-move decision, but on an in-place **grow** the backend must still ensure `Storage` covers `[addr, addr + new_size)`, which the `Option` doesn't signal. So the backend can't rely on the `Option` alone: either make the result 3-way (`Relocated{old,new}` | `InPlace{addr}` | `Unclaimed`), or keep `Option` and have the backend size `Storage` by *querying* the pointer's address+size after every resize regardless (the prototype does the query-based variant). Decide which; both work.
 
@@ -348,10 +355,3 @@ TODO: build a chunked `PersistableVec` implementation for kladde onto the redesi
 
 - [ ] Can `UnjournaledBackend` and `JournaledBackend` reuse some code from each other? Journal replay should do similar operations to what `UnjournaledBackend` does immediately. 
 - [ ] How would compaction work in this setup? It's the allocator's job to figure out where everything should move, but the allocator needs access to the `Storage` to actually perform it. In addition, any changes to the allocator state would also have to be persisted and operations should probably be journaled, and this is `Backend` logic.
-
-## Miscellaneous things to keep in mind
-
-These items are not so urgent, maybe defer until we've ironed out the main points.
-
-- In `Location`, use `Size` and not `Address` (and not `u32`) for `offset`.
-	- > **Claude:** agree. `offset` is a displacement *within* an allocation, so it's bounded by that allocation's `Size`; `Address` (absolute, `u64`) would be wrong-typed, and `u32` hard-codes what you're trying to parameterize. (`anchor` stays the erased pointer, not an `Address`, since user-level `Location`s never see addresses.)
