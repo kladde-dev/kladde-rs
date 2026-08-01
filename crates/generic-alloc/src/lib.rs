@@ -1,517 +1,304 @@
-//! Throwaway prototype for the `generic-allocator.md` redesign.
+//! Throwaway prototype for the *concrete-pointer* design decided in
+//! `generic-allocator.md`. Validates that these compile and compose:
 //!
-//! Goal: check that the proposed trait hierarchy actually *composes and
-//! compiles* — the generic integer associated types with arithmetic, the
-//! associated pointer types, the reserve/claim/convert/lookup surface, the
-//! `Storage`/`WriteBackend`/`Backend` layering, and the RPITIT `-> impl
-//! Write`/`-> impl Read + Seek` returns. It is not a working allocator.
-//!
-//! Findings are written back into `generic-allocator.md` (§ "Problems and
-//! regressions"). Nothing here is meant to be kept.
+//! - `Pointer<W = NonZeroU32>(W)` — the only type parameterized over the raw
+//!   width integer `W`;
+//! - owned handles parameterized over the *pointer type* `P` (default
+//!   `Pointer`), never over `W`, with inherent `.raw()` / `.into_fixed()`;
+//! - `Persistable<P = Pointer>`, whose methods pin the backend's pointer type
+//!   to `P` via `Backend<Pointer = P>`;
+//! - a container `PersistableVec<T, P = Pointer>` and its impl, with an
+//!   `INLINE_SIZE` that depends on `P`'s width via `size_of::<P>()`;
+//! - the three implementor styles from the doc's guidance (all-`P`, generic
+//!   container, and default-only);
+//! - default type parameters making the common case parameter-free
+//!   (`PersistableVec<i32>` round-trips through a `Pointer`-width backend).
 
-use std::collections::HashMap;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::marker::PhantomData;
 use std::num::NonZeroU32;
 
-// ---------------------------------------------------------------------------
-// A minimal "unsigned word" bound so the allocator can do arithmetic over its
-// generic `Address`/`Size` associated types. Rust std has no such trait, so
-// *some* helper like this is unavoidable once those become type parameters.
-// ---------------------------------------------------------------------------
+// ============================ pointer types ============================
 
-pub trait Word: Copy + Ord + std::fmt::Debug {
-    const ZERO: Self;
-    fn from_usize(n: usize) -> Self;
-    fn to_usize(self) -> usize;
-    fn checked_add(self, rhs: Self) -> Option<Self>;
+/// A `Copy`, type- and size-erased identity: the serialized/at-rest form of a
+/// pointer and the `anchor` of a [`Location`]. The *only* type parameterized
+/// over the raw width integer `W` (default `NonZeroU32`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Pointer<W = NonZeroU32>(pub W);
+
+/// Owned, single-owner handle to a resizable region. Parameterized over the
+/// *pointer type* `P` (default `Pointer`), not over `W`.
+#[derive(PartialEq, Eq, Debug)]
+pub struct UniquePointerResizable<P = Pointer>(P);
+
+/// Owned, single-owner handle to a fixed-size region.
+#[derive(PartialEq, Eq, Debug)]
+pub struct UniquePointerFixedSize<P = Pointer>(P);
+
+/// The typed `Box<T>`: a fixed-size handle plus a phantom `T`.
+pub struct UniquePointer<T, P = Pointer> {
+    inner: UniquePointerFixedSize<P>,
+    _marker: PhantomData<*const T>,
 }
 
-macro_rules! impl_word {
-    ($($t:ty),*) => {$(
-        impl Word for $t {
-            const ZERO: Self = 0;
-            fn from_usize(n: usize) -> Self { n as $t }
-            fn to_usize(self) -> usize { self as usize }
-            fn checked_add(self, rhs: Self) -> Option<Self> { <$t>::checked_add(self, rhs) }
+impl<P: Copy> UniquePointerResizable<P> {
+    pub fn from_pointer(p: P) -> Self {
+        Self(p)
+    }
+    /// Inherent `.raw()` — available because pointers are concrete.
+    pub fn raw(&self) -> P {
+        self.0
+    }
+}
+impl<P: Copy> UniquePointerFixedSize<P> {
+    pub fn from_pointer(p: P) -> Self {
+        Self(p)
+    }
+    pub fn raw(&self) -> P {
+        self.0
+    }
+}
+impl<T, P: Copy> UniquePointer<T, P> {
+    pub fn from_fixed(inner: UniquePointerFixedSize<P>) -> Self {
+        Self {
+            inner,
+            _marker: PhantomData,
         }
-    )*};
-}
-impl_word!(u32, u64);
-
-/// Whether an allocation may be resized.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Sizedness {
-    Fixed,
-    Resizable,
-}
-
-/// Everything the allocator knows about a single allocation — *no address*,
-/// which only `TransparentAllocator` exposes.
-#[derive(Clone, Debug)]
-pub struct Allocation<A: Allocator + ?Sized> {
-    pub id: A::Id,
-    pub size: A::Size,
-    pub sizedness: Sizedness,
-    pub meta: A::Meta,
-}
-
-// ---------------------------------------------------------------------------
-// Layer 0: Allocator (no memory access, no addresses exposed).
-// ---------------------------------------------------------------------------
-
-pub trait Allocator {
-    /// Stable, serializable identity of an allocation (`Index` in
-    /// allocator-spec.md). Exposed to user types.
-    type Id: Copy + Eq + std::hash::Hash;
-    /// Internal memory address — never exposed above `TransparentAllocator`.
-    type Address: Word;
-    /// Allocation size, exposed to user types.
-    type Size: Word + Into<Self::Address>;
-    /// Per-allocation metadata kept in the allocator's own table.
-    type Meta: Default + Clone;
-
-    /// Owned handle to a resizable region. Impl-chosen representation.
-    type ResizablePointer;
-    /// Owned handle to a fixed-size region.
-    type FixedPointer;
-    /// `Copy` identity handle: no size, no sizedness.
-    type RawPointer: Copy;
-
-    // --- lifecycle (no read/write) ---
-    fn alloc_resizable(&self, size: Self::Size) -> Self::ResizablePointer;
-    fn alloc_fixed(&self, size: Self::Size) -> Self::FixedPointer;
-    fn free_resizable(&self, p: Self::ResizablePointer);
-    fn free_fixed(&self, p: Self::FixedPointer);
-    fn resize(&self, p: &Self::ResizablePointer, new_size: Self::Size);
-
-    // --- reserve an id now, assign an address later (for journaling) ---
-    fn reserve_resizable(&self, size: Self::Size) -> Self::ResizablePointer {
-        self.alloc_resizable(size)
     }
-    fn reserve_fixed(&self, size: Self::Size) -> Self::FixedPointer {
-        self.alloc_fixed(size)
+    pub fn into_fixed(self) -> UniquePointerFixedSize<P> {
+        self.inner
     }
-    fn claim_resizable(&self, _p: &Self::ResizablePointer) {}
-    fn claim_fixed(&self, _p: &Self::FixedPointer) {}
-
-    // --- convert between kinds; may mint a new id, must not move memory ---
-    fn make_resizable(&self, p: Self::FixedPointer) -> Self::ResizablePointer;
-    fn make_fixed(&self, p: Self::ResizablePointer) -> Self::FixedPointer;
-
-    // --- erase to a Copy identity / recover the serializable id ---
-    fn raw_resizable(&self, p: &Self::ResizablePointer) -> Self::RawPointer;
-    fn raw_fixed(&self, p: &Self::FixedPointer) -> Self::RawPointer;
-    fn id(&self, raw: Self::RawPointer) -> Self::Id;
-
-    // --- reconstruct the single owner from a just-deserialized id, learning
-    //     its sizedness in the process (used on `load`). ---
-    fn resolve_owned(&self, id: Self::Id) -> Option<Owned<Self>>;
-
-    // --- query the table ---
-    fn lookup(&self, raw: Self::RawPointer) -> Option<Allocation<Self>>;
-    fn size(&self, raw: Self::RawPointer) -> Option<Self::Size> {
-        self.lookup(raw).map(|a| a.size)
-    }
-    fn meta(&self, raw: Self::RawPointer) -> Option<Self::Meta> {
-        self.lookup(raw).map(|a| a.meta)
+    pub fn raw(&self) -> P {
+        self.inner.raw()
     }
 }
 
-/// A single-owner handle recovered from a persisted id, of the kind the
-/// allocation actually has.
-pub enum Owned<A: Allocator + ?Sized> {
-    Resizable(A::ResizablePointer),
-    Fixed(A::FixedPointer),
-}
+// =============================== location ===============================
 
-// ---------------------------------------------------------------------------
-// Layer 0b: TransparentAllocator (exposes addresses; only Backends use it).
-// ---------------------------------------------------------------------------
-
-pub trait TransparentAllocator: Allocator {
-    /// `None` if `raw` was only reserved, never claimed.
-    fn address(&self, raw: Self::RawPointer) -> Option<Self::Address>;
-
-    /// Like [`Allocator::resize`], but reports a relocation as
-    /// `Some((old, new))` so the backend can move the bytes in `Storage`.
-    fn resize_transparently(
-        &self,
-        p: &Self::ResizablePointer,
-        new_size: Self::Size,
-    ) -> Option<(Self::Address, Self::Address)>;
-}
-
-// ---------------------------------------------------------------------------
-// Storage: raw byte access, orthogonal to Allocator.
-// ---------------------------------------------------------------------------
-
-pub trait Storage: Read + Write + Seek {
-    /// Grows or shrinks the backing store to `new_len` bytes.
-    fn resize(&mut self, new_len: u64) -> std::io::Result<()>;
-    /// Current length in bytes.
-    fn len(&self) -> std::io::Result<u64>;
-    fn is_empty(&self) -> std::io::Result<bool> {
-        Ok(self.len()? == 0)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WriteBackend / Backend: Allocator + memory access.
-// ---------------------------------------------------------------------------
-
-pub trait WriteBackend: Allocator {
-    /// Hand back a writer positioned at `raw`, promising exactly `size` bytes.
-    /// (See problems section: for a journaled backend, under-writing the
-    /// promised span corrupts the op frame.)
-    fn write_at(&mut self, raw: Self::RawPointer, size: Self::Size) -> impl Write + '_;
-
-    /// Atomic resize + tail-shift + content overwrite of one region.
-    fn splice(
-        &mut self,
-        p: &Self::ResizablePointer,
-        offset: Self::Size,
-        old_len: Self::Size,
-        new: &[u8],
-    );
-}
-
-pub trait Backend: WriteBackend {
-    /// Hand back a reader positioned at `raw + offset`.
-    fn read_at(&self, raw: Self::RawPointer, offset: Self::Size) -> impl Read + Seek + '_;
-}
-
-// ===========================================================================
-// A tiny in-memory mock `Allocator`, purely to prove the trait composes with
-// concrete associated types and the `Word` arithmetic.
-// ===========================================================================
-
-#[derive(Debug, Default, Clone)]
-pub struct NoMeta;
-
-pub struct Resizable(NonZeroU32);
-pub struct Fixed(NonZeroU32);
 #[derive(Clone, Copy)]
-pub struct Raw(NonZeroU32);
-
-#[derive(Default)]
-struct Slot {
-    address: Option<u64>, // None = reserved, not yet claimed
-    size: u32,
-    sizedness_fixed: bool,
+pub struct Location<P = Pointer> {
+    pub anchor: P,
+    pub offset: u32,
 }
 
-#[derive(Default)]
-pub struct MockAllocator {
-    table: std::cell::RefCell<HashMap<NonZeroU32, Slot>>,
-    next_id: std::cell::Cell<u32>,
-    bump: std::cell::Cell<u64>,
+// =========================== backend / allocator ===========================
+
+/// The pointer-facing backend. `type Pointer` is a *concrete* `Pointer<W>`
+/// (here `NonZeroU32`-wide by default); it is an associated type only so a
+/// `Persistable<P>` can pin `P == B::Pointer`. Because it is a concrete type,
+/// inherent pointer methods still work — no opacity.
+pub trait Backend {
+    type Pointer: Copy;
+
+    fn alloc_resizable(&self, size: usize) -> UniquePointerResizable<Self::Pointer>;
+    fn alloc_fixed(&self, size: usize) -> UniquePointerFixedSize<Self::Pointer>;
+    fn free_resizable(&self, p: UniquePointerResizable<Self::Pointer>);
+    fn free_fixed(&self, p: UniquePointerFixedSize<Self::Pointer>);
+    fn resize(&self, p: &UniquePointerResizable<Self::Pointer>, new_size: usize);
+
+    fn write(&self, anchor: Self::Pointer, offset: u32, bytes: &[u8]);
+    fn read(&self, anchor: Self::Pointer, offset: u32, len: u32) -> Vec<u8>;
 }
 
-impl MockAllocator {
-    fn fresh(&self, size: u32, fixed: bool, claim: bool) -> NonZeroU32 {
-        let raw = self.next_id.get() + 1;
-        self.next_id.set(raw);
-        let id = NonZeroU32::new(raw).unwrap();
-        let address = claim.then(|| {
-            let a = self.bump.get();
-            self.bump.set(a + u64::from(size));
-            a
-        });
-        self.table.borrow_mut().insert(
-            id,
-            Slot {
-                address,
-                size,
-                sizedness_fixed: fixed,
-            },
-        );
-        id
+/// Typed conveniences (would live in the `Persistable` crate). Blanket-impl'd.
+pub trait BackendExt: Backend {
+    fn alloc_typed<T: Persistable<Self::Pointer>>(&self) -> UniquePointer<T, Self::Pointer> {
+        UniquePointer::from_fixed(self.alloc_fixed(T::INLINE_SIZE))
+    }
+    fn free_typed<T>(&self, p: UniquePointer<T, Self::Pointer>) {
+        self.free_fixed(p.into_fixed())
+    }
+}
+impl<B: Backend + ?Sized> BackendExt for B {}
+
+// ============================== persistable ==============================
+
+/// Parameterized over the *pointer type* `P` (default `Pointer`). A type's
+/// `store`/`load` only accept backends whose pointer type is `P`.
+pub trait Persistable<P = Pointer>: Sized {
+    const INLINE_SIZE: usize;
+    fn store<B: Backend<Pointer = P>>(&mut self, backend: &B, location: Location<P>);
+    fn load<B: Backend<Pointer = P>>(backend: &B, location: Location<P>) -> Self;
+}
+
+// Style (1) from the doc: a type that stores no pointers can be `Persistable`
+// for *every* `P` -- works with any pointer width.
+impl<P> Persistable<P> for i32 {
+    const INLINE_SIZE: usize = 4;
+    fn store<B: Backend<Pointer = P>>(&mut self, backend: &B, location: Location<P>) {
+        backend.write(location.anchor, location.offset, &self.to_le_bytes());
+    }
+    fn load<B: Backend<Pointer = P>>(backend: &B, location: Location<P>) -> Self {
+        let bytes = backend.read(location.anchor, location.offset, 4);
+        i32::from_le_bytes(bytes.try_into().unwrap())
     }
 }
 
-impl Allocator for MockAllocator {
-    type Id = NonZeroU32;
-    type Address = u64;
-    type Size = u32;
-    type Meta = NoMeta;
-    type ResizablePointer = Resizable;
-    type FixedPointer = Fixed;
-    type RawPointer = Raw;
+// Style (2): a container that *does* store pointers is generic over `P`
+// (default `Pointer`), and stores `P`-typed owned handles.
+pub struct PersistableVec<T, P = Pointer> {
+    data: Vec<T>,
+    pointer: Option<UniquePointerResizable<P>>,
+}
 
-    fn alloc_resizable(&self, size: u32) -> Resizable {
-        Resizable(self.fresh(size, false, true))
-    }
-    fn alloc_fixed(&self, size: u32) -> Fixed {
-        Fixed(self.fresh(size, true, true))
-    }
-    fn free_resizable(&self, p: Resizable) {
-        self.table.borrow_mut().remove(&p.0);
-    }
-    fn free_fixed(&self, p: Fixed) {
-        self.table.borrow_mut().remove(&p.0);
-    }
-    fn resize(&self, p: &Resizable, new_size: u32) {
-        if let Some(slot) = self.table.borrow_mut().get_mut(&p.0) {
-            slot.size = new_size;
+impl<T, P: Copy> PersistableVec<T, P> {
+    pub fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            pointer: None,
         }
     }
-    fn reserve_resizable(&self, size: u32) -> Resizable {
-        Resizable(self.fresh(size, false, false))
+    pub fn len(&self) -> usize {
+        self.data.len()
     }
-    fn reserve_fixed(&self, size: u32) -> Fixed {
-        Fixed(self.fresh(size, true, false))
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
-    fn claim_resizable(&self, p: &Resizable) {
-        if let Some(slot) = self.table.borrow_mut().get_mut(&p.0) {
-            if slot.address.is_none() {
-                let a = self.bump.get();
-                self.bump.set(a + u64::from(slot.size));
-                slot.address = Some(a);
-            }
+    pub fn push_in_memory(&mut self, value: T) {
+        self.data.push(value);
+    }
+    pub fn get(&self, i: usize) -> Option<&T> {
+        self.data.get(i)
+    }
+}
+
+impl<T: Persistable<P>, P: Copy> Persistable<P> for PersistableVec<T, P> {
+    // Just the pointer id -- the length/size is owned by the allocator (query
+    // `size`), not stored inline. Empty is the null pointer, free via
+    // `Option<P>`'s niche, so this is `size_of::<P>()` for a NonZero id.
+    const INLINE_SIZE: usize = std::mem::size_of::<P>();
+
+    fn store<B: Backend<Pointer = P>>(&mut self, backend: &B, location: Location<P>) {
+        let byte_size = self.data.len() * T::INLINE_SIZE;
+        let pointer = self
+            .pointer
+            .take()
+            .unwrap_or_else(|| backend.alloc_resizable(byte_size));
+        for (i, item) in self.data.iter_mut().enumerate() {
+            item.store(
+                backend,
+                Location {
+                    anchor: pointer.raw(),
+                    offset: (i * T::INLINE_SIZE) as u32,
+                },
+            );
         }
+        // inline header: just the target pointer id (INLINE_SIZE bytes), no len
+        backend.write(location.anchor, location.offset, &vec![0u8; Self::INLINE_SIZE]);
+        self.pointer = Some(pointer);
     }
-    fn claim_fixed(&self, p: &Fixed) {
-        self.claim_resizable(&Resizable(p.0));
-    }
-    fn make_resizable(&self, p: Fixed) -> Resizable {
-        if let Some(slot) = self.table.borrow_mut().get_mut(&p.0) {
-            slot.sizedness_fixed = false;
-        }
-        Resizable(p.0)
-    }
-    fn make_fixed(&self, p: Resizable) -> Fixed {
-        if let Some(slot) = self.table.borrow_mut().get_mut(&p.0) {
-            slot.sizedness_fixed = true;
-        }
-        Fixed(p.0)
-    }
-    fn raw_resizable(&self, p: &Resizable) -> Raw {
-        Raw(p.0)
-    }
-    fn raw_fixed(&self, p: &Fixed) -> Raw {
-        Raw(p.0)
-    }
-    fn id(&self, raw: Raw) -> NonZeroU32 {
-        raw.0
-    }
-    fn resolve_owned(&self, id: NonZeroU32) -> Option<Owned<Self>> {
-        let fixed = self.table.borrow().get(&id)?.sizedness_fixed;
-        Some(if fixed {
-            Owned::Fixed(Fixed(id))
-        } else {
-            Owned::Resizable(Resizable(id))
-        })
-    }
-    fn lookup(&self, raw: Raw) -> Option<Allocation<Self>> {
-        let table = self.table.borrow();
-        let slot = table.get(&raw.0)?;
-        Some(Allocation {
-            id: raw.0,
-            size: slot.size,
-            sizedness: if slot.sizedness_fixed {
-                Sizedness::Fixed
-            } else {
-                Sizedness::Resizable
-            },
-            meta: NoMeta,
-        })
+
+    fn load<B: Backend<Pointer = P>>(_backend: &B, _location: Location<P>) -> Self {
+        // (reconstruction elided; the shape is what we're checking)
+        Self::new()
     }
 }
 
-impl TransparentAllocator for MockAllocator {
-    fn address(&self, raw: Raw) -> Option<u64> {
-        self.table.borrow().get(&raw.0)?.address
+// Style (3): a type that doesn't care about non-default widths implements
+// `Persistable` only for the default `P = Pointer`, with no `P` generic.
+#[allow(dead_code)] // compile-check only
+struct DefaultOnly(i32);
+impl Persistable for DefaultOnly {
+    const INLINE_SIZE: usize = 4;
+    fn store<B: Backend<Pointer = Pointer>>(&mut self, backend: &B, location: Location) {
+        self.0.store(backend, location);
     }
-    fn resize_transparently(&self, p: &Resizable, new_size: u32) -> Option<(u64, u64)> {
-        // The mock always "relocates" to keep the sketch honest about the
-        // return shape.
-        let old = self.address(self.raw_resizable(p))?;
-        self.resize(p, new_size);
-        let new = self.bump.get();
-        self.bump.set(new + u64::from(new_size));
-        if let Some(slot) = self.table.borrow_mut().get_mut(&p.0) {
-            slot.address = Some(new);
-        }
-        Some((old, new))
+    fn load<B: Backend<Pointer = Pointer>>(backend: &B, location: Location) -> Self {
+        DefaultOnly(i32::load(backend, location))
     }
 }
 
-// A `Cursor<Vec<u8>>`-backed `Storage`, proving the `Read+Write+Seek+resize`
-// shape works.
-#[allow(dead_code)] // constructed only in `#[cfg(test)]`
-struct MockStorage(Cursor<Vec<u8>>);
-
-impl Read for MockStorage {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-impl Write for MockStorage {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-}
-impl Seek for MockStorage {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        self.0.seek(pos)
-    }
-}
-impl Storage for MockStorage {
-    fn resize(&mut self, new_len: u64) -> std::io::Result<()> {
-        self.0.get_mut().resize(new_len as usize, 0);
-        Ok(())
-    }
-    fn len(&self) -> std::io::Result<u64> {
-        Ok(self.0.get_ref().len() as u64)
-    }
-}
-
-// A minimal `Backend` composed of a `Storage` + a `TransparentAllocator`,
-// proving the layering (Allocator -> WriteBackend -> Backend) composes and
-// that the RPITIT `-> impl Write` / `-> impl Read + Seek` returns work when a
-// backend hands out its inner `&mut Storage`/`&Storage`.
-pub struct UnjournaledBackend<S: Storage, A: TransparentAllocator> {
-    storage: S,
-    alloc: A,
-}
-
-impl<S: Storage, A: TransparentAllocator> Allocator for UnjournaledBackend<S, A> {
-    type Id = A::Id;
-    type Address = A::Address;
-    type Size = A::Size;
-    type Meta = A::Meta;
-    type ResizablePointer = A::ResizablePointer;
-    type FixedPointer = A::FixedPointer;
-    type RawPointer = A::RawPointer;
-
-    fn alloc_resizable(&self, size: A::Size) -> A::ResizablePointer {
-        self.alloc.alloc_resizable(size)
-    }
-    fn alloc_fixed(&self, size: A::Size) -> A::FixedPointer {
-        self.alloc.alloc_fixed(size)
-    }
-    fn free_resizable(&self, p: A::ResizablePointer) {
-        self.alloc.free_resizable(p)
-    }
-    fn free_fixed(&self, p: A::FixedPointer) {
-        self.alloc.free_fixed(p)
-    }
-    fn resize(&self, p: &A::ResizablePointer, new_size: A::Size) {
-        self.alloc.resize(p, new_size)
-    }
-    fn make_resizable(&self, p: A::FixedPointer) -> A::ResizablePointer {
-        self.alloc.make_resizable(p)
-    }
-    fn make_fixed(&self, p: A::ResizablePointer) -> A::FixedPointer {
-        self.alloc.make_fixed(p)
-    }
-    fn raw_resizable(&self, p: &A::ResizablePointer) -> A::RawPointer {
-        self.alloc.raw_resizable(p)
-    }
-    fn raw_fixed(&self, p: &A::FixedPointer) -> A::RawPointer {
-        self.alloc.raw_fixed(p)
-    }
-    fn id(&self, raw: A::RawPointer) -> A::Id {
-        self.alloc.id(raw)
-    }
-    fn resolve_owned(&self, id: A::Id) -> Option<Owned<Self>> {
-        Some(match self.alloc.resolve_owned(id)? {
-            Owned::Resizable(p) => Owned::Resizable(p),
-            Owned::Fixed(p) => Owned::Fixed(p),
-        })
-    }
-    fn lookup(&self, raw: A::RawPointer) -> Option<Allocation<Self>> {
-        let a = self.alloc.lookup(raw)?;
-        Some(Allocation {
-            id: a.id,
-            size: a.size,
-            sizedness: a.sizedness,
-            meta: a.meta,
-        })
-    }
-}
-
-impl<S: Storage, A: TransparentAllocator> WriteBackend for UnjournaledBackend<S, A> {
-    fn write_at(&mut self, raw: A::RawPointer, _size: A::Size) -> impl Write + '_ {
-        // Resolve to an address, seek, and hand out the storage as the writer.
-        let addr = self.alloc.address(raw).expect("write to unclaimed pointer");
-        self.storage
-            .seek(SeekFrom::Start(addr.to_usize() as u64))
-            .expect("seek");
-        &mut self.storage
-    }
-    fn splice(&mut self, _p: &A::ResizablePointer, _offset: A::Size, _old_len: A::Size, _new: &[u8]) {
-        // (elided in the prototype)
-    }
-}
-
-impl<S: Storage, A: TransparentAllocator> Backend for UnjournaledBackend<S, A> {
-    fn read_at(&self, raw: A::RawPointer, offset: A::Size) -> impl Read + Seek + '_ {
-        let addr = self.alloc.address(raw).expect("read from unclaimed pointer");
-        let start = addr.to_usize() + offset.to_usize();
-        // The prototype reads a fresh cursor over a copy; a real backend would
-        // hand out `&mut Storage` after seeking (needs `&mut self`, see the
-        // problems section on read/write both wanting the single cursor).
-        let bytes = {
-            // We can't easily reuse the single `Storage` cursor from `&self`,
-            // so this stand-in just proves the return type composes.
-            let _ = start;
-            Vec::<u8>::new()
-        };
-        Cursor::new(bytes)
-    }
-}
+// ================================ mock ================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::num::NonZeroU64;
 
-    #[test]
-    fn allocator_composes_with_generic_associated_types() {
-        let a = MockAllocator::default();
+    #[derive(Default)]
+    struct MockBackend {
+        regions: RefCell<HashMap<NonZeroU32, Vec<u8>>>,
+        next: Cell<u32>,
+    }
+    impl MockBackend {
+        fn fresh(&self, size: usize) -> Pointer {
+            let raw = self.next.get() + 1;
+            self.next.set(raw);
+            let id = NonZeroU32::new(raw).unwrap();
+            self.regions.borrow_mut().insert(id, vec![0u8; size]);
+            Pointer(id)
+        }
+    }
+    impl Backend for MockBackend {
+        type Pointer = Pointer; // = Pointer<NonZeroU32>
 
-        let r = a.alloc_resizable(16);
-        let raw = a.raw_resizable(&r);
-        assert_eq!(a.size(raw), Some(16));
-        assert_eq!(a.lookup(raw).unwrap().sizedness, Sizedness::Resizable);
-
-        // reserve (no address) -> claim (address assigned): the journaling path
-        let f = a.reserve_fixed(8);
-        let fraw = a.raw_fixed(&f);
-        assert_eq!(a.address(fraw), None);
-        a.claim_fixed(&f);
-        assert!(a.address(fraw).is_some());
-
-        // serialize the id, later reconstruct the correct owned handle
-        let id = a.id(raw);
-        assert!(matches!(a.resolve_owned(id), Some(Owned::Resizable(_))));
-
-        // fixed <-> resizable conversion keeps the id in the mock
-        let promoted = a.make_resizable(f);
-        assert_eq!(a.lookup(a.raw_resizable(&promoted)).unwrap().sizedness, Sizedness::Resizable);
-
-        a.free_resizable(r);
-        a.free_resizable(promoted);
+        fn alloc_resizable(&self, size: usize) -> UniquePointerResizable<Pointer> {
+            UniquePointerResizable::from_pointer(self.fresh(size))
+        }
+        fn alloc_fixed(&self, size: usize) -> UniquePointerFixedSize<Pointer> {
+            UniquePointerFixedSize::from_pointer(self.fresh(size))
+        }
+        fn free_resizable(&self, p: UniquePointerResizable<Pointer>) {
+            self.regions.borrow_mut().remove(&p.raw().0);
+        }
+        fn free_fixed(&self, p: UniquePointerFixedSize<Pointer>) {
+            self.regions.borrow_mut().remove(&p.raw().0);
+        }
+        fn resize(&self, p: &UniquePointerResizable<Pointer>, new_size: usize) {
+            if let Some(r) = self.regions.borrow_mut().get_mut(&p.raw().0) {
+                r.resize(new_size, 0);
+            }
+        }
+        fn write(&self, anchor: Pointer, offset: u32, bytes: &[u8]) {
+            let mut regions = self.regions.borrow_mut();
+            let r = regions.get_mut(&anchor.0).unwrap();
+            let start = offset as usize;
+            if r.len() < start + bytes.len() {
+                r.resize(start + bytes.len(), 0);
+            }
+            r[start..start + bytes.len()].copy_from_slice(bytes);
+        }
+        fn read(&self, anchor: Pointer, offset: u32, len: u32) -> Vec<u8> {
+            let regions = self.regions.borrow();
+            let r = &regions[&anchor.0];
+            r[offset as usize..(offset + len) as usize].to_vec()
+        }
     }
 
     #[test]
-    fn backend_layering_composes() {
-        let mut backend = UnjournaledBackend {
-            storage: MockStorage(Cursor::new(vec![0u8; 64])),
-            alloc: MockAllocator::default(),
-        };
-        let p = backend.alloc_resizable(4);
-        let raw = backend.raw_resizable(&p);
-        {
-            let mut w = backend.write_at(raw, 4);
-            w.write_all(&[1, 2, 3, 4]).unwrap();
-        }
-        let mut r = backend.read_at(raw, 0);
-        let mut buf = Vec::new();
-        r.read_to_end(&mut buf).unwrap();
-        backend.free_resizable(p);
+    fn default_pointer_common_case_is_parameter_free() {
+        let backend = MockBackend::default();
+        let root = backend.alloc_fixed(PersistableVec::<i32>::INLINE_SIZE);
+
+        // `PersistableVec::<i32>` — `P` defaults to `Pointer`; no width in sight.
+        let mut v = PersistableVec::<i32>::new();
+        v.push_in_memory(10);
+        v.push_in_memory(20);
+        v.store(
+            &backend,
+            Location {
+                anchor: root.raw(),
+                offset: 0,
+            },
+        );
+        assert_eq!(v.len(), 2);
+
+        // scalar `Persistable<P>` for all P, and a typed box, both compile:
+        let boxed = backend.alloc_typed::<i32>();
+        assert_eq!(std::mem::size_of_val(&boxed.raw()), 4);
+        backend.free_typed(boxed);
+    }
+
+    #[test]
+    fn inline_size_is_just_the_pointer_width() {
+        // The inline representation is just the pointer id -- the length/size
+        // lives in the allocator, not inline. Default `Pointer<NonZeroU32>` is
+        // 4 bytes; a wider `NonZeroU64` id is 8. (Per-`P` via `size_of::<P>()`.)
+        assert_eq!(<PersistableVec<i32> as Persistable>::INLINE_SIZE, 4);
+        assert_eq!(
+            <PersistableVec<i32, Pointer<NonZeroU64>> as Persistable<Pointer<NonZeroU64>>>::INLINE_SIZE,
+            8
+        );
     }
 }
