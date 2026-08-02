@@ -360,4 +360,46 @@ TODO: build a chunked `PersistableVec` implementation for kladde onto the redesi
 (Segments are deferred — that discussion has moved to `later.md`'s "Allocator" section. The "should `Persistable` be parameterized by the backend?" question is resolved: concrete pointers, `Persistable<P = Pointer>` — see the decision note under "Detailed consequences" and the `Persistable<P>` section above.)
 
 - [ ] Can `UnjournaledBackend` and `JournaledBackend` reuse some code from each other? Journal replay should do similar operations to what `UnjournaledBackend` does immediately. 
-- [ ] How would compaction work in this setup? It's the allocator's job to figure out where everything should move, but the allocator needs access to the `Storage` to actually perform it. In addition, any changes to the allocator state would also have to be persisted and operations should probably be journaled, and this is `Backend` logic.
+- [x] How would compaction work in this setup? It's the allocator's job to figure out where everything should move, but the allocator needs access to the `Storage` to actually perform it. In addition, any changes to the allocator state would also have to be persisted and operations should probably be journaled, and this is `Backend` logic.
+
+> **Claude (compaction):** Compaction decomposes cleanly along the exact seam this document already draws, so the allocator/backend split does **not** paint you into a corner. The decisive reason is the **ID-serialization pivot**: because serialized pointers are stable ids, relocating a block rewrites *no* on-disk pointer bytes — so compaction never has to walk the object graph or know a single `Persistable`/schema detail. It reduces to three jobs, each already owned by exactly one layer:
+> 1. **Plan** — *where* each live block moves. Pure `Address`/`Size` arithmetic over the id→(address, size) table. The **allocator's** job (`&self`, no `Storage`). It's the same computation `resize` already does — `resize` returns *one* `(old, new)` relocation; compaction returns a *batch* of them.
+> 2. **Execute** — copy the bytes `old → new` in `Storage` and shrink the file. Needs a `Storage`, so it's the **backend's** job.
+> 3. **Persist / journal** — record the address changes durably and crash-safely. Also **backend** logic, and it reuses the journal.
+>
+> So the communication channel compaction needs already exists in miniature — *allocator emits address moves, backend performs the byte copies* — it is the `resize` contract at batch scale. (This expands the mini-answer in the `JournaledBackend` note above.)
+>
+> **Options for distributing who-does-what** (all keep the allocator type-agnostic and `Storage`-free):
+>
+> - **(A) Allocator plans as *data*, backend executes — recommended.** `Allocator::plan_compaction(&self) -> Vec<Move>` (or an iterator) with `struct Move { id: Pointer, old: Address, new: Address, size: Size }`; the backend loops, copies bytes, commits each new address back via `apply_move(&mut self, id, new)` (or a batch `apply_compaction`), and finally `storage.resize(alloc.compacted_len())`. Plain-data interface, no callbacks, allocator never sees `Storage`. Same shape as `resize`-returns-`(old, new)`.
+> - **(D) Same split, orchestrated by a shared free function** `fn compact(alloc: &mut A, storage: &mut S)` — identical to (A) except the driver lives in the same shared place as the journal-replay `apply(alloc, storage, op)` (see the previous question), so `Unjournaled`/`Journaled` share it. This is (A) plus the code-reuse answer; probably how it should actually be written.
+> - **(B) Allocator executes via an injected mover.** `Allocator::compact(&mut self, mover: &mut dyn FnMut(old, new, size))`: the allocator updates its own table and calls the backend-supplied callback per move. Fewer round-trips and the table stays internally consistent, but it inverts control (the allocator drives I/O indirectly), complicates I/O-error and journal handling, and re-introduces a whiff of "allocator reaches into memory." Not preferred.
+> - **(C) Backend owns the policy too.** Allocator exposes only enumeration + `set_address`, and the backend computes the plan. Maximally flexible for backend-specific placement, but it moves "*where* things go" out of the allocator — hurting the standalone/tooling goal and contradicting this document's own division. Avoid unless a backend genuinely needs bespoke placement.
+>
+> **Sketch (A/D):**
+> ```rust
+> struct Move<A: Allocator> { id: A::Pointer, old: A::Address, new: A::Address, size: A::Size }
+> // On Allocator (pure arithmetic; the plan is emitted in a clobber-safe order):
+> fn plan_compaction(&self) -> Vec<Move<Self>>;
+> fn apply_move(&mut self, id: Self::Pointer, new: Self::Address);   // commit one move's new address
+> fn compacted_len(&self) -> Self::Address;                         // new file length afterwards
+>
+> // Shared orchestrator (backend logic; both backends call it):
+> fn compact<A: Allocator, S: Storage>(alloc: &mut A, storage: &mut S) -> io::Result<()> {
+>     for m in alloc.plan_compaction() {              // allocator decides the geometry
+>         storage.copy_within(m.old, m.new, m.size)?; // journaled backend: append a Copy op instead
+>         alloc.apply_move(m.id, m.new);              // commit the new address in the table
+>     }
+>     storage.resize(alloc.compacted_len().into())?;  // shrink the file
+>     Ok(())                                          // + persist alloc state / flush the journal
+> }
+> ```
+> For the journaled backend, replace the direct `copy_within` with appending a `Copy`/`Move` op; replay then applies it through the same `apply(alloc, storage, op)` path — so compaction and ordinary writes share one crash-safe channel.
+>
+> **Corners to keep in mind (all are contract details to pin down, none is an architectural block):**
+> - **Move ordering / overlap.** Sliding blocks down produces moves whose source and destination ranges overlap. The allocator emits the plan, so it must order the moves safely (or annotate overlaps / demand `memmove` semantics) — the backend doing a blind copy can't know the global geometry. Make this part of the plan's contract.
+> - **Atomicity.** Compaction is many moves; a crash partway must recover. Journaling the moves (idempotent — re-copying `old → new` is harmless on replay) and persisting the table only after those moves are durable gives the same guarantee as ordinary writes. Run it in the write phase / outside any live guard (like `flush`, `&mut self`).
+> - **Self-hosting interaction (problem 6).** The allocator-state blocks *themselves* move during compaction, so the bootstrap anchor (the `Storage` header's root pointer) must be updated last / specially. Compaction and the self-hosting bootstrap are coupled and should be designed together.
+> - **Policy vs. mechanism.** *When* to compact and *how aggressively* (full vs. incremental, target free ratio, the "extreme" pre-close pass from the chunked-vec test case) is a backend/application decision; the plan-and-execute *mechanism* above is independent of it. The allocator can take a strategy parameter without gaining any `Storage` knowledge.
+>
+> **Verdict:** not a corner. Compaction stays entirely within "compute address moves (allocator) + copy bytes and journal (backend)," never crossing into type/schema territory — precisely the division the document already commits to, and which the ID-serialization pivot is what makes possible. If anything, compaction is the strongest evidence *for* the split: it is the operation that most obviously wants "addresses here, bytes there," and the two layers land on exactly that.
