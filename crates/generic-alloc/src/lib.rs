@@ -12,7 +12,8 @@
 //!   becomes a `Persistable` type parameter.
 //! - `Allocator` is a `&mut self` API with addresses core to it; backends are
 //!   *composed of* an `Allocator`, split into `ReadBackend` (read = `&mut
-//!   self`) and `WriteBackend` (write = `&self`), unified by `Backend<P, S>`.
+//!   self`) and `WriteBackend` (write = `&self`), both extending a shared
+//!   `Backend` supertrait that carries the one `Pointer`/`Size` per backend.
 
 use std::io::{self, Read, Seek, Write};
 use std::marker::PhantomData;
@@ -154,21 +155,28 @@ pub trait Allocator {
 
 // ============================ backend split ============================
 
+/// Shared **type carrier**: every backend has exactly one `Pointer` and one
+/// `Size`, declared here once. Because the two halves *extend* `Backend` rather
+/// than each declaring their own copies, `B::Pointer`/`B::Size` stay
+/// unambiguous even under `ReadBackend + WriteBackend`, and the two halves
+/// structurally can't disagree. A bare `B: Backend` bound guarantees only these
+/// *types*, not read or write *access* (that's what the two halves are for).
+pub trait Backend {
+    type Pointer: Copy;
+    type Size: Word;
+}
+
 /// Read access. `read` is `&mut self`: `load` is *sequential*, so a `&mut`
 /// reborrowed down the recursion never needs two live borrows — which is why
 /// the read path can hand out the real seekable cursor with no `RefCell`.
-pub trait ReadBackend {
-    type Pointer: Copy;
-    type Size: Word;
+pub trait ReadBackend: Backend {
     fn read(&mut self, anchor: Self::Pointer, offset: Self::Size, len: Self::Size) -> Vec<u8>;
     fn size(&self, p: Self::Pointer) -> Option<Self::Size>;
 }
 
 /// Write access. `write`/`alloc_*`/`resize` are `&self` (guard reborrow model);
 /// interior mutability lives inside the backend. Addresses never surface here.
-pub trait WriteBackend {
-    type Pointer: Copy;
-    type Size: Word;
+pub trait WriteBackend: Backend {
     fn alloc_resizable(&self, size: Self::Size) -> UniquePointerResizable<Self::Pointer>;
     fn alloc_fixed(&self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer>;
     fn free_resizable(&self, p: UniquePointerResizable<Self::Pointer>);
@@ -178,16 +186,9 @@ pub trait WriteBackend {
     fn size(&self, p: Self::Pointer) -> Option<Self::Size>;
 }
 
-/// Convenience: name both halves at once, over the same `Pointer` **and** the
-/// same `Size`. Blanket-impl'd.
-pub trait Backend<P, S>:
-    ReadBackend<Pointer = P, Size = S> + WriteBackend<Pointer = P, Size = S>
-{
-}
-impl<P, S, B: ReadBackend<Pointer = P, Size = S> + WriteBackend<Pointer = P, Size = S>>
-    Backend<P, S> for B
-{
-}
+// A caller needing both just writes `B: ReadBackend + WriteBackend` -- no
+// parameterized convenience trait, and `B::Pointer`/`B::Size` stay unambiguous
+// because they are declared once, on the shared `Backend` supertrait.
 
 // ============================== persistable ==============================
 
@@ -467,9 +468,12 @@ impl<S: Storage, A: Allocator<Pointer = Pointer>> UnjournaledBackend<S, A> {
     }
 }
 #[cfg(test)]
-impl<S: Storage, A: Allocator<Pointer = Pointer>> WriteBackend for UnjournaledBackend<S, A> {
+impl<S: Storage, A: Allocator<Pointer = Pointer>> Backend for UnjournaledBackend<S, A> {
     type Pointer = Pointer;
     type Size = A::Size;
+}
+#[cfg(test)]
+impl<S: Storage, A: Allocator<Pointer = Pointer>> WriteBackend for UnjournaledBackend<S, A> {
     fn alloc_resizable(&self, size: A::Size) -> UniquePointerResizable<Pointer> {
         let mut g = self.inner.borrow_mut();
         let (storage, alloc) = &mut *g;
@@ -530,8 +534,6 @@ impl<S: Storage, A: Allocator<Pointer = Pointer>> WriteBackend for UnjournaledBa
 }
 #[cfg(test)]
 impl<S: Storage, A: Allocator<Pointer = Pointer>> ReadBackend for UnjournaledBackend<S, A> {
-    type Pointer = Pointer;
-    type Size = A::Size;
     fn read(&mut self, anchor: Pointer, offset: A::Size, len: A::Size) -> Vec<u8> {
         let (storage, alloc) = self.inner.get_mut();
         let addr = alloc.address(anchor).unwrap().to_usize();
