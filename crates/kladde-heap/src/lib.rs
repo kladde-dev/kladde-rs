@@ -11,13 +11,15 @@
 //! - [`Allocator`]: pure address-range management over stable ids, with
 //!   [`SimpleAllocator`] a simple in-memory implementation; and [`Storage`]: an
 //!   unstructured, resizable byte interface.
-//! - (later commits) the `Backend`/`ReadBackend`/`WriteBackend` split that
-//!   composes an `Allocator` with a `Storage`.
+//! - [`Backend`]/[`ReadBackend`]/[`WriteBackend`]: the trait split that a
+//!   concrete backend composing an `Allocator` with a `Storage` implements.
+//!   (Concrete backends land in later commits.)
 //!
 //! The kladde-specific serialization layer (`Persistable`, `PointerRepr`,
 //! `Location`, containers) lives on top of this crate, in `kladde-persist`.
 
 mod allocator;
+mod backend;
 mod pointer;
 mod storage;
 mod word;
@@ -25,6 +27,7 @@ mod word;
 pub use allocator::{
     AllocError, Allocation, AllocationMut, Allocator, Relocation, SimpleAllocator,
 };
+pub use backend::{Backend, BackendError, ReadBackend, WriteBackend};
 pub use pointer::{
     Pointer, ResolvedPointer, UniquePointer, UniquePointerFixedSize, UniquePointerResizable,
 };
