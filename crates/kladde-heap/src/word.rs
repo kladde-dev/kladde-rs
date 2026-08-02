@@ -81,6 +81,10 @@ pub unsafe trait Word:
     fn to_bytes(self) -> Self::Bytes;
     /// Reconstruct from canonical little-endian bytes.
     fn from_bytes(bytes: Self::Bytes) -> Self;
+    /// Reconstruct from the first `size_of::<Self::Bytes>()` little-endian bytes
+    /// of `bytes` (which must be at least that long). Useful when the bytes come
+    /// from a runtime-sized buffer rather than the exact `Bytes` array.
+    fn from_bytes_slice(bytes: &[u8]) -> Self;
 }
 
 /// Stamps out one `impl Word for <primitive>` per line. Every method is
@@ -117,6 +121,12 @@ macro_rules! impl_word {
                 fn to_bytes(self) -> Self::Bytes { self.to_le_bytes() }
                 #[inline]
                 fn from_bytes(bytes: Self::Bytes) -> Self { <$int>::from_le_bytes(bytes) }
+                #[inline]
+                fn from_bytes_slice(bytes: &[u8]) -> Self {
+                    let mut arr = [0u8; $bytes];
+                    arr.copy_from_slice(&bytes[..$bytes]);
+                    <$int>::from_le_bytes(arr)
+                }
             }
         )*
     };

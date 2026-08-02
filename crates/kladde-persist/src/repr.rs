@@ -16,12 +16,18 @@ use kladde_heap::{Pointer, Word};
 pub trait PointerRepr: Copy {
     type Bytes: Copy + AsRef<[u8]>;
 
+    /// The number of bytes in the encoding (the length of `Bytes`).
+    const BYTE_LEN: usize;
+
     /// Canonical little-endian bytes of a (valid, nonzero) pointer.
     fn to_bytes(self) -> Self::Bytes;
     /// Reconstruct from canonical little-endian bytes. The bytes must encode a
     /// valid (nonzero) pointer; the all-zero pattern is reserved for `None` and
     /// is handled by [`decode_option`], not here.
     fn from_bytes(bytes: Self::Bytes) -> Self;
+    /// Reconstruct from the first [`BYTE_LEN`](PointerRepr::BYTE_LEN) bytes of a
+    /// runtime-sized slice (for reading a pointer out of a byte buffer).
+    fn from_slice(bytes: &[u8]) -> Self;
     /// The all-zero encoding, reserved for `None` in the `Option<Self>` niche.
     fn zeroed_bytes() -> Self::Bytes;
 }
@@ -31,6 +37,8 @@ pub trait PointerRepr: Copy {
 impl<W: Word> PointerRepr for Pointer<W> {
     type Bytes = W::Bytes;
 
+    const BYTE_LEN: usize = std::mem::size_of::<W::Bytes>();
+
     #[inline]
     fn to_bytes(self) -> W::Bytes {
         self.raw().to_bytes()
@@ -39,6 +47,11 @@ impl<W: Word> PointerRepr for Pointer<W> {
     fn from_bytes(bytes: W::Bytes) -> Self {
         Pointer::from_raw(W::from_bytes(bytes))
             .expect("PointerRepr::from_bytes on a valid (nonzero) pointer id")
+    }
+    #[inline]
+    fn from_slice(bytes: &[u8]) -> Self {
+        Pointer::from_raw(W::from_bytes_slice(bytes))
+            .expect("PointerRepr::from_slice on a valid (nonzero) pointer id")
     }
     #[inline]
     fn zeroed_bytes() -> W::Bytes {
@@ -60,6 +73,18 @@ pub fn decode_option<P: PointerRepr>(bytes: P::Bytes) -> Option<P> {
         None
     } else {
         Some(P::from_bytes(bytes))
+    }
+}
+
+/// Like [`decode_option`], but from the first `P::BYTE_LEN` bytes of a
+/// runtime-sized slice.
+#[inline]
+pub fn decode_option_slice<P: PointerRepr>(bytes: &[u8]) -> Option<P> {
+    let bytes = &bytes[..P::BYTE_LEN];
+    if bytes.iter().all(|&b| b == 0) {
+        None
+    } else {
+        Some(P::from_slice(bytes))
     }
 }
 

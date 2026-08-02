@@ -17,11 +17,13 @@ mod ext;
 mod location;
 mod persistable;
 mod repr;
+mod vec;
 
 pub use ext::WriteBackendExt;
 pub use location::Location;
 pub use persistable::Persistable;
-pub use repr::{decode_option, encode_option, PointerRepr};
+pub use repr::{decode_option, decode_option_slice, encode_option, PointerRepr};
+pub use vec::PersistableVec;
 
 // Re-export the heap types most `Persistable` code needs, so downstream can
 // depend on just `kladde-persist` for the common case.
