@@ -20,16 +20,21 @@
 
 mod allocator;
 mod backend;
+mod composed;
+mod mock;
 mod pointer;
 mod storage;
+mod unjournaled;
 mod word;
 
 pub use allocator::{
     AllocError, Allocation, AllocationMut, Allocator, Relocation, SimpleAllocator,
 };
 pub use backend::{Backend, BackendError, ReadBackend, WriteBackend};
+pub use mock::MockBackend;
 pub use pointer::{
     Pointer, ResolvedPointer, UniquePointer, UniquePointerFixedSize, UniquePointerResizable,
 };
 pub use storage::Storage;
+pub use unjournaled::UnjournaledBackend;
 pub use word::Word;
