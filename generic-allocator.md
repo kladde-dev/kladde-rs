@@ -77,6 +77,8 @@ Inherent methods on the owned handles: `.raw() -> P`, and `UniquePointer::{from_
 ### `trait Allocator`
 - Has associated types `Pointer`, `Address`, and `Size` (most implementors are parameterized by them, i.e., `MyAllocator<P=Pointer, A=u64, S=u32> { type Pointer = P; ... }`, or are at least parameterized by a subset of them; TODO: figure out the most ergonomic order of type parameters; I think the most undisputed defaults should go to the end so callers can leave them out; is this correct?).
 	- `Pointer` is the concrete `Copy` identity `Pointer<W>` (§`Pointer`) the allocator hands out — the stable id, serialized into other allocations, previously called `Index` in `allocator-spec.md`. It stays a *concrete* type (not opaque/associated), so the owned handles keep inherent `.raw()`/`.into_fixed_size()` methods and `Persistable` needs no backend type parameter, only the pointer type `P` — which a `Persistable<P>` pins to the backend via `Backend<Pointer = P>`.
+
+> **Claude (answering "most undisputed defaults at the end — correct?"):** Yes, and the reason is a hard rule: a caller can only omit *trailing* type parameters, so the ones most often left at their default must come last. (Rust also forbids a defaulted parameter *before* a non-defaulted one — moot here, since all three have defaults, so their relative order is unconstrained.) Order by how often a caller overrides each, most-overridden first; and since you also can't *skip* a middle parameter, keep the rarely-touched ones contiguous at the tail. Pointer width is the most format-specific choice, so `<Pointer, Address, Size>` is the natural order. Caveat: in practice a format pins all three at once behind a type alias (`type KladdeAllocator = DefaultAllocator<…>`), so end users never spell them — this ordering only matters for generic library code, so don't over-optimize it.
 - Manages a set of non-overlapping `Address` ranges, where `Address` is an unsigned integer type that should probably somehow generically support `NonZero`.
 - The trait definition does not assume any connection to persistency. It doesn't interpret the integer ranges it manages as memory and doesn't provide read or write access to them (that's what the backends are for), and you can implement an `Allocator` that holds its entire state in memory and doesn't deal with persistence at all. A persisted allocator then typically builds on top of an in-memory allocator, somewhat analogous to how, at a higher level, types that implement `Persistable` (like `PersistableHashMap<K,V>`) often use standard library types (like `std::collections::HashMap<K,(V,Index)>`) for their in-memory representation.
 	- Concretely, this means that, different to the current `allocator-spec.md`, this new `Allocator` does not have the methods `read`, `write`, and `splice` (those go in the backends below)
@@ -96,7 +98,7 @@ Inherent methods on the owned handles: `.raw() -> P`, and `UniquePointer::{from_
 	- `Allocator`s that don't provide any `MetaData` can simply set `type MetaData = ()` and leave the query method default implemented (it returns `MetaData::default()`).
 	- The reason why we push `MetaData` into `Allocator` instead of requiring the containing types to simply store the meta data in a hash map themselves is that most `Allocator` implementations will probably have some sort of table `Id --> (Address, Size, ...)` anyway, and many use cases where one would query for `MetaData` would also involve a query for the addresses or size, which would hit that table anyway. So it's probably more efficient to have it all in a single table.
 - Apart from the above, model `Allocator` after the description in `allocator-spec.md`, with a few additional minor tweaks:
-	- `Allocator` should support recovering an *owned* handle of the correct kind from a `Pointer` (this is what `load` needs — deserialize a `Pointer`, reconstruct the single owner, learning sizedness on the way): `fn resolve_owned(Pointer) -> Result<Owned, AllocError>` with `enum Owned { Resizable(UniquePointerResizable), Fixed(UniquePointerFixedSize) }`; and a `lookup` returning size + sizedness + `MetaData`. These query methods (`resolve_owned`, `lookup`, `size`, `meta`) return `Result<_, AllocError>` rather than `Option`: an id that isn't a live allocation is a `DanglingPointer` — which, for an id decoded from a possibly-corrupt file during `load`, is a *recoverable* error, not a `None` to silently default on nor a panic. (Caveat: like `from_index` today, `resolve_owned` can mint a *second* owner for an already-owned region, so it stays a load/allocator-internal method by convention.)
+	- `Allocator` should support recovering an *owned* handle of the correct kind from a `Pointer` (this is what `load` needs — deserialize a `Pointer`, reconstruct the single owner, learning sizedness on the way): `fn resolve(Pointer) -> Result<ResolvedPointer, AllocError>` with `enum ResolvedPointer { Resizable(UniquePointerResizable), Fixed(UniquePointerFixedSize) }`; and a `lookup` returning the resolved pointer (which carries sizedness), size, and `MetaData`. These query methods (`resolve`, `lookup`, `size`, `meta`) return `Result<_, AllocError>` rather than `Option`: an id that isn't a live allocation is a `DanglingPointer` — which, for an id decoded from a possibly-corrupt file during `load`, is a *recoverable* error, not a `None` to silently default on nor a panic. (Caveat: like `from_index` today, `resolve` can mint a *second* owner for an already-owned region, so it stays a load/allocator-internal method by convention.)
 	- We should also require methods to convert between fixed sized and resizable allocations. These consume the old pointer and return a new pointer (possibly with a new `Id` because some `Allocator`s might use a bit in the `Id` as a flag for fixed size vs resizable).
 	- Don't use the term `capacity` here when referring to allocation sizes. Always call it `size` (also not `byte_size`) because that's what it is *from the perspective of the allocator*. The implementation of a `Persistable` type might interpret the *size of the allocation* as a *capacity of a container* but that's at a higher level of abstraction.
 
@@ -138,22 +140,22 @@ pub trait Allocator {
     // (a reserved-but-unclaimed pointer has a size, so it's Ok for these, but has
     //  no address yet -- which is fine, `address` is only ever called post-claim)
     fn lookup(&self, p: Self::Pointer) -> Result<Allocation<'_, Self>, AllocError>;
-    // Only the Meta part will actually be returned as an &mut.
-    fn lookup_mut (&self, p: Self::Pointer) -> Result<AllocationMut<'_, Self>, AllocError>;
+    // Only the Meta part is actually handed out as `&mut`, so this needs `&mut self`.
+    fn lookup_mut(&mut self, p: Self::Pointer) -> Result<AllocationMut<'_, Self>, AllocError>;
 
-    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self>, AllocError>{
+    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self::Pointer>, AllocError> {
         self.lookup(p).map(|a| a.pointer)
     }
-    fn size(&self, p: Self::Pointer) -> Result<Self::Size, AllocError> { /* default: self.lookup(p).map(..) */ }
-    fn meta(&self, p: Self::Pointer) -> Result<Self::Meta, AllocError> { /* default: self.lookup(p).map(..) */ }
-    fn meta_mut(&self, p: Self::Pointer) -> Result<Self::Meta, AllocError> { /* default: self.lookup(p).map(..) */ }
-    fn size_fixed_size(&self, p: Self::Pointer) -> Result<Self::Size, AllocError> { self.size() } // For potential optimizations. Should it be #[inline]?
-    fn size_resizable(&self, p: Self::Pointer) -> Result<Self::Size, AllocError> { self.size() } // For potential optimizations. Should it be #[inline]?
-    fn meta_fixed_size(&self, p: Self::Pointer) -> Result<Self::Meta, AllocError> { self.meta() } // For potential optimizations. Should it be #[inline]?
-    fn meta_resizable(&self, p: Self::Pointer) -> Result<Self::Meta, AllocError> { self.meta() } // For potential optimizations. Should it be #[inline]?
+    fn size(&self, p: Self::Pointer) -> Result<Self::Size, AllocError> { /* default: self.lookup(p).map(|a| a.size) */ }
+    fn meta(&self, p: Self::Pointer) -> Result<&Self::Meta, AllocError> { /* default: self.lookup(p).map(|a| a.meta) */ }
+    fn meta_mut(&mut self, p: Self::Pointer) -> Result<&mut Self::Meta, AllocError> { /* default: self.lookup_mut(p).map(|a| a.meta) */ }
+    fn size_fixed_size(&self, p: Self::Pointer) -> Result<Self::Size, AllocError> { self.size(p) } // For potential optimizations. Should it be #[inline]?
+    fn size_resizable(&self, p: Self::Pointer) -> Result<Self::Size, AllocError> { self.size(p) } // For potential optimizations. Should it be #[inline]?
+    fn meta_fixed_size(&self, p: Self::Pointer) -> Result<&Self::Meta, AllocError> { self.meta(p) } // For potential optimizations. Should it be #[inline]?
+    fn meta_resizable(&self, p: Self::Pointer) -> Result<&Self::Meta, AllocError> { self.meta(p) } // For potential optimizations. Should it be #[inline]?
     // Also: meta_mut_fixed_size and meta_mut_resizable (default impls forward to meta_mut)
-    fn resolve_resizable(&self, p: Self::Pointer) -> Result<UniquePointerResizable<Self::Pointer>, AllocError>> { /* default defers to `resolve` */ }
-    fn resolve_fixed_size(&self, p: Self::Pointer) -> Result<UniquePointerFixedSize<Self::Pointer>, AllocError>> { /* default defers to `resolve` */ }
+    fn resolve_resizable(&self, p: Self::Pointer) -> Result<UniquePointerResizable<Self::Pointer>, AllocError> { /* default defers to `resolve` */ }
+    fn resolve_fixed_size(&self, p: Self::Pointer) -> Result<UniquePointerFixedSize<Self::Pointer>, AllocError> { /* default defers to `resolve` */ }
 }
 
 /// Crate-local, Kladde-agnostic. Fallible (not a panic) so a bad *deserialized*
@@ -165,9 +167,11 @@ pub enum ResolvedPointer<P = Pointer> {
     Fixed(UniquePointerFixedSize<P>),
 }
 
-pub struct Allocation<'_, A: Allocator + ?Sized> { pub pointer: ResolvedPointer<A::Pointer>, pub size: A::Size, pub meta: &A::Meta }
-pub struct AllocationMut<'_, A: Allocator + ?Sized> { pub pointer: ResolvedPointer<A::Pointer>, pub size: A::Size, pub meta: &mut A::Meta }
+pub struct Allocation<'a, A: Allocator + ?Sized> { pub pointer: ResolvedPointer<A::Pointer>, pub size: A::Size, pub meta: &'a A::Meta }
+pub struct AllocationMut<'a, A: Allocator + ?Sized> { pub pointer: ResolvedPointer<A::Pointer>, pub size: A::Size, pub meta: &'a mut A::Meta }
 ```
+
+> **Claude (on the query-method sketch):** The review-flagged compile errors and the `&self`→`&mut self` / owned-`Meta`→borrow issues are now fixed inline above (named lifetimes on `Allocation`/`AllocationMut`; `lookup_mut`/`meta_mut` take `&mut self`; `meta`/`meta_mut` borrow; `resolve` returns `ResolvedPointer<Self::Pointer>`; stray `>>` removed; specialized defaults pass `p`). One open *design* point remains: the `_fixed_size`/`_resizable` variants of `size`/`meta`/`resolve` — I'd defer them. They roughly triple the query surface for a *speculative* win: knowing the sizedness only lets an impl skip a branch or a bit-check, negligible next to the table lookup these methods already do. This is exactly the generalization [Problems item 7](#problems-and-regressions) says to gate on a *measured* need (the chunked-vec case is the forcing function) — keep `size`/`meta`/`resolve` over a bare `Pointer` as the core and add specialization only if a benchmark shows the branch matters. `#[inline]` on the trivial forwarders is right and cheap if you keep them, but secondary. If it ever *does* come to this, prefer encoding "the caller knows the sizedness" through the *handle type* (methods taking `&UniquePointerResizable` / `&UniquePointerFixedSize`) over a combinatorial name matrix.
 
 (`reserve_*` sizes are `Self::Size`, applying the "call it `size`, in `Size`, not `usize`" rule from the bullets above. `Pointer` itself *is* the serialized id, so there's no separate `id()` method — you serialize a `Pointer` directly. `resize` returning `Ok(Some((old, new)))` addresses is fine on the `Allocator` because addresses are core here; the backend consumes the `Ok(Some(..))` to move bytes and returns `Result<(), _>` to its own callers, never an address.)
 
@@ -235,6 +239,8 @@ pub trait ReadBackend: Backend {                                                
 ```
 
 Note: `read_at` probably needs to return a `std::io::Result<impl Read + Seek + '_>` because the backend has to seek to the position, which can fail.
+
+> **Claude (answering "should the mirrored queries go here or in `Backend`?"):** In `Backend`. The shared, always-safe *queries* (`size`, `resolve`, sizedness — never `meta`, agreed) answer from the always-up-to-date in-memory allocator, so they're valid in *both* phases; only reads of *stored bytes* need the read/write isolation. Two payoffs from putting them on the supertrait: it **de-duplicates** (today `size` is declared on *both* halves), and it **removes an ambiguity** — with `size` on both siblings, `b.size(..)` under `B: ReadBackend + WriteBackend` is an E0221 error (the very thing the supertrait was introduced to fix for `Pointer`/`Size`); one declaration on `Backend` resolves it. The cost: `Backend` shifts from "pure type carrier" to "types + read-only allocator queries" — but the `fn f<B: Backend>(p: B::Pointer)` use case still works, and the journal-phase guarantee is untouched (it's about stored bytes, not allocator state). These queries fail only on a dangling id (no I/O), so they can return `Result<_, AllocError>` even on `Backend`. Net: queries → `Backend`; `read_at` → `ReadBackend`; `write`/`alloc*`/`resize`/`free*` → `WriteBackend`.
 
 > **Claude (the `&self`/`&mut self` asymmetry, verified in the prototype):** the natural split is **write = `&self`, read = `&mut self`**, and it falls out of *why* each exists. Writes go through guards that reborrow a shared `&B` (needs `&self`); reads happen during a sequential `load` that owns the backend exclusively for the duration (can take `&mut self`). A free side effect: the borrow checker then forbids `load` (needs `&mut B`) while any guard (holds `&B`) is alive — a correct, automatic enforcement of "don't read stale data mid-write". Because `ReadBackend` is `&mut self`, the whole `RefCell<Storage>`-on-the-read-path problem simply doesn't arise; interior mutability is confined to the *write* facade in the concrete backend.
 
