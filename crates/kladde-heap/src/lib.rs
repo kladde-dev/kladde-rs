@@ -21,6 +21,7 @@
 mod allocator;
 mod backend;
 mod composed;
+mod journaled;
 mod mock;
 mod pointer;
 mod storage;
@@ -31,6 +32,7 @@ pub use allocator::{
     AllocError, Allocation, AllocationMut, Allocator, Relocation, SimpleAllocator,
 };
 pub use backend::{Backend, BackendError, ReadBackend, WriteBackend};
+pub use journaled::{JournaledReadBackend, JournaledWriteBackend};
 pub use mock::MockBackend;
 pub use pointer::{
     Pointer, ResolvedPointer, UniquePointer, UniquePointerFixedSize, UniquePointerResizable,
