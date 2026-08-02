@@ -127,6 +127,20 @@ pub struct Location<P = Pointer, S = u32> {
 
 // ============================== allocator ==============================
 
+/// Crate-local, Kladde-agnostic allocator error. `DanglingPointer`: the id
+/// isn't a live allocation (freed / never existed / decoded from corrupt
+/// bytes). `Exhausted`: a (re)allocation can't be satisfied. Fallible, not a
+/// panic, because a persistence library must surface an invalid *deserialized*
+/// id as a recoverable error rather than crash on a corrupt file.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AllocError {
+    DanglingPointer,
+    Exhausted,
+}
+
+/// A resize's relocation report: `Some((old, new))` iff the bytes moved.
+pub type Relocation<Addr> = Option<(Addr, Addr)>;
+
 /// Pure address-range management: a *normal* `&mut self` mutating API, with no
 /// knowledge of the bytes stored at those ranges. Addresses are **core** to the
 /// `Allocator` (no separate `TransparentAllocator`); a `Backend` hides them.
@@ -140,20 +154,47 @@ pub trait Allocator {
     fn free_resizable(&mut self, p: UniquePointerResizable<Self::Pointer>);
     fn free_fixed(&mut self, p: UniquePointerFixedSize<Self::Pointer>);
 
-    /// Returns `Some((old_addr, new_addr))` iff the bytes must move; `None` =
-    /// in-place resize or an unclaimed (address-less) reservation.
+    /// `Ok(Some((old, new)))` iff the bytes must move; `Ok(None)` = in-place
+    /// resize or an unclaimed (address-less) reservation; `Err` = can't satisfy
+    /// the request (or the handle's id isn't live).
     fn resize(
         &mut self,
         p: &UniquePointerResizable<Self::Pointer>,
         new_size: Self::Size,
-    ) -> Option<(Self::Address, Self::Address)>;
+    ) -> Result<Relocation<Self::Address>, AllocError>;
 
-    /// `None` if `p` was only reserved, never claimed.
-    fn address(&self, p: Self::Pointer) -> Option<Self::Address>;
-    fn size(&self, p: Self::Pointer) -> Option<Self::Size>;
+    /// `Err(DanglingPointer)` if `p` isn't a live allocation. A reserved-but-
+    /// unclaimed pointer is *not* a valid argument: during journal replay
+    /// `claim` always precedes any `address` call, so the reserved state never
+    /// reaches here -- there is no valid "no address yet" case to model.
+    fn address(&self, p: Self::Pointer) -> Result<Self::Address, AllocError>;
+    /// `Err(DanglingPointer)` if `p` isn't a live allocation. Unlike `address`,
+    /// a reserved-but-unclaimed pointer *is* a valid argument here (it already
+    /// has a size), returning `Ok`; only a non-live id fails.
+    fn size(&self, p: Self::Pointer) -> Result<Self::Size, AllocError>;
 }
 
 // ============================ backend split ============================
+
+/// Backend-layer error: an [`AllocError`] (e.g. a dangling/corrupt id) *or* a
+/// storage I/O failure. The backend touches `Storage`, so its errors are a
+/// superset of the pure allocator's. (A real design might make this an
+/// associated `type Error`; a concrete enum keeps the prototype simple.)
+#[derive(Debug)]
+pub enum BackendError {
+    Alloc(AllocError),
+    Io(io::Error),
+}
+impl From<AllocError> for BackendError {
+    fn from(e: AllocError) -> Self {
+        Self::Alloc(e)
+    }
+}
+impl From<io::Error> for BackendError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
 
 /// Shared **type carrier**: every backend has exactly one `Pointer` and one
 /// `Size`, declared here once. Because the two halves *extend* `Backend` rather
@@ -171,7 +212,9 @@ pub trait Backend {
 /// the read path can hand out the real seekable cursor with no `RefCell`.
 pub trait ReadBackend: Backend {
     fn read(&mut self, anchor: Self::Pointer, offset: Self::Size, len: Self::Size) -> Vec<u8>;
-    fn size(&self, p: Self::Pointer) -> Option<Self::Size>;
+    /// Fallible: an id decoded from corrupt bytes surfaces as `Err`, so a
+    /// container's `load` propagates it instead of silently defaulting.
+    fn size(&self, p: Self::Pointer) -> Result<Self::Size, BackendError>;
 }
 
 /// Write access. `write`/`alloc_*`/`resize` are `&self` (guard reborrow model);
@@ -181,9 +224,15 @@ pub trait WriteBackend: Backend {
     fn alloc_fixed(&self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer>;
     fn free_resizable(&self, p: UniquePointerResizable<Self::Pointer>);
     fn free_fixed(&self, p: UniquePointerFixedSize<Self::Pointer>);
-    fn resize(&self, p: &UniquePointerResizable<Self::Pointer>, new_size: Self::Size);
+    /// Addresses never surface (contrast `Allocator::resize`); the relocation
+    /// report is consumed internally to move bytes. Fallible: the move is I/O.
+    fn resize(
+        &self,
+        p: &UniquePointerResizable<Self::Pointer>,
+        new_size: Self::Size,
+    ) -> Result<(), BackendError>;
     fn write(&self, anchor: Self::Pointer, offset: Self::Size, bytes: &[u8]);
-    fn size(&self, p: Self::Pointer) -> Option<Self::Size>;
+    fn size(&self, p: Self::Pointer) -> Result<Self::Size, BackendError>;
 }
 
 // A caller needing both just writes `B: ReadBackend + WriteBackend` -- no
@@ -284,7 +333,15 @@ impl<T: Persistable<P>, P: Copy> Persistable<P> for PersistableVec<T, P> {
         // sequential `&mut` read path reborrows cleanly, with `B::Size` offsets.
         let id_len: B::Size = Word::from_usize(Self::INLINE_SIZE);
         let _id_bytes = backend.read(location.anchor, location.offset, id_len);
-        let n = backend.size(location.anchor).map_or(0, Word::to_usize) / T::INLINE_SIZE.max(1);
+        // `size` is now fallible: a dangling/corrupt id surfaces as `Err`
+        // instead of silently defaulting to 0. (A real, fallible `load` would
+        // `?`-propagate it; this prototype keeps `load -> Self`, so it panics
+        // loudly rather than defaulting -- the point is that it can't be ignored.)
+        let n = backend
+            .size(location.anchor)
+            .expect("prototype: root allocation must be live")
+            .to_usize()
+            / T::INLINE_SIZE.max(1);
         let mut data = Vec::new();
         for i in 0..n {
             let offset: B::Size = Word::from_usize(i * T::INLINE_SIZE);
@@ -421,26 +478,35 @@ impl Allocator for MockAllocator {
         &mut self,
         p: &UniquePointerResizable<Pointer>,
         new_size: u32,
-    ) -> Option<(usize, usize)> {
+    ) -> Result<Relocation<usize>, AllocError> {
         let new_size = new_size.to_usize();
-        let row = *self.table.get(&p.raw().0)?;
+        let row = *self
+            .table
+            .get(&p.raw().0)
+            .ok_or(AllocError::DanglingPointer)?;
         if new_size <= row.size {
             self.table.get_mut(&p.raw().0).unwrap().size = new_size;
-            None // shrink in place -- no move
+            Ok(None) // shrink in place -- no move
         } else {
             let new_addr = self.bump; // bump allocator can't grow in place
             self.bump += new_size;
             let e = self.table.get_mut(&p.raw().0).unwrap();
             e.address = new_addr;
             e.size = new_size;
-            Some((row.address, new_addr))
+            Ok(Some((row.address, new_addr)))
         }
     }
-    fn address(&self, p: Pointer) -> Option<usize> {
-        self.table.get(&p.0).map(|r| r.address)
+    fn address(&self, p: Pointer) -> Result<usize, AllocError> {
+        self.table
+            .get(&p.0)
+            .map(|r| r.address)
+            .ok_or(AllocError::DanglingPointer)
     }
-    fn size(&self, p: Pointer) -> Option<u32> {
-        self.table.get(&p.0).map(|r| Word::from_usize(r.size))
+    fn size(&self, p: Pointer) -> Result<u32, AllocError> {
+        self.table
+            .get(&p.0)
+            .map(|r| Word::from_usize(r.size))
+            .ok_or(AllocError::DanglingPointer)
     }
 }
 
@@ -500,24 +566,30 @@ impl<S: Storage, A: Allocator<Pointer = Pointer>> WriteBackend for UnjournaledBa
     fn free_fixed(&self, p: UniquePointerFixedSize<Pointer>) {
         self.inner.borrow_mut().1.free_fixed(p);
     }
-    fn resize(&self, p: &UniquePointerResizable<Pointer>, new_size: A::Size) {
+    fn resize(
+        &self,
+        p: &UniquePointerResizable<Pointer>,
+        new_size: A::Size,
+    ) -> Result<(), BackendError> {
         let mut g = self.inner.borrow_mut();
         let (storage, alloc) = &mut *g;
-        let old_size = alloc.size(p.raw()).map_or(0, Word::to_usize);
-        // Consume the allocator's address-level relocation report and translate
-        // it into a `Storage` byte move; users of the backend never see addrs.
-        if let Some((old, new)) = alloc.resize(p, new_size) {
+        let old_size = alloc.size(p.raw())?.to_usize(); // AllocError -> BackendError
+                                                        // Consume the allocator's address-level relocation report and translate
+                                                        // it into a `Storage` byte move; users of the backend never see addrs.
+                                                        // The byte move is I/O, hence the `?`s (io::Error -> BackendError).
+        if let Some((old, new)) = alloc.resize(p, new_size)? {
             let (old, new) = (old.to_usize(), new.to_usize());
             let end = (new + new_size.to_usize()) as u64;
-            if storage.len().unwrap() < end {
-                storage.resize(end).unwrap();
+            if storage.len()? < end {
+                storage.resize(end)?;
             }
             let mut buf = vec![0u8; old_size.min(new_size.to_usize())];
-            storage.seek(SeekFrom::Start(old as u64)).unwrap();
-            storage.read_exact(&mut buf).unwrap();
-            storage.seek(SeekFrom::Start(new as u64)).unwrap();
-            storage.write_all(&buf).unwrap();
+            storage.seek(SeekFrom::Start(old as u64))?;
+            storage.read_exact(&mut buf)?;
+            storage.seek(SeekFrom::Start(new as u64))?;
+            storage.write_all(&buf)?;
         }
+        Ok(())
     }
     fn write(&self, anchor: Pointer, offset: A::Size, bytes: &[u8]) {
         let mut g = self.inner.borrow_mut();
@@ -528,8 +600,8 @@ impl<S: Storage, A: Allocator<Pointer = Pointer>> WriteBackend for UnjournaledBa
             .unwrap();
         storage.write_all(bytes).unwrap();
     }
-    fn size(&self, p: Pointer) -> Option<A::Size> {
-        self.inner.borrow().1.size(p)
+    fn size(&self, p: Pointer) -> Result<A::Size, BackendError> {
+        Ok(self.inner.borrow().1.size(p)?)
     }
 }
 #[cfg(test)]
@@ -544,8 +616,8 @@ impl<S: Storage, A: Allocator<Pointer = Pointer>> ReadBackend for UnjournaledBac
         storage.read_exact(&mut buf).unwrap();
         buf
     }
-    fn size(&self, p: Pointer) -> Option<A::Size> {
-        self.inner.borrow().1.size(p)
+    fn size(&self, p: Pointer) -> Result<A::Size, BackendError> {
+        Ok(self.inner.borrow().1.size(p)?)
     }
 }
 
@@ -630,11 +702,22 @@ mod tests {
         let p = backend.alloc_resizable(4);
         backend.write(p.raw(), 0, &[9, 8, 7, 6]);
         // grow -> the bump allocator relocates -> WriteBackend copies the bytes
-        backend.resize(&p, 8);
+        backend.resize(&p, 8).unwrap();
         // read back through a fresh &mut borrow
         let mut backend = backend;
         let got = backend.read(p.raw(), 0, 4);
         assert_eq!(got, vec![9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn size_of_a_dangling_pointer_is_an_error_not_a_default() {
+        let backend = backend();
+        let bogus = Pointer(NonZeroU32::new(999).unwrap()); // never allocated
+                                                            // `size` (both halves) takes `&self`; disambiguate via ReadBackend.
+        assert!(matches!(
+            <UnjournaledBackend<_, _> as ReadBackend>::size(&backend, bogus),
+            Err(BackendError::Alloc(AllocError::DanglingPointer))
+        ));
     }
 
     #[test]

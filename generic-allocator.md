@@ -46,7 +46,7 @@ Traits and structs build on each other. At the lowest level (`Allocator` and `St
 - The trait `Storage` is orthogonal to `Allocator` and the backends. While `Allocator` models memory *management*, `Storage` models memory *access*. It provides unstructured random and sequential memory access to a large block of stored data (e.g., a file).
 - Concrete backends (`UnjournaledBackend` and `Journaled[Write]Backend`) are **composed of** an `Allocator` and a `Storage`, generic over both. They perform two tasks:
 	- they translate the high-level read/write operations ("read/write bytes `x..y` of memory allocation `p`") to low-level read/write operations in an encapsulated `Storage`; and
-	- they delegate management calls to the encapsulated `Allocator`, translating as needed (e.g. `Allocator::resize` reports a relocation as `Some((old, new))` addresses, which the backend *consumes* to move the bytes in `Storage` and then returns nothing to its caller — users never see addresses). Mutating `Allocator` calls are also replicated to an in-`Storage` representation of the allocator state, from which the encapsulated `Allocator` can be recreated on open. The backend uses the encapsulated `Allocator` itself to manage the memory that holds this in-`Storage` allocator state, so allocator state and user data separate automatically without reserving fixed file regions for either.
+	- they delegate management calls to the encapsulated `Allocator`, translating as needed (e.g. `Allocator::resize` reports a relocation as `Ok(Some((old, new)))` addresses, which the backend *consumes* to move the bytes in `Storage` and then returns `Result<(), _>` to its caller — users never see addresses). Mutating `Allocator` calls are also replicated to an in-`Storage` representation of the allocator state, from which the encapsulated `Allocator` can be recreated on open. The backend uses the encapsulated `Allocator` itself to manage the memory that holds this in-`Storage` allocator state, so allocator state and user data separate automatically without reserving fixed file regions for either.
 	- Because the backend is a *composition*, it is exactly where the `&self`-write facade lives: it wraps the `&mut self` `Allocator` (and `Storage`) in a `RefCell` and borrows through it per call. The reusable `Allocator` stays a clean `&mut self` API; the interior mutability is contained in this one adapter.
 - On top of `Backend`, the header, schema, and its fingerprint are stored in normal allocations, reachable from a pointer stored in some fixed-sized header. For the serialized schema, we might actually reuse `PersistableVec<u8>` once we have a good implementation of that and pin it to a given version there.
 
@@ -80,7 +80,7 @@ Inherent methods on the owned handles: `.raw() -> P`, and `UniquePointer::{from_
 - Manages a set of non-overlapping `Address` ranges, where `Address` is an unsigned integer type that should probably somehow generically support `NonZero`.
 - The trait definition does not assume any connection to persistency. It doesn't interpret the integer ranges it manages as memory and doesn't provide read or write access to them (that's what the backends are for), and you can implement an `Allocator` that holds its entire state in memory and doesn't deal with persistence at all. A persisted allocator then typically builds on top of an in-memory allocator, somewhat analogous to how, at a higher level, types that implement `Persistable` (like `PersistableHashMap<K,V>`) often use standard library types (like `std::collections::HashMap<K,(V,Index)>`) for their in-memory representation.
 	- Concretely, this means that, different to the current `allocator-spec.md`, this new `Allocator` does not have the methods `read`, `write`, and `splice` (those go in the backends below)
-- **Addresses are core to `Allocator`, and there is no `TransparentAllocator`.** Every `Allocator` can resolve a `Pointer` to its `Address` (`fn address(p) -> Option<Address>`; `None` for a reserved-but-unclaimed pointer, whose address doesn't exist yet), and `resize` reports a relocation directly by returning `Option<(old_address, new_address)>` (`Some` iff the bytes must move). Addresses are simply never surfaced *above* the backend layer — the backend consumes the relocation report to move bytes and hands its own callers nothing. This removes the old `TransparentAllocator`/`resize_transparently` split (which existed only to route addresses around an `Allocator` that pretended not to have them).
+- **Addresses are core to `Allocator`, and there is no `TransparentAllocator`.** Every `Allocator` can resolve a `Pointer` to its `Address` (`fn address(p) -> Result<Address, AllocError>`; `Err(DanglingPointer)` for a non-live id — a reserved-but-unclaimed pointer is never a valid argument, since `claim` always precedes any `address` call), and `resize` reports a relocation directly by returning `Result<Option<(old_address, new_address)>, AllocError>` (`Ok(Some(..))` iff the bytes must move; `Err` iff it can't satisfy the request). Addresses are simply never surfaced *above* the backend layer — the backend consumes the relocation report to move bytes and hands its own callers a plain `Result<(), _>`. This removes the old `TransparentAllocator`/`resize_transparently` split (which existed only to route addresses around an `Allocator` that pretended not to have them).
 - **Mutating methods take `&mut self`.** `Allocator` is a plain, reusable data structure with a normal ownership-checked API — nice for standalone reuse, tooling, and compaction. The `&self` interior mutability that the guard model needs lives *only in the backend adapter* (which wraps the allocator in a `RefCell`), never in the reusable `Allocator` itself.
 - Maybe exposes some `alloc_scratch` (allocate largest contiguous memory within the file) and/or `alloc_at_end` method if that is needed for journaling. Maybe not necessary if we can simply use the standard allocation methods and then query whether we happen to be at the end of the file, exploiting that a persisted allocator that builds on top of a *concrete* in-memory allocator may make assumption about the in-memory allocator's specifics beyond the `Allocator` trait.
 - Should probably be self-hosting. I.e., the `UnjournaledBackend` below  uses the Allocator itself to manage the memory regions where in-file representation of the Allocator is stored. It will probably need special logic to manage it in-file, but that's separate.
@@ -91,16 +91,16 @@ Inherent methods on the owned handles: `.raw() -> P`, and `UniquePointer::{from_
 	- And methods that `claim` reservations (i.e., assign actual addresses)
 - Default implementations of `reserve_{resizable, fixed}` simply forward to `alloc_{resizable, fixed}`. Default implementations of `claim_{resizable, fixed}` are no-ops.
 - **The same reserve/claim deferral is needed for `resize`, not just `alloc`.** In a journaled backend, a live resize of an already-claimed region must not assign a new address on the spot (it could land past the current end of the journal and block the journal from growing). So there is a `reserve_resize` that records the intent now and defers the address assignment to journal replay's `claim`, exactly like `alloc`. This is a good sign that reserve/claim is the right primitive (it generalizes to any address-assigning op), but it does add a "reserved-resize" state on top of the "reserved-alloc" state (see [Problems and regressions](#problems-and-regressions)).
-- It must be allowed to call all `Allocator` methods (like freeing, resizing, ...) on valid `UniquePointerResizable` or `UniquePointerFixedSize` regardless of whether they're reserved or actually allocated. But `WriteBackend` and `ReadBackend` may return an error when provided pointers that are only reserved and where never claimed (they don't *have to* return an error, but if they don't then they must operate as if the allocations were normally created rather than just reserved, as in the default implementations)
+- It must be allowed to call all `Allocator` methods (like freeing, resizing, ...) on valid `UniquePointerResizable` or `UniquePointerFixedSize` regardless of whether they're reserved or actually allocated — **with the sole exception of `address`**, which requires a *claimed* pointer (a reservation has no address yet, and `claim` always precedes any `address` call, so this never arises in practice). `size`/`lookup`/etc. do accept a reservation (it already has a size). `WriteBackend` and `ReadBackend` may return an error when provided pointers that are only reserved and where never claimed (they don't *have to* return an error, but if they don't then they must operate as if the allocations were normally created rather than just reserved, as in the default implementations)
 - Has an additional associated type `MetaData: Default` for storing additional data for each allocation that can be queried either by a dedicated `meta_data` method or by a `lookup` method that returns everything about a given pointer (its address, sizedness, size, and meta data). This is used by `Backend` implementations to keep track of where allocator state is stored in `Storage`.
 	- `Allocator`s that don't provide any `MetaData` can simply set `type MetaData = ()` and leave the query method default implemented (it returns `MetaData::default()`).
 	- The reason why we push `MetaData` into `Allocator` instead of requiring the containing types to simply store the meta data in a hash map themselves is that most `Allocator` implementations will probably have some sort of table `Id --> (Address, Size, ...)` anyway, and many use cases where one would query for `MetaData` would also involve a query for the addresses or size, which would hit that table anyway. So it's probably more efficient to have it all in a single table.
 - Apart from the above, model `Allocator` after the description in `allocator-spec.md`, with a few additional minor tweaks:
-	- `Allocator` should support recovering an *owned* handle of the correct kind from a `Pointer` (this is what `load` needs — deserialize a `Pointer`, reconstruct the single owner, learning sizedness on the way): `fn resolve_owned(Pointer) -> Option<Owned>` with `enum Owned { Resizable(UniquePointerResizable), Fixed(UniquePointerFixedSize) }`; and a `lookup` returning size + sizedness + `MetaData`. (Caveat: like `from_index` today, `resolve_owned` can mint a *second* owner for an already-owned region, so it stays a load/allocator-internal method by convention.)
+	- `Allocator` should support recovering an *owned* handle of the correct kind from a `Pointer` (this is what `load` needs — deserialize a `Pointer`, reconstruct the single owner, learning sizedness on the way): `fn resolve_owned(Pointer) -> Result<Owned, AllocError>` with `enum Owned { Resizable(UniquePointerResizable), Fixed(UniquePointerFixedSize) }`; and a `lookup` returning size + sizedness + `MetaData`. These query methods (`resolve_owned`, `lookup`, `size`, `meta`) return `Result<_, AllocError>` rather than `Option`: an id that isn't a live allocation is a `DanglingPointer` — which, for an id decoded from a possibly-corrupt file during `load`, is a *recoverable* error, not a `None` to silently default on nor a panic. (Caveat: like `from_index` today, `resolve_owned` can mint a *second* owner for an already-owned region, so it stays a load/allocator-internal method by convention.)
 	- We should also require methods to convert between fixed sized and resizable allocations. These consume the old pointer and return a new pointer (possibly with a new `Id` because some `Allocator`s might use a bit in the `Id` as a flag for fixed size vs resizable).
 	- Don't use the term `capacity` here when referring to allocation sizes. Always call it `size` (also not `byte_size`) because that's what it is *from the perspective of the allocator*. The implementation of a `Persistable` type might interpret the *size of the allocation* as a *capacity of a container* but that's at a higher level of abstraction.
 
-A sketch (the concrete pointer shapes and the `&mut self` / `resize -> Option<(old, new)>` shapes are verified in `crates/generic-alloc`; `Word` is a helper trait bounding the generic unsigned integers — see the Word-bound item in [Problems and regressions](#problems-and-regressions)). Note the pointer types are the concrete `Pointer<W>`/`UniquePointer*<P>`, so `.raw()`/`.into_fixed()` are *inherent* on the handles and don't need allocator methods. Mutating methods take `&mut self` (the `&self` facade lives in the backend):
+A sketch (the concrete pointer shapes and the `&mut self` / `resize -> Result<Option<(old, new)>, AllocError>` shapes are verified in `crates/generic-alloc`; `Word` is a helper trait bounding the generic unsigned integers — see the Word-bound item in [Problems and regressions](#problems-and-regressions)). Note the pointer types are the concrete `Pointer<W>`/`UniquePointer*<P>`, so `.raw()`/`.into_fixed()` are *inherent* on the handles and don't need allocator methods. Mutating methods take `&mut self` (the `&self` facade lives in the backend):
 
 ```rust
 pub trait Allocator {
@@ -114,17 +114,18 @@ pub trait Allocator {
     fn alloc_fixed(&mut self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer>;
     fn free_resizable(&mut self, p: UniquePointerResizable<Self::Pointer>);
     fn free_fixed(&mut self, p: UniquePointerFixedSize<Self::Pointer>);
-    /// `Some((old, new))` iff the bytes must move; `None` = in-place or unclaimed.
+    /// `Ok(Some((old, new)))` iff the bytes must move; `Ok(None)` = in-place or
+    /// unclaimed; `Err(Exhausted)` = can't satisfy the request.
     fn resize(&mut self, p: &UniquePointerResizable<Self::Pointer>, new_size: Self::Size)
-        -> Option<(Self::Address, Self::Address)>;                        // FixedSize has no resize (the gate)
+        -> Result<Option<(Self::Address, Self::Address)>, AllocError>;    // FixedSize has no resize (the gate)
 
     // --- addresses are core (no TransparentAllocator) ---
-    fn address(&self, p: Self::Pointer) -> Option<Self::Address>;         // None if reserved, never claimed
+    fn address(&self, p: Self::Pointer) -> Result<Self::Address, AllocError>;   // Err(DanglingPointer); reserved never reaches here (claim precedes address)
 
     // --- reserve an id now, assign an address later (journaling) ---
     fn reserve_resizable(&mut self, size: Self::Size) -> UniquePointerResizable<Self::Pointer> { self.alloc_resizable(size) }
     fn reserve_fixed(&mut self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer> { self.alloc_fixed(size) }
-    fn reserve_resize(&mut self, p: &UniquePointerResizable<Self::Pointer>, new_size: Self::Size) { self.resize(p, new_size); }
+    fn reserve_resize(&mut self, p: &UniquePointerResizable<Self::Pointer>, new_size: Self::Size) -> Result<(), AllocError> { self.resize(p, new_size).map(|_| ()) }
     fn claim_resizable(&mut self, _p: &UniquePointerResizable<Self::Pointer>) {}
     fn claim_fixed(&mut self, _p: &UniquePointerFixedSize<Self::Pointer>) {}
 
@@ -132,12 +133,18 @@ pub trait Allocator {
     fn make_resizable(&mut self, p: UniquePointerFixedSize<Self::Pointer>) -> UniquePointerResizable<Self::Pointer>;
     fn make_fixed(&mut self, p: UniquePointerResizable<Self::Pointer>) -> UniquePointerFixedSize<Self::Pointer>;
 
-    // --- reconstruct the owner on load / query the table ---
-    fn resolve_owned(&self, p: Self::Pointer) -> Option<Owned<Self>>;     // learn sizedness, mint the owner
-    fn lookup(&self, p: Self::Pointer) -> Option<Allocation<Self>>;       // size, sizedness, meta
-    fn size(&self, p: Self::Pointer) -> Option<Self::Size> { /* default: self.lookup(p).map(..) */ }
-    fn meta(&self, p: Self::Pointer) -> Option<Self::Meta> { /* default: self.lookup(p).map(..) */ }
+    // --- query the table: Err(DanglingPointer) if `p` isn't a live allocation ---
+    // (a reserved-but-unclaimed pointer has a size, so it's Ok for these, but has
+    //  no address yet -- which is fine, `address` is only ever called post-claim)
+    fn resolve_owned(&self, p: Self::Pointer) -> Result<Owned<Self>, AllocError>;   // learn sizedness, mint the owner
+    fn lookup(&self, p: Self::Pointer) -> Result<Allocation<Self>, AllocError>;     // size, sizedness, meta
+    fn size(&self, p: Self::Pointer) -> Result<Self::Size, AllocError> { /* default: self.lookup(p).map(..) */ }
+    fn meta(&self, p: Self::Pointer) -> Result<Self::Meta, AllocError> { /* default: self.lookup(p).map(..) */ }
 }
+
+/// Crate-local, Kladde-agnostic. Fallible (not a panic) so a bad *deserialized*
+/// id surfaces as a recoverable error rather than crashing on a corrupt file.
+pub enum AllocError { DanglingPointer, Exhausted }
 
 pub enum Owned<A: Allocator + ?Sized> {
     Resizable(UniquePointerResizable<A::Pointer>),
@@ -147,7 +154,7 @@ pub enum Sizedness { Fixed, Resizable }
 pub struct Allocation<A: Allocator + ?Sized> { pub size: A::Size, pub sizedness: Sizedness, pub meta: A::Meta }
 ```
 
-(`reserve_*` sizes are `Self::Size`, applying the "call it `size`, in `Size`, not `usize`" rule from the bullets above. `Pointer` itself *is* the serialized id, so there's no separate `id()` method — you serialize a `Pointer` directly. `resize` returning `Some((old, new))` addresses is fine on the `Allocator` because addresses are core here; the backend consumes it and returns nothing to its own callers.)
+(`reserve_*` sizes are `Self::Size`, applying the "call it `size`, in `Size`, not `usize`" rule from the bullets above. `Pointer` itself *is* the serialized id, so there's no separate `id()` method — you serialize a `Pointer` directly. `resize` returning `Ok(Some((old, new)))` addresses is fine on the `Allocator` because addresses are core here; the backend consumes the `Ok(Some(..))` to move bytes and returns `Result<(), _>` to its own callers, never an address.)
 
 
 ### `trait Backend` (shared type carrier)
@@ -161,7 +168,14 @@ pub trait Backend {
     type Pointer: Copy;   // concrete Pointer<W>; the serialized id
     type Size: Word;      // offsets and allocation sizes
 }
+
+/// Backend-layer error: an `AllocError` (dangling/corrupt id) OR storage I/O.
+/// The backend touches `Storage`, so its errors are a superset of the pure
+/// allocator's. (Could be an associated `type Error` if backends need to differ.)
+pub enum BackendError { Alloc(AllocError), Io(std::io::Error) }
 ```
+
+- The backend query/mutation methods that can fail on a bad id or on storage I/O return `Result<_, BackendError>`. A bad *deserialized* id (during `load`) is thus a recoverable error the container `?`-propagates — never a silent default (`Option`'s trap) nor a crash (a `panic`'s). `write`/`read_at` would join this fallible surface in a fuller pass; the change below covers the two the discussion turned on, `size` and `resize`.
 
 ### `trait WriteBackend` (composes an `Allocator`; write = `&self`)
 - **Composed of** an `Allocator` (it holds one), not an extension of it. It equips that allocator with write access to the associated memory *and* re-exposes allocation/resize/free — but *address-hidden*: `WriteBackend::resize` never returns addresses (contrast `Allocator::resize`), because users of a backend must never see them.
@@ -176,11 +190,12 @@ pub trait WriteBackend: Backend {                                               
     fn alloc_fixed(&self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer>;
     fn free_resizable(&self, p: UniquePointerResizable<Self::Pointer>);
     fn free_fixed(&self, p: UniquePointerFixedSize<Self::Pointer>);
-    fn resize(&self, p: &UniquePointerResizable<Self::Pointer>, new_size: Self::Size); // no addresses out
+    fn resize(&self, p: &UniquePointerResizable<Self::Pointer>, new_size: Self::Size)
+        -> Result<(), BackendError>;                                                  // no addresses out; the byte move is I/O
     fn write(&self, anchor: Self::Pointer, offset: Self::Size, bytes: &[u8]);          // takes bytes, not `impl Write`
     /// Atomic resize + tail-shift + content overwrite of one region.
     fn splice(&self, p: &UniquePointerResizable<Self::Pointer>, offset: Self::Size, old_len: Self::Size, new: &[u8]);
-    fn size(&self, p: Self::Pointer) -> Option<Self::Size>;                            // querying is fine mid-write
+    fn size(&self, p: Self::Pointer) -> Result<Self::Size, BackendError>;              // querying is fine mid-write; Err on a bad id
 }
 ```
 
@@ -195,7 +210,7 @@ pub trait ReadBackend: Backend {                                                
     /// A reader positioned at `anchor + offset`. `&mut self` makes handing out a
     /// seekable cursor sound; the prototype returns the real `&mut Storage`.
     fn read_at(&mut self, anchor: Self::Pointer, offset: Self::Size) -> impl Read + Seek + '_;
-    fn size(&self, p: Self::Pointer) -> Option<Self::Size>;
+    fn size(&self, p: Self::Pointer) -> Result<Self::Size, BackendError>;   // Err on a dangling/corrupt id
 }
 
 // "needs both" is just `B: ReadBackend + WriteBackend` -- no convenience trait.
@@ -345,7 +360,7 @@ Written by Claude. This section collects the problems this proposal may run into
 
 3. **Duplicated surface: `alloc_*`/`free_*`/`resize`/`size` appear on both `Allocator` and the backends** *(new, from the composition-not-extension decision).* Because `Backend` no longer *is* an `Allocator`, each backend must forward-and-translate every management op: address-aware and `&mut self` on the `Allocator`, address-hidden and `&self` (write) / `&mut self` (read query) on the backend. That is real boilerplate — mostly mechanical, absorbable by a default-method layer or a small macro, but it exists where `Backend: Allocator` had none. It is the (worthwhile) price of letting the two layers choose their `&self`/`&mut self` and address-visibility independently. A related, *smaller* cost (after moving `Pointer`/`Size` onto a shared `Backend` supertrait — see that section): the umbrella `Backend` bound is weak (it guarantees only the associated types, not read/write access), and every backend needs one extra `impl Backend` block beside the half(s) it implements. In exchange, `B::Pointer`/`B::Size` are unambiguous everywhere and there is no parameterized convenience trait to thread.
 
-4. **`resize -> Option<(old, new)>` conflates two "no move" cases, and the in-place-*grow* case still needs backend work** *(new; confirmed in the prototype).* `None` means both *unclaimed* (no address yet) and *in-place claimed* (address unchanged) — fine for the byte-move decision, but on an in-place **grow** the backend must still ensure `Storage` covers `[addr, addr + new_size)`, which the `Option` doesn't signal. So the backend can't rely on the `Option` alone: either make the result 3-way (`Relocated{old,new}` | `InPlace{addr}` | `Unclaimed`), or keep `Option` and have the backend size `Storage` by *querying* the pointer's address+size after every resize regardless (the prototype does the query-based variant). Decide which; both work.
+4. **`resize`'s `Ok(Some/None)` conflates two "no move" cases, and the in-place-*grow* case still needs backend work** *(new; confirmed in the prototype).* Now that `resize` returns `Result<Option<(old, new)>, AllocError>`, the *error* axis is clean, but `Ok(None)` still means both *unclaimed* (no address yet) and *in-place claimed* (address unchanged) — fine for the byte-move decision, but on an in-place **grow** the backend must still ensure `Storage` covers `[addr, addr + new_size)`, which the `Option` doesn't signal. So the backend can't rely on the `Option` alone: either make the success payload 3-way (`Relocated{old,new}` | `InPlace{addr}` | `Unclaimed`), or keep `Option` and have the backend size `Storage` by *querying* the pointer's address+size after every resize regardless (the prototype does the query-based variant). Decide which; both work.
 
 5. **`reserve`/`claim` adds a "valid but unclaimed" state — now with a *reserved-resize* on top of reserved-alloc** *(the reserved-resize part is new, from generalizing deferral to `resize`).* Allowing *every* `Allocator` method on reserved-but-unclaimed pointers means `free`, `resize`, `make_fixed`, … must each define their effect on a reservation; and because a journaled backend must also defer address assignment on `resize` (not just `alloc`), there is a second reserved state to specify. It's expressible (the prototype models a reservation as a table row with `address: None`), but write down the state machine (reserved-alloc → claimed → freed; reserved-resize → claimed; reserved → freed = cancel), and note that a backend returning an error for I/O on unclaimed pointers turns every write path fallible where it wasn't before.
 
