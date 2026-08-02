@@ -32,7 +32,7 @@ A few design decisions follow from this that currently don't hold:
 
 - The default allocator implemented in `kladde-alloc` should be parameterized by its address type (the actual memory addresses used only internally by the backend and never exposed to user types), a `Size` type (used to express sizes of memory allocations, and exposed to user types), and its index/ID type (the stable identifier of pointers that survives compaction, and that is exposed to user types so they can serialize it). At least (NonZero) 32 and 64 bit integers should be supported for all of them. This makes the default allocator usable in different situations from embedded to desktop, and puts the decision about pointer size on the actual format that uses the allocator.
 	- I think when used inside Kladde, the default configuration should be `Address=u64`, `Size=u32`, `Id=NonZeroU32` (nonzero because the ID is exposed to user types, who will serialize it to allocated memory of the containing data structures, and we'll eventually want to implement niche optimizations). Choosing 64-bit `Address`es allows for essentially arbitrarily large files, and limiting `Size` and `Id` to 32 bit only limits the size of *individual allocations* (to just below 4 GiB) and the *number of allocations* (to 4 billion), both of which seem fine (allocating an individual chunk of memory > 4 GiB would render the advantages of Kladde, i.e., its automatic memory management, moot anyway; and an application that creates > 4 billion allocations is probably doing something wrong because Kladde is designed to make inline memory layout the default, avoiding unnecessary indirections). The smaller `Size` and `Id` will hopefully reduce storage costs of data structures that hold a lot of pointers, and possibly reduces memory requirements of the allocator (which will likely have to store IDs more often than addresses, we'll see). Maybe we want to set the defaults of trait parameters (e.g., for `Allocator`) or define type aliases accordingly. Which one is better (default type parameters or type aliases)?
-> **Decision (pointer width):** settled via default *type parameters*. The width lives in one place, `struct Pointer<W = NonZeroU32>(W)` (§`Pointer`), and everything above parameterizes over the *pointer type* `P` with a default (`trait Persistable<P = Pointer>`, `struct PersistableVec<T, P = Pointer>`). The allocator's own `Address`/`Size` similarly take struct-level defaults (`struct DefaultAllocator<Address = u64, Size = u32>`), and a type alias names the assembled Kladde backend (`type KladdeBackend = JournaledBackend<FileStorage, DefaultAllocator>`). There is no separate `Id` type any more — the stable id *is* the width `W` carried inside `Pointer<W>`.
+> **Decision (pointer width):** settled via default *type parameters*. The width lives in one place, `struct Pointer<W: Word = u32>(W::NonZero)` (§`Pointer` — `W` is a plain integer, the field its NonZero form, so every pointer is nonzero for the `Option<Pointer>` niche), and everything above parameterizes over the *pointer type* `P` with a default (`trait Persistable<P = Pointer>`, `struct PersistableVec<T, P = Pointer>`). The allocator's own `Address`/`Size` similarly take struct-level defaults (`struct DefaultAllocator<Address = u64, Size = u32>`), and a type alias names the assembled Kladde backend (`type KladdeBackend = JournaledBackend<FileStorage, DefaultAllocator>`). There is no separate `Id` type any more — the stable id *is* the (nonzero) width `W` carried inside `Pointer<W>`.
 
 - Completely decouple `Allocator` from `Persistable` types (except maybe via an extension trait, defined in the crate where `Persistable` is defined). Allocators don't know anything about types and aren't allowed to do anything different depending on the type of the stored data. They only know the size of an allocation and whether it is fixed or dynamically sized.
 
@@ -52,12 +52,14 @@ Traits and structs build on each other. At the lowest level (`Allocator` and `St
 
 ### Pointer types (concrete)
 
-The pointer types are concrete and shared across all allocators; only `Pointer` carries the raw width `W`, and everything above parameterizes over the *pointer type* `P` (default `Pointer`). Verified in `crates/generic-alloc`:
+The pointer types are concrete and shared across all allocators; only `Pointer` carries the raw width `W`, and everything above parameterizes over the *pointer type* `P` (default `Pointer`). (The handle and `Location` shapes are verified in `crates/generic-alloc`; the nonzero-`Pointer`/`Word`/`PointerRepr` refinement below is compile-checked separately and not yet migrated into the crate.)
 
 ```rust
 /// Copy, type- and size-erased identity: the serialized form of a pointer and
-/// the `anchor` of a `Location`. The only type parameterized over the width W.
-pub struct Pointer<W = NonZeroU32>(W);               // : Copy
+/// the `anchor` of a `Location`. The only type parameterized over the width W --
+/// which is now a *plain* unsigned integer (`u32`/`u64`), while the field is its
+/// NonZero counterpart, so every `Pointer` is guaranteed nonzero (see below).
+pub struct Pointer<W: Word = u32>(W::NonZero);       // : Copy; private field, `.raw() -> W`
 
 /// Owned, single-owner handles, over the pointer type P (default `Pointer`).
 pub struct UniquePointerResizable<P = Pointer>(P);   // not Copy
@@ -71,6 +73,53 @@ pub struct Location<P = Pointer, S = u32> { pub anchor: P, pub offset: S }
 ```
 
 `Location` is parametric over **both** the pointer type `P` and the size type `S` (default `u32`): `anchor` is a `P`, and `offset` is a displacement *within* an allocation, so it is `Size`-typed, not `usize`. Crucially, `S` does **not** become a second `Persistable` type parameter — `Persistable<P>` stays single-parameter and names the size as `Location<P, B::Size>` in its method signatures, so `S` *flows from the backend* (verified in `crates/generic-alloc`). See the `Persistable<P>` section.
+
+#### Nonzero pointers, `Word`, and the `Option<Pointer>` niche
+
+**Every `Pointer` is nonzero, by construction.** `Pointer<W: Word>` stores `W::NonZero` (not a raw `W`), so the "no valid pointer is zero" invariant is *structural* — it holds for every `W`, enforced by the field's type, needing no runtime check and no trait bound to guarantee. This exists because `Option<Pointer>` will come up constantly (an empty container's inline slot is a null pointer, etc.), and we want the null-niche both **in memory** and **on file**:
+
+- **In memory it's free:** `Pointer<W>` is a single-field newtype over a `NonZero`, so the compiler already lays out `Option<Pointer<W>>` in the *same* bytes as `Pointer<W>` (compile-checked: `size_of::<Option<Pointer>>() == size_of::<Pointer>() == 4`, and `== 8` for `Pointer<u64>`).
+- **On file it's manual** (this is the part that needs machinery, below): a valid pointer never serializes to all-zero, so `Option<Pointer>` encodes in the same width with the all-zero pattern reserved for `None`.
+
+`W` is now a **plain** integer and `Word` gains a `NonZero` associated type plus conversions, so `Pointer<u32>` reads more naturally than `Pointer<NonZeroU32>` and the default is `Pointer<W = u32>`. `Word` is the same trait already needed for `Address`/`Size` arithmetic — one home for the "unsigned word" abstraction.
+
+```rust
+/// # Safety
+/// `NonZero` must be a genuine null-niche type for `Self`; the conversions must
+/// round-trip, and `to_bytes`/`from_bytes` are the canonical little-endian form.
+/// (`unsafe` because `impl<W: Word> PointerRepr for Pointer<W>` relies on
+/// `W::NonZero` really being nonzero for its on-file null-niche to be correct.)
+pub unsafe trait Word: Copy /* + the arithmetic bounds: +, <, Into<Address>, from_usize/to_usize, ... */ {
+    type NonZero: Copy + Eq + Hash;
+    type Bytes: Copy + AsRef<[u8]>;                 // = [u8; SIZE]; see the SIZE note below
+    fn to_nonzero(self) -> Option<Self::NonZero>;   // None iff self == 0
+    fn from_nonzero(nz: Self::NonZero) -> Self;
+    fn to_bytes(self) -> Self::Bytes;               // little-endian -- kladde-canonical (no "le" in the name on purpose)
+    fn from_bytes(bytes: Self::Bytes) -> Self;
+}
+
+/// Byte (de)serialization of pointer ids, modeled on `num-traits`'
+/// `ToBytes`/`FromBytes`. Little-endian is kladde's blessed ordering, so the
+/// names carry no "le". `Option<Self>` layers the null niche on top: all-zero
+/// bytes == `None`, and a valid `Self` never encodes to all-zero.
+pub trait PointerRepr: Copy {
+    type Bytes: Copy + AsRef<[u8]>;                 // = [u8; SIZE]
+    fn to_bytes(self) -> Self::Bytes;
+    fn from_bytes(bytes: Self::Bytes) -> Self;
+}
+impl<W: Word> PointerRepr for Pointer<W> {          // sound because `unsafe Word` guarantees nonzero
+    type Bytes = W::Bytes;
+    #[inline] fn to_bytes(self) -> W::Bytes { self.raw().to_bytes() }
+    #[inline] fn from_bytes(b: W::Bytes) -> Self { /* raw -> to_nonzero (non-null) -> Pointer */ }
+}
+```
+
+Notes (all compile-checked in a scratch; the `crates/generic-alloc` prototype hasn't been migrated to this yet):
+- **Generate the `Word` and `PointerRepr` impls with a declarative macro, every method `#[inline]`.** Generic `NonZero`/bare-int conversion has bitten us with a *real* performance regression before when not inlined, so the `#[inline]` is load-bearing, not decorative — the macro stamps it on uniformly across widths.
+- **`SIZE` vs `type Bytes`:** the intent is `to_bytes(self) -> [u8; Self::SIZE]`, but an associated-const array length in a trait signature needs `generic_const_exprs` (unstable). The stable spelling — and what `num-traits` does — is an associated `type Bytes` that each impl sets to `[u8; N]`; expose a `const SIZE: usize` alongside if the byte count is wanted directly.
+- **Where the `PointerRepr` bound lives.** The nonzero *invariant* is structural (no bound needed to enforce it). The *machinery* to exploit the on-file niche is needed only where generic code serializes `Option<P>`: on **`Persistable<P: PointerRepr = Pointer>`** and the backend serialization path. It is deliberately **not** required of `Allocator::Pointer` (which needs only `Copy + Eq + Hash` for its table) — keeping serialization concerns out of the reusable, type-agnostic allocator. It would only move onto `Allocator::Pointer` if the allocator ever persisted its own id→(address, size) table generically over the pointer type rather than at a concrete `Pointer<W>`.
+
+**Why the newtype at all (vs. using a bare `W::NonZero`), given a private field:** two advantages survive regardless of privacy and justify it on their own — (1) a *nominal* type the checker won't let you confuse with the many other `NonZero` integers in play (sizes, counts, other ids), and (2) a *local* type to hang impls on (`PointerRepr`, `Persistable`, `Debug`), impossible on the foreign `NonZeroU32`. Making the field **private** (with `.raw() -> W` and a checked constructor) additionally buys representation independence — e.g. later packing a fixed/resizable flag bit into the id (see `make_fixed_size`) without touching call sites. The nonzero invariant itself comes from the field *type*, so privacy doesn't affect the niche either way; it's about representation flexibility and API hygiene.
 
 Inherent methods on the owned handles: `.raw() -> P`, and `UniquePointer::{from_fixed, into_fixed}`. The fixed/resizable **gate** (`resize`/`splice` accept only `UniquePointerResizable`) is unchanged from `allocator-spec.md`.
 
@@ -106,7 +155,7 @@ A sketch (the concrete pointer shapes and the `&mut self` / `resize -> Result<Op
 
 ```rust
 pub trait Allocator {
-    type Pointer: Copy;                     // concrete, e.g. Pointer<NonZeroU32>; the serialized id
+    type Pointer: Copy + Eq + Hash;         // concrete, e.g. Pointer<u32>; the serialized id (Eq+Hash for the table; NOT PointerRepr -- serialization is the backend's job)
     type Address: Word;                     // core to the allocator, hidden above the backend
     type Size: Word + Into<Self::Address>;
     type Meta: Default;                     // per-allocation, kept in the allocator's own table
@@ -346,7 +395,7 @@ TODO: include the above two arguments in a doc comment on `trait Persistable`.
 Verified in `crates/generic-alloc`:
 
 ```rust
-pub trait Persistable<P = Pointer>: Sized {
+pub trait Persistable<P: PointerRepr = Pointer>: Sized {   // P: PointerRepr -> can serialize Option<P> with the on-file null niche
     const INLINE_SIZE: usize;   // just the inline pointer id; may depend on P's width
     // store gets a shared &WriteBackend (guard reborrow); load gets an exclusive
     // &mut ReadBackend (sequential reads). The asymmetry is the whole point.
@@ -364,7 +413,7 @@ impl<T: Persistable<P>, P: Copy> Persistable<P> for PersistableVec<T, P> {
 }
 ```
 
-The `store`/`load` methods pin the backend's pointer type to `P` (`WriteBackend<Pointer = P>` / `ReadBackend<Pointer = P>`), so a `PersistableVec<T, P>` only works with a backend whose pointer type is `P`. `INLINE_SIZE` is a per-`P` const, and for a pointer-holding type it is **just the pointer id** — `size_of::<P>()` (4 for the default `NonZeroU32` id, 8 for a `NonZeroU64` one). There is *no inline `len`*: the length/size is owned by the allocator (query `size`/`lookup`; for a resize-to-exact vec, `len = size / elem_size`) or stored one indirection away for a chunked layout — matching the "the size only stored by the allocator, not by the `PersistableVec` itself" goal in the chunked-vec test case below. Empty is the null pointer, free via `Option<Pointer>`'s niche. This compiles (verified in `crates/generic-alloc`).
+The `store`/`load` methods pin the backend's pointer type to `P` (`WriteBackend<Pointer = P>` / `ReadBackend<Pointer = P>`), so a `PersistableVec<T, P>` only works with a backend whose pointer type is `P`. `INLINE_SIZE` is a per-`P` const, and for a pointer-holding type it is **just the pointer id** — `size_of::<P>()` (4 for the default `u32`-wide `Pointer`, 8 for a `u64`-wide one; the niche makes `size_of::<Option<Pointer>>()` the same). There is *no inline `len`*: the length/size is owned by the allocator (query `size`/`lookup`; for a resize-to-exact vec, `len = size / elem_size`) or stored one indirection away for a chunked layout — matching the "the size only stored by the allocator, not by the `PersistableVec` itself" goal in the chunked-vec test case below. Empty is the null pointer, free via `Option<Pointer>`'s niche. This compiles (verified in `crates/generic-alloc`).
 
 **TODO: write real implementor documentation for `Persistable`.** It should tell implementors there are three choices:
 
