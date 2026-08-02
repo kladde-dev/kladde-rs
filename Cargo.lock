@@ -94,6 +94,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kladde-heap"
+version = "0.1.0"
+
+[[package]]
 name = "kladde-schema"
 version = "0.1.0"
 dependencies = [
