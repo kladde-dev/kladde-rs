@@ -169,7 +169,7 @@ pub trait Allocator {
     /// unclaimed; `Err(Exhausted)` = can't satisfy the request.
     /// Doc string should document that resizing an unclaimed reservation is fine and may return `None`.
     fn resize(&mut self, p: &UniquePointerResizable<Self::Pointer>, new_size: Self::Size)
-        -> Result<Option<(Self::Address, Self::Address)>, AllocError>;    // FixedSize has no resize (the gate)
+        -> Result<Relocation, AllocError>;    // FixedSize has no resize (the gate)
 
     // --- addresses are core (no TransparentAllocator) ---
     fn address(&self, p: Self::Pointer) -> Result<Self::Address, AllocError>;   // Err(DanglingPointer); reserved never reaches here (claim precedes address)
@@ -177,13 +177,19 @@ pub trait Allocator {
     // --- reserve an id now, assign an address later (journaling) ---
     fn reserve_resizable(&mut self, size: Self::Size) -> UniquePointerResizable<Self::Pointer> { self.alloc_resizable(size) }
     fn reserve_fixed_size(&mut self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer> { self.alloc_fixed_size(size) }
-    fn reserve_resize(&mut self, p: &UniquePointerResizable<Self::Pointer>, new_size: Self::Size) -> Result<(), AllocError> { self.resize(p, new_size).map(|_| ()) }
+
+    // Note: I removed `reserve_resize`, see issue 5 under "Problems and regressions" below.
+
     fn claim_resizable(&mut self, _p: &UniquePointerResizable<Self::Pointer>) {}
     fn claim_fixed_size(&mut self, _p: &UniquePointerFixedSize<Self::Pointer>) {}
 
-    // --- convert kinds: consume the old handle, may mint a new id, must NOT move memory ---
-    fn make_resizable(&mut self, p: UniquePointerFixedSize<Self::Pointer>) -> UniquePointerResizable<Self::Pointer>;
-    fn make_fixed_size(&mut self, p: UniquePointerResizable<Self::Pointer>) -> UniquePointerFixedSize<Self::Pointer>;
+    // --- convert kinds: consume the old handle, may mint a new id;  ---
+    // Combines resizing with the conversion because that's the realistic use case anyway.
+    // If `new_size` is the old size then the allocator should *try* not to move the data
+    // (i.e., return `Relocation::InPlace` if `p` is claimed) but there's no guarantee for
+    // that (some allocators may reserv certain address ranges for fixed-size allocations).
+    fn make_resizable(&mut self, p: UniquePointerFixedSize<Self::Pointer>, new_size: Size) -> (UniquePointerResizable<Self::Pointer>, Relocation);
+    fn make_fixed_size(&mut self, p: UniquePointerResizable<Self::Pointer>, new_size: Size) -> (UniquePointerFixedSize<Self::Pointer>, Relocation);
 
     // --- query the table: Err(DanglingPointer) if `p` isn't a live allocation ---
     // (a reserved-but-unclaimed pointer has a size, so it's Ok for these, but has
@@ -207,6 +213,15 @@ pub trait Allocator {
     fn resolve_fixed_size(&self, p: Self::Pointer) -> Result<UniquePointerFixedSize<Self::Pointer>, AllocError> { /* default defers to `resolve` */ }
 }
 
+/// Resolves issue 4 under "Problems and Regressions" below. As a side effect, documents
+/// which of the two returned addresses is the old and which the new one in case of a
+/// relocation (the previous `Option<(Addr, Addr)>` didn't do that).
+pub enum Relocation<Addr> {
+    Relocated { old: Addr, new: Addr },
+    InPlace { addr: Addr },
+    Unclaimed,
+}
+
 /// Crate-local, Kladde-agnostic. Fallible (not a panic) so a bad *deserialized*
 /// id surfaces as a recoverable error rather than crashing on a corrupt file.
 pub enum AllocError { DanglingPointer, Exhausted }
@@ -222,8 +237,9 @@ pub struct AllocationMut<'a, A: Allocator + ?Sized> { pub pointer: ResolvedPoint
 
 > **Claude (on the query-method sketch):** The review-flagged compile errors and the `&self`→`&mut self` / owned-`Meta`→borrow issues are now fixed inline above (named lifetimes on `Allocation`/`AllocationMut`; `lookup_mut`/`meta_mut` take `&mut self`; `meta`/`meta_mut` borrow; `resolve` returns `ResolvedPointer<Self::Pointer>`; stray `>>` removed; specialized defaults pass `p`). One open *design* point remains: the `_fixed_size`/`_resizable` variants of `size`/`meta`/`resolve` — I'd defer them. They roughly triple the query surface for a *speculative* win: knowing the sizedness only lets an impl skip a branch or a bit-check, negligible next to the table lookup these methods already do. This is exactly the generalization [Problems item 7](#problems-and-regressions) says to gate on a *measured* need (the chunked-vec case is the forcing function) — keep `size`/`meta`/`resolve` over a bare `Pointer` as the core and add specialization only if a benchmark shows the branch matters. `#[inline]` on the trivial forwarders is right and cheap if you keep them, but secondary. If it ever *does* come to this, prefer encoding "the caller knows the sizedness" through the *handle type* (methods taking `&UniquePointerResizable` / `&UniquePointerFixedSize`) over a combinatorial name matrix.
 
-(`reserve_*` sizes are `Self::Size`, applying the "call it `size`, in `Size`, not `usize`" rule from the bullets above. `Pointer` itself *is* the serialized id, so there's no separate `id()` method — you serialize a `Pointer` directly. `resize` returning `Ok(Some((old, new)))` addresses is fine on the `Allocator` because addresses are core here; the backend consumes the `Ok(Some(..))` to move bytes and returns `Result<(), _>` to its own callers, never an address.)
-
+**Response (Rob):** Agreed partially: defer the ones that don't actually return any `ResolvedPointer`, but keep the `_fixed_size`/`_resizable` split for the ones that do (`lookup`, `lookup_mut`, and `resolve`), also on the backend (where they apply). I think these are natural specializations that are not just for an (admittedly very marginal, if any) performance improvement but more about simpler code at the call site: type implementors call `resolve` or `lookup` from `load` after deserializing a pointer from a file, and in many cases they'll know whether it will be a resizable or a fixed-size pointer because most types allow only one (the chunked `PersistedVec` example below is really the exception here for allowing both). If only one type of pointer is allowed to occur, then it's more convenient to say "I want to resolve this fixed sized pointer" and then have a single error handler than to say "I want to resolve this general pointer", deal with a possible error, and then match on the sizedness of the returned `ResolvedPointer` and do an additional error handling if it's not the expected sizedness. I'm not too worried about the increased API surface because:
+1. the specialized trait methods can all be default-implemented, so they don't *force* any more complexity or design constraints on implementors, they just allow it; and
+2. these traits are at the very low end of the abstraction hierarchy of the whole kladde system (especially `Allocator`, but also the backend-traits: I expect most kladde users to build on existing `Persistable` types most of the time). I'd definitely want to avoid this kind of preemptive overgeneralization on the level of `Persistable`, but I think it's warranted on this lower level of abstraction if it makes the call sites at the next higher level of abstraction a bit cleaner, see my double-error-handling argument above.
 
 ### `trait Backend` (shared type carrier)
 - Declares the single `Pointer` and `Size` a backend has. `ReadBackend` and `WriteBackend` **extend** it rather than each declaring their own copies, so (a) the two halves structurally can't disagree on the pointer/size types, and (b) `B::Pointer`/`B::Size` are *unambiguous* under `B: ReadBackend + WriteBackend`. (Verified: two *sibling* traits each declaring a `Pointer` make the `B::Pointer` shorthand an E0221 error — and a tying `Backend<P, S>: ReadBackend<Pointer=P> + WriteBackend<Pointer=P>` bound does *not* rescue it; a single supertrait declaration does.)
@@ -290,6 +306,8 @@ pub trait ReadBackend: Backend {                                                
 Note: `read_at` probably needs to return a `std::io::Result<impl Read + Seek + '_>` because the backend has to seek to the position, which can fail.
 
 > **Claude (answering "should the mirrored queries go here or in `Backend`?"):** In `Backend`. The shared, always-safe *queries* (`size`, `resolve`, sizedness — never `meta`, agreed) answer from the always-up-to-date in-memory allocator, so they're valid in *both* phases; only reads of *stored bytes* need the read/write isolation. Two payoffs from putting them on the supertrait: it **de-duplicates** (today `size` is declared on *both* halves), and it **removes an ambiguity** — with `size` on both siblings, `b.size(..)` under `B: ReadBackend + WriteBackend` is an E0221 error (the very thing the supertrait was introduced to fix for `Pointer`/`Size`); one declaration on `Backend` resolves it. The cost: `Backend` shifts from "pure type carrier" to "types + read-only allocator queries" — but the `fn f<B: Backend>(p: B::Pointer)` use case still works, and the journal-phase guarantee is untouched (it's about stored bytes, not allocator state). These queries fail only on a dangling id (no I/O), so they can return `Result<_, AllocError>` even on `Backend`. Net: queries → `Backend`; `read_at` → `ReadBackend`; `write`/`alloc*`/`resize`/`free*` → `WriteBackend`.
+
+Agreed.
 
 > **Claude (the `&self`/`&mut self` asymmetry, verified in the prototype):** the natural split is **write = `&self`, read = `&mut self`**, and it falls out of *why* each exists. Writes go through guards that reborrow a shared `&B` (needs `&self`); reads happen during a sequential `load` that owns the backend exclusively for the duration (can take `&mut self`). A free side effect: the borrow checker then forbids `load` (needs `&mut B`) while any guard (holds `&B`) is alive — a correct, automatic enforcement of "don't read stale data mid-write". Because `ReadBackend` is `&mut self`, the whole `RefCell<Storage>`-on-the-read-path problem simply doesn't arise; interior mutability is confined to the *write* facade in the concrete backend.
 
@@ -433,15 +451,29 @@ Written by Claude. This section collects the problems this proposal may run into
 
    All of this is confined to library/generic code and to non-default-width files; application code at one fixed width sees essentially the non-generic experience.
 
+**Decision:** keep it, the generality is worth the effort since the type noise is mostly confined to library code, and even for implementors of new `Persistable` types, the default types make it opt-in.
+
 2. **Generic integer associated types need an "unsigned word" bound that std doesn't provide.** Making `Address`/`Size` associated types means every offset/size computation needs `+`, `<`, `Into<Address>`, and `usize` conversions over a generic type. Rust has no single "unsigned integer" trait, so you need a helper trait (the prototype's `Word`) or a dependency like `num-traits`, and its bounds ride along on every generic function that does address arithmetic. Manageable, and `Size: Into<Address>` is the right core relation, but it is real bound-noise that the current concrete-`u32` code doesn't have. (You'll also want `TryFrom<usize>`/`to_usize`, because offsets from Rust collections arrive as `usize`.)
+
+**Decision:** It's worth it.
 
 3. **Duplicated surface: `alloc_*`/`free_*`/`resize`/`size` appear on both `Allocator` and the backends** *(new, from the composition-not-extension decision).* Because `Backend` no longer *is* an `Allocator`, each backend must forward-and-translate every management op: address-aware and `&mut self` on the `Allocator`, address-hidden and `&self` (write) / `&mut self` (read query) on the backend. That is real boilerplate — mostly mechanical, absorbable by a default-method layer or a small macro, but it exists where `Backend: Allocator` had none. It is the (worthwhile) price of letting the two layers choose their `&self`/`&mut self` and address-visibility independently. A related, *smaller* cost (after moving `Pointer`/`Size` onto a shared `Backend` supertrait — see that section): the umbrella `Backend` bound is weak (it guarantees only the associated types, not read/write access), and every backend needs one extra `impl Backend` block beside the half(s) it implements. In exchange, `B::Pointer`/`B::Size` are unambiguous everywhere and there is no parameterized convenience trait to thread.
 
+**Decision:** It's worth it since it only affects people who *implement* a backend, which I consider quite low level on the abstraction hierarchy. For implementors of a `Persistable` type, this duplication arguably makes their lives easier because it means they don't have to bother about `Allocator` at all (and most application developers will likely operate at an even higher level of abstraction and only *use* pre-implemented `Persistable` types).
+
 4. **`resize`'s `Ok(Some/None)` conflates two "no move" cases, and the in-place-*grow* case still needs backend work** *(new; confirmed in the prototype).* Now that `resize` returns `Result<Option<(old, new)>, AllocError>`, the *error* axis is clean, but `Ok(None)` still means both *unclaimed* (no address yet) and *in-place claimed* (address unchanged) — fine for the byte-move decision, but on an in-place **grow** the backend must still ensure `Storage` covers `[addr, addr + new_size)`, which the `Option` doesn't signal. So the backend can't rely on the `Option` alone: either make the success payload 3-way (`Relocated{old,new}` | `InPlace{addr}` | `Unclaimed`), or keep `Option` and have the backend size `Storage` by *querying* the pointer's address+size after every resize regardless (the prototype does the query-based variant). Decide which; both work.
+
+**Decision:** switch to the 3-way enum, as sketched above (but still wrapped in a `Result` in case the pointer is dangling).
 
 5. **`reserve`/`claim` adds a "valid but unclaimed" state — now with a *reserved-resize* on top of reserved-alloc** *(the reserved-resize part is new, from generalizing deferral to `resize`).* Allowing *every* `Allocator` method on reserved-but-unclaimed pointers means `free`, `resize`, `make_fixed`, … must each define their effect on a reservation; and because a journaled backend must also defer address assignment on `resize` (not just `alloc`), there is a second reserved state to specify. It's expressible (the prototype models a reservation as a table row with `address: None`), but write down the state machine (reserved-alloc → claimed → freed; reserved-resize → claimed; reserved → freed = cancel), and note that a backend returning an error for I/O on unclaimed pointers turns every write path fallible where it wasn't before.
 
+**Decision:**
+- Keep `reserve_fixed_size` and `reserve_resizable`: the "valid but unclaimed" state is probably easy to model in a real implementation of `Allocator` (add the pointer to the normal internal allocation table, but set its address to `None`, exploiting niche optimization). And it's really the allocator's task to reserve allocations because it needs to mint a unique ID for it.
+- Remove `reserve_resize`: the "reserved-resize" state would indeed be a bit tricky to manage and, more importantly and different to deferring the *creation* of an allocation (which still does the ID generation immediately), I think deferring a *resize* operation is really solely the backend's responsibility and shouldn't concern the allocator until the resize actually takes place. The easiest solution is probably to have a hash map `resized_allocation` in the backend. Then, `WriteBackend::resize` only writes to that hash map and doesn't touch the allocator. Any backend operations that query for sizes have to hit this hash map, but such operations likely only occur during initial load and during replay of resize operations.
+
 6. **Self-hosting bootstrap is a genuine open problem, not a detail.** Storing the allocator's own state in allocations it manages, and its journal in memory it allocates, is circular: you can't journal the allocation of journal space, and you can't read the allocator table without first knowing where it lives. This needs a bootstrap anchor *outside* the general mechanism — the fixed `Storage` header holding the root address of the persisted allocator state, plus journal space managed specially. The current implementation avoids this entirely because the mock allocator is in-memory and never persists its state; making the allocator self-hosting is new, load-bearing work.
+
+**Decision:** Defer. I think I have some concrete ideas how to solve this, but it'll be easier to think about this once the trait framework exists and I can start designing a toy allocator followed by a toy backend.
 
 7. **General over-generalization risk.** The document worries (twice) about generalizations hurting the Kladde common case. With pointers concrete, the widths settled as defaulted type parameters, and the backend/allocator split now resolving the `&self`/read-isolation tensions, the sharpest instances are gone; the residual caution stands: gate each remaining generalization (the full `Address`/`Size`/`Meta` genericity, `reserve`/`claim` including reserved-resize, the duplicated backend surface) on a concrete need — the chunked-vec test case is the forcing function — rather than adopting all of it up front. Keep without hesitation: separating `Storage` from `Allocator`; the composition + `ReadBackend`/`WriteBackend` split with `read = &mut self` / `write = &self`; concrete pointers with defaulted widths; `size` (not `capacity`); `Meta`/`lookup`. Defer or drop: the `write_vectored`-through-a-returned-`Write` convenience (given up by having `write` take bytes — items above) and segments (deferred already — see `later.md`).
 
@@ -451,15 +483,14 @@ TODO: build a chunked `PersistableVec` implementation for kladde onto the redesi
 - For content smaller than the chunk size, its should not require any more on-disk space than a pointer (inline in the parent struct), the size (*only* stored by the allocator, not by the `PersistableVec` itself), and the data (behind the pointer). There is no separate capacity for small vecs, the allocation size matches the vector size and gets resized by the allocator when the `PersistableVec` grows or shrinks.
 - For content larger than the chunk size, it should have a fast mode where only fixed-sized chunks are allocated, they're stored on disk in a linked list (but held in memory by a `std::vec::Vec` of pointers for fast random access). The on-disk representation then holds the length and a pointer to the first chunk. Since the inline size is only one pointer, some of this information has to be stored one indirection away.
 - There should also be a "compact" mode for content larger than the chunk size where the last chunk is variably sized and fits the content length. This could be generated, e.g., by an explicit "extreme" compaction before file closing (which is also a privacy measure as it removes stale data from unused memory regions in the file). This representation may turn out to be slightly suboptimal in disk size as it might store the overall vec size even though it could be determined from walking the linked list and querying the allocator for the size of the last chunk, but since this is only for large files the relative impact is small.
-- To distinguish between the above three cases, ~~we must be able to sneak at least one extra bit into pointers and/or sizes.~~ query the allocator: if the inline pointer is variable-size, then it's small-vec optimized. If the inline pointer is fixed size, then it's the first part of a linked list.
-- Switching between these representations (e.g., when the vector's size grows or shrinks across the one-chunk threshold) should not require a data move. Thus, linked-list pointers must probably be stored at the end of the chunk. Also, we need to be able to promote/demote allocations from/to resizable in place (index may change but memory location mustn't. Maybe use high bit of indices to distinguish resizable from fixed size). 
+- To distinguish between the above three cases, query the allocator: if the inline pointer is variable-size, then it's small-vec optimized. If the inline pointer is fixed size, then it's the first part of a linked list. In the latter case, the first chunk starts with the data (so that converting between the two variants doesn't necessarily require moving any data) and ends with the size of the vec followed by a pointer to the next chunk. Subsequent chunks don't include the size anymore, they just include the next chunk of data and a `next` pointer (either at the beginning or at the end of the chunk). The last chunk may be fixed size or resizable (for the compact representation). All fixed size chunks (including the first one with the extra `size` field and the last one if it is fixed-size) should have the same size because allocators will optimize for the case where fixed-size allocations come in few different sizes.
 
 ## Questions
 
 (Segments are deferred — that discussion has moved to `later.md`'s "Allocator" section. The "should `Persistable` be parameterized by the backend?" question is resolved: concrete pointers, `Persistable<P = Pointer>` — see the decision note under "Detailed consequences" and the `Persistable<P>` section above.)
 
 - [ ] Can `UnjournaledBackend` and `JournaledBackend` reuse some code from each other? Journal replay should do similar operations to what `UnjournaledBackend` does immediately. 
-  - Note: Don't create `Op`s in `UnjournaledBackend` that get then immediately `matched` on. Instead, figure out if we can have `UnjournaledBackend` call separate functions for each `Op` that can be reused by `JournaledBackend` when it replays the journal, and whether those should be free-standing functions or whether both `UnjournaledBackend` and `JournaledBackend` should be composed of some internal `ImmediateJournal` that has these functions as methods.
+  - Note: Don't create `Op`s in `UnjournaledBackend` that get then immediately `matched` on. Instead, figure out if we can have `UnjournaledBackend` call separate functions for each operation that can be reused by `JournaledBackend` when it replays the journal, and whether those functions should be free-standing functions or whether both `UnjournaledBackend` and `JournaledBackend` should be composed of some internal `ImmediateJournal` that has these functions as methods (or maybe even simpler and a `JournaledBackend` wraps an `UnjournaledBackend` and only manages the deferring and the journal -- not sure if this will work but try it out unless there's a clear reason why it won't work).
 - [x] How would compaction work in this setup? It's the allocator's job to figure out where everything should move, but the allocator needs access to the `Storage` to actually perform it. In addition, any changes to the allocator state would also have to be persisted and operations should probably be journaled, and this is `Backend` logic.
 
 > **Claude (compaction):** Compaction decomposes cleanly along the exact seam this document already draws, so the allocator/backend split does **not** paint you into a corner. The decisive reason is the **ID-serialization pivot**: because serialized pointers are stable ids, relocating a block rewrites *no* on-disk pointer bytes — so compaction never has to walk the object graph or know a single `Persistable`/schema detail. It reduces to three jobs, each already owned by exactly one layer:
