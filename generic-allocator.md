@@ -75,8 +75,8 @@ pub struct Location<P = Pointer, S = u32> { pub anchor: P, pub offset: S }
 Inherent methods on the owned handles: `.raw() -> P`, and `UniquePointer::{from_fixed, into_fixed}`. The fixed/resizable **gate** (`resize`/`splice` accept only `UniquePointerResizable`) is unchanged from `allocator-spec.md`.
 
 ### `trait Allocator`
-- Has associated types `Pointer`, `Address`, and `Size` (most implementors are parameterized by the latter two, e.g. `MyAllocator<Address, Size> { ... }`).
-	- `Pointer` is the concrete `Copy` identity `Pointer<W>` (§`Pointer`) the allocator hands out — the stable id, serialized into other allocations, previously called `Index` in `allocator-spec.md`. It stays a *concrete* type (not opaque/associated), so the owned handles keep inherent `.raw()`/`.into_fixed()` methods and `Persistable` needs no backend type parameter, only the pointer type `P` — which a `Persistable<P>` pins to the backend via `Backend<Pointer = P>`.
+- Has associated types `Pointer`, `Address`, and `Size` (most implementors are parameterized by them, i.e., `MyAllocator<P=Pointer, A=u64, S=u32> { type Pointer = P; ... }`, or are at least parameterized by a subset of them; TODO: figure out the most ergonomic order of type parameters; I think the most undisputed defaults should go to the end so callers can leave them out; is this correct?).
+	- `Pointer` is the concrete `Copy` identity `Pointer<W>` (§`Pointer`) the allocator hands out — the stable id, serialized into other allocations, previously called `Index` in `allocator-spec.md`. It stays a *concrete* type (not opaque/associated), so the owned handles keep inherent `.raw()`/`.into_fixed_size()` methods and `Persistable` needs no backend type parameter, only the pointer type `P` — which a `Persistable<P>` pins to the backend via `Backend<Pointer = P>`.
 - Manages a set of non-overlapping `Address` ranges, where `Address` is an unsigned integer type that should probably somehow generically support `NonZero`.
 - The trait definition does not assume any connection to persistency. It doesn't interpret the integer ranges it manages as memory and doesn't provide read or write access to them (that's what the backends are for), and you can implement an `Allocator` that holds its entire state in memory and doesn't deal with persistence at all. A persisted allocator then typically builds on top of an in-memory allocator, somewhat analogous to how, at a higher level, types that implement `Persistable` (like `PersistableHashMap<K,V>`) often use standard library types (like `std::collections::HashMap<K,(V,Index)>`) for their in-memory representation.
 	- Concretely, this means that, different to the current `allocator-spec.md`, this new `Allocator` does not have the methods `read`, `write`, and `splice` (those go in the backends below)
@@ -87,7 +87,7 @@ Inherent methods on the owned handles: `.raw() -> P`, and `UniquePointer::{from_
 - The pointer types (`UniquePointerResizable<P>`, `UniquePointerFixedSize<P>`, and the `Copy` `Pointer<W>`) are **concrete**, parameterized over `P`/`W` — *not* per-allocator associated types. (An earlier draft made them associated so an allocator could cache metadata like sizedness *in* the pointer; the `MetaData`/`lookup` table below already provides that, so the pointers stay concrete — which keeps inherent pointer methods and keeps `Persistable` free of a backend type parameter.)
 - Provides default-implemented methods that allow generating unique IDs and reserving them for later allocation of a given size (this will be used by `JournaledBackend` below, and it's also nice that this gets exposed to implementors of `Persistable` types because it may be useful for some of them, and it's easily implemented for the `JournaledBackend` itself):
 	- `fn reserve_resizable(&mut self, size: Self::Size) -> UniquePointerResizable;`
-	- `fn reserve_fixed(&mut self, size: Self::Size) -> UniquePointerFixedSize;`
+	- `fn reserve_fixed_size(&mut self, size: Self::Size) -> UniquePointerFixedSize;`
 	- And methods that `claim` reservations (i.e., assign actual addresses)
 - Default implementations of `reserve_{resizable, fixed}` simply forward to `alloc_{resizable, fixed}`. Default implementations of `claim_{resizable, fixed}` are no-ops.
 - **The same reserve/claim deferral is needed for `resize`, not just `alloc`.** In a journaled backend, a live resize of an already-claimed region must not assign a new address on the spot (it could land past the current end of the journal and block the journal from growing). So there is a `reserve_resize` that records the intent now and defers the address assignment to journal replay's `claim`, exactly like `alloc`. This is a good sign that reserve/claim is the right primitive (it generalizes to any address-assigning op), but it does add a "reserved-resize" state on top of the "reserved-alloc" state (see [Problems and regressions](#problems-and-regressions)).
@@ -111,11 +111,12 @@ pub trait Allocator {
 
     // --- lifecycle (deliberately no read/write/splice -- those are on the backends) ---
     fn alloc_resizable(&mut self, size: Self::Size) -> UniquePointerResizable<Self::Pointer>;
-    fn alloc_fixed(&mut self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer>;
+    fn alloc_fixed_size(&mut self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer>;
     fn free_resizable(&mut self, p: UniquePointerResizable<Self::Pointer>);
-    fn free_fixed(&mut self, p: UniquePointerFixedSize<Self::Pointer>);
+    fn free_fixed_size(&mut self, p: UniquePointerFixedSize<Self::Pointer>);
     /// `Ok(Some((old, new)))` iff the bytes must move; `Ok(None)` = in-place or
     /// unclaimed; `Err(Exhausted)` = can't satisfy the request.
+    /// Doc string should document that resizing an unclaimed reservation is fine and may return `None`.
     fn resize(&mut self, p: &UniquePointerResizable<Self::Pointer>, new_size: Self::Size)
         -> Result<Option<(Self::Address, Self::Address)>, AllocError>;    // FixedSize has no resize (the gate)
 
@@ -124,34 +125,48 @@ pub trait Allocator {
 
     // --- reserve an id now, assign an address later (journaling) ---
     fn reserve_resizable(&mut self, size: Self::Size) -> UniquePointerResizable<Self::Pointer> { self.alloc_resizable(size) }
-    fn reserve_fixed(&mut self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer> { self.alloc_fixed(size) }
+    fn reserve_fixed_size(&mut self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer> { self.alloc_fixed_size(size) }
     fn reserve_resize(&mut self, p: &UniquePointerResizable<Self::Pointer>, new_size: Self::Size) -> Result<(), AllocError> { self.resize(p, new_size).map(|_| ()) }
     fn claim_resizable(&mut self, _p: &UniquePointerResizable<Self::Pointer>) {}
-    fn claim_fixed(&mut self, _p: &UniquePointerFixedSize<Self::Pointer>) {}
+    fn claim_fixed_size(&mut self, _p: &UniquePointerFixedSize<Self::Pointer>) {}
 
     // --- convert kinds: consume the old handle, may mint a new id, must NOT move memory ---
     fn make_resizable(&mut self, p: UniquePointerFixedSize<Self::Pointer>) -> UniquePointerResizable<Self::Pointer>;
-    fn make_fixed(&mut self, p: UniquePointerResizable<Self::Pointer>) -> UniquePointerFixedSize<Self::Pointer>;
+    fn make_fixed_size(&mut self, p: UniquePointerResizable<Self::Pointer>) -> UniquePointerFixedSize<Self::Pointer>;
 
     // --- query the table: Err(DanglingPointer) if `p` isn't a live allocation ---
     // (a reserved-but-unclaimed pointer has a size, so it's Ok for these, but has
     //  no address yet -- which is fine, `address` is only ever called post-claim)
-    fn resolve_owned(&self, p: Self::Pointer) -> Result<Owned<Self>, AllocError>;   // learn sizedness, mint the owner
-    fn lookup(&self, p: Self::Pointer) -> Result<Allocation<Self>, AllocError>;     // size, sizedness, meta
+    fn lookup(&self, p: Self::Pointer) -> Result<Allocation<'_, Self>, AllocError>;
+    // Only the Meta part will actually be returned as an &mut.
+    fn lookup_mut (&self, p: Self::Pointer) -> Result<AllocationMut<'_, Self>, AllocError>;
+
+    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self>, AllocError>{
+        self.lookup(p).map(|a| a.pointer)
+    }
     fn size(&self, p: Self::Pointer) -> Result<Self::Size, AllocError> { /* default: self.lookup(p).map(..) */ }
     fn meta(&self, p: Self::Pointer) -> Result<Self::Meta, AllocError> { /* default: self.lookup(p).map(..) */ }
+    fn meta_mut(&self, p: Self::Pointer) -> Result<Self::Meta, AllocError> { /* default: self.lookup(p).map(..) */ }
+    fn size_fixed_size(&self, p: Self::Pointer) -> Result<Self::Size, AllocError> { self.size() } // For potential optimizations. Should it be #[inline]?
+    fn size_resizable(&self, p: Self::Pointer) -> Result<Self::Size, AllocError> { self.size() } // For potential optimizations. Should it be #[inline]?
+    fn meta_fixed_size(&self, p: Self::Pointer) -> Result<Self::Meta, AllocError> { self.meta() } // For potential optimizations. Should it be #[inline]?
+    fn meta_resizable(&self, p: Self::Pointer) -> Result<Self::Meta, AllocError> { self.meta() } // For potential optimizations. Should it be #[inline]?
+    // Also: meta_mut_fixed_size and meta_mut_resizable (default impls forward to meta_mut)
+    fn resolve_resizable(&self, p: Self::Pointer) -> Result<UniquePointerResizable<Self::Pointer>, AllocError>> { /* default defers to `resolve` */ }
+    fn resolve_fixed_size(&self, p: Self::Pointer) -> Result<UniquePointerFixedSize<Self::Pointer>, AllocError>> { /* default defers to `resolve` */ }
 }
 
 /// Crate-local, Kladde-agnostic. Fallible (not a panic) so a bad *deserialized*
 /// id surfaces as a recoverable error rather than crashing on a corrupt file.
 pub enum AllocError { DanglingPointer, Exhausted }
 
-pub enum Owned<A: Allocator + ?Sized> {
-    Resizable(UniquePointerResizable<A::Pointer>),
-    Fixed(UniquePointerFixedSize<A::Pointer>),
+pub enum ResolvedPointer<P = Pointer> {
+    Resizable(UniquePointerResizable<P>),
+    Fixed(UniquePointerFixedSize<P>),
 }
-pub enum Sizedness { Fixed, Resizable }
-pub struct Allocation<A: Allocator + ?Sized> { pub size: A::Size, pub sizedness: Sizedness, pub meta: A::Meta }
+
+pub struct Allocation<'_, A: Allocator + ?Sized> { pub pointer: ResolvedPointer<A::Pointer>, pub size: A::Size, pub meta: &A::Meta }
+pub struct AllocationMut<'_, A: Allocator + ?Sized> { pub pointer: ResolvedPointer<A::Pointer>, pub size: A::Size, pub meta: &mut A::Meta }
 ```
 
 (`reserve_*` sizes are `Self::Size`, applying the "call it `size`, in `Size`, not `usize`" rule from the bullets above. `Pointer` itself *is* the serialized id, so there's no separate `id()` method — you serialize a `Pointer` directly. `resize` returning `Ok(Some((old, new)))` addresses is fine on the `Allocator` because addresses are core here; the backend consumes the `Ok(Some(..))` to move bytes and returns `Result<(), _>` to its own callers, never an address.)
@@ -160,7 +175,7 @@ pub struct Allocation<A: Allocator + ?Sized> { pub size: A::Size, pub sizedness:
 ### `trait Backend` (shared type carrier)
 - Declares the single `Pointer` and `Size` a backend has. `ReadBackend` and `WriteBackend` **extend** it rather than each declaring their own copies, so (a) the two halves structurally can't disagree on the pointer/size types, and (b) `B::Pointer`/`B::Size` are *unambiguous* under `B: ReadBackend + WriteBackend`. (Verified: two *sibling* traits each declaring a `Pointer` make the `B::Pointer` shorthand an E0221 error — and a tying `Backend<P, S>: ReadBackend<Pointer=P> + WriteBackend<Pointer=P>` bound does *not* rescue it; a single supertrait declaration does.)
 - A bare `B: Backend` bound guarantees only these *types*, not read or write *access* — which is a feature: a function generic over "a backend's pointer type" (`fn f<B: Backend>(p: B::Pointer)`) can bound just this. The cost is that `Backend` alone is a weak bound (name it to signal "type carrier" if that reads better), and every backend needs one extra `impl Backend` block beside the half(s) it implements.
-- Pinning still works *through the subtrait*: `WriteBackend<Pointer = P>` compiles even though `Pointer` is declared on `Backend` (verified — you can bind a supertrait's associated type in a subtrait's angle brackets), so `Persistable`'s bounds are unchanged. There is **no** parameterized convenience trait; `B: ReadBackend + WriteBackend` is the explicit spelling for "needs both".
+- Pinning still works *through the subtrait*: `WriteBackend<Pointer = P>` compiles even though `Pointer` is declared on `Backend` (and this pattern has a common precedent in rust with `ExactSizeIterator<Item = ...>`), so `Persistable`'s bounds are unchanged. There is **no** parameterized convenience trait; `B: ReadBackend + WriteBackend` is the explicit spelling for "needs both".
 
 ```rust
 /// Shared type carrier: exactly one `Pointer` and one `Size` per backend.
@@ -178,18 +193,20 @@ pub enum BackendError { Alloc(AllocError), Io(std::io::Error) }
 - The backend query/mutation methods that can fail on a bad id or on storage I/O return `Result<_, BackendError>`. A bad *deserialized* id (during `load`) is thus a recoverable error the container `?`-propagates — never a silent default (`Option`'s trap) nor a crash (a `panic`'s). `write`/`read_at` would join this fallible surface in a fuller pass; the change below covers the two the discussion turned on, `size` and `resize`.
 
 ### `trait WriteBackend` (composes an `Allocator`; write = `&self`)
-- **Composed of** an `Allocator` (it holds one), not an extension of it. It equips that allocator with write access to the associated memory *and* re-exposes allocation/resize/free — but *address-hidden*: `WriteBackend::resize` never returns addresses (contrast `Allocator::resize`), because users of a backend must never see them.
+- Does not extend `Allocator`. Instead, implementors are typically **composed of** an `Allocator` and a `Storage`. A `WriteBackend` equips that allocator with write access to the associated memory *and* re-exposes allocation/resize/free — but *address-hidden*: `WriteBackend::resize` never returns addresses (contrast `Allocator::resize`), because users of a backend must never see them.
 - All its methods take **`&self`**. This is what the guard model needs: a parent guard holds `&B` and hands each nested field guard the *same* `&B` by reborrow, so two sibling field guards can both borrow it. The interior mutability this requires lives inside the concrete backend (a `RefCell` around the composed `Allocator`+`Storage`), *not* in the reusable `Allocator`.
 - Does not provide `read` operations — that is `ReadBackend`. This is deliberate: `Guard`/`store` methods must never read from the backend, because a `JournaledBackend` may hold stale bytes for a not-yet-replayed write. So `Persistable::store` gets a `&WriteBackend`, and only `Persistable::load` gets a `&mut ReadBackend`.
 - Does however provide *querying* allocator methods (`size`, `lookup`, …). These look read-like but are fine: any `WriteBackend` holds an always-up-to-date in-memory `Allocator`; only reads of *stored bytes* are forbidden mid-write, not queries of allocator state (which are often unavoidable).
 - `write` **takes the bytes** (`&[u8]`, or `&[IoSlice]` for the `write_vectored` case) rather than returning a bare `impl Write`. Returning a writer was tempting for `write_vectored`, but for the *journaled* backend it can corrupt the op frame — see the note below — and it also fights the `&self`/single-cursor constraint. Taking the bytes lets the journaled backend write header+payload+checksum itself.
 
+TODO: Claude make sure to summarize the above points in doc comments when implementing.
+
 ```rust
 pub trait WriteBackend: Backend {                                                  // Pointer/Size from the supertrait
     fn alloc_resizable(&self, size: Self::Size) -> UniquePointerResizable<Self::Pointer>;
-    fn alloc_fixed(&self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer>;
+    fn alloc_fixed_size(&self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer>;
     fn free_resizable(&self, p: UniquePointerResizable<Self::Pointer>);
-    fn free_fixed(&self, p: UniquePointerFixedSize<Self::Pointer>);
+    fn free_fixed_size(&self, p: UniquePointerFixedSize<Self::Pointer>);
     fn resize(&self, p: &UniquePointerResizable<Self::Pointer>, new_size: Self::Size)
         -> Result<(), BackendError>;                                                  // no addresses out; the byte move is I/O
     fn write(&self, anchor: Self::Pointer, offset: Self::Size, bytes: &[u8]);          // takes bytes, not `impl Write`
@@ -209,14 +226,19 @@ pub trait WriteBackend: Backend {                                               
 pub trait ReadBackend: Backend {                                                   // Pointer/Size from the supertrait
     /// A reader positioned at `anchor + offset`. `&mut self` makes handing out a
     /// seekable cursor sound; the prototype returns the real `&mut Storage`.
+    /// Returning an anonymous type (`impl Read`) instead of a concrete associated type allows implementors to choose to hide the concrete type if the concrete type supports operations they don't want to allow.
     fn read_at(&mut self, anchor: Self::Pointer, offset: Self::Size) -> impl Read + Seek + '_;
     fn size(&self, p: Self::Pointer) -> Result<Self::Size, BackendError>;   // Err on a dangling/corrupt id
-}
 
-// "needs both" is just `B: ReadBackend + WriteBackend` -- no convenience trait.
+    // TODO: we probably need to mirror more methods from `Allocator`, such as `resolve` and `size` (but never return `Meta`, that's a backend-internal helper). Some of these are probably fine (but probably not necessary) on `WriteBackend` too, so I'm not sure if they should go here or in `Backend` instead.
+}
 ```
 
+Note: `read_at` probably needs to return a `std::io::Result<impl Read + Seek + '_>` because the backend has to seek to the position, which can fail.
+
 > **Claude (the `&self`/`&mut self` asymmetry, verified in the prototype):** the natural split is **write = `&self`, read = `&mut self`**, and it falls out of *why* each exists. Writes go through guards that reborrow a shared `&B` (needs `&self`); reads happen during a sequential `load` that owns the backend exclusively for the duration (can take `&mut self`). A free side effect: the borrow checker then forbids `load` (needs `&mut B`) while any guard (holds `&B`) is alive — a correct, automatic enforcement of "don't read stale data mid-write". Because `ReadBackend` is `&mut self`, the whole `RefCell<Storage>`-on-the-read-path problem simply doesn't arise; interior mutability is confined to the *write* facade in the concrete backend.
+
+Make sure to include this in the relevant doc comments (probably of the module) when implementing.
 
 ### `trait Storage: Read + Write + Seek`
 - Provides both random and sequential read and write access (via `Read` and `Write`, and `Seek` for random access), plus resizing (via a trait method), in some abstract storage. The storage could be a file but doesn't have to be.
@@ -296,9 +318,9 @@ Extension trait with a blanket implementation, defined in the crate where `Persi
 pub trait WriteBackendExt: WriteBackend {
     fn alloc_typed<T: Persistable<Self::Pointer>>(&self) -> UniquePointer<T, Self::Pointer> {
         // T::INLINE_SIZE is a usize byte count -> convert to the backend's Size.
-        UniquePointer::from_fixed(self.alloc_fixed(Word::from_usize(T::INLINE_SIZE)))
+        UniquePointer::from_fixed_size(self.alloc_fixed_size(Word::from_usize(T::INLINE_SIZE)))
     }
-    fn free_typed<T>(&self, p: UniquePointer<T, Self::Pointer>) { self.free_fixed(p.into_fixed()) }
+    fn free_typed<T>(&self, p: UniquePointer<T, Self::Pointer>) { self.free_fixed_size(p.into_fixed_size()) }
     fn alloc_fixed_size_array<T: Persistable<Self::Pointer>>(&self, len: usize) -> UniquePointerFixedSize<Self::Pointer>;
     fn alloc_resizable_array<T: Persistable<Self::Pointer>>(&self, len: usize) -> UniquePointerResizable<Self::Pointer>;
 }
@@ -382,6 +404,7 @@ TODO: build a chunked `PersistableVec` implementation for kladde onto the redesi
 (Segments are deferred — that discussion has moved to `later.md`'s "Allocator" section. The "should `Persistable` be parameterized by the backend?" question is resolved: concrete pointers, `Persistable<P = Pointer>` — see the decision note under "Detailed consequences" and the `Persistable<P>` section above.)
 
 - [ ] Can `UnjournaledBackend` and `JournaledBackend` reuse some code from each other? Journal replay should do similar operations to what `UnjournaledBackend` does immediately. 
+  - Note: Don't create `Op`s in `UnjournaledBackend` that get then immediately `matched` on. Instead, figure out if we can have `UnjournaledBackend` call separate functions for each `Op` that can be reused by `JournaledBackend` when it replays the journal, and whether those should be free-standing functions or whether both `UnjournaledBackend` and `JournaledBackend` should be composed of some internal `ImmediateJournal` that has these functions as methods.
 - [x] How would compaction work in this setup? It's the allocator's job to figure out where everything should move, but the allocator needs access to the `Storage` to actually perform it. In addition, any changes to the allocator state would also have to be persisted and operations should probably be journaled, and this is `Backend` logic.
 
 > **Claude (compaction):** Compaction decomposes cleanly along the exact seam this document already draws, so the allocator/backend split does **not** paint you into a corner. The decisive reason is the **ID-serialization pivot**: because serialized pointers are stable ids, relocating a block rewrites *no* on-disk pointer bytes — so compaction never has to walk the object graph or know a single `Persistable`/schema detail. It reduces to three jobs, each already owned by exactly one layer:
