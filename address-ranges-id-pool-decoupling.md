@@ -114,7 +114,7 @@ rather than needing a per-allocation table (see §4 and §5). The minimal altern
 `alloc(id, size)` with the allocator keeping its own `id → (address, size)` table — is weighed
 and rejected in §4. This id-free split is also what makes `reserve`/`claim` vanish (below).
 
-### `Allocator` (task 1 only)
+### `Allocator` and `CompactingAllocator` (task 1 only)
 
 **Note — this `Allocator` does *less* than [`generic-allocator.md`](generic-allocator.md)
 describes.** There, the allocator "manages a dynamic collection of address regions" and
@@ -151,6 +151,12 @@ pub trait Allocator {
         new_size: Self::Size,
     ) -> Relocation<Self::Address>;
 
+    /// highest allocated address = minimal length of a file to store all live regions
+    /// without compaction.
+    fn uncompacted_len(&self) -> Self::Address;
+}
+
+pub trait CompactingAllocator: Allocator {
     // --- compaction: run-level sliding, derived from free space alone ---
     /// Plan the moves that defragment the address space. Each `Move` slides one contiguous
     /// *run* of neighbouring allocations by a common delta -- the runs are the complement
@@ -158,6 +164,8 @@ pub trait Allocator {
     /// bytes of each run and shifts every id in `[old, old+len)` by `new - old`.
     fn plan_compaction(&self) -> Vec<Move<Self::Address, Self::Size>>;
     fn apply_move(&mut self, m: Move<Self::Address, Self::Size>);   // commit one run's slide
+    /// total live bytes = file length after a full compaction. Useful for estimating if
+    /// compaction is worth doing.
     fn compacted_len(&self) -> Self::Address;
 }
 
@@ -305,12 +313,20 @@ Decisions (A is settled — that's the point of this branch; B–D left for impl
 - **B. Where the shared handle types live** (`Pointer`, `UniquePointer*`, `ResolvedPointer`)
   now that the allocator doesn't use them. Staying in `kladde-heap` is fine (the backends
   there use them) — they're simply no longer referenced by the `Allocator` module.
+
+**Decision (Rob):** Yes, keep them in `kladde-heap`.
+
 - **C. Sizedness on `free`/`resize`.** If the allocator segregates fixed vs resizable pools it
   needs sizedness on `free` too (or must derive the pool from the address). Passing it is
   simplest; the sketch does.
+
+**Decision (Rob):** Yes, pass sizedness to `free`. It can always choose to ignore it.
+
 - **D. Where `Relocation`/`AllocError` live.** `Relocation` stays with the allocator (`resize`
   needs it, minus `Unclaimed`); `AllocError`'s `DanglingPointer`/`WrongSizedness` become
   *backend-table* errors (the id table is the thing that can be queried with a bad id).
+
+**Decision (Rob):** I think `Relocation` can go away. `Allocator::resize` can simply return `Option<Address>` since the caller already knows the old address (and it's semantically obvious that any returned address must be the new address). `DanglingPointer`/`WrongSizedness` should be folded into `BackendError`. But `Allocator::{alloc, free, resize}` should return a new `AllocError` for out-of-memory (`alloc` and `resize`) and if the provided address range overlaps with a free region (`free` and `resize`).
 
 ## 5. Prior art: this is a handle-based relocatable heap
 
