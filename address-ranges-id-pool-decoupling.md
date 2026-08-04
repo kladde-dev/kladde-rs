@@ -92,14 +92,23 @@ restores the choice.
 
 **References.**
 
-- Online list labeling / file-maintenance: Itai–Konheim–Rodeh 1981; Willard 1982, and 1992
-  for the `O(log² n)` *worst-case*; deterministic linear-space lower bound Ω(log² n):
-  Bulánek–Koucký–Saks (STOC 2012), building on Dietz–Zhang.
-- Packed-Memory Array: Bender–Demaine–Farach-Colton 2000.
-- Randomized progress (oblivious adversary only): Bender et al., FOCS 2022.
-- Read–Update–Memory trade-off framing: Athanassoulis et al. 2016 ("RUM conjecture").
+- Online list labeling / file-maintenance:
+  [Itai–Konheim–Rodeh 1981](https://doi.org/10.1007/3-540-10843-2_34);
+  [Willard 1982](https://doi.org/10.1145/800070.802183), and
+  [1992](https://www.sciencedirect.com/science/article/pii/089054019290034D) for the
+  `O(log² n)` *worst-case*; deterministic linear-space lower bound Ω(log² n):
+  [Bulánek–Koucký–Saks (STOC 2012)](https://doi.org/10.1145/2213977.2214083), building on
+  [Dietz–Zhang](https://doi.org/10.1007/3-540-52846-6_87).
+- Packed-Memory Array:
+  [Bender–Demaine–Farach-Colton 2000](https://erikdemaine.org/papers/FOCS2000b/).
+- Randomized progress (oblivious adversary only):
+  [Bender et al., FOCS 2022](https://arxiv.org/abs/2203.02763).
+- Read–Update–Memory trade-off framing:
+  [Athanassoulis et al. 2016](https://openproceedings.org/2016/conf/edbt/paper-12.pdf)
+  ("RUM conjecture").
 - The escape is the **slot map / handle table** (generational-index pattern) with a
-  free-list; de-amortizing its compaction is **global rebuilding** (Overmars 1983).
+  free-list; de-amortizing its compaction is **global rebuilding**
+  ([Overmars 1983](https://archive.org/details/designofdynamicd0156over)).
 
 ## 3. Redesign sketch
 
@@ -314,19 +323,21 @@ handle → address table** — is old and well-charted. When actually implementi
 pull from this literature rather than inventing:
 
 - **Handle-based relocatable memory managers.** The classic reference is the original
-  **Macintosh Memory Manager**: a `Handle` is a double indirection through a "master pointer"
-  table (id → address); heap blocks are relocatable; compaction slides blocks and rewrites the
-  master pointers. That is almost exactly kladde's `id → address` table + compaction, so it is
-  the closest prior art. The same pattern recurs as **handle tables / generational-index "slot
-  maps"** in game engines.
+  [Macintosh Memory Manager](https://developer.apple.com/library/archive/documentation/mac/pdf/Memory/Intro_to_Mem_Mgmt.pdf):
+  a `Handle` is a double indirection through a "master pointer" table (id → address); heap
+  blocks are relocatable; compaction slides blocks and rewrites the master pointers. That is
+  almost exactly kladde's `id → address` table + compaction, so it is the closest prior art.
+  The same pattern recurs as **handle tables / generational-index "slot maps"** in game engines.
 - **Free-space management** (what the allocator here actually implements): Wilson, Johnstone,
-  Neely & Boles, *Dynamic Storage Allocation: A Survey and Critical Review* (1995) — the
-  canonical survey of free lists, boundary tags, coalescing, and fit policies.
-- **Compaction:** Jones, Hosking & Moss, *The Garbage Collection Handbook* (2nd ed.) — the
-  standard reference for compaction algorithms (mark-compact / sliding / threaded / one-pass)
-  and the collector ↔ metadata interface. Sliding compaction is what makes a `Move` here span
-  a whole contiguous *run*: sliding preserves order and shifts each run by a common delta, so
-  the natural (and most I/O-efficient) move unit is the run, not the individual allocation.
+  Neely & Boles,
+  [*Dynamic Storage Allocation: A Survey and Critical Review*](https://www.cs.hmc.edu/~oneill/gc-library/Wilson-Alloc-Survey-1995.pdf)
+  (1995) — the canonical survey of free lists, boundary tags, coalescing, and fit policies.
+- **Compaction:** Jones, Hosking & Moss,
+  [*The Garbage Collection Handbook*](https://gchandbook.org) (2nd ed.) — the standard
+  reference for compaction algorithms (mark-compact / sliding / threaded / one-pass) and the
+  collector ↔ metadata interface. Sliding compaction is what makes a `Move` here span a whole
+  contiguous *run*: sliding preserves order and shifts each run by a common delta, so the
+  natural (and most I/O-efficient) move unit is the run, not the individual allocation.
 
 **The one adaptation to keep in mind while reading them:** those systems recover a block's
 size from an *in-band header* or by *tracing*. Kladde has neither, so its equivalent of "the
