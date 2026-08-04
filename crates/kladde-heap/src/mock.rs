@@ -10,7 +10,7 @@
 
 use std::io::{Read, Seek};
 
-use crate::allocator::{AllocError, SimpleAllocator};
+use crate::allocator::SimpleAllocator;
 use crate::backend::{Backend, BackendError, ReadBackend, WriteBackend};
 use crate::pointer::{Pointer, ResolvedPointer, UniquePointerFixedSize, UniquePointerResizable};
 use crate::storage::InMemoryStorage;
@@ -45,10 +45,10 @@ impl Backend for MockBackend {
     type Pointer = Pointer;
     type Size = u32;
 
-    fn size(&self, p: Self::Pointer) -> Result<Self::Size, AllocError> {
+    fn size(&self, p: Self::Pointer) -> Result<Self::Size, BackendError> {
         self.0.size(p)
     }
-    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self::Pointer>, AllocError> {
+    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self::Pointer>, BackendError> {
         self.0.resolve(p)
     }
 }

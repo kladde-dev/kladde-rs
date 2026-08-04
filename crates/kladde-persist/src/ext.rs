@@ -58,7 +58,7 @@ mod tests {
         let b = MockBackend::new();
         let p = b.alloc_typed::<u64>();
         // u64's INLINE_SIZE is 8; the backend should report that size.
-        assert_eq!(kladde_heap::Backend::size(&b, p.raw()), Ok(8));
+        assert_eq!(kladde_heap::Backend::size(&b, p.raw()).unwrap(), 8);
         b.free_typed(p);
     }
 
@@ -66,6 +66,6 @@ mod tests {
     fn alloc_array_sizes_by_element_count() {
         let b = MockBackend::new();
         let p = b.alloc_fixed_size_array::<u32>(3);
-        assert_eq!(kladde_heap::Backend::size(&b, p.raw()), Ok(12));
+        assert_eq!(kladde_heap::Backend::size(&b, p.raw()).unwrap(), 12);
     }
 }

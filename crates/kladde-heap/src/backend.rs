@@ -28,25 +28,23 @@
 
 use std::io::{self, Read, Seek};
 
-use crate::allocator::AllocError;
 use crate::pointer::{ResolvedPointer, UniquePointerFixedSize, UniquePointerResizable};
 use crate::word::Word;
 
-/// Backend-layer error: an [`AllocError`] (dangling/corrupt id) *or* storage I/O.
-/// The backend touches `Storage`, so its errors are a superset of the pure
-/// allocator's. (Could become an associated `type Error` if backends need to
-/// differ; a concrete enum is enough for now.)
+/// Backend-layer error. The backend owns the id table, so a bad/corrupt *id* is
+/// its error (`DanglingPointer`/`WrongSizedness`, folded in from the old
+/// allocator error); it also touches `Storage`, hence `Io`. The allocator's own
+/// `OutOfMemory`/`Overlap` don't appear here -- the write path treats them as
+/// impossible (in-memory) and unwraps.
 #[derive(Debug)]
 pub enum BackendError {
-    Alloc(AllocError),
+    /// The id isn't a live allocation (freed / never existed / corrupt bytes).
+    DanglingPointer,
+    /// A `*_fixed_size`/`*_resizable` query found the *other* sizedness.
+    WrongSizedness,
     Io(io::Error),
 }
 
-impl From<AllocError> for BackendError {
-    fn from(e: AllocError) -> Self {
-        Self::Alloc(e)
-    }
-}
 impl From<io::Error> for BackendError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
@@ -55,7 +53,8 @@ impl From<io::Error> for BackendError {
 impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BackendError::Alloc(e) => write!(f, "allocator error: {e:?}"),
+            BackendError::DanglingPointer => write!(f, "dangling pointer"),
+            BackendError::WrongSizedness => write!(f, "wrong sizedness"),
             BackendError::Io(e) => write!(f, "storage I/O error: {e}"),
         }
     }
@@ -70,12 +69,10 @@ impl std::error::Error for BackendError {}
 /// declaring a `Pointer` would make that shorthand an E0221 error).
 ///
 /// The read-only *queries* (`size`, `resolve`, and the sizedness-specialized
-/// forms) live here too, because they answer from the always-up-to-date
-/// in-memory allocator and so are valid in *both* the read and write phases;
-/// only reads of *stored bytes* need the read/write isolation. They never expose
-/// per-allocation `meta` (that stays backend-internal) and never touch storage,
-/// so they fail only on a dangling id -- hence `Result<_, AllocError>`, not
-/// `BackendError`.
+/// forms) live here too, because they answer from the backend's own id table and
+/// so are valid in *both* the read and write phases; only reads of *stored bytes*
+/// need the read/write isolation. They fail only on a bad id, hence
+/// `Result<_, BackendError>` with no I/O.
 ///
 /// A bare `B: Backend` bound therefore guarantees the types plus these queries,
 /// but *not* read or write access to stored bytes -- that is what the two halves
@@ -87,11 +84,11 @@ pub trait Backend {
     type Size: Word;
 
     /// The allocation's size, or `Err(DanglingPointer)` for a non-live id.
-    fn size(&self, p: Self::Pointer) -> Result<Self::Size, AllocError>;
+    fn size(&self, p: Self::Pointer) -> Result<Self::Size, BackendError>;
 
     /// Recover the owned handle (with its sizedness) for `p`. By convention a
     /// `load`-time operation (it can mint a second owner of an owned region).
-    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self::Pointer>, AllocError>;
+    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self::Pointer>, BackendError>;
 
     /// Like [`Backend::resolve`] but returns the fixed-size handle directly, with
     /// a single error path (`WrongSizedness` if `p` is resizable). Convenient in
@@ -99,20 +96,20 @@ pub trait Backend {
     fn resolve_fixed_size(
         &self,
         p: Self::Pointer,
-    ) -> Result<UniquePointerFixedSize<Self::Pointer>, AllocError> {
+    ) -> Result<UniquePointerFixedSize<Self::Pointer>, BackendError> {
         match self.resolve(p)? {
             ResolvedPointer::Fixed(h) => Ok(h),
-            ResolvedPointer::Resizable(_) => Err(AllocError::WrongSizedness),
+            ResolvedPointer::Resizable(_) => Err(BackendError::WrongSizedness),
         }
     }
     /// The resizable counterpart of [`Backend::resolve_fixed_size`].
     fn resolve_resizable(
         &self,
         p: Self::Pointer,
-    ) -> Result<UniquePointerResizable<Self::Pointer>, AllocError> {
+    ) -> Result<UniquePointerResizable<Self::Pointer>, BackendError> {
         match self.resolve(p)? {
             ResolvedPointer::Resizable(h) => Ok(h),
-            ResolvedPointer::Fixed(_) => Err(AllocError::WrongSizedness),
+            ResolvedPointer::Fixed(_) => Err(BackendError::WrongSizedness),
         }
     }
 }

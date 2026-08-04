@@ -1,465 +1,313 @@
-//! [`Allocator`]: pure management of a dynamic set of non-overlapping address
-//! ranges keyed by stable [`Pointer`] ids, plus [`SimpleAllocator`], a simple
-//! functional (unoptimized) in-memory implementation.
+//! [`Allocator`]: a **free-space-only** manager of `Address` ranges, plus
+//! [`CompactingAllocator`] and [`SimpleAllocator`], a simple functional
+//! implementation.
 //!
-//! The allocator knows nothing about the *bytes* stored at those ranges (that is
-//! the backend's job) and nothing about *types* (that is `Persistable`'s job, a
-//! layer above). Addresses **are** core to the contract, but a backend hides
-//! them from everything above it. Mutating methods take a plain `&mut self`; the
-//! `&self` interior-mutability facade the guard model needs lives only in the
-//! backend adapter, never here.
+//! This allocator does *less* than a classic one: it tracks only the set of
+//! **free** address ranges (what it needs to satisfy `alloc`) and does **not**
+//! record how the occupied complement is divided into individual allocations.
+//! Per-allocation facts (id, size, sizedness) live in the *backend's* id table;
+//! the allocator is *told* a size on `free`/`resize` and derives occupied runs
+//! (for compaction) as the complement of its free ranges. See
+//! `address-ranges-id-pool-decoupling.md`.
 //!
-//! ## Fallible vs. infallible surface
-//!
-//! Methods that take an **owned handle** (`resize`, `make_*`, `free_*`) cannot
-//! receive a dangling id through normal use -- the handle itself proves the
-//! allocation is live -- so a dangling handle is a *logic bug* and they
-//! **panic** rather than return an error. `alloc_*` is likewise infallible
-//! (it panics on exhaustion, like the standard global allocator). Only the
-//! **queries over a raw `Pointer`** (`address`, `size`, `lookup`, `resolve`, …)
-//! are fallible: an id decoded from a possibly-corrupt file during `load` can be
-//! dangling, which is a recoverable [`AllocError`], not a panic.
+//! It is fallible only for out-of-memory ([`AllocError::OutOfMemory`], from
+//! `alloc`/`resize`) and corrupt / overlapping ranges ([`AllocError::Overlap`],
+//! from `free`/`resize` when the given range intersects a free region -- a
+//! double-free or a bad argument).
 
-use std::collections::HashMap;
-use std::hash::Hash;
-use std::num::NonZeroU32;
+use std::collections::BTreeMap;
 
-use crate::pointer::{Pointer, ResolvedPointer, UniquePointerFixedSize, UniquePointerResizable};
 use crate::word::Word;
 
-/// A query error over a raw, possibly-untrusted [`Pointer`].
-///
-/// Kept minimal and Kladde-agnostic. `DanglingPointer`: the id isn't a live
-/// allocation (freed, never existed, or decoded from corrupt bytes).
-/// `WrongSizedness`: a `*_fixed_size`/`*_resizable` query found a live
-/// allocation of the *other* sizedness (so the specialized call sites get a
-/// single error path instead of matching on [`ResolvedPointer`]).
-///
-/// There is deliberately no `Exhausted` variant yet: `alloc_*`/`resize` are
-/// infallible in this crate (panic on out-of-space, like `std`'s allocator), so
-/// nothing produces exhaustion. A future *bounded*, file-backed allocator that
-/// can genuinely run out of space would add it (and make those methods
-/// fallible) at that point.
+/// Whether an allocation may be resized. Passed to `alloc`/`free` as a *placement
+/// hint* (a segregating allocator can keep fixed and resizable in separate pools);
+/// [`SimpleAllocator`] ignores it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AllocError {
-    DanglingPointer,
-    WrongSizedness,
-}
-
-/// What a resize (or a `make_*` conversion) did to an allocation's address.
-///
-/// The 3-way split (rather than a bare `Option<(old, new)>`) both distinguishes
-/// the two "no move" cases a backend must treat differently and documents which
-/// address is old and which is new.
-///
-/// `Unclaimed` is retained for the raw-`Allocator` contract (resizing a
-/// reserved-but-not-yet-claimed allocation, which has no address yet); the
-/// backends route around it in practice, so an in-memory allocator like
-/// [`SimpleAllocator`] never produces it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Relocation<Addr> {
-    /// The bytes must move from `old` to `new`.
-    Relocated { old: Addr, new: Addr },
-    /// The allocation stayed at `addr` (shrink, or an in-place grow).
-    InPlace { addr: Addr },
-    /// The allocation has no address yet (a reservation); nothing to move.
-    Unclaimed,
-}
-
-/// Everything the table knows about one allocation, borrowing the allocator for
-/// `'a`. Addresses are deliberately *not* here -- they are queried separately
-/// (`address`) and never surfaced above the backend.
-pub struct Allocation<'a, A: Allocator + ?Sized> {
-    pub pointer: ResolvedPointer<A::Pointer>,
-    pub size: A::Size,
-    pub meta: &'a A::Meta,
-}
-
-/// Like [`Allocation`] but with a mutable borrow of the per-allocation metadata.
-pub struct AllocationMut<'a, A: Allocator + ?Sized> {
-    pub pointer: ResolvedPointer<A::Pointer>,
-    pub size: A::Size,
-    pub meta: &'a mut A::Meta,
-}
-
-/// Pure address-range management over stable, `Copy` [`Pointer`] ids.
-///
-/// Implementors provide the lifecycle methods, `address`, and `lookup`/
-/// `lookup_mut`; the query conveniences (`resolve`/`size`/`meta` and their
-/// sizedness-specialized `*_fixed_size`/`*_resizable` forms) are all defaulted.
-/// The specialized forms return the typed handle directly so a `load` that knows
-/// the sizedness in advance skips the [`ResolvedPointer`] match and has one error
-/// path (see `generic-allocator.md`, Rob's response on the query split).
-pub trait Allocator {
-    /// The concrete, serialized id (e.g. `Pointer<u32>`). `Eq + Hash` for the
-    /// table; **not** a serialization bound -- byte encoding is the backend's job.
-    type Pointer: Copy + Eq + Hash;
-    /// Internal memory address; core to the allocator, hidden above the backend.
-    type Address: Word;
-    /// Allocation sizes and offsets. `Into<Address>` because a size added to an
-    /// address must land in the address space.
-    type Size: Word + Into<Self::Address>;
-    /// Per-allocation metadata kept in the allocator's own table (backends use
-    /// it to track where allocator state lives). `()` if unused.
-    type Meta: Default;
-
-    // --- lifecycle (infallible; panic on exhaustion) ---
-    fn alloc_resizable(&mut self, size: Self::Size) -> UniquePointerResizable<Self::Pointer>;
-    fn alloc_fixed_size(&mut self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer>;
-    fn free_resizable(&mut self, p: UniquePointerResizable<Self::Pointer>);
-    fn free_fixed_size(&mut self, p: UniquePointerFixedSize<Self::Pointer>);
-
-    /// Resize a resizable allocation to `new_size`, reporting whether the bytes
-    /// must move. Infallible: the owned handle proves the id is live, so a
-    /// dangling handle is a bug and panics. (`FixedSize` has no `resize` -- that
-    /// is the sizedness gate.)
-    fn resize(
-        &mut self,
-        p: &UniquePointerResizable<Self::Pointer>,
-        new_size: Self::Size,
-    ) -> Relocation<Self::Address>;
-
-    // --- addresses are core (no TransparentAllocator) ---
-    /// The address of a *claimed* allocation. `Err(DanglingPointer)` for a
-    /// non-live id. A reserved-but-unclaimed pointer is never a valid argument
-    /// (during journal replay `claim` always precedes any `address` call).
-    fn address(&self, p: Self::Pointer) -> Result<Self::Address, AllocError>;
-
-    // --- reserve an id now, assign an address later (journaling) ---
-    // Defaults allocate immediately; a journaled allocator overrides these to
-    // defer address assignment to `claim_*` during replay.
-    fn reserve_resizable(&mut self, size: Self::Size) -> UniquePointerResizable<Self::Pointer> {
-        self.alloc_resizable(size)
-    }
-    fn reserve_fixed_size(&mut self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer> {
-        self.alloc_fixed_size(size)
-    }
-    fn claim_resizable(&mut self, _p: &UniquePointerResizable<Self::Pointer>) {}
-    fn claim_fixed_size(&mut self, _p: &UniquePointerFixedSize<Self::Pointer>) {}
-
-    // --- convert sizedness, bundling a resize (the realistic use case) ---
-    /// Consume a fixed-size handle, return a resizable one for the same data,
-    /// resized to `new_size`. May mint a new id (some allocators pack a
-    /// sizedness bit into the id); the caller must rewrite any serialized copy.
-    /// Tries to keep the data in place at the old size but does not guarantee it.
-    fn make_resizable(
-        &mut self,
-        p: UniquePointerFixedSize<Self::Pointer>,
-        new_size: Self::Size,
-    ) -> (
-        UniquePointerResizable<Self::Pointer>,
-        Relocation<Self::Address>,
-    );
-    /// The reverse of [`Allocator::make_resizable`].
-    fn make_fixed_size(
-        &mut self,
-        p: UniquePointerResizable<Self::Pointer>,
-        new_size: Self::Size,
-    ) -> (
-        UniquePointerFixedSize<Self::Pointer>,
-        Relocation<Self::Address>,
-    );
-
-    // --- query the table (raw Pointer -> fallible) ---
-    fn lookup(&self, p: Self::Pointer) -> Result<Allocation<'_, Self>, AllocError>;
-    /// `&mut self` because only the `meta` part is handed out mutably.
-    fn lookup_mut(&mut self, p: Self::Pointer) -> Result<AllocationMut<'_, Self>, AllocError>;
-
-    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self::Pointer>, AllocError> {
-        self.lookup(p).map(|a| a.pointer)
-    }
-    fn size(&self, p: Self::Pointer) -> Result<Self::Size, AllocError> {
-        self.lookup(p).map(|a| a.size)
-    }
-    fn meta(&self, p: Self::Pointer) -> Result<&Self::Meta, AllocError> {
-        self.lookup(p).map(|a| a.meta)
-    }
-    fn meta_mut(&mut self, p: Self::Pointer) -> Result<&mut Self::Meta, AllocError> {
-        self.lookup_mut(p).map(|a| a.meta)
-    }
-
-    // --- sizedness-specialized queries (return the typed handle directly) ---
-    fn resolve_fixed_size(
-        &self,
-        p: Self::Pointer,
-    ) -> Result<UniquePointerFixedSize<Self::Pointer>, AllocError> {
-        match self.resolve(p)? {
-            ResolvedPointer::Fixed(h) => Ok(h),
-            ResolvedPointer::Resizable(_) => Err(AllocError::WrongSizedness),
-        }
-    }
-    fn resolve_resizable(
-        &self,
-        p: Self::Pointer,
-    ) -> Result<UniquePointerResizable<Self::Pointer>, AllocError> {
-        match self.resolve(p)? {
-            ResolvedPointer::Resizable(h) => Ok(h),
-            ResolvedPointer::Fixed(_) => Err(AllocError::WrongSizedness),
-        }
-    }
-    #[allow(clippy::type_complexity)]
-    fn lookup_fixed_size(
-        &self,
-        p: Self::Pointer,
-    ) -> Result<
-        (
-            UniquePointerFixedSize<Self::Pointer>,
-            Self::Size,
-            &Self::Meta,
-        ),
-        AllocError,
-    > {
-        let a = self.lookup(p)?;
-        match a.pointer {
-            ResolvedPointer::Fixed(h) => Ok((h, a.size, a.meta)),
-            ResolvedPointer::Resizable(_) => Err(AllocError::WrongSizedness),
-        }
-    }
-    #[allow(clippy::type_complexity)]
-    fn lookup_resizable(
-        &self,
-        p: Self::Pointer,
-    ) -> Result<
-        (
-            UniquePointerResizable<Self::Pointer>,
-            Self::Size,
-            &Self::Meta,
-        ),
-        AllocError,
-    > {
-        let a = self.lookup(p)?;
-        match a.pointer {
-            ResolvedPointer::Resizable(h) => Ok((h, a.size, a.meta)),
-            ResolvedPointer::Fixed(_) => Err(AllocError::WrongSizedness),
-        }
-    }
-    #[allow(clippy::type_complexity)]
-    fn lookup_mut_fixed_size(
-        &mut self,
-        p: Self::Pointer,
-    ) -> Result<
-        (
-            UniquePointerFixedSize<Self::Pointer>,
-            Self::Size,
-            &mut Self::Meta,
-        ),
-        AllocError,
-    > {
-        let a = self.lookup_mut(p)?;
-        match a.pointer {
-            ResolvedPointer::Fixed(h) => Ok((h, a.size, a.meta)),
-            ResolvedPointer::Resizable(_) => Err(AllocError::WrongSizedness),
-        }
-    }
-    #[allow(clippy::type_complexity)]
-    fn lookup_mut_resizable(
-        &mut self,
-        p: Self::Pointer,
-    ) -> Result<
-        (
-            UniquePointerResizable<Self::Pointer>,
-            Self::Size,
-            &mut Self::Meta,
-        ),
-        AllocError,
-    > {
-        let a = self.lookup_mut(p)?;
-        match a.pointer {
-            ResolvedPointer::Resizable(h) => Ok((h, a.size, a.meta)),
-            ResolvedPointer::Fixed(_) => Err(AllocError::WrongSizedness),
-        }
-    }
-}
-
-// ============================ SimpleAllocator ============================
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Sizedness {
+pub enum Sizedness {
     Resizable,
     Fixed,
 }
 
-struct Row<M> {
-    address: u64,
-    size: u32,
-    sizedness: Sizedness,
-    meta: M,
+/// The allocator's own errors. (A bad *id* is a `BackendError`, not this -- the
+/// id table lives in the backend, not the allocator.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocError {
+    /// `alloc`/`resize` couldn't find room. (Never produced by the in-memory
+    /// [`SimpleAllocator`], whose address space is effectively unbounded.)
+    OutOfMemory,
+    /// `free`/`resize` was given a range that overlaps a free region -- a
+    /// double-free or a corrupt argument (the range wasn't fully live).
+    Overlap,
 }
 
-/// A simple, functional, **unoptimized** in-memory allocator: a `HashMap` from
-/// id to `(address, size, sizedness, meta)`, with a monotonically increasing
-/// address bump and id counter. It never reuses addresses or ids and never
-/// compacts -- it exists to exercise the trait surface and back the tests /
-/// `MockBackend`, not to be efficient.
+/// One contiguous run of neighbouring allocations that slides as a unit during
+/// compaction. Every allocation in `[old, old + len)` moves by `new - old`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Move<A, S> {
+    pub old: A,
+    pub new: A,
+    pub len: S,
+}
+
+/// Pure free-space management over an `Address` space. No ids, no per-allocation
+/// table -- the backend owns those.
+pub trait Allocator {
+    type Address: Word;
+    type Size: Word + Into<Self::Address>;
+
+    /// Reserve a free range of `size`, returning its address. `Err(OutOfMemory)`
+    /// if none fits. `sizedness` is a placement hint the allocator may ignore.
+    fn alloc(
+        &mut self,
+        size: Self::Size,
+        sizedness: Sizedness,
+    ) -> Result<Self::Address, AllocError>;
+
+    /// Release `[address, address + size)`. `Err(Overlap)` if that range overlaps
+    /// a free region (double-free / corrupt argument).
+    fn free(
+        &mut self,
+        address: Self::Address,
+        size: Self::Size,
+        sizedness: Sizedness,
+    ) -> Result<(), AllocError>;
+
+    /// Resize the range at `address`. `Ok(Some(new))` iff the bytes must move (the
+    /// caller already knows the old address); `Ok(None)` if resized in place.
+    /// `Err(OutOfMemory)` if a grow can't be satisfied; `Err(Overlap)` if the old
+    /// range wasn't fully allocated.
+    fn resize(
+        &mut self,
+        address: Self::Address,
+        old_size: Self::Size,
+        new_size: Self::Size,
+    ) -> Result<Option<Self::Address>, AllocError>;
+
+    /// One-past-the-end of the highest-addressed live region: the minimal file
+    /// length *without* compaction (what you can truncate to right now).
+    fn uncompacted_len(&self) -> Self::Address;
+}
+
+/// An [`Allocator`] that can defragment by sliding occupied runs down.
+pub trait CompactingAllocator: Allocator {
+    /// Plan the moves that pack all live data to the low end. One `Move` per
+    /// occupied run (in-place runs included as `old == new` no-ops, so the caller
+    /// can skip the byte copy and `apply_move` stays trivial). Derived purely from
+    /// the free ranges -- no per-allocation input.
+    fn plan_compaction(&self) -> Vec<Move<Self::Address, Self::Size>>;
+
+    /// Commit one run's slide into the allocator's own free-space state. Apply the
+    /// moves from [`plan_compaction`](CompactingAllocator::plan_compaction) in
+    /// order; afterwards the allocator holds no free ranges and its length is
+    /// [`compacted_len`](CompactingAllocator::compacted_len).
+    fn apply_move(&mut self, m: Move<Self::Address, Self::Size>);
+
+    /// Total live bytes = file length *after* a full compaction (contrast
+    /// [`uncompacted_len`](Allocator::uncompacted_len)).
+    fn compacted_len(&self) -> Self::Address;
+}
+
+// ============================ SimpleAllocator ============================
+
+/// A simple, functional, **unoptimized** free-space allocator: a `BTreeMap` of
+/// holes (below a bump `end`) with first-fit placement and neighbour coalescing.
+/// `Address = u64`, `Size = u32`. Ignores the `sizedness` hint (single space).
 ///
-/// Concrete widths: `Pointer = Pointer<u32>`, `Address = u64`, `Size = u32`.
-/// Generic only over the metadata type `M` (default `()`).
-pub struct SimpleAllocator<M = ()> {
-    table: HashMap<NonZeroU32, Row<M>>,
-    next_id: u32,
-    bump: u64,
+/// Hole lengths are stored as `u64` (a coalesced hole can exceed a single
+/// `Size`); individual allocations are still `Size`-bounded.
+#[derive(Default)]
+pub struct SimpleAllocator {
+    free: BTreeMap<u64, u64>, // hole start -> length, all strictly below `end`
+    end: u64,                 // high-water; everything at/above is unallocated
 }
 
-impl<M> Default for SimpleAllocator<M> {
-    fn default() -> Self {
-        Self {
-            table: HashMap::new(),
-            next_id: 0,
-            bump: 0,
-        }
-    }
-}
-
-impl<M> SimpleAllocator<M> {
+impl SimpleAllocator {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Number of live (not-yet-freed) allocations. Handy for leak checks.
-    pub fn live_count(&self) -> usize {
-        self.table.len()
-    }
-}
-
-impl<M: Default> SimpleAllocator<M> {
-    fn fresh(&mut self, size: u32, sizedness: Sizedness) -> Pointer {
-        self.next_id += 1;
-        let id = NonZeroU32::new(self.next_id).expect("id counter overflowed u32");
-        let address = self.bump;
-        self.bump += u64::from(size);
-        self.table.insert(
-            id,
-            Row {
-                address,
-                size,
-                sizedness,
-                meta: M::default(),
-            },
-        );
-        Pointer::from_nonzero(id)
-    }
-
-    /// Shared resize core for `resize`/`make_*`. Panics on a dangling id.
-    fn resize_row(&mut self, key: NonZeroU32, new_size: u32) -> Relocation<u64> {
-        let row = self.table.get(&key).expect("resize of a dangling pointer");
-        let old_addr = row.address;
-        if new_size <= row.size {
-            // shrink or same size: stays put (a real allocator might not, but a
-            // bump allocator trivially can leave the head where it is)
-            self.table.get_mut(&key).unwrap().size = new_size;
-            Relocation::InPlace { addr: old_addr }
-        } else {
-            let new_addr = self.bump;
-            self.bump += u64::from(new_size);
-            let row = self.table.get_mut(&key).unwrap();
-            row.address = new_addr;
-            row.size = new_size;
-            Relocation::Relocated {
-                old: old_addr,
-                new: new_addr,
+    /// Is `[address, address + size)` fully allocated (within `end`, disjoint from
+    /// every hole)? The negation is the `Overlap` condition.
+    fn is_allocated(&self, address: u64, size: u64) -> bool {
+        let end = address + size;
+        if end > self.end {
+            return false;
+        }
+        // A hole starting inside the range?
+        if self.free.range(address..end).next().is_some() {
+            return false;
+        }
+        // The hole just before `address` reaching into the range?
+        if let Some((&h_start, &h_len)) = self.free.range(..address).next_back() {
+            if h_start + h_len > address {
+                return false;
             }
         }
+        true
+    }
+
+    /// First-fit over the holes, else bump `end`. Never fails (unbounded space).
+    fn raw_alloc(&mut self, size: u64) -> u64 {
+        let hit = self
+            .free
+            .iter()
+            .find(|(_, &len)| len >= size)
+            .map(|(&s, &l)| (s, l));
+        if let Some((start, len)) = hit {
+            self.free.remove(&start);
+            if len > size {
+                self.free.insert(start + size, len - size);
+            }
+            start
+        } else {
+            let addr = self.end;
+            self.end += size;
+            addr
+        }
+    }
+
+    /// Return `[start, start + len)` to the free set, coalescing with neighbours,
+    /// or lowering `end` if it is trailing.
+    fn add_free(&mut self, start: u64, len: u64) {
+        let end = start + len;
+        if end == self.end {
+            // Trailing: drop it into `end`, then absorb any hole now at the tail.
+            self.end = start;
+            while let Some((&h_start, &h_len)) = self.free.range(..self.end).next_back() {
+                if h_start + h_len == self.end {
+                    self.free.remove(&h_start);
+                    self.end = h_start;
+                } else {
+                    break;
+                }
+            }
+            return;
+        }
+        let mut new_start = start;
+        let mut new_len = len;
+        if let Some((&p_start, &p_len)) = self.free.range(..start).next_back() {
+            if p_start + p_len == start {
+                self.free.remove(&p_start);
+                new_start = p_start;
+                new_len += p_len;
+            }
+        }
+        if let Some(&s_len) = self.free.get(&end) {
+            self.free.remove(&end);
+            new_len += s_len;
+        }
+        self.free.insert(new_start, new_len);
+    }
+
+    /// Occupied runs `(start, len)` = the complement of the free set below `end`.
+    fn occupied_runs(&self) -> Vec<(u64, u64)> {
+        let mut runs = Vec::new();
+        let mut cursor = 0u64;
+        for (&h_start, &h_len) in &self.free {
+            if h_start > cursor {
+                runs.push((cursor, h_start - cursor));
+            }
+            cursor = h_start + h_len;
+        }
+        if cursor < self.end {
+            runs.push((cursor, self.end - cursor));
+        }
+        runs
     }
 }
 
-impl<M: Default> Allocator for SimpleAllocator<M> {
-    type Pointer = Pointer;
+impl Allocator for SimpleAllocator {
     type Address = u64;
     type Size = u32;
-    type Meta = M;
 
-    fn alloc_resizable(&mut self, size: u32) -> UniquePointerResizable<Pointer> {
-        UniquePointerResizable::from_pointer(self.fresh(size, Sizedness::Resizable))
-    }
-    fn alloc_fixed_size(&mut self, size: u32) -> UniquePointerFixedSize<Pointer> {
-        UniquePointerFixedSize::from_pointer(self.fresh(size, Sizedness::Fixed))
-    }
-    fn free_resizable(&mut self, p: UniquePointerResizable<Pointer>) {
-        let existed = self.table.remove(&p.raw().nonzero()).is_some();
-        assert!(
-            existed,
-            "free of a dangling/already-freed resizable pointer"
-        );
-    }
-    fn free_fixed_size(&mut self, p: UniquePointerFixedSize<Pointer>) {
-        let existed = self.table.remove(&p.raw().nonzero()).is_some();
-        assert!(
-            existed,
-            "free of a dangling/already-freed fixed-size pointer"
-        );
+    fn alloc(&mut self, size: u32, _sizedness: Sizedness) -> Result<u64, AllocError> {
+        Ok(self.raw_alloc(size as u64))
     }
 
-    fn resize(&mut self, p: &UniquePointerResizable<Pointer>, new_size: u32) -> Relocation<u64> {
-        self.resize_row(p.raw().nonzero(), new_size)
+    fn free(&mut self, address: u64, size: u32, _sizedness: Sizedness) -> Result<(), AllocError> {
+        if !self.is_allocated(address, size as u64) {
+            return Err(AllocError::Overlap);
+        }
+        self.add_free(address, size as u64);
+        Ok(())
     }
 
-    fn address(&self, p: Pointer) -> Result<u64, AllocError> {
-        self.table
-            .get(&p.nonzero())
-            .map(|r| r.address)
-            .ok_or(AllocError::DanglingPointer)
-    }
-
-    fn make_resizable(
+    fn resize(
         &mut self,
-        p: UniquePointerFixedSize<Pointer>,
+        address: u64,
+        old_size: u32,
         new_size: u32,
-    ) -> (UniquePointerResizable<Pointer>, Relocation<u64>) {
-        let key = p.raw().nonzero();
-        self.table
-            .get_mut(&key)
-            .expect("make_resizable of a dangling pointer")
-            .sizedness = Sizedness::Resizable;
-        let reloc = self.resize_row(key, new_size);
-        (UniquePointerResizable::from_pointer(p.raw()), reloc)
-    }
-    fn make_fixed_size(
-        &mut self,
-        p: UniquePointerResizable<Pointer>,
-        new_size: u32,
-    ) -> (UniquePointerFixedSize<Pointer>, Relocation<u64>) {
-        let key = p.raw().nonzero();
-        self.table
-            .get_mut(&key)
-            .expect("make_fixed_size of a dangling pointer")
-            .sizedness = Sizedness::Fixed;
-        let reloc = self.resize_row(key, new_size);
-        (UniquePointerFixedSize::from_pointer(p.raw()), reloc)
+    ) -> Result<Option<u64>, AllocError> {
+        if !self.is_allocated(address, old_size as u64) {
+            return Err(AllocError::Overlap);
+        }
+        if new_size <= old_size {
+            let tail = (old_size - new_size) as u64;
+            if tail > 0 {
+                self.add_free(address + new_size as u64, tail);
+            }
+            return Ok(None);
+        }
+        let grow = (new_size - old_size) as u64;
+        let tail_start = address + old_size as u64;
+        // Grow in place off the top?
+        if tail_start == self.end {
+            self.end += grow;
+            return Ok(None);
+        }
+        // Grow into the hole immediately following?
+        if let Some(&hlen) = self.free.get(&tail_start) {
+            if hlen >= grow {
+                self.free.remove(&tail_start);
+                if hlen > grow {
+                    self.free.insert(tail_start + grow, hlen - grow);
+                }
+                return Ok(None);
+            }
+        }
+        // Relocate: carve a fresh range (old still allocated, so disjoint), free old.
+        let new_addr = self.raw_alloc(new_size as u64);
+        self.add_free(address, old_size as u64);
+        Ok(Some(new_addr))
     }
 
-    fn lookup(&self, p: Pointer) -> Result<Allocation<'_, Self>, AllocError> {
-        let row = self
-            .table
-            .get(&p.nonzero())
-            .ok_or(AllocError::DanglingPointer)?;
-        let pointer = match row.sizedness {
-            Sizedness::Resizable => {
-                ResolvedPointer::Resizable(UniquePointerResizable::from_pointer(p))
-            }
-            Sizedness::Fixed => ResolvedPointer::Fixed(UniquePointerFixedSize::from_pointer(p)),
-        };
-        Ok(Allocation {
-            pointer,
-            size: row.size,
-            meta: &row.meta,
-        })
+    fn uncompacted_len(&self) -> u64 {
+        self.end
     }
-    fn lookup_mut(&mut self, p: Pointer) -> Result<AllocationMut<'_, Self>, AllocError> {
-        let row = self
-            .table
-            .get_mut(&p.nonzero())
-            .ok_or(AllocError::DanglingPointer)?;
-        let pointer = match row.sizedness {
-            Sizedness::Resizable => {
-                ResolvedPointer::Resizable(UniquePointerResizable::from_pointer(p))
+}
+
+impl CompactingAllocator for SimpleAllocator {
+    fn plan_compaction(&self) -> Vec<Move<u64, u32>> {
+        let mut moves = Vec::new();
+        let mut packed = 0u64;
+        for (start, len) in self.occupied_runs() {
+            // Split runs longer than `Size` into Size-bounded chunks (same delta).
+            let mut s = start;
+            let mut remaining = len;
+            while remaining > 0 {
+                let chunk = remaining.min(u32::MAX as u64);
+                moves.push(Move {
+                    old: s,
+                    new: packed,
+                    len: chunk as u32,
+                });
+                s += chunk;
+                packed += chunk;
+                remaining -= chunk;
             }
-            Sizedness::Fixed => ResolvedPointer::Fixed(UniquePointerFixedSize::from_pointer(p)),
-        };
-        Ok(AllocationMut {
-            pointer,
-            size: row.size,
-            meta: &mut row.meta,
-        })
+        }
+        moves
+    }
+
+    fn apply_move(&mut self, m: Move<u64, u32>) {
+        // Runs are applied low-to-high; below the frontier everything is packed.
+        let frontier = m.new + m.len as u64;
+        self.free.retain(|&start, _| start >= frontier);
+        self.end = frontier;
+    }
+
+    fn compacted_len(&self) -> u64 {
+        self.end - self.free.values().sum::<u64>()
     }
 }
 
@@ -467,103 +315,122 @@ impl<M: Default> Allocator for SimpleAllocator<M> {
 mod tests {
     use super::*;
 
-    fn dangling() -> Pointer {
-        Pointer::from_raw(9999).unwrap()
+    #[test]
+    fn alloc_bumps_then_reuses_freed_holes() {
+        let mut a = SimpleAllocator::new();
+        let x = a.alloc(4, Sizedness::Fixed).unwrap();
+        let y = a.alloc(8, Sizedness::Resizable).unwrap();
+        assert_eq!(x, 0);
+        assert_eq!(y, 4);
+        assert_eq!(a.uncompacted_len(), 12);
+
+        a.free(x, 4, Sizedness::Fixed).unwrap(); // hole [0,4)
+        let z = a.alloc(4, Sizedness::Fixed).unwrap();
+        assert_eq!(z, 0); // first-fit reuses the hole
+        assert_eq!(a.uncompacted_len(), 12);
     }
 
     #[test]
-    fn alloc_records_size_address_and_sizedness() {
-        let mut a = SimpleAllocator::<()>::new();
-        let p = a.alloc_fixed_size(8);
-        assert_eq!(a.size(p.raw()), Ok(8));
-        assert_eq!(a.address(p.raw()), Ok(0));
-        let q = a.alloc_resizable(4);
-        assert_eq!(a.address(q.raw()), Ok(8)); // bumped past the first
-        assert_eq!(a.live_count(), 2);
+    fn free_at_the_top_lowers_the_high_water() {
+        let mut a = SimpleAllocator::new();
+        let _x = a.alloc(4, Sizedness::Fixed).unwrap();
+        let y = a.alloc(4, Sizedness::Fixed).unwrap();
+        a.free(y, 4, Sizedness::Fixed).unwrap();
+        assert_eq!(a.uncompacted_len(), 4); // trailing free reclaimed, not a hole
     }
 
     #[test]
-    fn queries_on_a_dangling_id_are_errors() {
-        let a = SimpleAllocator::<()>::new();
-        assert_eq!(a.size(dangling()), Err(AllocError::DanglingPointer));
-        assert_eq!(a.address(dangling()), Err(AllocError::DanglingPointer));
-        assert!(a.lookup(dangling()).is_err());
+    fn free_coalesces_adjacent_holes() {
+        let mut a = SimpleAllocator::new();
+        let x = a.alloc(4, Sizedness::Fixed).unwrap();
+        let y = a.alloc(4, Sizedness::Fixed).unwrap();
+        let _z = a.alloc(4, Sizedness::Fixed).unwrap(); // keep 12 as high-water
+        a.free(x, 4, Sizedness::Fixed).unwrap();
+        a.free(y, 4, Sizedness::Fixed).unwrap(); // coalesces into [0,8)
+                                                 // an 8-byte alloc fits the coalesced hole at 0
+        assert_eq!(a.alloc(8, Sizedness::Fixed).unwrap(), 0);
     }
 
     #[test]
-    fn resolve_recovers_the_right_sizedness() {
-        let mut a = SimpleAllocator::<()>::new();
-        let fixed = a.alloc_fixed_size(4);
-        let resizable = a.alloc_resizable(4);
-        assert!(a.resolve_fixed_size(fixed.raw()).is_ok());
-        assert_eq!(
-            a.resolve_fixed_size(resizable.raw()),
-            Err(AllocError::WrongSizedness)
-        );
-        assert!(a.resolve_resizable(resizable.raw()).is_ok());
-        assert_eq!(
-            a.resolve_resizable(fixed.raw()),
-            Err(AllocError::WrongSizedness)
-        );
+    fn double_free_is_an_overlap_error() {
+        let mut a = SimpleAllocator::new();
+        let x = a.alloc(4, Sizedness::Fixed).unwrap();
+        let _keep = a.alloc(4, Sizedness::Fixed).unwrap();
+        a.free(x, 4, Sizedness::Fixed).unwrap();
+        assert_eq!(a.free(x, 4, Sizedness::Fixed), Err(AllocError::Overlap));
     }
 
     #[test]
-    fn resize_reports_in_place_on_shrink_and_relocation_on_grow() {
-        let mut a = SimpleAllocator::<()>::new();
-        let p = a.alloc_resizable(8);
-        let addr0 = a.address(p.raw()).unwrap();
-        assert_eq!(a.resize(&p, 4), Relocation::InPlace { addr: addr0 });
-        // grow past capacity -> bump allocator relocates
-        match a.resize(&p, 16) {
-            Relocation::Relocated { old, new } => {
-                assert_eq!(old, addr0);
-                assert_ne!(new, addr0);
-                assert_eq!(a.address(p.raw()), Ok(new));
-            }
-            other => panic!("expected relocation, got {other:?}"),
+    fn resize_grows_in_place_off_the_top() {
+        let mut a = SimpleAllocator::new();
+        let x = a.alloc(4, Sizedness::Resizable).unwrap();
+        assert_eq!(a.resize(x, 4, 8), Ok(None)); // top -> just bump
+        assert_eq!(a.uncompacted_len(), 8);
+    }
+
+    #[test]
+    fn resize_grows_into_a_following_hole_in_place() {
+        let mut a = SimpleAllocator::new();
+        let x = a.alloc(4, Sizedness::Resizable).unwrap();
+        let y = a.alloc(4, Sizedness::Fixed).unwrap();
+        let _z = a.alloc(4, Sizedness::Fixed).unwrap();
+        a.free(y, 4, Sizedness::Fixed).unwrap(); // hole [4,8)
+        assert_eq!(a.resize(x, 4, 8), Ok(None)); // grows into the hole, in place
+    }
+
+    #[test]
+    fn resize_relocates_when_it_cannot_grow_in_place() {
+        let mut a = SimpleAllocator::new();
+        let x = a.alloc(4, Sizedness::Resizable).unwrap();
+        let _y = a.alloc(4, Sizedness::Fixed).unwrap(); // blocks growth after x
+        match a.resize(x, 4, 8).unwrap() {
+            Some(new) => assert_ne!(new, x),
+            None => panic!("expected relocation"),
         }
-        assert_eq!(a.size(p.raw()), Ok(16));
     }
 
     #[test]
-    fn make_resizable_flips_sizedness_keeping_the_id() {
-        let mut a = SimpleAllocator::<()>::new();
-        let fixed = a.alloc_fixed_size(4);
-        let id = fixed.raw();
-        let (resizable, _reloc) = a.make_resizable(fixed, 4);
-        assert_eq!(resizable.raw(), id); // same id
-        assert!(a.resolve_resizable(id).is_ok());
-        assert_eq!(a.resolve_fixed_size(id), Err(AllocError::WrongSizedness));
+    fn resize_shrinks_in_place_and_frees_the_tail() {
+        let mut a = SimpleAllocator::new();
+        let x = a.alloc(8, Sizedness::Resizable).unwrap();
+        let _keep = a.alloc(4, Sizedness::Fixed).unwrap();
+        assert_eq!(a.resize(x, 8, 4), Ok(None));
+        // the freed tail [4,8) is reused by the next alloc
+        assert_eq!(a.alloc(4, Sizedness::Fixed).unwrap(), 4);
     }
 
     #[test]
-    fn lookup_fixed_size_hands_back_a_typed_tuple() {
-        let mut a = SimpleAllocator::<()>::new();
-        let p = a.alloc_fixed_size(12);
-        let (handle, size, _meta) = a.lookup_fixed_size(p.raw()).unwrap();
-        assert_eq!(handle.raw(), p.raw());
-        assert_eq!(size, 12);
+    fn compaction_packs_live_runs_and_reports_lengths() {
+        let mut a = SimpleAllocator::new();
+        let _x = a.alloc(4, Sizedness::Fixed).unwrap(); // [0,4)  live
+        let y = a.alloc(4, Sizedness::Fixed).unwrap(); //  [4,8)  freed -> gap
+        let _z = a.alloc(4, Sizedness::Fixed).unwrap(); // [8,12) live
+        a.free(y, 4, Sizedness::Fixed).unwrap();
+        assert_eq!(a.uncompacted_len(), 12);
+        assert_eq!(a.compacted_len(), 8);
+
+        let moves = a.plan_compaction();
+        // run [0,4) stays (no-op), run [8,12) slides down to [4,8)
         assert_eq!(
-            a.lookup_resizable(p.raw()).map(|_| ()),
-            Err(AllocError::WrongSizedness)
+            moves,
+            vec![
+                Move {
+                    old: 0,
+                    new: 0,
+                    len: 4
+                },
+                Move {
+                    old: 8,
+                    new: 4,
+                    len: 4
+                },
+            ]
         );
-    }
-
-    #[test]
-    fn free_removes_the_allocation() {
-        let mut a = SimpleAllocator::<()>::new();
-        let p = a.alloc_fixed_size(4);
-        a.free_fixed_size(p);
-        assert_eq!(a.live_count(), 0);
-        assert_eq!(a.size(dangling()), Err(AllocError::DanglingPointer));
-    }
-
-    #[test]
-    fn metadata_is_readable_and_mutable() {
-        let mut a = SimpleAllocator::<u32>::new();
-        let p = a.alloc_fixed_size(4);
-        assert_eq!(a.meta(p.raw()), Ok(&0));
-        *a.meta_mut(p.raw()).unwrap() = 7;
-        assert_eq!(a.meta(p.raw()), Ok(&7));
+        for m in moves {
+            a.apply_move(m);
+        }
+        assert_eq!(a.uncompacted_len(), 8); // now packed; no interior holes
+        assert_eq!(a.compacted_len(), 8);
+        assert!(a.free.is_empty());
     }
 }

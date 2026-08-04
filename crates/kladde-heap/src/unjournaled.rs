@@ -1,69 +1,61 @@
 //! [`UnjournaledBackend`]: the simplest concrete backend -- a
-//! [`Composed`]`(Storage, Allocator)` with no journal, applying every operation
-//! immediately.
+//! [`Composed`]`(Storage, Allocator, id table)` with no journal, applying every
+//! operation immediately.
 //!
-//! It is a *composition*, not an extension of `Allocator`, which is exactly why
-//! it can present the `&self` write facade: the `Composed` core is wrapped in a
-//! `RefCell`, so `WriteBackend`'s `&self` methods borrow it mutably per call
-//! while the reusable `Allocator` keeps its clean `&mut self` API. The
-//! `ReadBackend` methods take `&mut self` and reach the core via
-//! `RefCell::get_mut` -- no runtime borrow, and the real seekable cursor comes
-//! straight out. Addresses never leave the backend.
-//!
-//! Probably not directly useful for Kladde (which wants journaling), but a good
-//! versatility test and the foundation the journaled backend reuses.
+//! It presents the `&self` write facade by wrapping the `Composed` core in a
+//! `RefCell`; the `ReadBackend` methods take `&mut self` and reach the core via
+//! `RefCell::get_mut`, so the real seekable cursor comes straight out. The
+//! backend owns the id table + id pool (over the pointer width `W`); the
+//! allocator only manages free address ranges.
 
+use std::cell::RefCell;
 use std::io::{Read, Seek};
 
-use crate::allocator::{AllocError, Allocator, SimpleAllocator};
+use crate::allocator::Allocator;
 use crate::backend::{Backend, BackendError, ReadBackend, WriteBackend};
 use crate::composed::Composed;
-use crate::pointer::{ResolvedPointer, UniquePointerFixedSize, UniquePointerResizable};
-use crate::storage::{InMemoryStorage, Storage};
-use std::cell::RefCell;
+use crate::pointer::{Pointer, ResolvedPointer, UniquePointerFixedSize, UniquePointerResizable};
+use crate::storage::Storage;
+use crate::word::Word;
 
-/// A non-journaled backend composing a `Storage` and an `Allocator`.
-pub struct UnjournaledBackend<S, A> {
-    inner: RefCell<Composed<S, A>>,
+/// A non-journaled backend composing a `Storage`, a free-space `Allocator`, and
+/// the id table (over pointer width `W`, defaulted to `u32`).
+pub struct UnjournaledBackend<S, A: Allocator, W: Word = u32> {
+    inner: RefCell<Composed<S, A, W>>,
 }
 
-impl<S: Storage, A: Allocator> UnjournaledBackend<S, A> {
+impl<S: Storage, A: Allocator, W: Word> UnjournaledBackend<S, A, W> {
     pub fn new(storage: S, alloc: A) -> Self {
         Self {
             inner: RefCell::new(Composed::new(storage, alloc)),
         }
     }
 
-    /// Consume the backend, returning the inner storage and allocator (handy for
-    /// tests that want to re-open or inspect the raw state).
+    /// Number of live (not-yet-freed) allocations -- useful for leak checks.
+    pub fn live_count(&self) -> usize {
+        self.inner.borrow().live_count()
+    }
+
+    /// Consume the backend, returning the inner storage and allocator.
     pub fn into_parts(self) -> (S, A) {
         let composed = self.inner.into_inner();
         (composed.storage, composed.alloc)
     }
 }
 
-impl UnjournaledBackend<InMemoryStorage, SimpleAllocator> {
-    /// Number of live allocations. Concrete because `live_count` is a
-    /// `SimpleAllocator` inherent, not part of the `Allocator` trait; used by
-    /// `MockBackend` for downstream leak checks.
-    pub fn live_count(&self) -> usize {
-        self.inner.borrow().alloc.live_count()
-    }
-}
-
-impl<S: Storage, A: Allocator> Backend for UnjournaledBackend<S, A> {
-    type Pointer = A::Pointer;
+impl<S: Storage, A: Allocator, W: Word> Backend for UnjournaledBackend<S, A, W> {
+    type Pointer = Pointer<W>;
     type Size = A::Size;
 
-    fn size(&self, p: Self::Pointer) -> Result<Self::Size, AllocError> {
-        self.inner.borrow().alloc.size(p)
+    fn size(&self, p: Self::Pointer) -> Result<Self::Size, BackendError> {
+        self.inner.borrow().size(p)
     }
-    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self::Pointer>, AllocError> {
-        self.inner.borrow().alloc.resolve(p)
+    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self::Pointer>, BackendError> {
+        self.inner.borrow().resolve(p)
     }
 }
 
-impl<S: Storage, A: Allocator> WriteBackend for UnjournaledBackend<S, A> {
+impl<S: Storage, A: Allocator, W: Word> WriteBackend for UnjournaledBackend<S, A, W> {
     fn alloc_resizable(&self, size: Self::Size) -> UniquePointerResizable<Self::Pointer> {
         self.inner.borrow_mut().alloc_resizable(size)
     }
@@ -111,7 +103,7 @@ impl<S: Storage, A: Allocator> WriteBackend for UnjournaledBackend<S, A> {
     }
 }
 
-impl<S: Storage, A: Allocator> ReadBackend for UnjournaledBackend<S, A> {
+impl<S: Storage, A: Allocator, W: Word> ReadBackend for UnjournaledBackend<S, A, W> {
     fn read_at(&mut self, anchor: Self::Pointer, offset: Self::Size) -> impl Read + Seek + '_ {
         self.inner.get_mut().read_at(anchor, offset)
     }
@@ -120,7 +112,6 @@ impl<S: Storage, A: Allocator> ReadBackend for UnjournaledBackend<S, A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pointer::Pointer;
     use crate::storage::InMemoryStorage;
     use crate::SimpleAllocator;
     use std::io::Read;
@@ -151,7 +142,6 @@ mod tests {
         let mut one = [0u8; 1];
         cursor.read_exact(&mut one).unwrap();
         assert_eq!(one, [3]);
-        // rewind on the handed-out cursor to prove Seek works
         cursor.seek(std::io::SeekFrom::Current(-1)).unwrap();
         cursor.read_exact(&mut one).unwrap();
         assert_eq!(one, [3]);
@@ -162,7 +152,8 @@ mod tests {
         let mut b = backend();
         let p = b.alloc_resizable(4);
         b.write(p.raw(), 0, &[9, 8, 7, 6]);
-        // grow -> the bump allocator relocates -> the backend copies the bytes
+        // grow past the following allocation -> relocates -> backend copies bytes
+        let _blocker = b.alloc_fixed_size(4);
         b.resize(&p, 8).unwrap();
         let mut cursor = b.read_at(p.raw(), 0);
         let mut buf = [0u8; 4];
@@ -174,7 +165,7 @@ mod tests {
     fn size_of_a_dangling_id_is_an_error() {
         let b = backend();
         let bogus = Pointer::from_raw(999).unwrap();
-        assert_eq!(b.size(bogus), Err(AllocError::DanglingPointer));
+        assert!(matches!(b.size(bogus), Err(BackendError::DanglingPointer)));
     }
 
     #[test]
@@ -195,9 +186,8 @@ mod tests {
         let mut b = backend();
         let p = b.alloc_resizable(6);
         b.write(p.raw(), 0, &[1, 2, 3, 4, 5, 6]);
-        // replace the 2 bytes at offset 1 with 3 bytes -> size grows to 7
-        b.splice(&p, 1, 2, &[9, 9, 9]);
-        assert_eq!(b.size(p.raw()), Ok(7));
+        b.splice(&p, 1, 2, &[9, 9, 9]); // grows to 7
+        assert_eq!(b.size(p.raw()).unwrap(), 7);
         let mut cursor = b.read_at(p.raw(), 0);
         let mut buf = [0u8; 7];
         cursor.read_exact(&mut buf).unwrap();
@@ -207,9 +197,10 @@ mod tests {
     #[test]
     fn free_reduces_live_count() {
         let b = backend();
+        assert_eq!(b.live_count(), 0);
         let p = b.alloc_fixed_size(4);
+        assert_eq!(b.live_count(), 1);
         b.free_fixed_size(p);
-        let (_s, a) = b.into_parts();
-        assert_eq!(a.live_count(), 0);
+        assert_eq!(b.live_count(), 0);
     }
 }
