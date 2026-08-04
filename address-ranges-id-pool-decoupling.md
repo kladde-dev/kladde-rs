@@ -110,9 +110,8 @@ The allocator here is **id-free**: it manages only free address space, exactly a
 free-space allocator does — it never holds a per-allocation table. That is not merely cleaner
 separation; it is how real (compacting) allocators are actually built, and it is *why*
 `plan_compaction` works at the level of occupied *runs* it derives from its own free space,
-rather than needing a per-allocation table (see §4 and §5). The minimal alternative —
-`alloc(id, size)` with the allocator keeping its own `id → (address, size)` table — is weighed
-and rejected in §4. This id-free split is also what makes `reserve`/`claim` vanish (below).
+rather than needing a per-allocation table (see §5). This id-free split is also what makes
+`reserve`/`claim` vanish (below).
 
 ### `Allocator` and `CompactingAllocator` (task 1 only)
 
@@ -125,11 +124,12 @@ divided into individual allocations. Per-allocation facts (which id, what size, 
 sizedness) live only in the backend's id table; the allocator is *told* a size when the
 backend calls `free`/`resize`, and it plans compaction at the granularity of occupied *runs*
 (the complement of its free ranges), never seeing the per-allocation breakdown at all. This is
-deliberate — see §4 and the literature note (§5): it is how real free-space allocators work,
-and it is what keeps this a genuinely thin, reusable heap.
+deliberate — see the literature note (§5): it is how real free-space allocators work, and it
+is what keeps this a genuinely thin, reusable heap.
 
 ```rust
-// No `Pointer`, no `Meta`, no id-keyed queries, no reserve/claim, no lookup/resolve.
+// No `Pointer`, no `Meta`, no id-keyed queries, no reserve/claim, no lookup/resolve,
+// no `Relocation`. Fallible only for out-of-memory and corrupt / overlapping ranges.
 pub trait Allocator {
     type Address: Word;
     type Size: Word + Into<Self::Address>;
@@ -137,22 +137,27 @@ pub trait Allocator {
     /// Reserve a free range for a new allocation, returning its address.
     /// `sizedness` is a *placement hint* only (the allocator may segregate fixed vs
     /// resizable); it is NOT remembered as an id attribute -- that's the backend's table.
-    fn alloc(&mut self, size: Self::Size, sizedness: Sizedness) -> Self::Address;
+    /// `Err(OutOfMemory)` if no range fits.
+    fn alloc(&mut self, size: Self::Size, sizedness: Sizedness)
+        -> Result<Self::Address, AllocError>;
 
-    /// Release the range `[address, address + size)`.
-    fn free(&mut self, address: Self::Address, size: Self::Size, sizedness: Sizedness);
+    /// Release the range `[address, address + size)`. `Err(Overlap)` if that range
+    /// overlaps a free region (a double-free or corrupt argument -- it wasn't fully live).
+    fn free(&mut self, address: Self::Address, size: Self::Size, sizedness: Sizedness)
+        -> Result<(), AllocError>;
 
-    /// Resize the range at `address`; report whether the bytes must move
-    /// (in place iff the following space is free).
+    /// Resize the range at `address`. `Ok(Some(new))` if the bytes moved, `Ok(None)` if
+    /// resized in place (the caller already knows the old address). `Err(OutOfMemory)` if a
+    /// grow can't be satisfied; `Err(Overlap)` if the old range wasn't fully allocated.
     fn resize(
         &mut self,
         address: Self::Address,
         old_size: Self::Size,
         new_size: Self::Size,
-    ) -> Relocation<Self::Address>;
+    ) -> Result<Option<Self::Address>, AllocError>;
 
-    /// highest allocated address = minimal length of a file to store all live regions
-    /// without compaction.
+    /// One-past-the-end of the highest-addressed live region = the minimal file length
+    /// *without* compaction (what you can truncate to right now; contrast `compacted_len`).
     fn uncompacted_len(&self) -> Self::Address;
 }
 
@@ -164,30 +169,35 @@ pub trait CompactingAllocator: Allocator {
     /// bytes of each run and shifts every id in `[old, old+len)` by `new - old`.
     fn plan_compaction(&self) -> Vec<Move<Self::Address, Self::Size>>;
     fn apply_move(&mut self, m: Move<Self::Address, Self::Size>);   // commit one run's slide
-    /// total live bytes = file length after a full compaction. Useful for estimating if
-    /// compaction is worth doing.
+    /// Total live bytes = file length *after* a full compaction (NOT the current high-water).
+    /// Compare with `uncompacted_len` to decide whether compaction is worth doing.
     fn compacted_len(&self) -> Self::Address;
 }
 
 pub enum Sizedness { Resizable, Fixed }
 /// One contiguous run of neighbouring allocations sliding as a unit.
 pub struct Move<A, S> { pub old: A, pub new: A, pub len: S }
-// Relocation<Addr>: Relocated { old, new } | InPlace { addr }   (Unclaimed no longer arises here)
+/// The allocator's own errors. (The old `DanglingPointer`/`WrongSizedness` are now
+/// `BackendError`s -- the id table, not the allocator, is what a bad id is queried against.)
+pub enum AllocError { OutOfMemory, Overlap }
 ```
 
 What left the trait, and where it went:
 
 - `type Pointer`, the owned handles, `ResolvedPointer` → **backend** (it mints ids and hands
-  out handles). They stay concrete shared types; the allocator just stops referencing them.
+  out handles). They stay concrete shared types **in `kladde-heap`**; the allocator just
+  stops referencing them.
 - `type Meta`, `lookup`/`lookup_mut`, `Allocation`/`AllocationMut` → **backend's id table**
   (the backend is the one keeping per-id records now).
 - `address(id)`, `size(id)`, `resolve(id)`, `meta(id)`, and every `*_fixed_size`/
   `*_resizable` query → **backend** (answered from its table).
 - `reserve_*` / `claim_*` → **gone entirely** (see below).
-- `alloc_*`/`resize`/`make_*` go from id-keyed to address-keyed; the sizedness *gate* (only
-  resizable resizes) is now enforced by the backend's handle types, not the allocator.
-- `Relocation::Unclaimed` becomes unreachable here (the allocator only sees claimed
-  addresses) and can be dropped from the allocator's variant.
+- `alloc`/`free`/`resize` are now address-keyed (no id argument). `make_*` (sizedness
+  conversion) is **no longer an allocator op at all**: the backend re-tags the id's sizedness
+  in its table and, if placement must change, relocates via `free` + `alloc`. The sizedness
+  *gate* (only resizable resizes) is enforced by the backend's handle types.
+- `Relocation` is gone: `resize` returns `Option<Address>`, and `alloc`/`free`/`resize` are
+  fallible for out-of-memory / overlapping-range instead (`AllocError`).
 
 ### The `reserve`/`claim` question — yes, it leaves `Allocator` entirely
 
@@ -215,13 +225,15 @@ pub trait Backend {
     type Pointer: Copy;   // the id -- minted and recycled by the backend now
     type Size: Word;
 
-    // Answered from the backend's OWN id table (sole owner of id -> address/size/sizedness/meta):
-    fn size(&self, p: Self::Pointer) -> Result<Self::Size, AllocError>;
-    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self::Pointer>, AllocError>;
+    // Answered from the backend's OWN id table (sole owner of id -> address/size/sizedness/meta).
+    // `BackendError` folds in the old `DanglingPointer`/`WrongSizedness` (a bad/corrupt id),
+    // storage I/O, and the allocator's `AllocError`.
+    fn size(&self, p: Self::Pointer) -> Result<Self::Size, BackendError>;
+    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self::Pointer>, BackendError>;
     fn resolve_fixed_size(&self, p: Self::Pointer)
-        -> Result<UniquePointerFixedSize<Self::Pointer>, AllocError> { /* default via resolve */ }
+        -> Result<UniquePointerFixedSize<Self::Pointer>, BackendError> { /* default via resolve */ }
     fn resolve_resizable(&self, p: Self::Pointer)
-        -> Result<UniquePointerResizable<Self::Pointer>, AllocError> { /* default via resolve */ }
+        -> Result<UniquePointerResizable<Self::Pointer>, BackendError> { /* default via resolve */ }
 }
 ```
 
@@ -268,65 +280,32 @@ Public signatures are unchanged. The *bodies* move; e.g. `alloc_resizable`:
 4. return the handle.
 
 `free_*` returns the id to the pool and calls `allocator.free(address, size, sizedness)`.
-`resize` looks up the address, calls `allocator.resize(address, old, new)`, moves bytes on
-relocation, updates the table. `make_*` re-tags sizedness in the table and asks the allocator
-to place accordingly (in place when possible). **Compaction:** the backend calls
+`resize` looks up the address, calls `allocator.resize(address, old, new)`, moves bytes if it
+returns `Some(new)`, and updates the table. `make_*` re-tags the id's sizedness in the table
+and relocates via `free` + `alloc` if placement must change (there is no allocator `make_*`).
+**Compaction:** the backend calls
 `allocator.plan_compaction()` (no argument — the allocator derives the runs from its free
 space); for each returned `Move { old, new, len }` it copies `[old, old+len)` to `new` in
 `Storage`, shifts every id whose address is in that range by `new - old` in its table, and
 calls `allocator.apply_move(m)`. Because serialized pointers are stable ids, no on-disk
 *pointer* is rewritten (unchanged from today) — only the table's address column.
 
-## 4. Net effect and open decisions
+## 4. Net effect
 
-Net effect:
-
-- `Allocator` shrinks to a pure `Address`/`Size` heap: `alloc`/`free`/`resize` + compaction.
-  Trivially reusable and testable; no persistence, no ids, no `Meta`.
+- `Allocator` shrinks to a pure `Address`/`Size` heap: `alloc`/`free`/`resize` +
+  `uncompacted_len`, with compaction split into `CompactingAllocator`. Trivially reusable and
+  testable; no persistence, no ids, no `Meta`. It is fallible only for out-of-memory and
+  corrupt/overlapping ranges (`AllocError { OutOfMemory, Overlap }`); `resize` reports
+  relocation as `Option<Address>`.
 - `Backend` gains explicit ownership of the id pool and the id-table layout — the whole
   point, since that layout is where the RUM/list-labeling choice is made, and it can now be
   chosen (positional, swap-remove, PMA, …) without touching the `Allocator` contract or
-  `Persistable`.
-- `reserve`/`claim` disappear as allocator concepts.
-
-Decisions (A is settled — that's the point of this branch; B–D left for implementation):
-
-- **A. Settled: the allocator is free-space-only; the `id → address` table lives in the
-  backend.** The real reason isn't tidiness — it's how allocators are built. A malloc-family
-  allocator keeps a *free* structure and recovers a block's size from an in-band boundary tag
-  or from the caller; a compacting collector recovers per-object size from an in-band header
-  or by tracing. Kladde's allocator has **neither** source: data in `Storage` is opaque (no
-  in-band headers) and it is type-agnostic (can't trace). So per-allocation facts can come
-  *only* from the external id table — the backend's. Hence the allocator holds only free
-  space and is *told* sizes on `free`/`resize`. Compaction needs nothing handed to it either:
-  a run-based sliding compactor works at the granularity of occupied *runs* (the complement of
-  the free ranges) and never looks inside a run, so `plan_compaction()` takes no argument and
-  emits one `Move` per run. (Only a finer strategy that relocates individual allocations into
-  scattered gaps — best-fit, two-finger/Cheney — would need the per-allocation live ranges;
-  sliding, the I/O-friendly default, does not.) The alternative — `alloc(id, size)` with the
-  allocator keeping an `id → (address, size)` table — would force it into a per-allocation
-  table that real free-space allocators don't keep, and duplicate the backend's table in
-  memory. Rejected.
-  (An earlier draft worried this "forces the backend to hold the table" — but the backend
-  *owns* that table anyway, since it persists it; holding the in-memory copy is just the
-  `PersistedVec` → `Vec` split, with the allocator as a pure free-space helper.)
-- **B. Where the shared handle types live** (`Pointer`, `UniquePointer*`, `ResolvedPointer`)
-  now that the allocator doesn't use them. Staying in `kladde-heap` is fine (the backends
-  there use them) — they're simply no longer referenced by the `Allocator` module.
-
-**Decision (Rob):** Yes, keep them in `kladde-heap`.
-
-- **C. Sizedness on `free`/`resize`.** If the allocator segregates fixed vs resizable pools it
-  needs sizedness on `free` too (or must derive the pool from the address). Passing it is
-  simplest; the sketch does.
-
-**Decision (Rob):** Yes, pass sizedness to `free`. It can always choose to ignore it.
-
-- **D. Where `Relocation`/`AllocError` live.** `Relocation` stays with the allocator (`resize`
-  needs it, minus `Unclaimed`); `AllocError`'s `DanglingPointer`/`WrongSizedness` become
-  *backend-table* errors (the id table is the thing that can be queried with a bad id).
-
-**Decision (Rob):** I think `Relocation` can go away. `Allocator::resize` can simply return `Option<Address>` since the caller already knows the old address (and it's semantically obvious that any returned address must be the new address). `DanglingPointer`/`WrongSizedness` should be folded into `BackendError`. But `Allocator::{alloc, free, resize}` should return a new `AllocError` for out-of-memory (`alloc` and `resize`) and if the provided address range overlaps with a free region (`free` and `resize`).
+  `Persistable`. Its `BackendError` absorbs the old `DanglingPointer`/`WrongSizedness` plus
+  storage I/O.
+- `reserve`/`claim` disappear as allocator concepts (deferral = when the backend chooses to
+  call `alloc`).
+- Handle types (`Pointer`, `UniquePointer*`, `ResolvedPointer`) stay in `kladde-heap`,
+  unreferenced by the `Allocator` module.
 
 ## 5. Prior art: this is a handle-based relocatable heap
 
