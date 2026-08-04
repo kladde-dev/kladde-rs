@@ -106,12 +106,26 @@ restores the choice.
 Guiding rule: **`Allocator` speaks only `Address`/`Size`; the `Backend` owns ids, the id
 table, and its layout.**
 
-The sketches below take the *fuller* decoupling — an **id-free** allocator — rather than the
-minimal "`alloc` gains an `id` argument" you floated. That minimal version works too; §4.A
-weighs the two. The id-free version realizes the task split more completely and is what makes
-`reserve`/`claim` vanish cleanly, so it's the one I'd aim for.
+The allocator here is **id-free**: it manages only free address space, exactly as a textbook
+free-space allocator does — it never holds a per-allocation table. That is not merely cleaner
+separation; it is how real (compacting) allocators are actually built, and it is *why*
+`plan_compaction` is *handed* the live ranges instead of owning them (see §4 and §5). The
+minimal alternative — `alloc(id, size)` with the allocator keeping its own `id → (address,
+size)` table — is weighed and rejected in §4. This id-free split is also what makes
+`reserve`/`claim` vanish (below).
 
 ### `Allocator` (task 1 only)
+
+**Note — this `Allocator` does *less* than [`generic-allocator.md`](generic-allocator.md)
+describes.** There, the allocator "manages a dynamic collection of address regions" and
+answers per-allocation queries (`size`, `lookup`, `address`, `resolve`). Under this pivot it
+does **not** track the allocations at all: it holds only the set of **free** address ranges
+(what it needs to satisfy `alloc`), and it does **not** record how the occupied complement is
+divided into individual allocations. Per-allocation facts (which id, what size, what
+sizedness) live only in the backend's id table; the allocator is *told* a size when the
+backend calls `free`/`resize`, and learns the live ranges only when the backend hands them to
+`plan_compaction`. This is deliberate — see §4 and the literature note (§5): it is how real
+free-space allocators work, and it is what keeps this a genuinely thin, reusable heap.
 
 ```rust
 // No `Pointer`, no `Meta`, no id-keyed queries, no reserve/claim, no lookup/resolve.
@@ -264,15 +278,23 @@ Net effect:
   `Persistable`.
 - `reserve`/`claim` disappear as allocator concepts.
 
-Open decisions (deliberately left for implementation):
+Decisions (A is settled — that's the point of this branch; B–D left for implementation):
 
-- **A. Id-free allocator (sketched, "B") vs `alloc(id, size)` ("A", your suggestion).** "B"
-  keeps the *only* id table in the backend; compaction is driven by the backend passing live
-  ranges, and it builds a transient `address → id` view to apply the returned moves (O(n) —
-  and compaction is O(n) anyway). "A" lets the allocator keep an in-memory id-keyed table so
-  compaction `Move`s can carry ids directly, at the cost of a second id table (allocator's
-  in-memory vs backend's on-file). Recommend **B**; fall back to A only if that reverse-map
-  proves genuinely annoying.
+- **A. Settled: the allocator is free-space-only; the `id → address` table lives in the
+  backend.** The real reason isn't tidiness — it's how allocators are built. A malloc-family
+  allocator keeps a *free* structure and recovers a block's size from an in-band boundary tag
+  or from the caller; a compacting collector recovers per-object size from an in-band header
+  or by tracing. Kladde's allocator has **neither** source: data in `Storage` is opaque (no
+  in-band headers) and it is type-agnostic (can't trace). So per-allocation facts can come
+  *only* from the external id table — the backend's. Hence the allocator holds only free
+  space, is *told* sizes on `free`/`resize`, and is *handed* the live ranges for a compaction
+  pass (which is also all a run-based sliding compactor needs — it never has to look inside a
+  live run). The alternative — `alloc(id, size)` with the allocator keeping an
+  `id → (address, size)` table — would force it into a per-allocation table that real
+  free-space allocators don't keep, and duplicate the backend's table in memory. Rejected.
+  (An earlier draft worried this "forces the backend to hold the table" — but the backend
+  *owns* that table anyway, since it persists it; holding the in-memory copy is just the
+  `PersistedVec` → `Vec` split, with the allocator as a pure free-space helper.)
 - **B. Where the shared handle types live** (`Pointer`, `UniquePointer*`, `ResolvedPointer`)
   now that the allocator doesn't use them. Staying in `kladde-heap` is fine (the backends
   there use them) — they're simply no longer referenced by the `Allocator` module.
@@ -282,3 +304,27 @@ Open decisions (deliberately left for implementation):
 - **D. Where `Relocation`/`AllocError` live.** `Relocation` stays with the allocator (`resize`
   needs it, minus `Unclaimed`); `AllocError`'s `DanglingPointer`/`WrongSizedness` become
   *backend-table* errors (the id table is the thing that can be queried with a bad id).
+
+## 5. Prior art: this is a handle-based relocatable heap
+
+The shape being built — **stable handles + relocatable blocks + compaction that rewrites a
+handle → address table** — is old and well-charted. When actually implementing the allocator,
+pull from this literature rather than inventing:
+
+- **Handle-based relocatable memory managers.** The classic reference is the original
+  **Macintosh Memory Manager**: a `Handle` is a double indirection through a "master pointer"
+  table (id → address); heap blocks are relocatable; compaction slides blocks and rewrites the
+  master pointers. That is almost exactly kladde's `id → address` table + compaction, so it is
+  the closest prior art. The same pattern recurs as **handle tables / generational-index "slot
+  maps"** in game engines.
+- **Free-space management** (what the allocator here actually implements): Wilson, Johnstone,
+  Neely & Boles, *Dynamic Storage Allocation: A Survey and Critical Review* (1995) — the
+  canonical survey of free lists, boundary tags, coalescing, and fit policies.
+- **Compaction:** Jones, Hosking & Moss, *The Garbage Collection Handbook* (2nd ed.) — the
+  standard reference for compaction algorithms (mark-compact / sliding / threaded / one-pass)
+  and the collector ↔ metadata interface.
+
+**The one adaptation to keep in mind while reading them:** those systems recover a block's
+size from an *in-band header* or by *tracing*. Kladde has neither, so its equivalent of "the
+header" is the **external id table** — and *where that table lives* is exactly the split this
+note makes: it lives in the backend, and the allocator stays free-space-only.
