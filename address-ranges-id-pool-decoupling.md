@@ -109,10 +109,10 @@ table, and its layout.**
 The allocator here is **id-free**: it manages only free address space, exactly as a textbook
 free-space allocator does — it never holds a per-allocation table. That is not merely cleaner
 separation; it is how real (compacting) allocators are actually built, and it is *why*
-`plan_compaction` is *handed* the live ranges instead of owning them (see §4 and §5). The
-minimal alternative — `alloc(id, size)` with the allocator keeping its own `id → (address,
-size)` table — is weighed and rejected in §4. This id-free split is also what makes
-`reserve`/`claim` vanish (below).
+`plan_compaction` works at the level of occupied *runs* it derives from its own free space,
+rather than needing a per-allocation table (see §4 and §5). The minimal alternative —
+`alloc(id, size)` with the allocator keeping its own `id → (address, size)` table — is weighed
+and rejected in §4. This id-free split is also what makes `reserve`/`claim` vanish (below).
 
 ### `Allocator` (task 1 only)
 
@@ -123,9 +123,10 @@ does **not** track the allocations at all: it holds only the set of **free** add
 (what it needs to satisfy `alloc`), and it does **not** record how the occupied complement is
 divided into individual allocations. Per-allocation facts (which id, what size, what
 sizedness) live only in the backend's id table; the allocator is *told* a size when the
-backend calls `free`/`resize`, and learns the live ranges only when the backend hands them to
-`plan_compaction`. This is deliberate — see §4 and the literature note (§5): it is how real
-free-space allocators work, and it is what keeps this a genuinely thin, reusable heap.
+backend calls `free`/`resize`, and it plans compaction at the granularity of occupied *runs*
+(the complement of its free ranges), never seeing the per-allocation breakdown at all. This is
+deliberate — see §4 and the literature note (§5): it is how real free-space allocators work,
+and it is what keeps this a genuinely thin, reusable heap.
 
 ```rust
 // No `Pointer`, no `Meta`, no id-keyed queries, no reserve/claim, no lookup/resolve.
@@ -150,19 +151,19 @@ pub trait Allocator {
         new_size: Self::Size,
     ) -> Relocation<Self::Address>;
 
-    // --- compaction: pure address arithmetic; the backend drives it ---
-    /// Plan where live ranges should move to defragment. The backend passes its live
-    /// ranges (from its own table); the allocator returns address remappings, keyed by
-    /// address -- it never learns ids.
-    fn plan_compaction(&self, live: &[LiveRange<Self::Address, Self::Size>])
-        -> Vec<Move<Self::Address>>;                 // Move { old, new }
-    fn apply_move(&mut self, old: Self::Address, new: Self::Address, size: Self::Size);
+    // --- compaction: run-level sliding, derived from free space alone ---
+    /// Plan the moves that defragment the address space. Each `Move` slides one contiguous
+    /// *run* of neighbouring allocations by a common delta -- the runs are the complement
+    /// of the free ranges, so no per-allocation input is needed. The backend copies the
+    /// bytes of each run and shifts every id in `[old, old+len)` by `new - old`.
+    fn plan_compaction(&self) -> Vec<Move<Self::Address, Self::Size>>;
+    fn apply_move(&mut self, m: Move<Self::Address, Self::Size>);   // commit one run's slide
     fn compacted_len(&self) -> Self::Address;
 }
 
 pub enum Sizedness { Resizable, Fixed }
-pub struct LiveRange<A, S> { pub address: A, pub size: S }
-pub struct Move<A> { pub old: A, pub new: A }
+/// One contiguous run of neighbouring allocations sliding as a unit.
+pub struct Move<A, S> { pub old: A, pub new: A, pub len: S }
 // Relocation<Addr>: Relocated { old, new } | InPlace { addr }   (Unclaimed no longer arises here)
 ```
 
@@ -262,9 +263,11 @@ Public signatures are unchanged. The *bodies* move; e.g. `alloc_resizable`:
 `resize` looks up the address, calls `allocator.resize(address, old, new)`, moves bytes on
 relocation, updates the table. `make_*` re-tags sizedness in the table and asks the allocator
 to place accordingly (in place when possible). **Compaction:** the backend calls
-`allocator.plan_compaction(its live ranges)`, performs the `Storage` byte moves, and updates
-its own `id → address` entries — no ids enter the allocator, and because serialized pointers
-are stable ids, no on-disk pointer is rewritten (unchanged from today).
+`allocator.plan_compaction()` (no argument — the allocator derives the runs from its free
+space); for each returned `Move { old, new, len }` it copies `[old, old+len)` to `new` in
+`Storage`, shifts every id whose address is in that range by `new - old` in its table, and
+calls `allocator.apply_move(m)`. Because serialized pointers are stable ids, no on-disk
+*pointer* is rewritten (unchanged from today) — only the table's address column.
 
 ## 4. Net effect and open decisions
 
@@ -287,11 +290,15 @@ Decisions (A is settled — that's the point of this branch; B–D left for impl
   or by tracing. Kladde's allocator has **neither** source: data in `Storage` is opaque (no
   in-band headers) and it is type-agnostic (can't trace). So per-allocation facts can come
   *only* from the external id table — the backend's. Hence the allocator holds only free
-  space, is *told* sizes on `free`/`resize`, and is *handed* the live ranges for a compaction
-  pass (which is also all a run-based sliding compactor needs — it never has to look inside a
-  live run). The alternative — `alloc(id, size)` with the allocator keeping an
-  `id → (address, size)` table — would force it into a per-allocation table that real
-  free-space allocators don't keep, and duplicate the backend's table in memory. Rejected.
+  space and is *told* sizes on `free`/`resize`. Compaction needs nothing handed to it either:
+  a run-based sliding compactor works at the granularity of occupied *runs* (the complement of
+  the free ranges) and never looks inside a run, so `plan_compaction()` takes no argument and
+  emits one `Move` per run. (Only a finer strategy that relocates individual allocations into
+  scattered gaps — best-fit, two-finger/Cheney — would need the per-allocation live ranges;
+  sliding, the I/O-friendly default, does not.) The alternative — `alloc(id, size)` with the
+  allocator keeping an `id → (address, size)` table — would force it into a per-allocation
+  table that real free-space allocators don't keep, and duplicate the backend's table in
+  memory. Rejected.
   (An earlier draft worried this "forces the backend to hold the table" — but the backend
   *owns* that table anyway, since it persists it; holding the in-memory copy is just the
   `PersistedVec` → `Vec` split, with the allocator as a pure free-space helper.)
@@ -322,7 +329,9 @@ pull from this literature rather than inventing:
   canonical survey of free lists, boundary tags, coalescing, and fit policies.
 - **Compaction:** Jones, Hosking & Moss, *The Garbage Collection Handbook* (2nd ed.) — the
   standard reference for compaction algorithms (mark-compact / sliding / threaded / one-pass)
-  and the collector ↔ metadata interface.
+  and the collector ↔ metadata interface. Sliding compaction is what makes a `Move` here span
+  a whole contiguous *run*: sliding preserves order and shifts each run by a common delta, so
+  the natural (and most I/O-efficient) move unit is the run, not the individual allocation.
 
 **The one adaptation to keep in mind while reading them:** those systems recover a block's
 size from an *in-band header* or by *tracing*. Kladde has neither, so its equivalent of "the
