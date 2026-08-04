@@ -129,8 +129,9 @@ pub trait ReadBackend: Backend {
 /// Write access to *stored bytes*, plus **address-hidden** allocation. All
 /// methods take `&self` (the guard-reborrow model); the interior mutability this
 /// needs lives inside the concrete backend, never in the reusable `Allocator`.
-/// Addresses never surface here (contrast `Allocator::resize`, which reports a
-/// `Relocation`): the backend consumes the relocation internally to move bytes.
+/// Addresses never surface here: the backend owns the id table and consumes the
+/// allocator's relocation report (`Allocator::resize`'s `Option<Address>`)
+/// internally to move bytes.
 pub trait WriteBackend: Backend {
     fn alloc_resizable(&self, size: Self::Size) -> UniquePointerResizable<Self::Pointer>;
     fn alloc_fixed_size(&self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer>;
@@ -145,8 +146,9 @@ pub trait WriteBackend: Backend {
         new_size: Self::Size,
     ) -> Result<(), BackendError>;
 
-    /// Convert a fixed-size allocation to resizable (address-hidden counterpart
-    /// of `Allocator::make_resizable`), moving bytes if it relocates.
+    /// Convert a fixed-size allocation to resizable, keeping the same id (the
+    /// backend re-tags sizedness in its table and relocates the bytes via
+    /// `free` + `alloc`). There is no allocator-level `make_*`.
     fn make_resizable(
         &self,
         p: UniquePointerFixedSize<Self::Pointer>,
