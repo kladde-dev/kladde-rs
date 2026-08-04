@@ -104,12 +104,19 @@ impl<S: Storage, A: Allocator, W: Word> Composed<S, A, W> {
 
     // ---- immediate operations ----
 
-    fn alloc(&mut self, size: A::Size, sizedness: Sizedness) -> Pointer<W> {
+    /// Mint a fresh id without allocating an address (the id is not yet in the
+    /// table). Used by the journaled backend to hand out a stable id early and
+    /// defer the address to [`claim`](Composed::claim) at flush.
+    pub(crate) fn mint(&mut self) -> Pointer<W> {
+        self.fresh_id()
+    }
+
+    /// Allocate an address for an already-minted `id` and record it.
+    pub(crate) fn claim(&mut self, id: Pointer<W>, size: A::Size, sizedness: Sizedness) {
         let address = self
             .alloc
             .alloc(size, sizedness)
             .expect("in-memory allocator never runs out of memory");
-        let id = self.fresh_id();
         self.table.insert(
             id,
             Entry {
@@ -120,6 +127,11 @@ impl<S: Storage, A: Allocator, W: Word> Composed<S, A, W> {
         );
         self.cover(address, size)
             .expect("extend storage for new allocation");
+    }
+
+    fn alloc(&mut self, size: A::Size, sizedness: Sizedness) -> Pointer<W> {
+        let id = self.mint();
+        self.claim(id, size, sizedness);
         id
     }
 

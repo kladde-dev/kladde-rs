@@ -1,219 +1,178 @@
-//! [`JournaledWriteBackend`] / [`JournaledReadBackend`]: an **attempt** at a
-//! journaled backend, sharing the immediate-operation core ([`Composed`]) with
-//! the unjournaled one -- journal *replay* is literally "run the immediate path
-//! over the buffered ops."
+//! [`JournaledWriteBackend`] / [`JournaledReadBackend`]: an in-memory-journal
+//! backend on the free-space-allocator model.
 //!
-//! ## What this models
+//! It defers *everything* to flush: `alloc` mints an id immediately (so a `store`
+//! can serialize it) but **records only a pending `(size, sizedness)`** -- the
+//! allocator's `alloc` (address assignment) is deferred to [`flush`], the
+//! `claim`. Writes are buffered. `size`/`resolve` answer from the pending map
+//! during the write phase. On `flush`, every still-live id is claimed (addresses
+//! assigned via `Composed::claim`) and the buffered writes are replayed at the
+//! now-known addresses; the result is a read-only [`JournaledReadBackend`].
 //!
-//! - **Buffered writes.** `write` appends an op instead of touching storage;
-//!   `flush` replays them. So nothing a `store` writes is visible until the
-//!   transaction is flushed (there is no read surface on the write backend at
-//!   all -- the phase split is enforced by the *types*).
-//! - **Deferred resizes via the `resized_allocation` map** (the design decision
-//!   that replaced `reserve_resize`). `resize` records the new size in a map and
-//!   journals an op; it does **not** touch the allocator. `size` consults the map
-//!   first, so callers see the pending size mid-transaction. `flush` applies the
-//!   resizes (through `Composed`) and clears the map, restoring the invariant
-//!   that in the **read phase the map is empty**.
-//! - **The read/write phase split by ownership**: `JournaledWriteBackend`
-//!   implements only `WriteBackend`; `flush(self)` consumes it and returns a
-//!   `JournaledReadBackend` that implements only `ReadBackend`.
+//! The read/write phase split is by ownership: `JournaledWriteBackend` implements
+//! only `WriteBackend`; `flush(self)` consumes it and returns a
+//! `JournaledReadBackend` that implements only `ReadBackend`.
 //!
-//! ## What is deliberately NOT done here (see implementation-notes.md)
-//!
-//! This is an in-memory-journal mock; several load-bearing pieces are stubbed or
-//! simplified because they were explicitly deferred or are blocked on machinery
-//! this pass doesn't build:
-//!
-//! - **Self-hosting bootstrap** (persisting the journal + allocator state *in*
-//!   `Storage`, and recovering them on open) is deferred (Problem 6). The
-//!   journal and allocator table live in memory only; [`JournaledWriteBackend::open`]
-//!   is a `todo!()` placeholder for the recovery path.
-//! - **Deferred address assignment** (`reserve`/`claim`) is not exercised:
-//!   `SimpleAllocator` assigns addresses eagerly and the journal is in memory
-//!   (not in `Storage`), so the file-tail-collision problem that motivates
-//!   deferral doesn't arise. A real journaled file needs a journaling allocator
-//!   and an in-`Storage` journal together.
-//! - **Crash-safe framing** (length prefixes / checksums) is absent; ops are a
-//!   plain in-memory `Vec`.
-//! - **`alloc`/`free`/`make_*` apply immediately** (only `write`/`resize` defer),
-//!   so this mock is not atomic-rollback-capable; and **`splice` is `todo!()`**
-//!   (deferring it interacts subtly with the `resized_allocation` map).
-//! - **Auto-flush on journal overflow** is not implemented; `flush` is explicit.
+//! Still an in-memory-journal *mock*: the journal + id table live in memory only,
+//! so [`JournaledWriteBackend::open`] (recovery from `Storage`) is a `todo!()`
+//! -- the self-hosting bootstrap is deferred. `splice` is likewise `todo!()`, and
+//! freed-during-write ids are dropped from the pending set without recycling
+//! their id number until flush (no aliasing within a transaction; ids stay dense
+//! *enough* for the mock).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::{Allocator, Sizedness};
 use crate::backend::{Backend, BackendError, ReadBackend, WriteBackend};
 use crate::composed::Composed;
-use crate::pointer::{ResolvedPointer, UniquePointerFixedSize, UniquePointerResizable};
+use crate::pointer::{Pointer, ResolvedPointer, UniquePointerFixedSize, UniquePointerResizable};
 use crate::storage::Storage;
-use std::cell::RefCell;
+use crate::word::Word;
 
-/// A buffered mutation. Only the operations whose durable effect on stored bytes
-/// we defer are journaled (`write`, `resize`); `alloc`/`free`/`make_*` apply to
-/// the in-memory table immediately in this mock.
-enum Op<P, S> {
-    Write {
-        anchor: P,
-        offset: S,
-        bytes: Vec<u8>,
-    },
-    Resize {
-        p: P,
-        new_size: S,
-    },
+struct JournaledInner<S, A: Allocator, W: Word = u32> {
+    composed: Composed<S, A, W>,
+    /// Minted-but-not-yet-claimed allocations: the deferred allocator state,
+    /// mutated by `alloc`/`resize`/`free`/`make_*`.
+    pending: HashMap<Pointer<W>, (A::Size, Sizedness)>,
+    /// Buffered writes `(id, offset, bytes)`, replayed after claim.
+    journal: Vec<(Pointer<W>, A::Size, Vec<u8>)>,
 }
 
-struct JournaledInner<S, A: Allocator> {
-    composed: Composed<S, A>,
-    journal: Vec<Op<A::Pointer, A::Size>>,
-    resized: HashMap<A::Pointer, A::Size>,
-}
-
-impl<S: Storage, A: Allocator> JournaledInner<S, A> {
-    /// Apply every buffered op through the shared immediate path, then clear the
-    /// deferred-resize map (restoring the read-phase invariant that it's empty).
-    fn replay(&mut self) {
-        for op in std::mem::take(&mut self.journal) {
-            match op {
-                Op::Write {
-                    anchor,
-                    offset,
-                    bytes,
-                } => self.composed.write(anchor, offset, &bytes),
-                Op::Resize { p, new_size } => {
-                    let handle = self
-                        .composed
-                        .alloc
-                        .resolve_resizable(p)
-                        .expect("replay: resize target must be a live resizable allocation");
-                    self.composed
-                        .resize(&handle, new_size)
-                        .expect("replay: resize must succeed");
-                }
-            }
+fn handle_for<W: Word>(id: Pointer<W>, sizedness: Sizedness) -> ResolvedPointer<Pointer<W>> {
+    match sizedness {
+        Sizedness::Resizable => {
+            ResolvedPointer::Resizable(UniquePointerResizable::from_pointer(id))
         }
-        self.resized.clear();
+        Sizedness::Fixed => ResolvedPointer::Fixed(UniquePointerFixedSize::from_pointer(id)),
     }
 }
 
-/// The write half of a journaled transaction: buffers ops via `&self` (guard
-/// model), applies none of the deferred ones until [`JournaledWriteBackend::flush`].
-pub struct JournaledWriteBackend<S, A: Allocator> {
-    inner: RefCell<JournaledInner<S, A>>,
+/// The write half of a journaled transaction.
+pub struct JournaledWriteBackend<S, A: Allocator, W: Word = u32> {
+    inner: RefCell<JournaledInner<S, A, W>>,
 }
 
-impl<S: Storage, A: Allocator> JournaledWriteBackend<S, A> {
+impl<S: Storage, A: Allocator, W: Word> JournaledWriteBackend<S, A, W> {
     pub fn new(storage: S, alloc: A) -> Self {
         Self {
             inner: RefCell::new(JournaledInner {
                 composed: Composed::new(storage, alloc),
+                pending: HashMap::new(),
                 journal: Vec::new(),
-                resized: HashMap::new(),
             }),
         }
     }
 
-    /// Reopen a journaled file, reconstructing the in-memory allocator from state
-    /// persisted in `storage`.
-    ///
-    /// Blocked on the self-hosting bootstrap (Problem 6, deferred): the journal
-    /// and allocator table currently live in memory only, so there is nothing in
-    /// `storage` to recover from yet.
+    /// Reopen a journaled file, reconstructing state persisted in `storage`.
+    /// Blocked on the self-hosting bootstrap (deferred): the journal + id table
+    /// live in memory only, so there is nothing in `storage` to recover yet.
     pub fn open(_storage: S) -> Self {
-        todo!("self-hosting bootstrap: recover the allocator table + journal from Storage (deferred, Problem 6)")
+        todo!("self-hosting bootstrap: recover the id table + journal from Storage (deferred)")
     }
 
-    /// End the write transaction: replay every buffered op into storage and hand
-    /// back a read-only view. Consuming `self` guarantees no live guard remains
-    /// and that nothing writes after the flush.
-    pub fn flush(self) -> JournaledReadBackend<S, A> {
+    /// End the write transaction: claim every still-live id (assigning addresses),
+    /// replay the buffered writes, and hand back a read-only view.
+    pub fn flush(self) -> JournaledReadBackend<S, A, W> {
         let mut inner = self.inner.into_inner();
-        inner.replay();
+        let pending: Vec<(Pointer<W>, A::Size, Sizedness)> = inner
+            .pending
+            .drain()
+            .map(|(id, (size, sizedness))| (id, size, sizedness))
+            .collect();
+        for (id, size, sizedness) in pending {
+            inner.composed.claim(id, size, sizedness);
+        }
+        for (id, offset, bytes) in std::mem::take(&mut inner.journal) {
+            inner.composed.write(id, offset, &bytes);
+        }
         JournaledReadBackend { inner }
     }
 }
 
-impl<S: Storage, A: Allocator> Backend for JournaledWriteBackend<S, A> {
-    type Pointer = A::Pointer;
+impl<S: Storage, A: Allocator, W: Word> Backend for JournaledWriteBackend<S, A, W> {
+    type Pointer = Pointer<W>;
     type Size = A::Size;
 
-    fn size(&self, p: Self::Pointer) -> Result<Self::Size, AllocError> {
-        let inner = self.inner.borrow();
-        // Deferred-resize map wins over the allocator's (still-old) size.
-        if let Some(&s) = inner.resized.get(&p) {
-            return Ok(s);
-        }
-        inner.composed.alloc.size(p)
+    fn size(&self, p: Self::Pointer) -> Result<Self::Size, BackendError> {
+        self.inner
+            .borrow()
+            .pending
+            .get(&p)
+            .map(|&(size, _)| size)
+            .ok_or(BackendError::DanglingPointer)
     }
-    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self::Pointer>, AllocError> {
-        self.inner.borrow().composed.alloc.resolve(p)
+    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self::Pointer>, BackendError> {
+        let inner = self.inner.borrow();
+        let &(_, sizedness) = inner.pending.get(&p).ok_or(BackendError::DanglingPointer)?;
+        Ok(handle_for(p, sizedness))
     }
 }
 
-impl<S: Storage, A: Allocator> WriteBackend for JournaledWriteBackend<S, A> {
+impl<S: Storage, A: Allocator, W: Word> WriteBackend for JournaledWriteBackend<S, A, W> {
     fn alloc_resizable(&self, size: Self::Size) -> UniquePointerResizable<Self::Pointer> {
-        // Applied immediately so the minted id is stable and queryable at once.
-        self.inner.borrow_mut().composed.alloc_resizable(size)
+        let mut inner = self.inner.borrow_mut();
+        let id = inner.composed.mint();
+        inner.pending.insert(id, (size, Sizedness::Resizable));
+        UniquePointerResizable::from_pointer(id)
     }
     fn alloc_fixed_size(&self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer> {
-        self.inner.borrow_mut().composed.alloc_fixed_size(size)
+        let mut inner = self.inner.borrow_mut();
+        let id = inner.composed.mint();
+        inner.pending.insert(id, (size, Sizedness::Fixed));
+        UniquePointerFixedSize::from_pointer(id)
     }
     fn free_resizable(&self, p: UniquePointerResizable<Self::Pointer>) {
-        let mut inner = self.inner.borrow_mut();
-        inner.resized.remove(&p.raw()); // drop any pending resize for this id
-        inner.composed.free_resizable(p);
+        self.inner.borrow_mut().pending.remove(&p.raw());
     }
     fn free_fixed_size(&self, p: UniquePointerFixedSize<Self::Pointer>) {
-        self.inner.borrow_mut().composed.free_fixed_size(p);
+        self.inner.borrow_mut().pending.remove(&p.raw());
     }
-
     fn resize(
         &self,
         p: &UniquePointerResizable<Self::Pointer>,
         new_size: Self::Size,
     ) -> Result<(), BackendError> {
-        // Deferred: record in the map + journal, don't touch the allocator.
         let mut inner = self.inner.borrow_mut();
-        inner.resized.insert(p.raw(), new_size);
-        inner.journal.push(Op::Resize {
-            p: p.raw(),
-            new_size,
-        });
-        Ok(())
+        match inner.pending.get_mut(&p.raw()) {
+            Some(e) => {
+                e.0 = new_size;
+                Ok(())
+            }
+            None => Err(BackendError::DanglingPointer),
+        }
     }
-
     fn make_resizable(
         &self,
         p: UniquePointerFixedSize<Self::Pointer>,
         new_size: Self::Size,
     ) -> Result<UniquePointerResizable<Self::Pointer>, BackendError> {
-        // Applied immediately (mock simplification): the new handle must be
-        // available synchronously for the caller to serialize.
-        self.inner.borrow_mut().composed.make_resizable(p, new_size)
+        let id = p.raw();
+        self.inner
+            .borrow_mut()
+            .pending
+            .insert(id, (new_size, Sizedness::Resizable));
+        Ok(UniquePointerResizable::from_pointer(id))
     }
     fn make_fixed_size(
         &self,
         p: UniquePointerResizable<Self::Pointer>,
         new_size: Self::Size,
     ) -> Result<UniquePointerFixedSize<Self::Pointer>, BackendError> {
+        let id = p.raw();
         self.inner
             .borrow_mut()
-            .composed
-            .make_fixed_size(p, new_size)
+            .pending
+            .insert(id, (new_size, Sizedness::Fixed));
+        Ok(UniquePointerFixedSize::from_pointer(id))
     }
-
     fn write(&self, anchor: Self::Pointer, offset: Self::Size, bytes: &[u8]) {
-        // Buffered: nothing hits storage until `flush`.
-        self.inner.borrow_mut().journal.push(Op::Write {
-            anchor,
-            offset,
-            bytes: bytes.to_vec(),
-        });
+        self.inner
+            .borrow_mut()
+            .journal
+            .push((anchor, offset, bytes.to_vec()));
     }
-
     fn splice(
         &self,
         _p: &UniquePointerResizable<Self::Pointer>,
@@ -222,40 +181,36 @@ impl<S: Storage, A: Allocator> WriteBackend for JournaledWriteBackend<S, A> {
         _new: &[u8],
     ) {
         todo!(
-            "journaled splice: buffering a splice (resize + tail-shift + overwrite) \
-             interacts with the resized_allocation map and buffered writes; deferred"
+            "journaled splice: deferring a splice interacts with the pending map + buffered writes"
         )
     }
 }
 
-/// The read-only view produced by [`JournaledWriteBackend::flush`]. Implements
-/// only `ReadBackend`; there is no way back to writing without a fresh
-/// transaction (which, once self-hosting exists, would reopen from `Storage`).
-pub struct JournaledReadBackend<S, A: Allocator> {
-    inner: JournaledInner<S, A>,
+/// The read-only view produced by [`JournaledWriteBackend::flush`].
+pub struct JournaledReadBackend<S, A: Allocator, W: Word = u32> {
+    inner: JournaledInner<S, A, W>,
 }
 
-impl<S: Storage, A: Allocator> JournaledReadBackend<S, A> {
-    /// Consume the view, returning the raw storage and allocator (test inspection).
+impl<S: Storage, A: Allocator, W: Word> JournaledReadBackend<S, A, W> {
+    /// Consume the view, returning the raw storage and allocator.
     pub fn into_parts(self) -> (S, A) {
         (self.inner.composed.storage, self.inner.composed.alloc)
     }
 }
 
-impl<S: Storage, A: Allocator> Backend for JournaledReadBackend<S, A> {
-    type Pointer = A::Pointer;
+impl<S: Storage, A: Allocator, W: Word> Backend for JournaledReadBackend<S, A, W> {
+    type Pointer = Pointer<W>;
     type Size = A::Size;
 
-    fn size(&self, p: Self::Pointer) -> Result<Self::Size, AllocError> {
-        // Read phase: the resized map is empty, so the allocator is authoritative.
-        self.inner.composed.alloc.size(p)
+    fn size(&self, p: Self::Pointer) -> Result<Self::Size, BackendError> {
+        self.inner.composed.size(p)
     }
-    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self::Pointer>, AllocError> {
-        self.inner.composed.alloc.resolve(p)
+    fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self::Pointer>, BackendError> {
+        self.inner.composed.resolve(p)
     }
 }
 
-impl<S: Storage, A: Allocator> ReadBackend for JournaledReadBackend<S, A> {
+impl<S: Storage, A: Allocator, W: Word> ReadBackend for JournaledReadBackend<S, A, W> {
     fn read_at(&mut self, anchor: Self::Pointer, offset: Self::Size) -> impl Read + Seek + '_ {
         self.inner.composed.read_at(anchor, offset)
     }
@@ -264,7 +219,6 @@ impl<S: Storage, A: Allocator> ReadBackend for JournaledReadBackend<S, A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pointer::Pointer;
     use crate::storage::InMemoryStorage;
     use crate::SimpleAllocator;
     use std::io::Read;
@@ -280,7 +234,6 @@ mod tests {
         wb.write(p.raw(), 0, &[1, 2, 3, 4]);
         let id = p.raw();
 
-        // Flush -> read view; the buffered write is now applied.
         let mut rb = wb.flush();
         let mut cursor = rb.read_at(id, 0);
         let mut buf = [0u8; 4];
@@ -289,21 +242,16 @@ mod tests {
     }
 
     #[test]
-    fn resize_is_deferred_and_size_reflects_the_map() {
+    fn resize_is_deferred_and_size_reflects_the_pending_state() {
         let wb = write_backend();
         let p = wb.alloc_resizable(4);
-        // Before resize: allocator size.
-        assert_eq!(wb.size(p.raw()), Ok(4));
+        assert_eq!(wb.size(p.raw()).unwrap(), 4);
         wb.resize(&p, 8).unwrap();
-        // After a deferred resize: the map reports the pending size...
-        assert_eq!(wb.size(p.raw()), Ok(8));
-        // ...but the allocator hasn't been touched yet.
-        assert_eq!(wb.inner.borrow().composed.alloc.size(p.raw()), Ok(4));
+        assert_eq!(wb.size(p.raw()).unwrap(), 8); // pending reflects the new size
 
-        // Flush applies it and clears the map.
         let id = p.raw();
-        let (_s, a) = wb.flush().into_parts();
-        assert_eq!(a.size(id), Ok(8));
+        let rb = wb.flush();
+        assert_eq!(rb.size(id).unwrap(), 8); // claimed at the final size
     }
 
     #[test]
@@ -312,7 +260,7 @@ mod tests {
         let p = wb.alloc_resizable(4);
         wb.write(p.raw(), 0, &[1, 2, 3, 4]);
         wb.resize(&p, 8).unwrap();
-        wb.write(p.raw(), 4, &[5, 6, 7, 8]); // into the grown region
+        wb.write(p.raw(), 4, &[5, 6, 7, 8]);
         let id = p.raw();
 
         let mut rb = wb.flush();
@@ -323,14 +271,13 @@ mod tests {
     }
 
     #[test]
-    fn free_drops_a_pending_resize() {
+    fn free_drops_the_pending_allocation() {
         let wb = write_backend();
         let p = wb.alloc_resizable(4);
         wb.resize(&p, 8).unwrap();
-        assert_eq!(wb.size(p.raw()), Ok(8));
+        assert_eq!(wb.size(p.raw()).unwrap(), 8);
+        let id = p.raw();
         wb.free_resizable(p);
-        // the id is gone from both the map and the table
-        let bogus = Pointer::from_raw(1).unwrap();
-        assert_eq!(wb.size(bogus), Err(AllocError::DanglingPointer));
+        assert!(matches!(wb.size(id), Err(BackendError::DanglingPointer)));
     }
 }

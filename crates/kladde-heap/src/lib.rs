@@ -21,8 +21,7 @@
 mod allocator;
 mod backend;
 mod composed;
-// `journaled` is being reworked to the free-space-allocator model in the next
-// commit; temporarily out of the tree so this one stays green.
+mod journaled;
 mod mock;
 mod pointer;
 mod storage;
@@ -31,6 +30,7 @@ mod word;
 
 pub use allocator::{AllocError, Allocator, CompactingAllocator, Move, SimpleAllocator, Sizedness};
 pub use backend::{Backend, BackendError, ReadBackend, WriteBackend};
+pub use journaled::{JournaledReadBackend, JournaledWriteBackend};
 pub use mock::MockBackend;
 pub use pointer::{
     Pointer, ResolvedPointer, UniquePointer, UniquePointerFixedSize, UniquePointerResizable,
