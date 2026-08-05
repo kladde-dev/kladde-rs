@@ -29,24 +29,38 @@ Progress can be made precise with a potential function: let
 `free`) leaves the suffix of the address space free — so `Φ` is the *progress* measure and
 `end` the *payoff*, which lags it.
 
-Two kinds of step exist, distinguished by cost-effectiveness:
+Every step relocates live bytes downward, and one lens prices all of them: relocating a
+single extent of size `s` down by a distance `d` copies `s` bytes and makes `ΔΦ = d`
+progress — **gain `d/s`**, unbounded in both directions. Two familiar shapes are extremes
+of this, and neither dominates the other:
 
-- **Exact-fit move**: a live extent of size `s` at a high address moves into a free gap of
-  size `s` at a lower address. Copies `s` bytes, frees `s` bytes of high address space.
-  Gain (bytes of `Φ`-progress per byte copied): **1**.
-- **Slide**: the live run directly above a gap of size `g` shifts down by `g`. Copies `R`
-  bytes (the run) to make `g` bytes of progress. Gain: **`g/R ≤ 1`**, arbitrarily bad for
-  long runs above small gaps.
+- **Slide**: the packed run directly above a gap of size `g` shifts down by `g`. Every
+  extent in the run moves the same small `d = g`, so a run of `k` extents totaling `R`
+  bytes has gain `k·g/R = g/mean-size` — poor when a long run of large extents sits above
+  a small gap. (It is tempting to read a slide as "copy `R` to gain `g`, hence gain
+  `≤ 1`" — wrong as a general rule: nothing forces `R ≥ g`.)
+- **Evacuation**: a single extent relocates from near the tail into a gap far below,
+  `d ≫ s`. The extreme case is the mirror image of the slide's worst case: a few small
+  extents stranded above a large free region — copying a handful of bytes releases a huge
+  suffix. That is the most valuable move a compactor ever gets, and it is precisely the
+  state a file lands in after a burst of frees below a few survivors.
 
-So the scheduling problem is: *prefer exact-fit moves whenever one exists; slide only as
-fallback* — and find each next move in O(log n), not by rescanning.
+**Exact fit is about fragmentation, not gain.** Placing an extent into a gap of exactly
+its size leaves no remainder sliver and lets the vacated range coalesce fully. But among
+candidate destinations it is a *tie-break*, not a gate: a deep, larger-than-needed gap
+(large `d`) beats a shallow exact one on progress, and the split remainder is a tracked
+gap like any other.
+
+So the scheduling problem is: pick relocations with high gain `d/s` — in particular, ones
+that clear the suffix — prefer exact fits among comparable destinations, and find each
+next move in O(log n), not by rescanning.
 
 **Why exact fits should exist at all**: kladde deliberately hands out many equal-sized
 fixed-size allocations (that was the point of the `Sizedness::Fixed` hint and the size-class
 placement idea). Freeing any one of them mints a gap that is a plug-compatible slot for
 every other live member of the same size class. In the degenerate case where all sizes are
-unique, the mechanism degrades gracefully to slide-only — nothing breaks, compaction is just
-less cheap.
+unique, exact fits simply never fire and every step is an evacuation-with-split or a slide
+— nothing breaks, compaction is just less tidy.
 
 ## 2. What incremental compactors in the wild do, and what is different here
 
@@ -83,10 +97,12 @@ would over-engineer this: the natural design here is index-driven, not scan-driv
   worthless if finding the step scans O(heap). The actionable-move set must be maintained
   by the foreground ops (`alloc`/`free`/`resize` each touch O(1) size classes) so that
   `compact_step` starts from a ready answer.
-- **P3 — Track the intersection, not the ingredients.** What compaction consumes is
-  neither "gaps" nor "movable extents" but the *pairs* (low gap, high same-size extent).
-  Represent that intersection as its own incrementally-maintained set (§4), so a step is
-  pop-and-execute, and quiescence ("nothing worth moving") is a cheap emptiness test.
+- **P3 — Discovery must be a query, not a scan.** What compaction consumes is neither
+  "gaps" nor "movable extents" but *pairs* (deep destination, high extent). Either the
+  next pair must be answerable in O(log n) directly against the primary structure (§4's
+  tail-first policy manages exactly that), or the pair set must be maintained
+  incrementally by the foreground ops — never recomputed per step. Quiescence ("nothing
+  worth moving") must be equally cheap to detect.
 - **P4 — Mechanism/policy split.** The mechanism is "move extent X into gap Y, update
   indexes, report the move." Which pair to pick, when to slide instead, when to stop — that
   is policy, and it should be swappable without touching the index maintenance.
@@ -99,7 +115,7 @@ would over-engineer this: the natural design here is index-driven, not scan-driv
   interrupted move is abandoned at zero cost. (This falls out of the id-table indirection;
   it is worth preserving in whatever design wins.)
 
-## 4. The core structure: one partition, three indexes, one actionable set
+## 4. The core structure: one partition, derived indexes, tail-first steps
 
 Single source of truth — the partition of the address space:
 
@@ -116,7 +132,7 @@ mutation paths (`alloc`, `free`, `resize`, `apply move`):
 by_token:  HashMap<Token, Address>              // id resolution (this IS the id table's
                                                 // address column; the sunk cost, exploited)
 free_by_size: BTreeMap<Size, BTreeSet<Address>> // gaps, grouped by exact size
-live_by_size: BTreeMap<Size, BTreeSet<Address>> // movable live extents, grouped by size
+live_by_size: BTreeMap<Size, BTreeSet<Address>> // OPTIONAL accelerator (see below)
 ```
 
 `BTreeSet<Address>` per class rather than a binary heap: min *and* max are O(log), and —
@@ -124,32 +140,41 @@ unlike a heap — arbitrary deletion is native, which matters because gaps are c
 ordinary `alloc` and extents die by ordinary `free`, not only by compaction. (This subsumes
 the per-class min-heap idea; the heap's O(1) peek isn't worth losing cheap deletion.)
 
-The intersection, maintained rather than recomputed (P3):
+The destination lookup the corrected gain analysis (§1) demands is one query the per-class
+sets cannot answer cheaply: **the lowest gap with `len ≥ s`** — a 2-D dominance query
+(minimize address subject to a size bound). The textbook structure is an address-ordered
+balanced tree augmented with each subtree's *maximum gap length*: descend leftmost-first
+into any subtree whose max is `≥ s`, O(log n). `std` has no augmented `BTreeMap`, so this
+is a small bespoke tree — or, initially, a scan over `free_by_size.range(s..)` classes
+accepted as a stopgap until measured.
 
-```rust
-actionable: BTreeSet<(Address, Size)>   // ordered by the movable extent's address, descending use
-// s is actionable  ⇔  min(free_by_size[s]) < max(live_by_size[s])
-```
+`compact_step(budget)` — **tail-first evacuation**:
 
-Every foreground mutation touches O(1) size classes and re-checks this one inequality for
-each touched class — flipping a class in or out of `actionable` is the "switching a flag"
-this design was missing. `compact_step` is then:
+1. Candidate: the highest-addressed live extent (the last live entry of `extents` — the
+   one pinning `end`). One lookup, no scan.
+2. Destination: exact-fit fast path (`free_by_size[s]`'s lowest address, if below the
+   candidate), else the augmented-tree query for the lowest gap `≥ s` below it, splitting
+   the gap; the remainder re-enters `free_by_size` as a smaller gap.
+3. Copy `s` bytes, flip the table entry, update the indexes; the vacated range coalesces
+   with its free neighbors (touching O(1) classes).
+4. If no gap below fits, or `s` exceeds `budget`: slide the tail extent down against its
+   lower neighbor chunk-by-chunk (front-to-back copy), or probe the next-highest extent
+   (bounded probe count — policy).
+5. If the suffix of the address space is now free, retreat `end`. Repeat while budget
+   remains.
 
-1. Pop the actionable class whose movable extent has the **highest address** (tail-first:
-   most likely to shrink `end` soon). O(log n).
-2. Move that extent into the class's lowest gap: copy `s` bytes, flip the table entry,
-   update the four indexes. The vacated range coalesces with free neighbors (possibly
-   changing *their* class membership — still O(1) classes touched).
-3. If `actionable` is empty, optionally fall back to a bounded **slide**: take the lowest
-   gap, and shift the single extent immediately above it down (its successor in `extents`
-   — one lookup, no scan). Chunk the copy front-to-back if the extent exceeds the budget.
-4. If the suffix of the address space is now free, retreat `end`.
+Discovery is O(log n) per step with **no materialized intersection at all**: because the
+policy is driven from the tail extent — one lookup — plus one destination query, the
+dynamically-maintained actionable set that an exact-fit-only design would need
+(`s` actionable ⇔ `min(free_by_size[s]) < max(live_by_size[s])`, flag-flipped by the O(1)
+classes each foreground op touches) survives only as an *optional accelerator*, together
+with `live_by_size`, for opportunistically draining mid-file exact fits when the tail is
+already tight.
 
-Gap splitting makes "combination fits" fall out for free: a gap of size `3s` never matches
-class `3s` extents? Fine — best-fit `alloc` or an explicit policy can place an `s`-extent at
-its front, and the `2s` remainder re-enters `free_by_size` as a smaller class, ready for the
-next exact fit. Full bin-packing of combinations is NP-hard and not worth chasing; greedy
-splitting captures the realistic case (many allocations of few distinct sizes).
+Splitting (step 2) makes "combination fits" fall out for free: a gap of size `3s` receives
+an `s`-extent, and the `2s` remainder re-enters `free_by_size`, ready for the next tail
+extent. Full bin-packing of combinations is NP-hard and not worth chasing; greedy splitting
+captures the realistic case (many allocations of few distinct sizes).
 
 Cost accounting: all indexes together hold one entry per extent — O(live + gaps) — a
 constant factor on the table the stable-id constraint already forces into memory (P1).
@@ -206,7 +231,7 @@ either one polls the other (recompute — violates P2/P3) or they exchange notif
 ### Sketch C: Sketch A plus an explicit policy object
 
 Same mechanism; `propose_step` delegates to a `CompactionPolicy` trait reading the indexes
-(tail-first exact-fit, gain-greedy hybrid with slides, "only when `len > 2 × live_bytes`"
+(tail-first evacuation, exact-fit-preferring variants, "only when `len > 2 × live_bytes`"
 hysteresis, never-move-pinned…). This is not an alternative but the natural second story on
 Sketch A once two policies actually exist; premature before then (P4 says keep the seam in
 mind, not build the trait now).
@@ -244,9 +269,12 @@ mind, not build the trait now).
   ones only if growth allocates at the tail — worth a placement-policy decision.
 - **When to run steps.** Per-flush? Every N foreground ops? Budgeted idle work? This is
   pure policy (P4) and can be decided last.
-- **`free_by_size` fragmentation of classes.** Coalescing merges gaps into ever-rarer
-  sizes; if exact-match rates in practice disappoint, the fallback query "smallest gap of
-  size ≥ s" is one `BTreeMap::range(s..)` step away — measure first.
+- **Index weight.** The tail-first core needs only `extents`, `by_token`, and the gap
+  destination query; `free_by_size` (exact-fit fast path) and especially `live_by_size` +
+  the actionable-class accelerator (mid-file exact fits) are optional. Ship the core
+  first; add accelerators when a workload shows exact fits going unexploited. The
+  augmented gap tree is the one bespoke structure — confirm the `free_by_size.range(s..)`
+  scan stopgap is actually too slow before building it.
 
 ## References
 
