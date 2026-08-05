@@ -23,27 +23,31 @@ Support:
   bytes). No stop-the-world phase, ever; a full compaction is just `compact_step` in a loop
   that something is allowed to interrupt.
 
-Progress can be made precise with a potential function: let
-`Φ = Σ_{live extents a} address(a)`. Every useful compaction step strictly decreases `Φ`;
-`Φ` is minimal exactly when the heap is compact. `end` itself shrinks whenever a step (or a
-`free`) leaves the suffix of the address space free — so `Φ` is the *progress* measure and
-`end` the *payoff*, which lags it.
+Progress can be made precise with a potential function over live **bytes**, not extents:
+`Φ = Σ_{live bytes b} address(b)`
+(`= Σ_{live extents a} size(a)·(address(a) + (size(a)−1)/2)`). With `L` total live bytes,
+`Φ ≥ L(L−1)/2`, with equality for **every** gapless layout regardless of extent order; the
+excess `Φ − L(L−1)/2` counts exactly the (free byte, live byte) pairs where the free byte
+sits *below* the live byte — the heap's "inversions" — so minimal `Φ` ⟺ compact, and the
+excess doubles as a fragmentation-debt metric. (The simpler-looking variant that sums
+extent *start* addresses is subtly wrong: its minimum depends on extent order — it insists
+small extents come first — and the bias this induces in the greedy policy is actively
+harmful; see the second worked example in §4.) Every useful compaction step strictly
+decreases `Φ`. `end` itself shrinks whenever a step (or a `free`) clears the suffix — so
+`Φ` is the *progress* measure and `end` the *payoff*, which lags it.
 
-Every step relocates live bytes downward, and one lens prices all of them: relocating a
-single extent of size `s` down by a distance `d` copies `s` bytes and makes `ΔΦ = d`
-progress — **gain `d/s`**, unbounded in both directions. Two familiar shapes are extremes
-of this, and neither dominates the other:
+Every step relocates live bytes downward, and one lens prices all of them: relocating an
+extent of size `s` down by a distance `d` copies `s` bytes and makes `ΔΦ = s·d` progress —
+per byte copied, **gain `d`**, the travel distance. Two familiar shapes are extremes:
 
 - **Slide**: the packed run directly above a gap of size `g` shifts down by `g`. Every
-  extent in the run moves the same small `d = g`, so a run of `k` extents totaling `R`
-  bytes has gain `k·g/R = g/mean-size` — poor when a long run of large extents sits above
-  a small gap. (It is tempting to read a slide as "copy `R` to gain `g`, hence gain
-  `≤ 1`" — wrong as a general rule: nothing forces `R ≥ g`.)
-- **Evacuation**: a single extent relocates from near the tail into a gap far below,
-  `d ≫ s`. The extreme case is the mirror image of the slide's worst case: a few small
-  extents stranded above a large free region — copying a handful of bytes releases a huge
-  suffix. That is the most valuable move a compactor ever gets, and it is precisely the
-  state a file lands in after a burst of frees below a few survivors.
+  byte in the run travels `d = g`, so the gain is the **gap size** — independent of what
+  the run contains, and poor whenever the gap is small.
+- **Evacuation**: a single extent jumps from near the tail into a gap far below it; the
+  gain is its full travel distance, possibly `d ≫ g` for every gap `g`. The extreme case
+  is a few small extents stranded above a large free region — copying a handful of bytes
+  releases a huge suffix. That is the most valuable move a compactor ever gets, and it is
+  precisely the state a file lands in after a burst of frees below a few survivors.
 
 **Exact fit is about fragmentation, not gain.** Placing an extent into a gap of exactly
 its size leaves no remainder sliver and lets the vacated range coalesce fully. But among
@@ -56,10 +60,11 @@ discontinuous payoff — a single unfortunately-sized tail extent defers all of 
 cheap interior moves, whose payoff to `end` arrives later via gap coalescence, score zero
 and go untaken. `Φ` is the smooth surrogate: interior downward moves are credited
 immediately, and truncation falls out whenever the suffix happens to clear. So the
-scheduling rule is: **greedily maximize `d/s`, wherever in the file the move is**; prefer
-exact fits among comparable destinations; and find each next move in O(log n), not by
-rescanning. §4 walks a worked example where `end`-greed degenerates into ~11×
-overcopying while plain `d/s`-greed compacts the same file optimally, with no lookahead.
+scheduling rule is: **greedily maximize the per-byte gain — travel distance — wherever in
+the file the move is**; prefer exact fits among comparable destinations; and find each
+next move in O(log n), not by rescanning. §4 walks a worked example where `end`-greed
+degenerates into ~11× overcopying while plain distance-greed compacts the same file
+optimally, with no lookahead.
 
 **Why exact fits should exist at all**: kladde deliberately hands out many equal-sized
 fixed-size allocations (that was the point of the `Sizedness::Fixed` hint and the size-class
@@ -158,11 +163,12 @@ accepted as a stopgap until measured.
 `compact_step(budget)` — **gain-greedy**:
 
 1. Candidate generation, one per size class `s` that has live members: the class's best
-   mover is its **highest-addressed member** (`live_by_size[s].last()` — within a class,
-   `d` is maximized there). Its destination is the exact-fit fast path
-   (`free_by_size[s]`'s lowest address) or the augmented-tree query (lowest gap `≥ s`,
-   split on use); its gain is `d/s`. Add one *slide* candidate — the run above the lowest
-   gap, gain `g/mean-size` — for the regime where no fit exists anywhere.
+   mover is its **highest-addressed member** (`live_by_size[s].last()` — within a class
+   the destination is shared, so the highest member maximizes `d`). Its destination is
+   the exact-fit fast path (`free_by_size[s]`'s lowest address) or the augmented-tree
+   query (lowest gap `≥ s`, split on use); its gain is its travel distance `d`. Add one
+   *slide* candidate — the run above the **largest** gap, gain `g` — for the regime where
+   no fit exists anywhere.
 2. Pick the best candidate. Under kladde's design bet — many allocations of *few* distinct
    sizes (the `Sizedness::Fixed` classes) plus a handful of one-off resizable sizes — the
    class count is small, so evaluating every class is O(#classes · log n) per step with no
@@ -175,7 +181,7 @@ accepted as a stopgap until measured.
 4. If the suffix of the address space is now free, retreat `end`. Repeat while budget
    remains; quiesce when no candidate's gain clears a policy threshold.
 
-**Why greed in `d/s` needs no lookahead — worked example.** Live extents
+**Why distance-greed needs no lookahead — worked example.** Live extents
 `E1 = 0..1000`, `E2 = 1020..2000`, `E3 = 2100..2110`, `E4 = 2200..2210`,
 `E5 = 2310..2420`, with gaps of 20, 100, 90, 100 between them. The tail `E5` (110 bytes)
 fits no gap, so an `end`-greedy compactor stalls or slides — and pure sliding copies
@@ -183,13 +189,13 @@ fits no gap, so an `end`-greedy compactor stalls or slides — and pure sliding 
 descends). Gain-greedy instead reads the cheap interior moves off the top of the
 candidate list:
 
-1. `E4 → 1000` (gain `1200/10 = 120`); its vacated slot coalesces with the gap above it
+1. `E4 → 1000` (gain `d = 1200`); its vacated slot coalesces with the gap above it
    into 110 free bytes at `2200`.
-2. `E3 → 1010` (gain `109`, an exact fit into the split remainder — and it outranks
-   `E5 → 2200`, gain `1`, which would waste a copy); its vacated slot merges the two gaps
-   around it into 200 free bytes at `2000`.
-3. `E5 → 2000` (gain `310/110 ≈ 2.8` — the coalesced gap now fits it); the heap is
-   gapless, truncate `2420 → 2110`.
+2. `E3 → 1010` (gain `1090`, an exact fit into the split remainder — and it outranks
+   `E5 → 2200`, gain `110`, which would waste a copy); its vacated slot merges the two
+   gaps around it into 200 free bytes at `2000`.
+3. `E5 → 2000` (gain `310` — the coalesced gap now fits it); the heap is gapless,
+   truncate `2420 → 2110`.
 
 Fully compact, 130 bytes copied, no planning: the "enabling" interior moves were
 themselves the highest-gain single moves, because `Φ` credits deferred payoff immediately
@@ -197,6 +203,20 @@ themselves the highest-gain single moves, because `Φ` credits deferred payoff i
 is still greed: bin-packing hides inside exact-fit choices, so no general optimality claim
 — but the "unfortunately-sized tail holds everything hostage" trap is dissolved
 structurally, not by luck.)
+
+**Why the potential must weight by size — second example.** Extents
+`E_bulk = 100..2000`, `E_90 = 2000..2090`, `E_100 = 2190..2290` (the tail), with gaps
+`0..100` and `2090..2190`. The extent-*start* potential prices a move at `d/s`, which
+ranks `E_90 → 0` (`2000/90 ≈ 22.2`) above `E_100 → 0` (`2190/100 ≈ 21.9`): the smaller
+extent jumps first, *splits* the 100-byte gap down to a useless 10, and strands `E_100` —
+the file bottoms out at `end = 2100` after 190 bytes copied, and finishing costs a
+2000-byte slide over the sliver. Distance-greed ranks `E_100 → 0` first (`2190 > 2000`):
+the tail lands in the exact-fitting gap, the suffix clears, and the file is fully compact
+at `end = 2090` after copying exactly 100 bytes. The general lesson: `d/s` divides by
+size and so systematically demotes large movers — but large extents are precisely the
+ones that need large gaps, the scarce resource, and bin-packing folklore (first-fit
+*decreasing*) says to serve them first. The by-byte `Φ` removes the bias, and as a bonus
+keeps per-byte gain uniform within a move, so budget-chunked moves account cleanly.
 
 Note what returned: this policy consumes *pairs* (a class's best mover, its best gap), so
 `live_by_size` is core — the instinct to track the free/live intersection dynamically
@@ -306,6 +326,12 @@ mind, not build the trait now).
   tree ("lowest gap `≥ s`") — confirm the `free_by_size.range(s..)` scan stopgap is
   actually too slow before building it — and the gain-ordered class priority queue,
   pointless while the class count stays small.
+- **Destination rule.** "Lowest gap that fits" maximizes gain but can squander a large
+  gap on a small far-travelling extent — split it, strand the large extent that needed it
+  — a failure no lookahead-free gain ordering avoids (it hits the by-byte and by-start
+  potentials alike). Best-fit (smallest adequate gap, low addresses preferred) trades a
+  little travel distance for scarcity preservation; the exact-fit tie-break is the cheap
+  first approximation of that. Decide empirically.
 
 ## References
 
