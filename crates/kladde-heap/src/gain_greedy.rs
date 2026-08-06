@@ -47,6 +47,49 @@ struct Entry<Id> {
     id: Id,
 }
 
+/// The best candidate seen so far, on two tracks.
+///
+/// `budget` is a ranking input rather than a cap, so a step that exceeds it is
+/// still worth remembering: without it a heap whose only useful move is one
+/// oversized slide would report quiescence and never compact. But a step that
+/// fits is always preferred, however much less it gains.
+#[derive(Default, Clone, Copy)]
+struct Best {
+    within: Option<(u64, Step<u64>)>,
+    overall: Option<(u64, Step<u64>)>,
+}
+
+impl Best {
+    fn offer(&mut self, gain: u64, step: Step<u64>, budget: u64) {
+        if gain == 0 {
+            return;
+        }
+        if step.len <= budget && self.within.is_none_or(|(g, _)| gain > g) {
+            self.within = Some((gain, step));
+        }
+        if self.overall.is_none_or(|(g, _)| gain > g) {
+            self.overall = Some((gain, step));
+        }
+    }
+
+    /// The gain a further candidate must beat to change the outcome.
+    ///
+    /// This is the *within-budget* gain, not the overall one, and deliberately
+    /// so: a class that cannot beat the within-budget best cannot beat the
+    /// overall best either (`within <= overall`), so pruning on it is sound for
+    /// both tracks -- whereas pruning on the overall gain could discard a
+    /// cheaper candidate that would actually have been chosen. Before any
+    /// within-budget candidate is found the bound is 0 and nothing is pruned,
+    /// which is no worse than the exhaustive scan this replaces.
+    fn bound(&self) -> u64 {
+        self.within.map_or(0, |(gain, _)| gain)
+    }
+
+    fn pick(self) -> Option<Step<u64>> {
+        self.within.or(self.overall).map(|(_, step)| step)
+    }
+}
+
 /// A relocatable heap over a `u64` address space with `u32` allocation sizes,
 /// compacting by gain-greedy incremental steps. See the module docs.
 pub struct GainGreedyHeap<Id> {
@@ -61,6 +104,11 @@ pub struct GainGreedyHeap<Id> {
     /// ones would scatter one-per-class and would only have to move again on the
     /// next growth; they stay movable by slides.
     live_by_size: BTreeMap<u32, BTreeSet<u64>>,
+    /// Each class's highest member address -> its size class. The search key for
+    /// the branch-and-bound candidate walk: unlike a gain, a class's top changes
+    /// only when that class's own members do, never when a `free` elsewhere
+    /// opens a deep gap. See [`GainGreedyHeap::propose_compaction_step`].
+    tops: BTreeMap<u64, u32>,
     /// One past the highest live byte.
     end: u64,
     /// Sum of all live allocation sizes.
@@ -74,6 +122,7 @@ impl<Id> Default for GainGreedyHeap<Id> {
             by_id: HashMap::new(),
             free_by_size: BTreeMap::new(),
             live_by_size: BTreeMap::new(),
+            tops: BTreeMap::new(),
             end: 0,
             live_bytes: 0,
         }
@@ -123,6 +172,24 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         self.allocations.range(addr..).next().map(|(&a, _)| a)
     }
 
+    // ---- class-top index (the branch-and-bound key) ----
+
+    /// The highest-addressed member of size class `size`, if any.
+    fn class_top(&self, size: u32) -> Option<u64> {
+        self.live_by_size.get(&size)?.last().copied()
+    }
+
+    /// Re-key `tops` for `size` after its membership changed. `was` is the
+    /// class's top *before* the change.
+    fn refresh_top(&mut self, size: u32, was: Option<u64>) {
+        if let Some(old) = was {
+            self.tops.remove(&old);
+        }
+        if let Some(now) = self.class_top(size) {
+            self.tops.insert(now, size);
+        }
+    }
+
     // ---- the two primitives every mutation goes through ----
 
     /// Record an allocation at `addr`, which must be free and `len` bytes wide.
@@ -144,7 +211,9 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         self.allocations.insert(addr, Entry { len, id });
         self.by_id.insert(id, addr);
         if id.is_fixed_size() {
+            let was = self.class_top(len);
             self.live_by_size.entry(len).or_default().insert(addr);
+            self.refresh_top(len, was);
         }
         self.live_bytes += len as u64;
     }
@@ -158,12 +227,14 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             .expect("remove_raw on an address with no allocation");
         self.by_id.remove(&e.id);
         if e.id.is_fixed_size() {
+            let was = self.class_top(e.len);
             if let Some(set) = self.live_by_size.get_mut(&e.len) {
                 set.remove(&addr);
                 if set.is_empty() {
                     self.live_by_size.remove(&e.len);
                 }
             }
+            self.refresh_top(e.len, was);
         }
         self.live_bytes -= e.len as u64;
 
@@ -230,24 +301,21 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         taken
     }
 
-    /// Evacuation candidates: one per fixed-size class, its highest member
+    /// The evacuation candidate for size class `size`: its highest member
     /// jumping into the lowest gap that fits.
-    fn evacuation_candidates(&self) -> impl Iterator<Item = (u64, Step<u64>)> + '_ {
-        self.live_by_size.iter().filter_map(|(&size, members)| {
-            let from = *members.last()?;
-            let (to, _) = self.lowest_gap_fitting(size as u64)?;
-            // `then`, not `then_some`: the latter would evaluate `from - to`
-            // even when the gap sits *above* the mover, underflowing.
-            (to < from).then(|| {
-                (
-                    from - to,
-                    Step {
-                        from,
-                        to,
-                        len: size as u64,
-                    },
-                )
-            })
+    fn evacuation_candidate(&self, size: u32, from: u64) -> Option<(u64, Step<u64>)> {
+        let (to, _) = self.lowest_gap_fitting(size as u64)?;
+        // `then`, not `then_some`: the latter would evaluate `from - to` even
+        // when the gap sits *above* the mover, underflowing.
+        (to < from).then(|| {
+            (
+                from - to,
+                Step {
+                    from,
+                    to,
+                    len: size as u64,
+                },
+            )
         })
     }
 
@@ -335,30 +403,37 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
             .map(|(&addr, e)| (e.id, addr, e.len))
     }
 
+    /// Pick the highest-gain move, **without** evaluating every size class.
+    ///
+    /// A naive priority queue over classes keyed by last-computed gain would be
+    /// subtly wrong: when a `free` opens a deep gap, the true gains of every
+    /// class small enough to fit it rise at once, and a max-queue can sit on a
+    /// stale-low key forever. The fix is to key by something *class-locally*
+    /// maintainable. A mover's gain is `top - dest <= top`, since `dest >= 0`,
+    /// and `top(s)` changes only when class `s`'s own members change -- never
+    /// through gap events. So walking `tops` downward, the walk can stop the
+    /// moment the best gain so far reaches the next class's top: no unvisited
+    /// class can beat it.
+    ///
+    /// The slide is evaluated first, outside the walk, because it is a single
+    /// O(log n) lookup and usually seeds a bound straight away.
     fn propose_compaction_step(&self, budget: u64) -> Option<Step<u64>> {
         if self.free_by_size.is_empty() {
             return None; // gapless: compact
         }
-        let candidates = self
-            .evacuation_candidates()
-            .chain(self.slide_candidate(budget));
-
-        // Prefer a step within budget; fall back to the best over-budget one
-        // rather than claiming quiescence with work still to do.
-        let mut best_within: Option<(u64, Step<u64>)> = None;
-        let mut best_overall: Option<(u64, Step<u64>)> = None;
-        for (gain, step) in candidates {
-            if gain == 0 {
-                continue;
+        let mut best = Best::default();
+        if let Some((gain, step)) = self.slide_candidate(budget) {
+            best.offer(gain, step, budget);
+        }
+        for (&top, &size) in self.tops.iter().rev() {
+            if top <= best.bound() {
+                break; // gain <= top, so nothing further down can win
             }
-            if step.len <= budget && best_within.is_none_or(|(g, _)| gain > g) {
-                best_within = Some((gain, step));
-            }
-            if best_overall.is_none_or(|(g, _)| gain > g) {
-                best_overall = Some((gain, step));
+            if let Some((gain, step)) = self.evacuation_candidate(size, top) {
+                best.offer(gain, step, budget);
             }
         }
-        best_within.or(best_overall).map(|(_, step)| step)
+        best.pick()
     }
 
     fn commit_compaction_step(&mut self, step: Step<u64>) {
@@ -396,6 +471,25 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         gaps
     }
 
+    /// The reference implementation the branch-and-bound walk must agree with:
+    /// evaluate every size class, prune nothing.
+    fn propose_by_exhaustive_scan(&self, budget: u64) -> Option<Step<u64>> {
+        if self.free_by_size.is_empty() {
+            return None;
+        }
+        let mut best = Best::default();
+        if let Some((gain, step)) = self.slide_candidate(budget) {
+            best.offer(gain, step, budget);
+        }
+        for (&size, members) in &self.live_by_size {
+            let top = *members.last().expect("no empty classes");
+            if let Some((gain, step)) = self.evacuation_candidate(size, top) {
+                best.offer(gain, step, budget);
+            }
+        }
+        best.pick()
+    }
+
     /// Check that the derived indexes still agree with the source of truth.
     fn assert_invariants(&self) {
         let mut cursor = 0u64;
@@ -424,6 +518,12 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             }
         }
         assert_eq!(self.live_by_size, expected_live, "live_by_size drifted");
+
+        let expected_tops: BTreeMap<u64, u32> = expected_live
+            .iter()
+            .map(|(&size, members)| (*members.last().expect("no empty classes"), size))
+            .collect();
+        assert_eq!(self.tops, expected_tops, "tops drifted");
     }
 }
 
@@ -695,6 +795,51 @@ mod tests {
             }
         );
         assert!(step.len > 5, "the caller is the one who gets to say no");
+    }
+
+    #[test]
+    fn the_bounded_walk_agrees_with_an_exhaustive_scan() {
+        // The branch-and-bound is meant to be a pure optimization, so check it
+        // against the scan it replaces over a churny workload.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut h = Heap::new();
+        let mut live: Vec<Pointer<u32>> = Vec::new();
+        let mut counter = 1u32;
+
+        for _ in 0..600 {
+            if rand() % 100 < 55 || live.is_empty() {
+                let size = [4u32, 12, 12, 40, 96, 300][(rand() % 6) as usize];
+                let id = if rand() % 5 == 0 {
+                    resizable(counter)
+                } else {
+                    fixed(counter)
+                };
+                counter += 1;
+                h.alloc(id, size).unwrap();
+                live.push(id);
+            } else {
+                let victim = live.swap_remove((rand() % live.len() as u64) as usize);
+                h.free(victim).unwrap();
+            }
+
+            for budget in [1u64, 16, 64, u64::MAX] {
+                assert_eq!(
+                    h.propose_compaction_step(budget),
+                    h.propose_by_exhaustive_scan(budget),
+                    "bounded walk disagreed with the exhaustive scan at budget {budget}"
+                );
+            }
+            if let Some(step) = h.propose_compaction_step(64) {
+                h.commit_compaction_step(step);
+                h.assert_invariants();
+            }
+        }
     }
 
     /// The worked example of `incremental-compaction.md` §4: distance-greed
