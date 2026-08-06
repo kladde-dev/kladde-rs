@@ -5,21 +5,27 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# A standalone, type-agnostic relocatable persistent heap: pointers, an
-# `Allocator` over stable ids, a `Storage` byte interface, and the
+# A standalone, type-agnostic relocatable persistent heap: pointers, a
+# `RelocatableHeap` over stable ids, a `Storage` byte interface, and the
 # `Backend`/`ReadBackend`/`WriteBackend` split that composes them. Deliberately
 # free of any `Persistable`/serde/kladde dependency so it can be reused on its
 # own (see `assessment.md`, "kladde-alloc as a standalone product"). The kladde
 # serialization layer lives on top, in `kladde-persist`.
 
 [dependencies]
-
+# For the augmented B+ tree behind the "lowest gap that fits" query (see
+# `gap_tree.rs`). `std` has no augmented `BTreeMap`. This crate looks
+# unmaintained, so expect to vendor it or move to an alternative eventually.
+sweep-bptree = "0.4.1"
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
 rand = "0.10.2"
-sweep-bptree = "0.4.1"
 
 [[bench]]
 name = "btree_point_lookup"
+harness = false
+
+[[bench]]
+name = "lowest_fitting_gap"
 harness = false

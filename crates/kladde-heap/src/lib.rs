@@ -25,6 +25,7 @@
 mod backend;
 mod composed;
 mod gain_greedy;
+mod gap_tree;
 mod heap;
 mod journaled;
 mod mock;
@@ -48,3 +49,14 @@ pub use pointer::{
 pub use storage::Storage;
 pub use unjournaled::UnjournaledBackend;
 pub use word::Word;
+
+/// Internals exposed **only** so that `benches/` -- which compiles as a separate
+/// crate and can therefore see nothing private -- measures the code that
+/// actually ships rather than a copy of it.
+///
+/// Not part of the public API: hidden from the docs, and free to change or
+/// vanish without notice. Do not depend on it.
+#[doc(hidden)]
+pub mod bench_support {
+    pub use crate::gap_tree::GapTree;
+}

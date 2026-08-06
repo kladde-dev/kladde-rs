@@ -183,24 +183,44 @@ The destination lookup the corrected gain analysis (§1) demands is one query th
 sets cannot answer cheaply: **the lowest gap with `len ≥ s`** — a 2-D dominance query
 (minimize address subject to a size bound). The textbook structure is an address-ordered
 balanced tree augmented with each subtree's *maximum gap length*: descend leftmost-first
-into any subtree whose max is `≥ s`, O(log n). `std` has no augmented `BTreeMap`, but the
-crate `sweep-bptree` does, and it can run directly on `allocations` with **implicitly
-calculated** gap lengths — no stored gap field. The one non-obvious part is that "max gap"
-is not a plain bottom-up maximum: the largest gap in a subtree may *straddle* the boundary
-between two children, so the augmentation must carry enough to reconstruct it, i.e. the
-monoid
+into any subtree whose max is `≥ s`, O(log n). `std` has no augmented `BTreeMap`; the crate
+`sweep-bptree` does, via its `Argument` (maintain) and `SearchArgument` (descend) traits.
+
+**Gaps are materialized as tree entries rather than left implicit between allocations.**
+Augmenting the `allocations` map directly stores nothing new, which is why it looked
+preferable, but it is a much sharper knife: a gap can *straddle* the boundary between two
+children and so belongs to no child's subtree, forcing the augmentation up to the monoid
 
     A = (min_start, max_end, max_gap)
-    A(left) ∘ A(right) = ( left.min_start,
-                           right.max_end,
+    A(left) ∘ A(right) = ( left.min_start, right.max_end,
                            max(left.max_gap, right.max_gap,
                                right.min_start − left.max_end) )
 
-which is associative and computable from a leaf's own entries. See
-[`btree_point_lookup.rs`](crates/kladde-heap/benches/btree_point_lookup.rs) — but note
-that implementation is somewhat ad-hoc and might contain errors. `sweep-bptree` also seems
-to be unmaintained, so we'll eventually want to replace it with either a vendored
-implementation or something else, maybe `btree-slab` or `rust-lapper`.
+and forcing the *descent* to thread the left-hand boundary down through the query to
+reconstruct those crossing gaps. On top of that the leading gap (address 0 to the first
+allocation) has no left neighbour and needs handling outside the tree, and empty subtrees
+must be told apart from zero-length ones or the crossing subtraction underflows.
+(`benches/btree_point_lookup.rs`'s augmentation is exactly this shape, and is ad-hoc: it
+skips the leading gap and underflows on an empty child.) Materializing gaps dissolves all
+of it — the augmentation becomes a plain bottom-up maximum of a value each entry already
+carries — at the cost of one index the heap was keeping anyway, since `free_by_size` stays
+for *exact*-fit lookups regardless. One wrinkle drove the key's shape:
+`SearchArgument::locate_in_leaf` receives only the leaf's **keys**, never its values, so
+the length has to live in the key.
+
+**Measured** (`benches/lowest_fitting_gap.rs`, and the reason §7 no longer lists this as
+open): the axis that matters is not the gap count but the number of distinct gap
+*lengths*, since the scan costs one probe per distinct length `≥ s`. With gap lengths
+clustered on 4 values the scan is *faster* — ~4.5 µs vs ~5.1 µs per 256 queries at 100
+gaps — so kladde's design bet, taken alone, argues against the tree. But the scan degrades
+with spread while the descent does not: at 64 distinct lengths the tree is 7–9× faster, and
+at 1024 it is 11–118× (976 µs vs 8.3 µs at 100k gaps). The tree stays in the 5–8 µs band
+across every configuration. Since split remainders and resizable allocations generate
+arbitrary lengths regardless of how disciplined the fixed-size classes are, the flat
+profile is worth the constant factor in the clustered case.
+
+`sweep-bptree` seems to be unmaintained, so we'll eventually want to replace it with either
+a vendored implementation or something else, maybe `btree-slab` or `rust-lapper`.
 
 A compaction step (`propose_compaction_step(budget)`, then `commit_compaction_step`) —
 **gain-greedy**:
@@ -685,10 +705,11 @@ out not to earn their keep.
    all-classes iteration.
 4. **Fragmentation term (§4.2).** `Φ + α·G`, with `α` a field of `GainGreedyHeap` behind a
    getter/setter.
+5. **Augmented gap tree (§4).** `GapTree` behind "the lowest gap that fits", replacing the
+   `free_by_size.range(s..)` scan, which stays as the tests' oracle.
 
-Still genuinely open, to be settled by measurement rather than argument: whether the
-augmented gap tree ("lowest gap `≥ s`") beats a plain `free_by_size.range(s..)` scan in
-practice, and how to tune `α`.
+Still genuinely open: how to tune `α`. (Whether the augmented tree earns its place is
+settled — see the measurement in §4.)
 
 ## References
 

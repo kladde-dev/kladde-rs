@@ -44,6 +44,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::gap_tree::GapTree;
 use crate::heap::{
     AllocationId, HeapError, IncrementallyCompactableHeap, RelocatableHeap, Relocation, Step,
 };
@@ -184,8 +185,13 @@ pub struct GainGreedyHeap<Id> {
     allocations: BTreeMap<u64, Entry<Id>>,
     /// The id table's address column (P1: held once, here).
     by_id: HashMap<Id, u64>,
-    /// Gap length -> the start addresses of gaps that long.
+    /// Gap length -> the start addresses of gaps that long. Answers *exact*-fit
+    /// lookups and "the largest gap"; the by-address view lives in `gaps`.
     free_by_size: BTreeMap<u64, BTreeSet<u64>>,
+    /// The same gaps, address-ordered and augmented with each subtree's longest
+    /// gap, which is what makes "the lowest gap that fits" a single descent
+    /// instead of a scan over size classes. See [`GapTree`].
+    gaps: GapTree,
     /// Allocation size -> addresses, **fixed-size allocations only**. Resizable
     /// ones would scatter one-per-class and would only have to move again on the
     /// next growth; they stay movable by slides.
@@ -213,6 +219,7 @@ impl<Id> Default for GainGreedyHeap<Id> {
             allocations: BTreeMap::new(),
             by_id: HashMap::new(),
             free_by_size: BTreeMap::new(),
+            gaps: GapTree::default(),
             live_by_size: BTreeMap::new(),
             tops: BTreeMap::new(),
             end: 0,
@@ -267,6 +274,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     fn gap_record(&mut self, start: u64, len: u64) {
         if len > 0 {
             self.free_by_size.entry(len).or_default().insert(start);
+            self.gaps.insert(start, len);
         }
     }
 
@@ -280,6 +288,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
                 self.free_by_size.remove(&len);
             }
         }
+        self.gaps.remove(start);
     }
 
     /// End of the allocation immediately below `addr` (0 if there is none).
@@ -448,12 +457,17 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
 
     // ---- placement ----
 
-    /// The lowest-addressed gap at least `min_len` bytes wide.
+    /// The lowest-addressed gap at least `min_len` bytes wide -- the destination
+    /// that maximizes travel distance, and so per-byte gain, for a `min_len`-byte
+    /// mover.
+    ///
+    /// One `O(log n)` descent of the augmented [`GapTree`]. The obvious
+    /// alternative, scanning `free_by_size.range(min_len..)` for the minimum
+    /// address, costs one probe per distinct gap *size* -- fine when gaps cluster
+    /// on a few sizes, but unbounded when they do not. `benches/lowest_fitting_gap.rs`
+    /// measures the difference.
     fn lowest_gap_fitting(&self, min_len: u64) -> Option<(u64, u64)> {
-        self.free_by_size
-            .range(min_len..)
-            .filter_map(|(&len, set)| set.first().map(|&start| (start, len)))
-            .min_by_key(|&(start, _)| start)
+        self.gaps.lowest_fitting(min_len)
     }
 
     /// Where to put a new `size`-byte allocation: an exactly-fitting gap if one
@@ -713,6 +727,15 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         gaps
     }
 
+    /// The reference `lowest_gap_fitting` must agree with: the size-class scan
+    /// the augmented tree replaced.
+    fn lowest_gap_fitting_by_scan(&self, min_len: u64) -> Option<(u64, u64)> {
+        self.free_by_size
+            .range(min_len..)
+            .filter_map(|(&len, set)| set.first().map(|&start| (start, len)))
+            .min_by_key(|&(start, _)| start)
+    }
+
     /// The reference implementation the branch-and-bound walk must agree with:
     /// evaluate every size class, prune nothing.
     fn propose_by_exhaustive_scan(&self, budget: u64) -> Option<Step<u64>> {
@@ -746,11 +769,28 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         assert_eq!(self.live_bytes, live, "live_bytes drifted");
         assert_eq!(self.by_id.len(), self.allocations.len(), "stale by_id rows");
 
+        let gaps = self.implied_gaps();
         let mut expected_free: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
-        for (start, len) in self.implied_gaps() {
+        for &(start, len) in &gaps {
             expected_free.entry(len).or_default().insert(start);
         }
         assert_eq!(self.free_by_size, expected_free, "free_by_size drifted");
+
+        // The augmented tree must hold exactly the same gaps...
+        assert_eq!(self.gaps.iter().collect::<Vec<_>>(), gaps, "gaps drifted");
+        // ...and its descent must still agree with the scan it replaced, which
+        // is what would catch a stale augmentation rather than a stale entry.
+        for min_len in gaps
+            .iter()
+            .flat_map(|&(_, len)| [len.saturating_sub(1), len, len + 1])
+            .chain([1])
+        {
+            assert_eq!(
+                self.lowest_gap_fitting(min_len),
+                self.lowest_gap_fitting_by_scan(min_len.max(1)),
+                "the gap tree disagreed with the scan at min_len={min_len}"
+            );
+        }
 
         let mut expected_live: BTreeMap<u32, [BTreeSet<u64>; FreeNeighbours::COUNT]> =
             BTreeMap::new();
