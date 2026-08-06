@@ -14,8 +14,9 @@
 use std::collections::HashMap;
 use std::io::{self, SeekFrom};
 
-use crate::allocator::{Allocator, Sizedness};
+use crate::allocator::Allocator;
 use crate::backend::BackendError;
+use crate::pointer::Sizedness;
 use crate::pointer::{Pointer, ResolvedPointer, UniquePointerFixedSize, UniquePointerResizable};
 use crate::storage::Storage;
 use crate::word::Word;

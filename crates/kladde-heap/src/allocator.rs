@@ -17,16 +17,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::pointer::Sizedness;
 use crate::word::Word;
-
-/// Whether an allocation may be resized. Passed to `alloc`/`free` as a *placement
-/// hint* (a segregating allocator can keep fixed and resizable in separate pools);
-/// [`SimpleAllocator`] ignores it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sizedness {
-    Resizable,
-    Fixed,
-}
 
 /// The allocator's own errors. (A bad *id* is a `BackendError`, not this -- the
 /// id table lives in the backend, not the allocator.)

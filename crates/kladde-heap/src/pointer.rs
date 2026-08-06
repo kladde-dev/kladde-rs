@@ -13,7 +13,22 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 
+use crate::heap::AllocationId;
 use crate::word::Word;
+
+/// Whether an allocation may be resized in place over its lifetime.
+///
+/// This is *placement-relevant* (fixed-size allocations pack into dense size
+/// classes; resizable ones scatter and would only have to move again on the next
+/// growth), which is why the heap gets to see it -- see
+/// [`AllocationId::is_fixed_size`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Sizedness {
+    /// The allocation may grow or shrink; `resize` is legal on it.
+    Resizable,
+    /// The allocation keeps its size for life.
+    Fixed,
+}
 
 /// A `Copy`, type- and size-erased identity: the serialized/at-rest form of a
 /// pointer and the anchor of a `Location`. The **only** type parameterized over
@@ -54,6 +69,55 @@ impl<W: Word> Pointer<W> {
     #[inline]
     pub fn nonzero(self) -> W::NonZero {
         self.0
+    }
+
+    /// Build an id from a **nonzero** minting counter and a sizedness.
+    ///
+    /// The layout is `raw = (counter << 1) | fixed_bit` -- the low bit carries
+    /// sizedness (see [`AllocationId`]), the rest is the counter. `None` if
+    /// `counter` is zero (which would make a resizable id zero, the reserved null
+    /// pattern) or if shifting it would drop the high bit.
+    ///
+    /// The low bit rather than the high one is deliberate: it keeps `raw` about
+    /// twice the counter, so ids stay small and dense. A high-bit flag would put
+    /// every fixed-size id in the top half of the range -- a full-width varint on
+    /// file, and fatal to any table that wants ids dense. The counter pool is
+    /// **shared** between the two sizednesses so that `counter()` stays unique.
+    #[inline]
+    pub fn from_parts(counter: W, sizedness: Sizedness) -> Option<Self> {
+        if counter == W::zero() || counter != (counter << 1) >> 1 {
+            return None;
+        }
+        let flag = match sizedness {
+            Sizedness::Fixed => W::from_nonzero(W::one()),
+            Sizedness::Resizable => W::zero(),
+        };
+        Self::from_raw((counter << 1) | flag)
+    }
+
+    /// The minting counter this id was built from (the raw id without its
+    /// sizedness bit). Unique across both sizednesses.
+    #[inline]
+    pub fn counter(self) -> W {
+        self.raw() >> 1
+    }
+
+    /// The sizedness this id was minted with. Fixed for the id's lifetime -- a
+    /// sizedness conversion mints a *new* id rather than re-tagging this one.
+    #[inline]
+    pub fn sizedness(self) -> Sizedness {
+        if self.is_fixed_size() {
+            Sizedness::Fixed
+        } else {
+            Sizedness::Resizable
+        }
+    }
+}
+
+impl<W: Word> AllocationId for Pointer<W> {
+    #[inline]
+    fn is_fixed_size(&self) -> bool {
+        self.raw() & W::from_nonzero(W::one()) != W::zero()
     }
 }
 
@@ -174,6 +238,42 @@ mod tests {
         assert!(Pointer::<u32>::from_raw(0).is_none());
         let p = Pointer::<u32>::from_raw(42).unwrap();
         assert_eq!(p.raw(), 42);
+    }
+
+    #[test]
+    fn the_low_bit_carries_sizedness_and_the_rest_carries_the_counter() {
+        for counter in [1u32, 2, 3, 1000, u32::MAX >> 1] {
+            for sizedness in [Sizedness::Fixed, Sizedness::Resizable] {
+                let p = Pointer::<u32>::from_parts(counter, sizedness).unwrap();
+                assert_eq!(p.counter(), counter, "counter must round-trip");
+                assert_eq!(p.sizedness(), sizedness);
+                assert_eq!(p.is_fixed_size(), sizedness == Sizedness::Fixed);
+            }
+        }
+    }
+
+    #[test]
+    fn the_counter_pool_is_shared_so_ids_stay_unique_across_sizednesses() {
+        let f = Pointer::<u32>::from_parts(7, Sizedness::Fixed).unwrap();
+        let r = Pointer::<u32>::from_parts(7, Sizedness::Resizable).unwrap();
+        assert_ne!(f, r, "same counter, different sizedness => different ids");
+        assert_eq!(f.counter(), r.counter());
+        // Ids stay dense: ~2x the counter, not pushed into the top half of the
+        // range the way a high-bit flag would.
+        assert_eq!(r.raw(), 14);
+        assert_eq!(f.raw(), 15);
+    }
+
+    #[test]
+    fn from_parts_rejects_a_zero_counter_and_one_that_would_lose_its_high_bit() {
+        // Counter 0 would make the resizable id zero -- the reserved null pattern.
+        assert!(Pointer::<u32>::from_parts(0, Sizedness::Resizable).is_none());
+        assert!(Pointer::<u32>::from_parts(0, Sizedness::Fixed).is_none());
+        // Halving the id space is the price of the flag bit; overflow is refused
+        // rather than silently aliasing another id.
+        assert!(Pointer::<u32>::from_parts(1 << 31, Sizedness::Fixed).is_none());
+        assert!(Pointer::<u32>::from_parts(u32::MAX, Sizedness::Fixed).is_none());
+        assert!(Pointer::<u64>::from_parts(1 << 62, Sizedness::Fixed).is_some());
     }
 
     #[test]

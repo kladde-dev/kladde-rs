@@ -24,9 +24,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 
-use crate::allocator::{Allocator, Sizedness};
+use crate::allocator::Allocator;
 use crate::backend::{Backend, BackendError, ReadBackend, WriteBackend};
 use crate::composed::Composed;
+use crate::pointer::Sizedness;
 use crate::pointer::{Pointer, ResolvedPointer, UniquePointerFixedSize, UniquePointerResizable};
 use crate::storage::Storage;
 use crate::word::Word;

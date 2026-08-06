@@ -21,6 +21,8 @@
 mod allocator;
 mod backend;
 mod composed;
+mod gain_greedy;
+mod heap;
 mod journaled;
 mod mock;
 mod pointer;
@@ -28,12 +30,17 @@ mod storage;
 mod unjournaled;
 mod word;
 
-pub use allocator::{AllocError, Allocator, CompactingAllocator, Move, SimpleAllocator, Sizedness};
+pub use allocator::{AllocError, Allocator, CompactingAllocator, Move, SimpleAllocator};
 pub use backend::{Backend, BackendError, ReadBackend, WriteBackend};
+pub use gain_greedy::GainGreedyHeap;
+pub use heap::{
+    AllocationId, HeapError, IncrementallyCompactableHeap, RelocatableHeap, Relocation, Step,
+};
 pub use journaled::{JournaledReadBackend, JournaledWriteBackend};
 pub use mock::MockBackend;
 pub use pointer::{
-    Pointer, ResolvedPointer, UniquePointer, UniquePointerFixedSize, UniquePointerResizable,
+    Pointer, ResolvedPointer, Sizedness, UniquePointer, UniquePointerFixedSize,
+    UniquePointerResizable,
 };
 pub use storage::Storage;
 pub use unjournaled::UnjournaledBackend;

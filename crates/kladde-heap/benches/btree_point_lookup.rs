@@ -18,7 +18,7 @@ struct Entry {
 
 impl PartialOrd for Entry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.pos.partial_cmp(&other.pos)
+        Some(self.cmp(other))
     }
 }
 
