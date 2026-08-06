@@ -11,8 +11,8 @@ like.
 
 ## 1. Problem statement
 
-Maintain a partition of the address space `[0, end)` into **live extents** (each tagged with
-the stable **id** that names it) and **free extents** (gaps). Support:
+Maintain a partition of the address space `[0, end)` into **allocations** (each tagged with
+the stable **id** that names it) and **gaps** (the free space between them). Support:
 
 - `alloc(id, size) → address`, `free(id)`, `resize(..) → Option<new address>` —
   the foreground operations, each O(log n) CPU, no byte movement except resize-relocation.
@@ -22,40 +22,40 @@ the stable **id** that names it) and **free extents** (gaps). Support:
   bytes). No stop-the-world phase, ever; a full compaction is just that step in a loop
   that something is allowed to interrupt.
 
-Progress can be made precise with a potential function over live **bytes**, not extents:
+Progress can be made precise with a potential function over live **bytes**, not allocations:
 `Φ = Σ_{live bytes b} address(b)`
-(`= Σ_{live extents a} size(a)·(address(a) + (size(a)−1)/2)`). With `L` total live bytes,
-`Φ ≥ L(L−1)/2`, with equality for **every** gapless layout regardless of extent order; the
+(`= Σ_{allocations a} size(a)·(address(a) + (size(a)−1)/2)`). With `L` total live bytes,
+`Φ ≥ L(L−1)/2`, with equality for **every** gapless layout regardless of allocation order; the
 excess `Φ − L(L−1)/2` counts exactly the (free byte, live byte) pairs where the free byte
 sits *below* the live byte — the heap's "inversions" — so minimal `Φ` ⟺ compact, and the
 excess doubles as a fragmentation-debt metric. (The simpler-looking variant that sums
-extent *start* addresses is subtly wrong: its minimum depends on extent order — it insists
-small extents come first — and the bias this induces in the greedy policy is actively
+allocation *start* addresses is subtly wrong: its minimum depends on allocation order — it insists
+small allocations come first — and the bias this induces in the greedy policy is actively
 harmful; see the second worked example in §4.) Every useful compaction step strictly
 decreases `Φ`. `end` itself shrinks whenever a step (or a `free`) clears the suffix — so
 `Φ` is the *progress* measure and `end` the *payoff*, which lags it.
 
 Every step relocates live bytes downward, and one lens prices all of them: relocating an
-extent of size `s` down by a distance `d` copies `s` bytes and makes `ΔΦ = s·d` progress —
+allocation of size `s` down by a distance `d` copies `s` bytes and makes `ΔΦ = s·d` progress —
 per byte copied, **gain `d`**, the travel distance. Two familiar shapes are extremes:
 
 - **Slide**: the packed run directly above a gap of size `g` shifts down by `g`. Every
   byte in the run travels `d = g`, so the gain is the **gap size** — independent of what
   the run contains, and poor whenever the gap is small.
-- **Evacuation**: a single extent jumps from near the tail into a gap far below it; the
+- **Evacuation**: a single allocation jumps from near the tail into a gap far below it; the
   gain is its full travel distance, possibly `d ≫ g` for every gap `g`. The extreme case
-  is a few small extents stranded above a large free region — copying a handful of bytes
+  is a few small allocations stranded above a large free region — copying a handful of bytes
   releases a huge suffix. That is the most valuable move a compactor ever gets, and it is
   precisely the state a file lands in after a burst of frees below a few survivors.
 
-**Exact fit is about fragmentation, not gain.** Placing an extent into a gap of exactly
+**Exact fit is about fragmentation, not gain.** Placing an allocation into a gap of exactly
 its size leaves no remainder sliver and lets the vacated range coalesce fully. But among
 candidate destinations it is a *tie-break*, not a gate: a deep, larger-than-needed gap
 (large `d`) beats a shallow exact one on progress, and the split remainder is a tracked
 gap like any other.
 
 A warning the gain lens makes precise: **greed in `end` is myopic**. `end` is a
-discontinuous payoff — a single unfortunately-sized tail extent defers all of it, while
+discontinuous payoff — a single unfortunately-sized tail allocation defers all of it, while
 cheap interior moves, whose payoff to `end` arrives later via gap coalescence, score zero
 and go untaken. `Φ` is the smooth surrogate: interior downward moves are credited
 immediately, and truncation falls out whenever the suffix happens to clear. So the
@@ -100,7 +100,7 @@ would over-engineer this: the natural design here is index-driven, not scan-driv
 
 - **P1 — Sunk state is free state.** The live table must exist (stable ids). Any design
   that hides it from the component doing placement/compaction pays twice: once for the
-  table, once for a shadow of it. Corollary: the free-space index and the live-extent index
+  table, once for a shadow of it. Corollary: the free-space index and the allocation index
   should be *views of one structure*, not sibling structs that mirror each other through an
   interface.
 - **P2 — Incremental means incremental discovery.** Bounding the bytes copied per step is
@@ -108,19 +108,19 @@ would over-engineer this: the natural design here is index-driven, not scan-driv
   by the foreground ops (`alloc`/`free`/`resize` each touch O(1) size classes) so that
   each compaction step starts from a ready answer.
 - **P3 — Discovery must be a query, not a scan.** What compaction consumes is neither
-  "gaps" nor "movable extents" but *pairs* (mover, destination), weighted by gain. The
+  "gaps" nor "movable allocations" but *pairs* (mover, destination), weighted by gain. The
   candidate pairs must come from maintained per-class indexes and O(log n) queries (§4
   evaluates one candidate per size class this way — cheap because the class count is
-  small), never from rescanning extents. Quiescence ("nothing worth moving") must be
+  small), never from rescanning allocations. Quiescence ("nothing worth moving") must be
   equally cheap to detect.
-- **P4 — Mechanism/policy split.** The mechanism is "move extent X into gap Y, update
+- **P4 — Mechanism/policy split.** The mechanism is "move allocation X into gap Y, update
   indexes, report the move." Which pair to pick, when to slide instead, when to stop — that
   is policy, and it should be swappable without touching the index maintenance.
 - **P5 — Persistence concerns stay out.** Id *minting* policy and the on-file table layout
   remain coupled to the persistent format (that argument from the earlier note stands).
   The memory manager never chooses ids and never serializes them. It is *nearly* opaque
   about them: the one thing it reads is a single placement-relevant bit, sizedness, via the
-  `ExtentId` trait (§5) — which leaves the minting policy entirely with the backend.
+  `AllocationId` trait (§5) — which leaves the minting policy entirely with the backend.
 - **P6 — Crash safety by construction.** A move copies into *free* space and then flips
   one table entry. Until the flip, the copy is invisible; after it, the old bytes are
   garbage. The flip is the sole commit point, so incremental moves are atomic and an
@@ -129,54 +129,54 @@ would over-engineer this: the natural design here is index-driven, not scan-driv
 
 ## 4. The core structure: one partition, derived indexes, gain-greedy steps
 
-Single source of truth — the **live** extents; gaps are *implied* by what lies between them:
+Single source of truth — the allocations; gaps are *implied* by what lies between them:
 
 ```rust
 // Keyed by start address. Gaps are never stored here: the gap preceding the entry at
 // `a` runs from `prev.address + prev.len` (or 0 if there is no predecessor) to `a`,
 // and may be empty. `end` is the last entry's end.
-live_extents: BTreeMap<Address, LiveExtent>
-struct LiveExtent { len: Size, id: Id }
+allocations: BTreeMap<Address, Allocation>
+struct Allocation { len: Size, id: Id }
 ```
 
-No sizedness field: it is carried by `id` itself (§5's `ExtentId::is_fixed_size`).
+No sizedness field: it is carried by `id` itself (§5's `AllocationId::is_fixed_size`).
 
-Keeping only live extents (rather than a tagged `enum Extent { Live, Free }` covering
-`[0, end)`) is the lighter representation on every axis: fewer entries, no
+Keeping only the allocations (rather than a tagged cover of `[0, end)` by an
+`enum { Live, Free }`) is the lighter representation on every axis: fewer entries, no
 `Live`/`Free` match on a lookup whose variant the caller already knows, and — the useful
 invariant — **compaction never changes the entry count**, since a move rewrites one key
 rather than splitting or merging cover entries. A gap query at `address` is
-`live_extents.range(..address).next_back()`, and the gap's extent falls out of that
+`allocations.range(..address).next_back()`, and the gap's length falls out of that
 entry's end.
 
-Secondary indexes, all derivable from `live_extents`, all maintained by the same handful of
+Secondary indexes, all derivable from `allocations`, all maintained by the same handful of
 mutation paths (`alloc`, `free`, `resize`, `apply move`):
 
 ```rust
 by_id:  HashMap<Id, Address>                    // id resolution (this IS the id table's
                                                 // address column; the sunk cost, exploited)
 free_by_size: BTreeMap<Size, BTreeSet<Address>> // gaps, grouped by exact size
-live_by_size: BTreeMap<Size, BTreeSet<Address>> // movers (fixed-size extents only — see
+live_by_size: BTreeMap<Size, BTreeSet<Address>> // movers (fixed-size allocations only — see
                                                 // below): a class's best candidate is its
                                                 // highest-addressed member
 ```
 
 `free_by_size` is the one place gaps are materialized — a derived index over the implied
-gaps, not a second source of truth. Empty gaps (two live extents flush against each other)
+gaps, not a second source of truth. Empty gaps (two allocations flush against each other)
 are simply never inserted.
 
-**`live_by_size` holds only `Fixed`-sizedness extents.** Those are the ones kladde
+**`live_by_size` holds only `Fixed`-sizedness allocations.** Those are the ones kladde
 deliberately mints in bulk at a handful of distinct sizes, so their classes are few and
 densely populated — exactly what `BTreeMap<Size, BTreeSet<Address>>` is good at. Resizable
-extents would instead scatter across many classes with often a single member each: a poor
-fit for the structure, and poor candidates besides, since parking a resizable extent in a
+allocations would instead scatter across many classes with often a single member each: a poor
+fit for the structure, and poor candidates besides, since parking a resizable allocation in a
 snugly fitting gap only guarantees it must relocate again the moment it grows a byte. They
-remain movable by *slides* (which are derived from geometry and so cover every extent
+remain movable by *slides* (which are derived from geometry and so cover every allocation
 regardless of sizedness); they just do not generate exact-fit candidates.
 
 `BTreeSet<Address>` per class rather than a binary heap: min *and* max are O(log), and —
 unlike a heap — arbitrary deletion is native, which matters because gaps are consumed by
-ordinary `alloc` and extents die by ordinary `free`, not only by compaction. (This subsumes
+ordinary `alloc` and allocations die by ordinary `free`, not only by compaction. (This subsumes
 the per-class min-heap idea; the heap's O(1) peek isn't worth losing cheap deletion.)
 
 The destination lookup the corrected gain analysis (§1) demands is one query the per-class
@@ -184,7 +184,7 @@ sets cannot answer cheaply: **the lowest gap with `len ≥ s`** — a 2-D domina
 (minimize address subject to a size bound). The textbook structure is an address-ordered
 balanced tree augmented with each subtree's *maximum gap length*: descend leftmost-first
 into any subtree whose max is `≥ s`, O(log n). `std` has no augmented `BTreeMap`, but the
-crate `sweep-bptree` does, and it can run directly on `live_extents` with **implicitly
+crate `sweep-bptree` does, and it can run directly on `allocations` with **implicitly
 calculated** gap lengths — no stored gap field. The one non-obvious part is that "max gap"
 is not a plain bottom-up maximum: the largest gap in a subtree may *straddle* the boundary
 between two children, so the augmentation must carry enough to reconstruct it, i.e. the
@@ -211,17 +211,48 @@ A compaction step (`propose_compaction_step(budget)`, then `commit_compaction_st
    is the exact-fit fast path (`free_by_size[s]`'s lowest address) or the augmented-tree
    query (lowest gap `≥ s`, split on use); its gain is its travel distance `d`. Add one
    *slide* candidate — the run above the **largest** gap, gain `g` — for the regime where
-   no fit exists anywhere; the slide is also what moves resizable extents, which generate
+   no fit exists anywhere; the slide is also what moves resizable allocations, which generate
    no candidates of their own.
 2. Pick the best candidate, by **iterating over all classes**. Under kladde's design bet —
    many allocations of *few* distinct fixed sizes — the class count is small, so evaluating
    every class is O(#classes · log n) per step with no incremental machinery. This naive
    scan is what ships first; §4.1 describes the bounded best-candidate upgrade for the day
    class counts grow (and why a naively gain-keyed priority queue is subtly broken).
-3. Execute: copy `s` bytes (chunked against `budget`), flip the table entry, update the
-   indexes; the vacated range coalesces with its free neighbors (touching O(1) classes).
+3. Execute: copy the bytes (chunked against `budget`), flip the affected table entries,
+   update the indexes; the vacated range coalesces with its free neighbors (touching O(1)
+   classes).
 4. If the suffix of the address space is now free, retreat `end`. Repeat while budget
    remains; quiesce when no candidate's gain clears a policy threshold.
+
+**A `Step` is a contiguous byte-range move, not a per-allocation one.**
+
+```rust
+pub struct Step<Address, Size> { pub from: Address, pub to: Address, pub len: Size }
+```
+
+It deliberately carries **no id**. An id would be redundant — the backend never needs one
+(it just copies `len` bytes `from → to`; it owns no table anymore), and
+`commit_compaction_step` recovers it with a single `allocations[from]` lookup. Dropping it
+is what lets one `Step` describe a whole **run**: the slide candidate moves the maximal
+contiguous run above the largest gap as one transfer, and `commit_compaction_step` shifts
+every entry in `[from, from+len)` by `to − from`. Evacuation candidates are the degenerate
+`k = 1` case of the same shape.
+
+This costs nothing and is what §4.3's cost model actually wants: the per-operation term
+`c₀` is paid once per run rather than once per allocation. Three properties make it work
+with no extra machinery:
+
+- **The potential is grouping-invariant.** `Φ` sums over *bytes*, so a run of total size
+  `S` sliding by `d` scores `ΔΦ = S·d` — the identical per-byte gain `d` as a single
+  allocation. Run and single-allocation candidates are therefore directly comparable.
+- **Run discovery is output-sensitive and needs no index.** A run is found by walking
+  forward from the first allocation above the gap while
+  `next.address == cur.address + cur.len` — O(k) to move k allocations. Crucially the
+  algorithm never *searches over* runs (which would need an index that splits on `free` and
+  merges on `alloc`); the **gap** is chosen first, and it determines the run above it.
+- **Prefix-chunking stays valid.** Taking only the bottom `j` allocations of a run is
+  itself a legal move: the gap simply reopens above them. So §5.2's chunking needs no
+  special case, and the copy is a downward (overlapping-safe) transfer whenever `g < S`.
 
 **`budget` shapes the choice; it does not hard-cap it.** The budget participates in
 candidate *ranking* (§4.3's cost model), but a step may be proposed whose cost exceeds it
@@ -231,7 +262,7 @@ cost and decide for itself whether to execute, defer, or chunk it, so the honest
 is "prefer to stay within `budget`", not "never exceed it". The parameter keeps its value
 as long as a real Pareto front on the gain/cost trade-off exists.
 
-**Why distance-greed needs no lookahead — worked example.** Live extents
+**Why distance-greed needs no lookahead — worked example.** Allocations
 `E1 = 0..1000`, `E2 = 1020..2000`, `E3 = 2100..2110`, `E4 = 2200..2210`,
 `E5 = 2310..2420`, with gaps of 20, 100, 90, 100 between them. The tail `E5` (110 bytes)
 fits no gap, so an `end`-greedy compactor stalls or slides — and pure sliding copies
@@ -254,16 +285,16 @@ is still greed: bin-packing hides inside exact-fit choices, so no general optima
 — but the "unfortunately-sized tail holds everything hostage" trap is dissolved
 structurally, not by luck.)
 
-**Why the potential must weight by size — second example.** Extents
+**Why the potential must weight by size — second example.** Allocations
 `E_bulk = 100..2000`, `E_90 = 2000..2090`, `E_100 = 2190..2290` (the tail), with gaps
-`0..100` and `2090..2190`. The extent-*start* potential prices a move at `d/s`, which
+`0..100` and `2090..2190`. The allocation-*start* potential prices a move at `d/s`, which
 ranks `E_90 → 0` (`2000/90 ≈ 22.2`) above `E_100 → 0` (`2190/100 ≈ 21.9`): the smaller
-extent jumps first, *splits* the 100-byte gap down to a useless 10, and strands `E_100` —
+allocation jumps first, *splits* the 100-byte gap down to a useless 10, and strands `E_100` —
 the file bottoms out at `end = 2100` after 190 bytes copied, and finishing costs a
 2000-byte slide over the sliver. Distance-greed ranks `E_100 → 0` first (`2190 > 2000`):
 the tail lands in the exact-fitting gap, the suffix clears, and the file is fully compact
 at `end = 2090` after copying exactly 100 bytes. The general lesson: `d/s` divides by
-size and so systematically demotes large movers — but large extents are precisely the
+size and so systematically demotes large movers — but large allocations are precisely the
 ones that need large gaps, the scarce resource, and bin-packing folklore (first-fit
 *decreasing*) says to serve them first. The by-byte `Φ` removes the bias, and as a bonus
 keeps per-byte gain uniform within a move, so budget-chunked moves account cleanly.
@@ -274,11 +305,11 @@ survives the correction, in weighted (gain-ordered) form, with the small class c
 keeping its maintenance trivial.
 
 Splitting (step 1) makes "combination fits" fall out for free: a gap of size `3s` receives
-an `s`-extent, and the `2s` remainder re-enters `free_by_size`, ready for the next mover.
+an `s`-allocation, and the `2s` remainder re-enters `free_by_size`, ready for the next mover.
 Full bin-packing of combinations is NP-hard and not worth chasing; greedy splitting
 captures the realistic case.
 
-Cost accounting: all indexes together hold one entry per extent — O(live + gaps) — a
+Cost accounting: all indexes together hold one entry per allocation — O(live + gaps) — a
 constant factor on the table the stable-id constraint already forces into memory (P1).
 
 ### 4.1 Finding the best candidate without a full class scan (deferred)
@@ -338,8 +369,8 @@ models the *capability* to compact, and must not leak the tuning parameters of w
 policy a particular implementation happens to use.
 
 So far exact fits earn only a tie-break, which leaves one real failure mode: "lowest gap
-that fits" maximizes gain but can squander a large gap on a small far-travelling extent,
-splitting it and stranding the large extent that needed it. No lookahead-free gain ordering
+that fits" maximizes gain but can squander a large gap on a small far-travelling allocation,
+splitting it and stranding the large allocation that needed it. No lookahead-free gain ordering
 avoids this (it hits the by-byte and by-start potentials alike). A **structural term** is
 the principled soft mitigation — it reroutes the small mover to an exact fit when one exists
 at comparable depth, though when none exists the large gap still gets split. With `G` = the
@@ -353,7 +384,7 @@ per-byte gain becomes
 
     gain = d + α·r/s,      r = r_src + r_dest ∈ {−1, 0, +1, +2},
 
-where vacating an extent flanked by two gaps merges them (`r_src = +1`: the "plug"
+where vacating an allocation flanked by two gaps merges them (`r_src = +1`: the "plug"
 extraction), one gap neighbor is neutral, two live neighbors mint a new gap
 (`r_src = −1`), and an exact-fit destination erases one (`r_dest = +1`). Three notes:
 
@@ -364,7 +395,7 @@ extraction), one gap neighbor is neutral, two live neighbors mint a new gap
   moves distance-greed already took.)
 - **The structural prize is per-move, so per-byte it scales as `1/s`** — small plugs are
   the cheap structural wins. That is correct accounting: the same `+1` costs 10 copied
-  bytes via a 10-byte plug and 1000 via a 1000-byte extent.
+  bytes via a 10-byte plug and 1000 via a 1000-byte allocation.
 - **Termination is safe for every `α`**: a *maximal* run is always flanked by free space,
   so a full-run slide always merges two gaps (or truncates) — `r ≥ +1`, gain strictly
   positive — so positive-gain moves never run out before compactness.
@@ -380,8 +411,8 @@ O(1)-neighbor updates each foreground op performs anyway.
 **No smoothing.** A saturating variant (`Φ + α·Σ f(g)` with `f(g) = g/(β+g)`, rewarding
 *almost*-exact fits and discounting sub-`β` slivers) is deliberately **not** part of this
 design. Its whole motivation was that byte-granular exact-size coincidences are rare — but
-that premise is wrong here: `live_by_size` holds only fixed-size extents, and kladde is
-built end to end to mint many extents at few identical sizes, so exact fits should be the
+that premise is wrong here: `live_by_size` holds only fixed-size allocations, and kladde is
+built end to end to mint many allocations at few identical sizes, so exact fits should be the
 common case rather than a lucky one. Smoothing would buy a snugness dial for exactly the
 population (resizable, one-off sizes) that generates no exact-fit candidates anyway, at
 the price of losing exact greed and adding a size-window query.
@@ -433,16 +464,16 @@ compaction) end to end and reads exactly one bit of an otherwise opaque id. It i
 **trait**, so a backend can be generic over heap implementations that do or do not compact:
 
 ```rust
-/// What the heap needs to know about an id it never mints: whether the extent it
+/// What the heap needs to know about an id it never mints: whether the allocation it
 /// names is fixed-size. See below for why this rides on the id.
-pub trait ExtentId: Copy + Eq + Hash {
+pub trait AllocationId: Copy + Eq + Hash {
     fn is_fixed_size(&self) -> bool;
 }
 
 /// Geometry: what lives where, where the free space is, and how to shrink it.
 /// Ids are minted by the caller (P5); the heap only ever asks them one question.
 pub trait RelocatableHeap {
-    type Id: ExtentId;
+    type Id: AllocationId;
     type Address: Word;
     type Size: Word + Into<Self::Address>;
 
@@ -465,11 +496,11 @@ pub trait RelocatableHeap {
     /// exists (see §4): the caller can price the returned step itself and decide whether
     /// to execute, chunk, or drop it. Default: `None` — this heap does not compact.
     fn propose_compaction_step(&self, _budget: Self::Size)
-        -> Option<Step<Self::Id, Self::Address, Self::Size>> { None }
+        -> Option<Step<Self::Address, Self::Size>> { None }
 
-    /// Apply a step previously obtained from `propose_compaction_step`, updating the
-    /// in-memory geometry. Moving the actual bytes is the caller's job.
-    fn commit_compaction_step(&mut self, _step: Step<Self::Id, Self::Address, Self::Size>) {
+    /// Apply a step previously obtained from `propose_compaction_step`, re-keying every
+    /// allocation in the moved range. Moving the actual bytes is the caller's job.
+    fn commit_compaction_step(&mut self, _step: Step<Self::Address, Self::Size>) {
         unreachable!("commit_compaction_step called on a heap that proposes no steps")
     }
 }
@@ -479,8 +510,8 @@ pub trait RelocatableHeap {
 pub trait IncrementallyCompactableHeap: RelocatableHeap {}
 ```
 
-`Step { id, from, to, len }` stays a concrete struct rather than an associated type: the
-backend must be able to *serialize* it — a step is just another journal record — so an
+`Step` (§4) stays a concrete struct rather than an associated type: the backend must be
+able to *serialize* it — a step is just another journal record — so an
 implementation-private step payload would have to be re-exposed anyway.
 
 **This shape does deliver the gating you want.** A generic backend takes `H: RelocatableHeap`
@@ -504,17 +535,17 @@ naming keeps "incremental" explicit throughout, leaving room for a later
 `compact_fully` / `FullyCompactableHeap` with an algorithm optimized for the
 stop-the-world case.
 
-The concrete implementation of §4 — `live_extents` plus the three derived indexes and the
+The concrete implementation of §4 — `allocations` plus the three derived indexes and the
 gain-greedy policy — is **`GainGreedyHeap`**, named for the policy rather than the
 structure, since a future sibling implementation would differ exactly there.
 
 #### Why sizedness rides on the id (and `Meta` is gone)
 
-`live_by_size` holds only fixed-size extents (§4), so the heap *must* be able to ask "is
-this extent fixed-size?". An opaque `Meta` associated type cannot answer that, so `Meta`
+`live_by_size` holds only fixed-size allocations (§4), so the heap *must* be able to ask "is
+this allocation fixed-size?". An opaque `Meta` associated type cannot answer that, so `Meta`
 would have needed a trait bound leaking exactly that one bit — at which point it is
-carrying nothing else, since sizedness is the only per-extent fact the heap has ever
-needed. So `Meta` is **removed**, and the bit moves onto the id via the `ExtentId` bound.
+carrying nothing else, since sizedness is the only per-allocation fact the heap has ever
+needed. So `Meta` is **removed**, and the bit moves onto the id via the `AllocationId` bound.
 
 **Implementing it on `Pointer<W>`: one dedicated flag bit of `W`.** The existing types were
 already built for this — `Pointer`'s field is private precisely to buy "representation
@@ -524,7 +555,7 @@ for building flag masks". So:
 
 ```rust
 // raw = (counter << 1) | fixed_bit,  counter >= 1
-impl<W: Word> ExtentId for Pointer<W> {
+impl<W: Word> AllocationId for Pointer<W> {
     fn is_fixed_size(&self) -> bool {
         self.raw() & W::from_nonzero(W::one()) != W::zero()
     }
@@ -608,11 +639,12 @@ in [`later.md`](later.md).
 ### 5.2 Chunking large moves
 
 A move whose bytes exceed what one step should copy is handled by **capping and chunking**,
-not by a `moving` flag with write-redirection. Only extents that fit the budget move in one
-step; a giant slide proceeds chunk by chunk, each chunk committing its own table-visible
-progress (a slide of the *frontier* extent can flip the address after each chunk). The
-extent is briefly torn across old and new only if a crash lands mid-chunk, which the
-journal already covers. This is what makes `budget` a ranking input rather than a hard cap
+not by a `moving` flag with write-redirection. A long run slides a prefix at a time — which
+§4 already establishes is a legal move in its own right — so each chunk commits its own
+table-visible progress, and the tearing window is one chunk wide. A single allocation
+larger than the budget is the residual case: it moves whole, or its copy is chunked
+front-to-back with the address flipped once at the end. Either way an interrupted move is
+covered by the journal. This is what makes `budget` a ranking input rather than a hard cap
 (§4): the heap may still propose an over-budget step when nothing cheaper is worth doing,
 and the caller decides whether to run it, chunk it, or skip it.
 
@@ -641,10 +673,10 @@ and the caller decides whether to run it, chunk it, or skip it.
 Each item is its own commit, so the two deferred refinements stay revertible if they turn
 out not to earn their keep.
 
-1. **Core.** The `ExtentId` bound plus its `Pointer<W>` impl (low-bit sizedness flag, and
+1. **Core.** The `AllocationId` bound plus its `Pointer<W>` impl (low-bit sizedness flag, and
    the id-pool change to shift the counter), then the `RelocatableHeap` +
-   `IncrementallyCompactableHeap` traits and `GainGreedyHeap`: `live_extents`, the three
-   derived indexes (`live_by_size` restricted to fixed-size extents), gain-greedy
+   `IncrementallyCompactableHeap` traits and `GainGreedyHeap`: `allocations`, the three
+   derived indexes (`live_by_size` restricted to fixed-size allocations), gain-greedy
    `propose_compaction_step`/`commit_compaction_step` with the plain potential (`α = 0`)
    and the naive all-classes iteration.
 2. **Backend integration.** A generic backend over `RelocatableHeap`, compacting per flush
