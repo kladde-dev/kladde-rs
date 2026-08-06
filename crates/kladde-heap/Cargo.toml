@@ -13,3 +13,13 @@ publish.workspace = true
 # serialization layer lives on top, in `kladde-persist`.
 
 [dependencies]
+
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+rand = "0.10.2"
+sweep-bptree = "0.4.1"
+
+[[bench]]
+name = "btree_point_lookup"
+harness = false
