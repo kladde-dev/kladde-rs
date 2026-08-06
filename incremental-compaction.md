@@ -136,6 +136,8 @@ extents: BTreeMap<Address, Extent>       // keyed by start address
 enum Extent { Live { len, token, meta }, Free { len } }
 ```
 
+**Note:** it might be easier to explicitly keep track only of live extents, and to leve free extents implied: `live_extents: BTreeMap<Address, LiveExtent` with `struct LiveExtent { len, token, meta}`. Queries for a gap at a given `address` then become queries for the live extent with the largest address below `address`, and the address of the gap is the address of that live extent plus its size (defaulting to 0 if there is live extent below `address`). This way, `live_extents` holds fewer items, compaction never changes the total number of entries in `live_extents` and querying for a live extent or a gap doesn't have to match on the returned enum variant when it already knows what enum variant to expect.
+
 Secondary indexes, all derivable from `extents`, all maintained by the same handful of
 mutation paths (`alloc`, `free`, `resize`, `apply move`):
 
@@ -156,9 +158,7 @@ The destination lookup the corrected gain analysis (§1) demands is one query th
 sets cannot answer cheaply: **the lowest gap with `len ≥ s`** — a 2-D dominance query
 (minimize address subject to a size bound). The textbook structure is an address-ordered
 balanced tree augmented with each subtree's *maximum gap length*: descend leftmost-first
-into any subtree whose max is `≥ s`, O(log n). `std` has no augmented `BTreeMap`, so this
-is a small bespoke tree — or, initially, a scan over `free_by_size.range(s..)` classes
-accepted as a stopgap until measured.
+into any subtree whose max is `≥ s`, O(log n). `std` has no augmented `BTreeMap`, but the crate`sweep-bptree` does, and should work on implicitly calculated gap lengths (see [`btree_point_lookup.rs`](/workspaces/backed-data-structures/crates/kladde-heap/benches/btree_point_lookup.rs) but note that that implementation is somewhat ad-hoc and might contain errors; note: `sweep-bptree` seems to be unmaintained, so we'll eventually want to replace it with either a vendored implementation or something else, maybe `btree-slab` or `rust-lapper`).
 
 `compact_step(budget)` — **gain-greedy**:
 
@@ -274,6 +274,8 @@ capped regime is exactly where all gains are small and misordering is cheapest. 
 from-the-top scan before declaring quiescence restores exactness. (The slide candidate
 stays a single separate O(log n) lookup — largest gap — outside the scan.)
 
+**Decision:** implement the logic without this optimization first (i.e., probably just iterate over all size classes) and commit. Then implement the upgrade described in this section (§4.1) as a separate commit so that it can be reverted if I change my mind.
+
 ### 4.2 A fragmentation term in the potential
 
 So far exact fits earn only a tie-break, and on a byte-granular address space exact size
@@ -341,6 +343,8 @@ All of this is a pure change of *scoring* (P4): the mechanism and indexes barely
 (three per-class sub-maxima; for the smooth form, one size-window query). Ship `α = 0`;
 add the count term when traces show squandered-gap moves; smooth it when one-off sizes
 dominate compaction traffic.
+
+**Decision:** Implement the original potential (`α = 0`) first and commit. Then implement the `α·G` addition as a separate commit that can be reverted if I change my mind. Here, α should be a field of the `RelocatableHeap` with getters and setters, *not* an argument of any trait method (traits should model the capability to compact without reference to parameters of the specific policy that any specific implementation uses for compaction). Don't implement the smoothing (β). If we restrict `live_by_size` to only contain fixed-size extents, and we build the entire system to encourage the creation of many equally sized fixed-size extents, then exact fits might actually become quite common. If anything, we might want to think about encouraging moves where the target gap is an integer multiple of the moved extent (Claude: note this in `later.md`).
 
 ### 4.3 A more realistic cost model
 
@@ -414,6 +418,13 @@ actually becomes is arguably a more coherent reusable product: *a relocatable he
 stable handles* — the Mac-Memory-Manager shape — rather than a bare free-list that cannot
 compact without a chaperone.
 
+**Decision:** actually, introduce
+- a *trait* `RelocatableHeap` with associated types `Id` (use the term "id" throughout, not "token"), `Address`, `Size`, and `Meta` that has the above methods; `propose_step` and `commit_step` are default-implemented as no-ops;
+- a subtrait `IncrementallyCompactableHeap: RelocatableHeap` that is just a marker trait to communicate that `propose_step` and `commit_step` actually do useful work (similar to how `ExactSizeIterator` communicates that the supertrait's `size_hint` is actually useful);
+- a struct that implements `IncrementallyCompactableHeap` using the methods proposed in this document. Choose an appropriate name.
+
+Comment if you can think of a better trait architecture. I want to be able to implement a generic backend that is composed of a `RelocatableHeap`, and that performs incremental compaction, e.g., on every journal flush. But that generic backend should also work for `RelocatableHeap`s that don't actually do compaction. I further might want to expose inherrent methods on the generic backend that expose the ability for incremental compaction to the user, but those methods should ideally not be implemented if the `RelocatableHeap` doesn't actually do anything on incremental compaction. Further, method names should communicate that the compaction is *incremental* because we might want to add optimized full compaction later.
+
 ### Sketch B (rejected): thin allocator + compactor fed by backend notifications
 
 Keep the free-space-only allocator; add a compactor that maintains `live_by_size` from
@@ -459,17 +470,24 @@ mind, not build the trait now).
   can flip the address after each chunk — the extent is briefly "torn" across old/new only
   if a crash hits mid-chunk, which journaling covers); (b) a `moving` flag in `Meta` with
   write-redirection. (a) is simpler and probably enough.
+    - **Decision:** Go with (a). But document in the trait method for `propose_step` that it may return a step with a cost that exceeds the `budget` if no worthwhile step with lower cost exists. The caller (backend) can easily verify the cost and decide on its own what to do if the cost exceeds the budget. The `budget` parameter still has merit as it still affects which step will be returned as long as a true Pareto front on the gain/cost trade-off still exists.
 - **Resizable extents.** They relocate on growth anyway and may deserve tail placement +
   headroom; should `live_by_size` include them (movable) or should meta exclude hot ones?
   Cheap default: include, but tail-first ordering naturally deprioritizes recently-grown
   ones only if growth allocates at the tail — worth a placement-policy decision.
+    - **Decision:** `live_by_size` should only contain fixed-size extents unless that makes the implementation considerably more difficult.
+      Those are the ones which we expect to fall into only few size classes.
+      Resizable extents will likely cover many size classes with often only a single entry per size class, a poor fit for `BTreeMap<Size, BTreeSet<Address>>`.
+      If this means we don't encourage moving resizable extents into exact fitting gaps then that's fine: for resizable extents, an exactly fitting gap will probably exist rarely anyway, and if it does, it's not even clear whether moving a resizable extent there is a good idea because it means the extent will have to be relocated when it grows even a single byte.
 - **When to run steps.** Per-flush? Every N foreground ops? Budgeted idle work? This is
   pure policy (P4) and can be decided last.
+    - **Decision:** Per flush. Just naively execute incremental compaction up to a certain budget for now (terminating early if no step is proposed). See section "Incremental compaction" in `later.md` for a future, more sophisticated strategy.
 - **Index weight.** The gain-greedy core needs all four structures of §4, each touched
   on O(1) size classes per foreground op. Two structures stay deferred: the augmented gap
   tree ("lowest gap `≥ s`") — confirm the `free_by_size.range(s..)` scan stopgap is
   actually too slow before building it — and the gain-ordered class priority queue,
   pointless while the class count stays small.
+    - **Decision:** Follow the instructions labeled "Decision" in §4.1.
 - **Destination rule.** "Lowest gap that fits" maximizes gain but can squander a large
   gap on a small far-travelling extent — split it, strand the large extent that needed it
   — a failure no lookahead-free gain ordering avoids (it hits the by-byte and by-start
@@ -477,6 +495,7 @@ mind, not build the trait now).
   reroutes the small mover to an exact or near-exact fit when one exists at comparable
   depth. When none exists, the large gap still gets split — full protection would need
   lookahead. Tune `α` (and `β`) empirically.
+    - **Decision:** Follow the instructions labeled "Decision" in §4.2.
 
 ## References
 
