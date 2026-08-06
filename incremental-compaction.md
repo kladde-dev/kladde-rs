@@ -172,10 +172,9 @@ accepted as a stopgap until measured.
 2. Pick the best candidate. Under kladde's design bet — many allocations of *few* distinct
    sizes (the `Sizedness::Fixed` classes) plus a handful of one-off resizable sizes — the
    class count is small, so evaluating every class is O(#classes · log n) per step with no
-   incremental machinery. If class counts ever grow, the upgrade path is a gain-ordered
-   priority queue over classes with lazy revalidation on pop (gains go stale whenever gaps
-   change; but any *positive*-gain move strictly decreases `Φ`, so approximate ordering
-   costs efficiency, never correctness).
+   incremental machinery. If class counts ever grow, the upgrade path is the bounded
+   best-candidate scan of §4.1 (a naively gain-keyed priority queue is subtly broken —
+   see there).
 3. Execute: copy `s` bytes (chunked against `budget`), flip the table entry, update the
    indexes; the vacated range coalesces with its free neighbors (touching O(1) classes).
 4. If the suffix of the address space is now free, retreat `end`. Repeat while budget
@@ -230,6 +229,151 @@ captures the realistic case.
 
 Cost accounting: all indexes together hold one entry per extent — O(live + gaps) — a
 constant factor on the table the stable-id constraint already forces into memory (P1).
+
+### 4.1 Finding the best candidate without a full class scan
+
+The obvious upgrade for a large class count — a priority queue over classes keyed by
+last-computed gain, lazily revalidated on pop — is subtly **incorrect**. Gains go stale in
+both directions, and only one direction is benign. Stale-*high* keys are fixed by
+recomputing on pop; stale-*low* keys are not: when a `free` opens a deep gap, the true
+gains of *every* class with size ≤ that gap rise at once, their stored keys do not, and a
+max-queue can sit on the globally best move indefinitely. Updating the affected classes
+eagerly is a range update over sizes — exactly the scan the queue was meant to avoid.
+
+The fix is to key classes not by their (globally volatile) gains but by a bound that is
+*class-locally maintainable*: a mover's gain never exceeds its own address
+(`d = a − dest ≤ a`, since `dest ≥ 0`), so
+
+    gain(s) ≤ top(s)        (widened by the bonus cap `2α/s` under §4.2's term)
+
+where `top(s)`, the class's highest member, changes only on alloc/free/move of that
+class's own members — never through gap events. Keep one ordered map
+`tops: BTreeMap<Address, Size>` (top-member address → class), updated by the same
+class-local hooks that maintain `live_by_size`. Then search branch-and-bound style:
+
+1. Walk `tops` in descending address order; for each class, compute the true gain (the
+   destination queries of §4, or §4.2's variants).
+2. Track the best true gain `B` found; **stop as soon as the next class's `top ≤ B`** —
+   no unvisited class can beat `B`, because gain ≤ top.
+
+When a good move exists high in the file — the common case during active compaction — `B`
+is large after a class or two and the scan stops immediately. It degenerates toward
+O(#classes) only when *all* gains are small, i.e. near quiescence, where compaction has
+little left to do anyway. Bound even that with a visit cap: if the cap fires before the
+stop condition, execute the best candidate found *so far* and let the next `compact_step`
+resume the walk from a cursor instead of re-walking the prefix. Two provisos: the cursor
+belongs to the capped regime only — a scan that terminated via the bound found the exact
+best, and the next scan should restart from the top (the executed move often makes the
+same top classes the best again) — and cursor invalidation cannot be made exact cheaply:
+a `free` *anywhere* can drop below a visited class's previous destination, an alloc can
+mint a member above a visited top, and the compactor's own vacated ranges can hand a
+destination-less class its first candidate. So invalidate on any foreground op, keep the
+cursor only across consecutive compactor-driven steps, and accept it as best-effort: a
+stale cursor merely misorders positive-gain moves (`Φ` still strictly decreases), and the
+capped regime is exactly where all gains are small and misordering is cheapest. One fresh
+from-the-top scan before declaring quiescence restores exactness. (The slide candidate
+stays a single separate O(log n) lookup — largest gap — outside the scan.)
+
+### 4.2 A fragmentation term in the potential
+
+So far exact fits earn only a tie-break, and on a byte-granular address space exact size
+coincidences are rare outside the fixed classes. A **structural term** makes the trade-off
+soft: with `G` = the number of gaps and a tuning knob `α ≥ 0`,
+
+    Φ_α = Φ + α·G.
+
+Unbiasedness survives: every gapless layout has `G = 0`, so the minimum is untouched and
+still order-free; the excess becomes `inversions + α·G`, still zero iff compact. A move's
+per-byte gain becomes
+
+    gain = d + α·r/s,      r = r_src + r_dest ∈ {−1, 0, +1, +2},
+
+where vacating an extent flanked by two gaps merges them (`r_src = +1`: the "plug"
+extraction), one gap neighbor is neutral, two live neighbors mint a new gap
+(`r_src = −1`), and an exact-fit destination erases one (`r_dest = +1`). Three notes:
+
+- **Source triage is new information.** The base `Φ` is source-agnostic; the α-term is
+  the first thing that prices *where a move takes from* — "extract the plug between two
+  gaps" now outranks "carve a hole out of a solid run" at equal distance. (In the first
+  worked example above, `E3` and `E4` are both plugs: the term reinforces exactly the
+  moves distance-greed already took.)
+- **The structural prize is per-move, so per-byte it scales as `1/s`** — small plugs are
+  the cheap structural wins. That is correct accounting: the same `+1` costs 10 copied
+  bytes via a 10-byte plug and 1000 via a 1000-byte extent.
+- **Termination is safe for every `α`**: a *maximal* run is always flanked by free space,
+  so a full-run slide always merges two gaps (or truncates) — `r ≥ +1`, gain strictly
+  positive — so positive-gain moves never run out before compactness.
+
+Greedy stays **exact** and nearly as cheap. Destinations: for a fixed mover, among
+non-exact gaps the lowest maximizes `d`, and among exact gaps likewise — so *two*
+candidates provably suffice: the lowest fitting gap and the lowest exact one
+(`free_by_size[s]`'s first). Movers: within a class the best member now maximizes
+`a + α·r_src/s`, so a single per-class top no longer suffices — keep the top member per
+*neighbor category* (gap|gap, gap|live, live|live), three sub-maxima maintained by the
+O(1)-neighbor updates each foreground op performs anyway.
+
+**Smoothing: rewarding almost-exact fits.** Replace the count with a saturating sum,
+
+    Φ_αβ = Φ + α·Σ_gaps f(g),      f(g) = g/(β+g):
+
+gaps well above `β` cost ≈ `α` as before; slivers below `β` fade out. Filling a gap `g`
+with `s` bytes leaves remainder `ρ = g − s` and earns `α·(f(g) − f(ρ))` ≈ `α·(1 − ρ/β)`
+for `ρ ≪ β ≪ g` — the *snugness dial* the count version lacks, and the version that
+actually fires for one-off (resizable) sizes, where exact fits essentially never occur.
+Concavity caps the destination bonus: `f(g) − f(g−s) ≤ f(s)`, so per byte it is at most
+`α/(β+s)`. Two honest observations:
+
+- **The reward and its price are the same coin**: crediting a near-exact fill *is*
+  discounting the sub-`β` sliver it leaves — the two are inseparable in this functional
+  form, and the form is self-consistent about it: it declares slivers below `β` an
+  acceptable price for killing gaps. Their byte-inversions stay charged by the base `Φ`,
+  and under kladde's churn they tend to heal (a sliver plus a freed same-class neighbor
+  is a usable hole again). So `β` means: *the sliver size worth stranding per fill* —
+  keep it small relative to the common class sizes.
+- **Exact greed is lost, boundedly.** The destination trade-off (depth vs. snugness)
+  becomes continuous, so no fixed candidate set is provably sufficient. The practical
+  scheme evaluates three destinations — lowest fitting, lowest exact, and lowest with
+  remainder `≤ β` (one extra size-window query: a scan of `free_by_size.range(s..=s+β)`,
+  or a second, size-keyed augmented tree) — with per-move suboptimality below the bonus
+  cap `α/(β+s)`. Bounded-loss approximate greed, not exact greed.
+
+All of this is a pure change of *scoring* (P4): the mechanism and indexes barely move
+(three per-class sub-maxima; for the smooth form, one size-window query). Ship `α = 0`;
+add the count term when traces show squandered-gap moves; smooth it when one-off sizes
+dominate compaction traffic.
+
+### 4.3 A more realistic cost model
+
+"Cost = bytes copied" is only half-true on a real OS/hardware stack. A contiguous
+transfer costs roughly **`c₀ + c₁·s`**: a fixed per-operation term — syscall, page-cache
+work, and 4K page granularity (a small write to a cold page is a read-modify-write of the
+whole page; any move's unaligned edges RMW their boundary pages) — plus a throughput term
+per byte. On SSDs `c₀` is tens of microseconds; on HDDs, milliseconds of seek that
+dominate small transfers. Travel distance `d` is essentially free (no seek-distance term
+worth modeling on SSDs, a mild one on HDDs), and slides are *sequential* I/O where
+evacuations are random — representable as a larger `c₀` for evacuations, not a new cost
+shape.
+
+Under the affine cost, the objective becomes
+
+    gain/cost = (s·d + α·r) / (c₀ + c₁·s):
+
+`≈ d/c₁` for `s ≫ c₀/c₁` (nothing changes for bulk moves), while tiny moves are
+discounted by their fixed overhead — a healthy counterweight to §4.2's small-plug
+favoritism: a 10-byte plug that costs a full-page RMW is no longer priced as 10 bytes.
+
+Greedy difficulty is unchanged *in kind*, because the affine cost keeps the two
+properties the machinery relies on: it is **class-uniform** (a function of `s` only, so
+the best mover within a class is still the same sub-maxima) and
+**destination-independent** (so the 2–3 destination candidates per mover still suffice).
+The only real change is §4.1's key: the class-local bound becomes
+`b(s) = (s·top(s) + 2α)/(c₀ + c₁·s)` — still a function of `s` and `top(s)` only — and
+the `tops` map is ordered by `b(s)` instead of raw top address. One formula, one sort
+key. More generally: the *potential* governs soundness (any positive-gain move decreases
+`Φ`, under any cost model), the cost model only reshapes the ordering — and the one cost
+feature that would genuinely complicate the greedy is destination-*dependence* (real
+seek-distance costs), which would turn destination choice into a continuous two-term
+trade-off, handled the same bounded-loss way as §4.2's smooth term.
 
 ## 5. Architecture sketches
 
@@ -329,9 +473,10 @@ mind, not build the trait now).
 - **Destination rule.** "Lowest gap that fits" maximizes gain but can squander a large
   gap on a small far-travelling extent — split it, strand the large extent that needed it
   — a failure no lookahead-free gain ordering avoids (it hits the by-byte and by-start
-  potentials alike). Best-fit (smallest adequate gap, low addresses preferred) trades a
-  little travel distance for scarcity preservation; the exact-fit tie-break is the cheap
-  first approximation of that. Decide empirically.
+  potentials alike). §4.2's fragmentation term is the principled soft mitigation: it
+  reroutes the small mover to an exact or near-exact fit when one exists at comparable
+  depth. When none exists, the large gap still gets split — full protection would need
+  lookahead. Tune `α` (and `β`) empirically.
 
 ## References
 
