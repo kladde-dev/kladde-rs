@@ -325,6 +325,10 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
         self.live_bytes
     }
 
+    fn live_count(&self) -> usize {
+        self.allocations.len()
+    }
+
     fn iter(&self) -> impl Iterator<Item = (Id, u64, u32)> + '_ {
         self.allocations
             .iter()

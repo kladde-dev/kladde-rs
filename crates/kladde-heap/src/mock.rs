@@ -2,7 +2,7 @@
 //! `Persistable` types (and containers) in *other* crates without wiring up a
 //! real `Storage` or `Allocator`.
 //!
-//! It is a newtype over `UnjournaledBackend<InMemoryStorage, SimpleAllocator>`:
+//! It is a newtype over `UnjournaledBackend<InMemoryStorage, GainGreedyHeap>`:
 //! the storage stays private (per `generic-allocator.md`, the public vehicle is
 //! a `MockBackend` that hides addresses, not a public `MockStorage`), and the
 //! backend traits are re-exposed by delegation. Not `#[cfg(test)]`-gated, so
@@ -10,21 +10,21 @@
 
 use std::io::{Read, Seek};
 
-use crate::allocator::SimpleAllocator;
 use crate::backend::{Backend, BackendError, ReadBackend, WriteBackend};
+use crate::gain_greedy::GainGreedyHeap;
 use crate::pointer::{Pointer, ResolvedPointer, UniquePointerFixedSize, UniquePointerResizable};
 use crate::storage::InMemoryStorage;
 use crate::unjournaled::UnjournaledBackend;
 
 /// An in-memory [`WriteBackend`] + [`ReadBackend`] with `Pointer = Pointer<u32>`
 /// and `Size = u32`, for exercising persistable types in tests.
-pub struct MockBackend(UnjournaledBackend<InMemoryStorage, SimpleAllocator>);
+pub struct MockBackend(UnjournaledBackend<InMemoryStorage, GainGreedyHeap<Pointer<u32>>>);
 
 impl MockBackend {
     pub fn new() -> Self {
         Self(UnjournaledBackend::new(
             InMemoryStorage::default(),
-            SimpleAllocator::new(),
+            GainGreedyHeap::new(),
         ))
     }
 

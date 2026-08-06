@@ -1,128 +1,166 @@
 //! [`JournaledWriteBackend`] / [`JournaledReadBackend`]: an in-memory-journal
-//! backend on the free-space-allocator model.
+//! backend on the relocatable-heap model.
 //!
 //! It defers *everything* to flush: `alloc` mints an id immediately (so a `store`
-//! can serialize it) but **records only a pending `(size, sizedness)`** -- the
-//! allocator's `alloc` (address assignment) is deferred to [`flush`], the
-//! `claim`. Writes are buffered. `size`/`resolve` answer from the pending map
-//! during the write phase. On `flush`, every still-live id is claimed (addresses
-//! assigned via `Composed::claim`) and the buffered writes are replayed at the
-//! now-known addresses; the result is a read-only [`JournaledReadBackend`].
+//! can serialize it) but **records only a pending size** -- reserving the address
+//! range is deferred to [`flush`](JournaledWriteBackend::flush), the `claim`.
+//! Sizedness needs no pending state at all, since it rides on the id. Writes are
+//! buffered. `size`/`resolve` answer from the pending map during the write phase.
+//!
+//! On flush, every still-live id is claimed, the buffered writes are replayed at
+//! the now-known addresses, and then a bounded round of **incremental
+//! compaction** runs -- the per-flush schedule of `incremental-compaction.md`
+//! §5.1. That call is unconditional: a backend over a heap that does not compact
+//! gets a no-op out of it, which is exactly why the compaction methods are
+//! defaulted on `RelocatableHeap` rather than living on the marker subtrait.
 //!
 //! The read/write phase split is by ownership: `JournaledWriteBackend` implements
 //! only `WriteBackend`; `flush(self)` consumes it and returns a
 //! `JournaledReadBackend` that implements only `ReadBackend`.
 //!
-//! Still an in-memory-journal *mock*: the journal + id table live in memory only,
-//! so [`JournaledWriteBackend::open`] (recovery from `Storage`) is a `todo!()`
-//! -- the self-hosting bootstrap is deferred. `splice` is likewise `todo!()`, and
-//! freed-during-write ids are dropped from the pending set without recycling
-//! their id number until flush (no aliasing within a transaction; ids stay dense
-//! *enough* for the mock).
+//! Still an in-memory-journal *mock*: the journal + id pool live in memory only,
+//! so [`JournaledWriteBackend::open`] (recovery from `Storage`) is a `todo!()`.
+//! `splice` is likewise `todo!()`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 
-use crate::allocator::Allocator;
 use crate::backend::{Backend, BackendError, ReadBackend, WriteBackend};
-use crate::composed::Composed;
-use crate::pointer::Sizedness;
-use crate::pointer::{Pointer, ResolvedPointer, UniquePointerFixedSize, UniquePointerResizable};
+use crate::composed::{resolved, Composed};
+use crate::heap::{CompactionProgress, IncrementallyCompactableHeap, RelocatableHeap};
+use crate::pointer::{
+    Pointer, ResolvedPointer, Sizedness, UniquePointerFixedSize, UniquePointerResizable,
+};
 use crate::storage::Storage;
 use crate::word::Word;
 
-struct JournaledInner<S, A: Allocator, W: Word = u32> {
-    composed: Composed<S, A, W>,
-    /// Minted-but-not-yet-claimed allocations: the deferred allocator state,
-    /// mutated by `alloc`/`resize`/`free`/`make_*`.
-    pending: HashMap<Pointer<W>, (A::Size, Sizedness)>,
-    /// Buffered writes `(id, offset, bytes)`, replayed after claim.
-    journal: Vec<(Pointer<W>, A::Size, Vec<u8>)>,
-}
+/// Bytes of compaction work attempted per flush when nothing else is configured.
+pub const DEFAULT_COMPACTION_BUDGET: usize = 64 * 1024;
 
-fn handle_for<W: Word>(id: Pointer<W>, sizedness: Sizedness) -> ResolvedPointer<Pointer<W>> {
-    match sizedness {
-        Sizedness::Resizable => {
-            ResolvedPointer::Resizable(UniquePointerResizable::from_pointer(id))
-        }
-        Sizedness::Fixed => ResolvedPointer::Fixed(UniquePointerFixedSize::from_pointer(id)),
-    }
+struct JournaledInner<S, H: RelocatableHeap, W: Word = u32> {
+    composed: Composed<S, H, W>,
+    /// Minted-but-not-yet-claimed allocations and their pending sizes. The
+    /// deferred heap state, mutated by `alloc`/`resize`/`free`/`make_*`.
+    pending: HashMap<Pointer<W>, H::Size>,
+    /// Buffered writes `(id, offset, bytes)`, replayed after claim.
+    journal: Vec<(Pointer<W>, H::Size, Vec<u8>)>,
 }
 
 /// The write half of a journaled transaction.
-pub struct JournaledWriteBackend<S, A: Allocator, W: Word = u32> {
-    inner: RefCell<JournaledInner<S, A, W>>,
+pub struct JournaledWriteBackend<S, H: RelocatableHeap, W: Word = u32> {
+    inner: RefCell<JournaledInner<S, H, W>>,
+    compaction_budget: usize,
 }
 
-impl<S: Storage, A: Allocator, W: Word> JournaledWriteBackend<S, A, W> {
-    pub fn new(storage: S, alloc: A) -> Self {
+impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> JournaledWriteBackend<S, H, W> {
+    pub fn new(storage: S, heap: H) -> Self {
         Self {
             inner: RefCell::new(JournaledInner {
-                composed: Composed::new(storage, alloc),
+                composed: Composed::new(storage, heap),
                 pending: HashMap::new(),
                 journal: Vec::new(),
             }),
+            compaction_budget: DEFAULT_COMPACTION_BUDGET,
         }
     }
 
-    /// Reopen a journaled file, reconstructing state persisted in `storage`.
-    /// Blocked on the self-hosting bootstrap (deferred): the journal + id table
-    /// live in memory only, so there is nothing in `storage` to recover yet.
-    pub fn open(_storage: S) -> Self {
-        todo!("self-hosting bootstrap: recover the id table + journal from Storage (deferred)")
+    /// How many bytes of compaction work [`flush`](Self::flush) will attempt.
+    /// Zero disables per-flush compaction.
+    pub fn compaction_budget(&self) -> usize {
+        self.compaction_budget
     }
 
-    /// End the write transaction: claim every still-live id (assigning addresses),
-    /// replay the buffered writes, and hand back a read-only view.
-    pub fn flush(self) -> JournaledReadBackend<S, A, W> {
+    /// Set the per-flush compaction budget. A *policy* knob on the backend, not
+    /// a parameter of the heap trait, which models only the capability.
+    pub fn set_compaction_budget(&mut self, budget: usize) {
+        self.compaction_budget = budget;
+    }
+
+    /// Reopen a journaled file, reconstructing state persisted in `storage`.
+    /// Blocked on the self-hosting bootstrap (deferred): the journal + id pool
+    /// live in memory only, so there is nothing in `storage` to recover yet.
+    pub fn open(_storage: S) -> Self {
+        todo!("self-hosting bootstrap: recover the id pool + journal from Storage (deferred)")
+    }
+
+    /// End the write transaction: claim every still-live id (reserving address
+    /// ranges), replay the buffered writes, compact within the budget, and hand
+    /// back a read-only view.
+    pub fn flush(self) -> JournaledReadBackend<S, H, W> {
+        let budget = self.compaction_budget;
         let mut inner = self.inner.into_inner();
-        let pending: Vec<(Pointer<W>, A::Size, Sizedness)> = inner
-            .pending
-            .drain()
-            .map(|(id, (size, sizedness))| (id, size, sizedness))
-            .collect();
-        for (id, size, sizedness) in pending {
-            inner.composed.claim(id, size, sizedness);
+        let pending: Vec<(Pointer<W>, H::Size)> = inner.pending.drain().collect();
+        for (id, size) in pending {
+            inner.composed.claim(id, size);
         }
         for (id, offset, bytes) in std::mem::take(&mut inner.journal) {
             inner.composed.write(id, offset, &bytes);
         }
-        JournaledReadBackend { inner }
+        // Unconditional: a non-compacting heap proposes nothing and this is free.
+        let progress = inner
+            .composed
+            .compact_incrementally(Word::from_usize(budget));
+        JournaledReadBackend { inner, progress }
     }
 }
 
-impl<S: Storage, A: Allocator, W: Word> Backend for JournaledWriteBackend<S, A, W> {
+impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Backend
+    for JournaledWriteBackend<S, H, W>
+{
     type Pointer = Pointer<W>;
-    type Size = A::Size;
+    type Size = H::Size;
 
     fn size(&self, p: Self::Pointer) -> Result<Self::Size, BackendError> {
         self.inner
             .borrow()
             .pending
             .get(&p)
-            .map(|&(size, _)| size)
+            .copied()
             .ok_or(BackendError::DanglingPointer)
     }
     fn resolve(&self, p: Self::Pointer) -> Result<ResolvedPointer<Self::Pointer>, BackendError> {
-        let inner = self.inner.borrow();
-        let &(_, sizedness) = inner.pending.get(&p).ok_or(BackendError::DanglingPointer)?;
-        Ok(handle_for(p, sizedness))
+        if !self.inner.borrow().pending.contains_key(&p) {
+            return Err(BackendError::DanglingPointer);
+        }
+        Ok(resolved(p))
     }
 }
 
-impl<S: Storage, A: Allocator, W: Word> WriteBackend for JournaledWriteBackend<S, A, W> {
-    fn alloc_resizable(&self, size: Self::Size) -> UniquePointerResizable<Self::Pointer> {
+impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> JournaledWriteBackend<S, H, W> {
+    /// Mint an id of `sizedness` and record its pending size.
+    fn mint_pending(&self, size: H::Size, sizedness: Sizedness) -> Pointer<W> {
         let mut inner = self.inner.borrow_mut();
-        let id = inner.composed.mint();
-        inner.pending.insert(id, (size, Sizedness::Resizable));
-        UniquePointerResizable::from_pointer(id)
+        let id = inner.composed.mint(sizedness);
+        inner.pending.insert(id, size);
+        id
+    }
+
+    /// Re-mint `old` with the other sizedness (sizedness lives in the id, so a
+    /// conversion cannot re-tag in place), carrying the pending entry over and
+    /// re-anchoring any writes already buffered against the old id.
+    fn remint(&self, old: Pointer<W>, new_size: H::Size, sizedness: Sizedness) -> Pointer<W> {
+        let mut inner = self.inner.borrow_mut();
+        inner.pending.remove(&old);
+        let new = inner.composed.mint(sizedness);
+        inner.pending.insert(new, new_size);
+        for (anchor, _, _) in &mut inner.journal {
+            if *anchor == old {
+                *anchor = new;
+            }
+        }
+        new
+    }
+}
+
+impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> WriteBackend
+    for JournaledWriteBackend<S, H, W>
+{
+    fn alloc_resizable(&self, size: Self::Size) -> UniquePointerResizable<Self::Pointer> {
+        UniquePointerResizable::from_pointer(self.mint_pending(size, Sizedness::Resizable))
     }
     fn alloc_fixed_size(&self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer> {
-        let mut inner = self.inner.borrow_mut();
-        let id = inner.composed.mint();
-        inner.pending.insert(id, (size, Sizedness::Fixed));
-        UniquePointerFixedSize::from_pointer(id)
+        UniquePointerFixedSize::from_pointer(self.mint_pending(size, Sizedness::Fixed))
     }
     fn free_resizable(&self, p: UniquePointerResizable<Self::Pointer>) {
         self.inner.borrow_mut().pending.remove(&p.raw());
@@ -135,10 +173,9 @@ impl<S: Storage, A: Allocator, W: Word> WriteBackend for JournaledWriteBackend<S
         p: &UniquePointerResizable<Self::Pointer>,
         new_size: Self::Size,
     ) -> Result<(), BackendError> {
-        let mut inner = self.inner.borrow_mut();
-        match inner.pending.get_mut(&p.raw()) {
-            Some(e) => {
-                e.0 = new_size;
+        match self.inner.borrow_mut().pending.get_mut(&p.raw()) {
+            Some(size) => {
+                *size = new_size;
                 Ok(())
             }
             None => Err(BackendError::DanglingPointer),
@@ -149,11 +186,7 @@ impl<S: Storage, A: Allocator, W: Word> WriteBackend for JournaledWriteBackend<S
         p: UniquePointerFixedSize<Self::Pointer>,
         new_size: Self::Size,
     ) -> Result<UniquePointerResizable<Self::Pointer>, BackendError> {
-        let id = p.raw();
-        self.inner
-            .borrow_mut()
-            .pending
-            .insert(id, (new_size, Sizedness::Resizable));
+        let id = self.remint(p.raw(), new_size, Sizedness::Resizable);
         Ok(UniquePointerResizable::from_pointer(id))
     }
     fn make_fixed_size(
@@ -161,11 +194,7 @@ impl<S: Storage, A: Allocator, W: Word> WriteBackend for JournaledWriteBackend<S
         p: UniquePointerResizable<Self::Pointer>,
         new_size: Self::Size,
     ) -> Result<UniquePointerFixedSize<Self::Pointer>, BackendError> {
-        let id = p.raw();
-        self.inner
-            .borrow_mut()
-            .pending
-            .insert(id, (new_size, Sizedness::Fixed));
+        let id = self.remint(p.raw(), new_size, Sizedness::Fixed);
         Ok(UniquePointerFixedSize::from_pointer(id))
     }
     fn write(&self, anchor: Self::Pointer, offset: Self::Size, bytes: &[u8]) {
@@ -188,20 +217,53 @@ impl<S: Storage, A: Allocator, W: Word> WriteBackend for JournaledWriteBackend<S
 }
 
 /// The read-only view produced by [`JournaledWriteBackend::flush`].
-pub struct JournaledReadBackend<S, A: Allocator, W: Word = u32> {
-    inner: JournaledInner<S, A, W>,
+pub struct JournaledReadBackend<S, H: RelocatableHeap, W: Word = u32> {
+    inner: JournaledInner<S, H, W>,
+    progress: CompactionProgress,
 }
 
-impl<S: Storage, A: Allocator, W: Word> JournaledReadBackend<S, A, W> {
-    /// Consume the view, returning the raw storage and allocator.
-    pub fn into_parts(self) -> (S, A) {
-        (self.inner.composed.storage, self.inner.composed.alloc)
+impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> JournaledReadBackend<S, H, W> {
+    /// What the compaction round at the end of the flush achieved.
+    pub fn compaction_progress(&self) -> CompactionProgress {
+        self.progress
+    }
+
+    /// Number of live allocations.
+    pub fn live_count(&self) -> usize {
+        self.inner.composed.live_count()
+    }
+
+    /// One past the highest live byte.
+    pub fn len(&self) -> H::Address {
+        self.inner.composed.heap.len()
+    }
+
+    /// Whether nothing is allocated.
+    pub fn is_empty(&self) -> bool {
+        self.inner.composed.heap.is_empty()
+    }
+
+    /// Consume the view, returning the raw storage and heap.
+    pub fn into_parts(self) -> (S, H) {
+        (self.inner.composed.storage, self.inner.composed.heap)
     }
 }
 
-impl<S: Storage, A: Allocator, W: Word> Backend for JournaledReadBackend<S, A, W> {
+/// Compaction controls, present only when the heap actually compacts.
+impl<S: Storage, H: IncrementallyCompactableHeap<Id = Pointer<W>>, W: Word>
+    JournaledReadBackend<S, H, W>
+{
+    /// Run another bounded round of compaction outside the flush schedule.
+    pub fn compact_incrementally(&mut self, budget: H::Address) -> CompactionProgress {
+        self.inner.composed.compact_incrementally(budget)
+    }
+}
+
+impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Backend
+    for JournaledReadBackend<S, H, W>
+{
     type Pointer = Pointer<W>;
-    type Size = A::Size;
+    type Size = H::Size;
 
     fn size(&self, p: Self::Pointer) -> Result<Self::Size, BackendError> {
         self.inner.composed.size(p)
@@ -211,7 +273,9 @@ impl<S: Storage, A: Allocator, W: Word> Backend for JournaledReadBackend<S, A, W
     }
 }
 
-impl<S: Storage, A: Allocator, W: Word> ReadBackend for JournaledReadBackend<S, A, W> {
+impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> ReadBackend
+    for JournaledReadBackend<S, H, W>
+{
     fn read_at(&mut self, anchor: Self::Pointer, offset: Self::Size) -> impl Read + Seek + '_ {
         self.inner.composed.read_at(anchor, offset)
     }
@@ -221,11 +285,13 @@ impl<S: Storage, A: Allocator, W: Word> ReadBackend for JournaledReadBackend<S, 
 mod tests {
     use super::*;
     use crate::storage::InMemoryStorage;
-    use crate::SimpleAllocator;
+    use crate::GainGreedyHeap;
     use std::io::Read;
 
-    fn write_backend() -> JournaledWriteBackend<InMemoryStorage, SimpleAllocator> {
-        JournaledWriteBackend::new(InMemoryStorage::default(), SimpleAllocator::new())
+    type Wb = JournaledWriteBackend<InMemoryStorage, GainGreedyHeap<Pointer<u32>>>;
+
+    fn write_backend() -> Wb {
+        JournaledWriteBackend::new(InMemoryStorage::default(), GainGreedyHeap::new())
     }
 
     #[test]
@@ -280,5 +346,77 @@ mod tests {
         let id = p.raw();
         wb.free_resizable(p);
         assert!(matches!(wb.size(id), Err(BackendError::DanglingPointer)));
+    }
+
+    #[test]
+    fn a_sizedness_conversion_re_anchors_writes_buffered_against_the_old_id() {
+        let wb = write_backend();
+        let p = wb.alloc_fixed_size(4);
+        wb.write(p.raw(), 0, &[1, 2, 3, 4]); // buffered against the *old* id
+        let old = p.raw();
+
+        let q = wb.make_resizable(p, 4).unwrap();
+        assert_ne!(
+            q.raw(),
+            old,
+            "sizedness lives in the id, so it must re-mint"
+        );
+        assert_eq!(q.raw().sizedness(), Sizedness::Resizable);
+        assert!(matches!(wb.size(old), Err(BackendError::DanglingPointer)));
+
+        // The buffered write must follow the id, or flush would replay it
+        // against an id that no longer exists.
+        let id = q.raw();
+        let mut rb = wb.flush();
+        let mut cursor = rb.read_at(id, 0);
+        let mut buf = [0u8; 4];
+        cursor.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn flush_compacts_within_its_budget_and_truncates_the_store() {
+        let wb = write_backend();
+        // Three allocations, the middle one freed before flush -- so the claim
+        // order leaves no gap at all and there is nothing to compact.
+        let a = wb.alloc_fixed_size(64);
+        let b = wb.alloc_fixed_size(64);
+        let c = wb.alloc_fixed_size(64);
+        wb.write(a.raw(), 0, &[1; 64]);
+        wb.write(c.raw(), 0, &[3; 64]);
+        wb.free_fixed_size(b);
+
+        let rb = wb.flush();
+        assert!(rb.compaction_progress().quiesced);
+        assert_eq!(rb.len(), 128, "two 64-byte allocations, gaplessly claimed");
+        let (storage, _) = rb.into_parts();
+        assert_eq!(storage.len().unwrap(), 128, "store truncated to the heap");
+    }
+
+    #[test]
+    fn a_gap_opened_after_a_flush_is_closed_by_the_next_one() {
+        let wb = write_backend();
+        let a = wb.alloc_fixed_size(64);
+        let b = wb.alloc_fixed_size(64);
+        wb.write(b.raw(), 0, &[7; 64]);
+        let (a_id, b_id) = (a.raw(), b.raw());
+        let rb = wb.flush();
+        assert_eq!(rb.len(), 128);
+
+        // Reopen a write phase over the same heap, drop the low allocation, and
+        // flush again: the survivor should slide down and the file halve.
+        let (storage, heap) = rb.into_parts();
+        let wb: Wb = JournaledWriteBackend::new(storage, heap);
+        wb.inner.borrow_mut().composed.free(a_id);
+
+        let mut rb = wb.flush();
+        assert_eq!(rb.len(), 64, "the survivor slid down into the freed range");
+        let mut cursor = rb.read_at(b_id, 0);
+        let mut buf = [0u8; 64];
+        cursor.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            buf, [7; 64],
+            "compaction moved the bytes, not just the entry"
+        );
     }
 }

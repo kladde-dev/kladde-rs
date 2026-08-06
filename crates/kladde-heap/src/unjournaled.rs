@@ -1,33 +1,33 @@
 //! [`UnjournaledBackend`]: the simplest concrete backend -- a
-//! [`Composed`]`(Storage, Allocator, id table)` with no journal, applying every
-//! operation immediately.
+//! [`Composed`]`(Storage, RelocatableHeap, id pool)` with no journal, applying
+//! every operation immediately.
 //!
 //! It presents the `&self` write facade by wrapping the `Composed` core in a
 //! `RefCell`; the `ReadBackend` methods take `&mut self` and reach the core via
 //! `RefCell::get_mut`, so the real seekable cursor comes straight out. The
-//! backend owns the id table + id pool (over the pointer width `W`); the
-//! allocator only manages free address ranges.
+//! backend owns the id pool (over the pointer width `W`); the heap owns the
+//! geometry and the `id -> address` table.
 
 use std::cell::RefCell;
 use std::io::{Read, Seek};
 
-use crate::allocator::Allocator;
 use crate::backend::{Backend, BackendError, ReadBackend, WriteBackend};
 use crate::composed::Composed;
+use crate::heap::{CompactionProgress, IncrementallyCompactableHeap, RelocatableHeap};
 use crate::pointer::{Pointer, ResolvedPointer, UniquePointerFixedSize, UniquePointerResizable};
 use crate::storage::Storage;
 use crate::word::Word;
 
-/// A non-journaled backend composing a `Storage`, a free-space `Allocator`, and
-/// the id table (over pointer width `W`, defaulted to `u32`).
-pub struct UnjournaledBackend<S, A: Allocator, W: Word = u32> {
-    inner: RefCell<Composed<S, A, W>>,
+/// A non-journaled backend composing a `Storage`, a `RelocatableHeap`, and the
+/// id pool (over pointer width `W`, defaulted to `u32`).
+pub struct UnjournaledBackend<S, H: RelocatableHeap, W: Word = u32> {
+    inner: RefCell<Composed<S, H, W>>,
 }
 
-impl<S: Storage, A: Allocator, W: Word> UnjournaledBackend<S, A, W> {
-    pub fn new(storage: S, alloc: A) -> Self {
+impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> UnjournaledBackend<S, H, W> {
+    pub fn new(storage: S, heap: H) -> Self {
         Self {
-            inner: RefCell::new(Composed::new(storage, alloc)),
+            inner: RefCell::new(Composed::new(storage, heap)),
         }
     }
 
@@ -36,16 +36,41 @@ impl<S: Storage, A: Allocator, W: Word> UnjournaledBackend<S, A, W> {
         self.inner.borrow().live_count()
     }
 
-    /// Consume the backend, returning the inner storage and allocator.
-    pub fn into_parts(self) -> (S, A) {
+    /// One past the highest live byte: what the store can be truncated to.
+    pub fn len(&self) -> H::Address {
+        self.inner.borrow().heap.len()
+    }
+
+    /// Whether nothing is allocated.
+    pub fn is_empty(&self) -> bool {
+        self.inner.borrow().heap.is_empty()
+    }
+
+    /// Consume the backend, returning the inner storage and heap.
+    pub fn into_parts(self) -> (S, H) {
         let composed = self.inner.into_inner();
-        (composed.storage, composed.alloc)
+        (composed.storage, composed.heap)
     }
 }
 
-impl<S: Storage, A: Allocator, W: Word> Backend for UnjournaledBackend<S, A, W> {
+/// Compaction controls, present only when the heap actually compacts -- a
+/// backend over a non-compacting heap simply has no such method.
+impl<S: Storage, H: IncrementallyCompactableHeap<Id = Pointer<W>>, W: Word>
+    UnjournaledBackend<S, H, W>
+{
+    /// Run compaction steps until the heap quiesces or `budget` bytes have been
+    /// copied, then truncate the store. Named for the *incremental* algorithm;
+    /// an optimized whole-heap compaction would be a separate entry point.
+    pub fn compact_incrementally(&self, budget: H::Address) -> CompactionProgress {
+        self.inner.borrow_mut().compact_incrementally(budget)
+    }
+}
+
+impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Backend
+    for UnjournaledBackend<S, H, W>
+{
     type Pointer = Pointer<W>;
-    type Size = A::Size;
+    type Size = H::Size;
 
     fn size(&self, p: Self::Pointer) -> Result<Self::Size, BackendError> {
         self.inner.borrow().size(p)
@@ -55,7 +80,9 @@ impl<S: Storage, A: Allocator, W: Word> Backend for UnjournaledBackend<S, A, W> 
     }
 }
 
-impl<S: Storage, A: Allocator, W: Word> WriteBackend for UnjournaledBackend<S, A, W> {
+impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> WriteBackend
+    for UnjournaledBackend<S, H, W>
+{
     fn alloc_resizable(&self, size: Self::Size) -> UniquePointerResizable<Self::Pointer> {
         self.inner.borrow_mut().alloc_resizable(size)
     }
@@ -103,7 +130,9 @@ impl<S: Storage, A: Allocator, W: Word> WriteBackend for UnjournaledBackend<S, A
     }
 }
 
-impl<S: Storage, A: Allocator, W: Word> ReadBackend for UnjournaledBackend<S, A, W> {
+impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> ReadBackend
+    for UnjournaledBackend<S, H, W>
+{
     fn read_at(&mut self, anchor: Self::Pointer, offset: Self::Size) -> impl Read + Seek + '_ {
         self.inner.get_mut().read_at(anchor, offset)
     }
@@ -113,11 +142,11 @@ impl<S: Storage, A: Allocator, W: Word> ReadBackend for UnjournaledBackend<S, A,
 mod tests {
     use super::*;
     use crate::storage::InMemoryStorage;
-    use crate::SimpleAllocator;
+    use crate::GainGreedyHeap;
     use std::io::Read;
 
-    fn backend() -> UnjournaledBackend<InMemoryStorage, SimpleAllocator> {
-        UnjournaledBackend::new(InMemoryStorage::default(), SimpleAllocator::new())
+    fn backend() -> UnjournaledBackend<InMemoryStorage, GainGreedyHeap<Pointer<u32>>> {
+        UnjournaledBackend::new(InMemoryStorage::default(), GainGreedyHeap::new())
     }
 
     #[test]
@@ -192,6 +221,60 @@ mod tests {
         let mut buf = [0u8; 7];
         cursor.read_exact(&mut buf).unwrap();
         assert_eq!(buf, [1, 9, 9, 9, 4, 5, 6]);
+    }
+
+    #[test]
+    fn compaction_moves_the_bytes_and_shrinks_the_store() {
+        let mut b = backend();
+        let low = b.alloc_fixed_size(8);
+        let high = b.alloc_fixed_size(8);
+        b.write(low.raw(), 0, &[1; 8]);
+        b.write(high.raw(), 0, &[2; 8]);
+        b.free_fixed_size(low); // gap at 0..8
+        assert_eq!(b.len(), 16, "the survivor still pins the end");
+
+        let progress = b.compact_incrementally(1024);
+        assert_eq!(progress.steps, 1);
+        assert_eq!(progress.bytes_moved, 8);
+        assert!(progress.quiesced);
+        assert_eq!(b.len(), 8, "the survivor slid down into the gap");
+
+        // The data must have moved with the entry, not just the bookkeeping.
+        let mut buf = [0u8; 8];
+        {
+            let mut cursor = b.read_at(high.raw(), 0);
+            cursor.read_exact(&mut buf).unwrap();
+        }
+        assert_eq!(buf, [2; 8]);
+
+        let (storage, _) = b.into_parts();
+        assert_eq!(storage.len().unwrap(), 8, "store truncated to the heap");
+    }
+
+    #[test]
+    fn compaction_respects_its_budget_and_reports_not_having_quiesced() {
+        let b = backend();
+        let mut live = Vec::new();
+        for _ in 0..6 {
+            live.push(b.alloc_fixed_size(8));
+        }
+        // Free every other one, leaving three 8-byte gaps to close.
+        for p in live
+            .drain(..)
+            .enumerate()
+            .filter_map(|(i, p)| (i % 2 == 0).then_some(p))
+        {
+            b.free_fixed_size(p);
+        }
+
+        let progress = b.compact_incrementally(8);
+        assert!(!progress.quiesced, "the budget, not the heap, stopped it");
+        assert!(progress.bytes_moved <= 8);
+        assert_eq!(progress.steps, 1);
+
+        // Further rounds finish the job.
+        while !b.compact_incrementally(8).quiesced {}
+        assert_eq!(b.len(), 24, "three 8-byte survivors, gaplessly packed");
     }
 
     #[test]

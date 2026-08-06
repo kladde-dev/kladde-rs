@@ -7,18 +7,21 @@
 //!
 //! - [`Word`]: the unsigned-integer abstraction for address/size arithmetic.
 //! - [`Pointer`] and the owned handles: concrete, `Copy` stable ids and their
-//!   single-owner resizable/fixed-size wrappers.
-//! - [`Allocator`]: pure address-range management over stable ids, with
-//!   [`SimpleAllocator`] a simple in-memory implementation; and [`Storage`]: an
-//!   unstructured, resizable byte interface.
+//!   single-owner resizable/fixed-size wrappers. A `Pointer`'s low bit carries
+//!   its [`Sizedness`], which is what [`AllocationId`] reads.
+//! - [`RelocatableHeap`]: the whole partition of the address space into
+//!   allocations and gaps, including the `id -> address` table and the ability
+//!   to close the gaps one bounded [`Step`] at a time
+//!   ([`IncrementallyCompactableHeap`]). [`GainGreedyHeap`] implements it. See
+//!   `incremental-compaction.md`.
+//! - [`Storage`]: an unstructured, resizable byte interface.
 //! - [`Backend`]/[`ReadBackend`]/[`WriteBackend`]: the trait split that a
-//!   concrete backend composing an `Allocator` with a `Storage` implements.
-//!   (Concrete backends land in later commits.)
+//!   concrete backend composing a `RelocatableHeap` with a `Storage` implements
+//!   ([`UnjournaledBackend`], [`JournaledWriteBackend`], [`MockBackend`]).
 //!
 //! The kladde-specific serialization layer (`Persistable`, `PointerRepr`,
 //! `Location`, containers) lives on top of this crate, in `kladde-persist`.
 
-mod allocator;
 mod backend;
 mod composed;
 mod gain_greedy;
@@ -30,13 +33,13 @@ mod storage;
 mod unjournaled;
 mod word;
 
-pub use allocator::{AllocError, Allocator, CompactingAllocator, Move, SimpleAllocator};
 pub use backend::{Backend, BackendError, ReadBackend, WriteBackend};
 pub use gain_greedy::GainGreedyHeap;
 pub use heap::{
-    AllocationId, HeapError, IncrementallyCompactableHeap, RelocatableHeap, Relocation, Step,
+    AllocationId, CompactionProgress, HeapError, IncrementallyCompactableHeap, RelocatableHeap,
+    Relocation, Step,
 };
-pub use journaled::{JournaledReadBackend, JournaledWriteBackend};
+pub use journaled::{JournaledReadBackend, JournaledWriteBackend, DEFAULT_COMPACTION_BUDGET};
 pub use mock::MockBackend;
 pub use pointer::{
     Pointer, ResolvedPointer, Sizedness, UniquePointer, UniquePointerFixedSize,

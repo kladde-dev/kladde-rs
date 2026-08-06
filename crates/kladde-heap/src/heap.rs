@@ -133,6 +133,12 @@ pub trait RelocatableHeap {
         self.live_bytes() == Self::Address::zero()
     }
 
+    /// Number of live allocations. Useful for leak checks; override if the
+    /// implementation can answer it without walking.
+    fn live_count(&self) -> usize {
+        self.iter().count()
+    }
+
     /// Every live allocation, in ascending address order. For snapshotting the
     /// table to the persistent format.
     fn iter(&self) -> impl Iterator<Item = (Self::Id, Self::Address, Self::Size)> + '_;
@@ -163,6 +169,19 @@ pub trait RelocatableHeap {
     fn commit_compaction_step(&mut self, _step: Step<Self::Address>) {
         unreachable!("commit_compaction_step on a heap that proposes no steps")
     }
+}
+
+/// What one round of incremental compaction achieved. Returned by the backends'
+/// `compact_incrementally`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CompactionProgress {
+    /// How many steps were executed.
+    pub steps: usize,
+    /// How many bytes were copied in total.
+    pub bytes_moved: u64,
+    /// Whether the heap reported quiescence (rather than the budget running
+    /// out). When true there is nothing left to gain from further rounds.
+    pub quiesced: bool,
 }
 
 /// Marker: this heap's [`RelocatableHeap::propose_compaction_step`] really
