@@ -14,6 +14,10 @@ file) and remembers where each one lives:
   `resize(id, new_size)` changes one's length.
 - The heap owns the `id → address` table. Everything that refers to an allocation
   refers to it *by id*, and resolves through that table.
+- An allocation is either **fixed-size** — its length is settled when it is
+  created and `resize` is never called on it — or **resizable**. Which one it is
+  is fixed when the id is minted and readable from the id itself, so the heap can
+  tell the two apart without consulting anything. §4 explains why it cares.
 - A **gap** is free space between two allocations.
 - **`end`** is one past the highest live byte — the length the store must have.
   **`live_bytes`** is the total size of all allocations.
@@ -35,8 +39,9 @@ commit_compaction_step(step)
 
 such that:
 
-1. each call does a bounded amount of work — both bytes copied and CPU spent
-   *deciding*, which rules out scanning the heap to find a move;
+1. each call copies roughly `budget` bytes (§3.1 is precise about "roughly") and
+   spends bounded CPU *deciding* — which rules out scanning the heap to find a
+   move;
 2. repeated calls converge to a compact heap;
 3. there is no phase that must run to completion. A full compaction is just this
    step in a loop, and the loop may be abandoned at any point. Whatever work was
@@ -49,10 +54,10 @@ struct Step { from: Address, to: Address, len: Address }   // always to < from
 ```
 
 The heap only decides and bookkeeps; the caller performs the copy. That split
-exists because the copy is I/O: the caller can journal the step, chunk it, or
-defer it. `commit_compaction_step` then re-keys every allocation in
-`[from, from + len)` by `to − from`. Note that a step's `len` can span *several*
-allocations — see §4.
+exists because the copy is I/O, and the caller may want to chunk it, defer it, or
+record it in a write-ahead log first so that a crash mid-move is recoverable.
+`commit_compaction_step` then re-keys every allocation in `[from, from + len)` by
+`to − from`. Note that a step's `len` can span *several* allocations — see §4.
 
 ## 2. Measuring progress: the potential
 
@@ -166,8 +171,7 @@ below it. Its gain is its full travel distance, which can be far larger than any
 gap is wide. The extreme case is a handful of small allocations stranded above a
 large free region: copying a few bytes releases a large suffix.
 
-Only allocations of **fixed size** are considered as evacuation movers. The heap
-can tell from the id alone whether an allocation is fixed-size or resizable.
+Only **fixed-size** allocations are considered as evacuation movers.
 Fixed-size allocations are minted in bulk at a handful of distinct sizes, so they
 form a few densely populated size classes — and freeing one mints a gap that is a
 plug-compatible slot for every other member of its class. Resizable allocations
@@ -197,9 +201,9 @@ the exact one only ever wins by also being lower.
 
 **Choosing the mover.** Within a size class, all members share the same
 destination, so the highest-addressed member maximizes `d`. When `α > 0` the best
-member instead maximizes `a + α·r_src/s`, so the highest member is tracked
-separately for each of the three neighbour categories, and all three are
-considered.
+member instead maximizes `a + α·r_src/s`, which the highest member need not do —
+so the class contributes three candidate movers, the highest one in each of the
+three neighbour categories.
 
 Larger-than-needed gaps are simply **split**: the mover takes the bottom, and the
 remainder becomes an ordinary gap available to the next move. This makes
@@ -214,9 +218,12 @@ of the heap), so sliding it either merges two gaps or lets `end` retreat —
 `r ≥ +1` — and its distance term is the gap width, which is positive. So the gain
 is positive for every `α`.
 
-Every executed move strictly decreases `Φ_α` by at least 1, and `Φ_α` is bounded
-below. Therefore the loop terminates, and it can only terminate where no gap
-remains — which is exactly `end == live_bytes`.
+Every executed move reduces `Φ_α` by `s·d + α·r`, which is a positive integer and
+so at least 1, and `Φ_α` is bounded below. Repeated steps therefore cannot
+continue indefinitely, and the only state in which no step is proposed is one
+with no gaps — which is exactly `end == live_bytes`. (A caller that stops early
+because its budget ran out simply keeps the progress made; nothing is left in an
+intermediate state.)
 
 ### 4.2 A worked example
 
@@ -237,9 +244,9 @@ Running the loop to quiescence (all sizes fixed, `α = 0`, unbounded budget):
 | 2 | `C`: `[2100, 2110)` → `1010` | 1090 | 10 | its slot merges everything above 2000 into one 310-byte gap |
 | 3 | `E`: `[2310, 2420)` → `2000` | 310 | 110 | the coalesced gap now fits the tail; `end` drops to 2110 |
 
-Fully compact after copying **130 bytes** — less than the 310 bytes of free space
-recovered, and far less than the 1460 bytes that sliding every run in address
-order would have cost.
+Fully compact after copying **130 bytes** to recover 310 bytes of free space. The
+two cheap moves went first not because they were cheap but because they were the
+deepest: `D` and `C` had further to fall than the 110-byte tail did.
 
 Nothing here required lookahead. Steps 1 and 2 were not chosen *because* they
 would enable step 3; they were chosen because they had the highest per-byte gain
@@ -270,7 +277,7 @@ propose_step(budget):
         # A whole run is flanked by free space above, so sliding it removes a
         # gap; a budget-truncated prefix merely relocates one.
         r = 0 if truncated else 1
-        offer(best, gain(d = gap_len, s = run_len, r), 
+        offer(best, gain(d = gap_len, s = run_len, r),
                     Step(from = gap_start + gap_len, to = gap_start, len = run_len),
                     budget)
 
@@ -293,7 +300,7 @@ propose_step(budget):
     return best.within_budget ?? best.overall     # prefer to fit; else the best move
 
 
-offer(best, gain, step, budget):               # keep two tracks
+offer(best, gain, step, budget):        # two tracks; an absent best counts as -inf
     if gain <= 0: return
     if step.len <= budget and gain > gain(best.within_budget): best.within_budget = step
     if gain > gain(best.overall):                              best.overall      = step
@@ -325,7 +332,7 @@ compact_incrementally(budget):
         step = propose_step(budget - moved)
         if step is None: break                      # quiesced: compact
         if step.len > budget - moved and moved > 0: break   # save it for next time
-        copy step.len bytes from step.from to step.to       # I/O; may be journaled
+        copy step.len bytes from step.from to step.to       # I/O; may be logged first
         commit_step(step)
         moved += step.len
         if moved >= budget: break
@@ -365,10 +372,11 @@ Discussed, not implemented:
 - **A dedicated full-compaction routine.** Today a full compaction is this step in
   a loop. An algorithm that may run to completion could plan the whole permutation
   at once and beat the incremental one on total bytes copied.
-- **Smarter scheduling.** Steps currently run on each journal flush up to a fixed
-  budget. A journal-aware schedule could fold compaction moves into the pending
-  writes — for instance allocating a newly created allocation directly at the
-  address compaction would have moved it to.
+- **Smarter scheduling.** Steps currently run up to a fixed budget whenever the
+  caller flushes its buffered writes. A schedule aware of what is in that buffer
+  could fold compaction into it — for instance placing a newly created allocation
+  directly at the address compaction would have moved it to, so the bytes are
+  written once instead of written and then moved.
 
 ## 7. The data structures
 
@@ -406,13 +414,22 @@ maximum is at least `s`, recurse, and the first qualifying leaf entry is the
 answer. `std` has no augmented `BTreeMap`, so this uses the `sweep-bptree` crate.
 Gaps are materialized as tree *entries* (with the length in the key, since the
 crate's leaf-level search sees only keys), which keeps the augmentation a plain
-bottom-up maximum. Measured against the alternative of scanning `free_by_size`
-upward from `s`: with gap widths clustered on a handful of values the scan is
-marginally faster, but it degrades with the number of distinct widths while the
-descent does not — at 1024 distinct widths and 100k gaps the descent is over 100×
-faster, and it stays in the same few-microsecond band throughout. Split remainders
-and resizable allocations produce arbitrary widths regardless of how disciplined
-the fixed-size classes are, so the flat profile wins.
+bottom-up maximum.
+
+A whole augmented tree is a lot of machinery for one query, so it is worth saying
+why the obvious cheaper answer is not enough. `free_by_size` can answer the same
+question by walking upward from `s` and taking the lowest address across the
+classes it visits — one probe per distinct gap *width* at least `s`. The tests use
+exactly that as the reference the descent is checked against. But its cost is
+governed by how many distinct widths exist, and `benches/lowest_fitting_gap.rs`
+measures the consequence: with widths clustered on four values the scan is
+marginally the faster of the two, at 64 distinct widths the descent is 7–9×
+faster, and at 1024 it is over 100× (976 µs against 8.3 µs per 256 queries on
+100k gaps), while the descent stays within a 5–8 µs band throughout. Since
+splitting a gap leaves a remainder of arbitrary width, and resizable allocations
+are of arbitrary width to begin with, the widths spread out no matter how
+disciplined the fixed-size classes are — so the flat profile is worth the constant
+factor in the clustered case.
 
 **`live_by_size` is split three ways** by whether an allocation has two, one, or
 no free neighbours, because that is what determines `r_src`. A move can change the
