@@ -33,6 +33,14 @@
 //! - **Slide**, one overall: the maximal contiguous *run* above the largest gap
 //!   shifts down into it. This is what moves resizable allocations, which are
 //!   deliberately not indexed as movers.
+//!
+//! The best candidate is found by a bounded walk rather than a full scan of the
+//! classes -- see [`GainGreedyHeap::propose_compaction_step`] for why the search
+//! key is a class's top address and not its gain.
+//!
+//! [`GainGreedyHeap::alpha`] optionally adds a fragmentation term, which is the
+//! only thing that prices the *shape* of the free space rather than just how far
+//! bytes travel. It ships at zero.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -47,6 +55,84 @@ struct Entry<Id> {
     id: Id,
 }
 
+/// Which of an allocation's neighbours are free -- the only thing that decides
+/// what vacating it does to the *gap count*, and so the only source triage the
+/// `α` term of [`GainGreedyHeap::alpha`] needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreeNeighbours {
+    /// Free on both sides (or free below and at the top of the heap): vacating
+    /// merges two gaps into one, or lets `end` retreat. The "plug" case.
+    Both,
+    /// Free on exactly one side: the gap just extends.
+    One,
+    /// Live on both sides: vacating mints a brand new gap.
+    Neither,
+}
+
+impl FreeNeighbours {
+    const COUNT: usize = 3;
+
+    /// The change in the number of gaps when this allocation is vacated.
+    fn r_src(self) -> i128 {
+        match self {
+            FreeNeighbours::Both => 1,
+            FreeNeighbours::One => 0,
+            FreeNeighbours::Neither => -1,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            FreeNeighbours::Both => 0,
+            FreeNeighbours::One => 1,
+            FreeNeighbours::Neither => 2,
+        }
+    }
+}
+
+/// A candidate's per-byte gain, as the exact rational `num / den`.
+///
+/// With `α = 0` this is just the travel distance, but the fragmentation term
+/// makes it `d + α·r/s`, which is not an integer -- and the denominators differ
+/// between candidates, so comparison has to cross-multiply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gain {
+    num: i128,
+    den: i128,
+}
+
+impl Gain {
+    /// Per-byte gain of moving `size` bytes down by `distance`, where the move
+    /// changes the gap count by `r`.
+    fn new(distance: u64, size: u64, r: i128, alpha: u64) -> Self {
+        Self {
+            num: (distance as i128) * (size as i128) + (alpha as i128) * r,
+            den: size as i128,
+        }
+    }
+
+    fn is_positive(self) -> bool {
+        self.num > 0
+    }
+}
+
+impl Ord for Gain {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Denominators are allocation sizes, hence strictly positive, so the
+        // cross-multiplied comparison keeps its direction. `saturating_mul`
+        // only ever bites at heap sizes far past anything realistic, and never
+        // at the shipped `α = 0` (where this reduces to comparing distances).
+        self.num
+            .saturating_mul(other.den)
+            .cmp(&other.num.saturating_mul(self.den))
+    }
+}
+impl PartialOrd for Gain {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// The best candidate seen so far, on two tracks.
 ///
 /// `budget` is a ranking input rather than a cap, so a step that exceeds it is
@@ -55,13 +141,13 @@ struct Entry<Id> {
 /// fits is always preferred, however much less it gains.
 #[derive(Default, Clone, Copy)]
 struct Best {
-    within: Option<(u64, Step<u64>)>,
-    overall: Option<(u64, Step<u64>)>,
+    within: Option<(Gain, Step<u64>)>,
+    overall: Option<(Gain, Step<u64>)>,
 }
 
 impl Best {
-    fn offer(&mut self, gain: u64, step: Step<u64>, budget: u64) {
-        if gain == 0 {
+    fn offer(&mut self, gain: Gain, step: Step<u64>, budget: u64) {
+        if !gain.is_positive() {
             return;
         }
         if step.len <= budget && self.within.is_none_or(|(g, _)| gain > g) {
@@ -80,9 +166,9 @@ impl Best {
     /// both tracks -- whereas pruning on the overall gain could discard a
     /// cheaper candidate that would actually have been chosen. Before any
     /// within-budget candidate is found the bound is 0 and nothing is pruned,
-    /// which is no worse than the exhaustive scan this replaces.
-    fn bound(&self) -> u64 {
-        self.within.map_or(0, |(gain, _)| gain)
+    /// which is no worse than an exhaustive scan.
+    fn bound(&self) -> Option<Gain> {
+        self.within.map(|(gain, _)| gain)
     }
 
     fn pick(self) -> Option<Step<u64>> {
@@ -103,7 +189,11 @@ pub struct GainGreedyHeap<Id> {
     /// Allocation size -> addresses, **fixed-size allocations only**. Resizable
     /// ones would scatter one-per-class and would only have to move again on the
     /// next growth; they stay movable by slides.
-    live_by_size: BTreeMap<u32, BTreeSet<u64>>,
+    ///
+    /// Split by [`FreeNeighbours`], because the `α` term prices *where a move takes
+    /// from*: with it, the best mover in a class is no longer simply its highest
+    /// member, so one sub-maximum per neighbour category is needed.
+    live_by_size: BTreeMap<u32, [BTreeSet<u64>; FreeNeighbours::COUNT]>,
     /// Each class's highest member address -> its size class. The search key for
     /// the branch-and-bound candidate walk: unlike a gain, a class's top changes
     /// only when that class's own members do, never when a `free` elsewhere
@@ -113,6 +203,8 @@ pub struct GainGreedyHeap<Id> {
     end: u64,
     /// Sum of all live allocation sizes.
     live_bytes: u64,
+    /// Weight of the fragmentation term. See [`GainGreedyHeap::alpha`].
+    alpha: u64,
 }
 
 impl<Id> Default for GainGreedyHeap<Id> {
@@ -125,6 +217,7 @@ impl<Id> Default for GainGreedyHeap<Id> {
             tops: BTreeMap::new(),
             end: 0,
             live_bytes: 0,
+            alpha: 0,
         }
     }
 }
@@ -137,6 +230,36 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// Number of live allocations.
     pub fn live_count(&self) -> usize {
         self.allocations.len()
+    }
+
+    /// Weight of the fragmentation term in the compaction potential.
+    ///
+    /// The base potential `Φ = Σ_{live bytes} address` is blind to how the free
+    /// space is *shaped*: it prices a move purely by how far its bytes travel, so
+    /// filling a gap exactly and splitting a large gap into a useless sliver
+    /// score the same. Adding `α·G`, with `G` the number of gaps, makes a move's
+    /// per-byte gain `d + α·r/s`, where `r` is the move's net effect on the gap
+    /// count. That prices two things the base potential cannot: extracting a
+    /// "plug" between two gaps (which merges them) now beats carving a hole out
+    /// of a solid run at equal distance, and an exactly-fitting destination beats
+    /// one that leaves a remainder.
+    ///
+    /// `α` is a policy knob of *this* implementation, so it is a field with an
+    /// accessor rather than an argument of any trait method -- the trait models
+    /// the capability to compact, not the policy behind it. Ships at `0`, which
+    /// makes the gain exactly the travel distance again; raise it when traces
+    /// show large gaps being squandered on small far-travelling movers.
+    ///
+    /// Every gapless layout has `G = 0`, so no value of `α` moves the optimum,
+    /// and a full-run slide always has `r >= +1`, so no value of `α` can stall
+    /// compaction short of compactness.
+    pub fn alpha(&self) -> u64 {
+        self.alpha
+    }
+
+    /// Set the fragmentation weight. See [`alpha`](Self::alpha).
+    pub fn set_alpha(&mut self, alpha: u64) {
+        self.alpha = alpha;
     }
 
     // ---- gap index maintenance ----
@@ -172,11 +295,76 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         self.allocations.range(addr..).next().map(|(&a, _)| a)
     }
 
+    // ---- the mover index, split by neighbour category ----
+
+    /// How `addr` sits between its neighbours, derived from the current map.
+    /// Being at the top of the heap counts as free above: vacating there lets
+    /// `end` retreat rather than minting a gap.
+    fn neighbours_of(&self, addr: u64, len: u32) -> FreeNeighbours {
+        let below_free = self.prev_end(addr) < addr;
+        let above = addr + len as u64;
+        let above_free = self.next_start(above).is_none_or(|next| next > above);
+        match (below_free, above_free) {
+            (true, true) => FreeNeighbours::Both,
+            (false, false) => FreeNeighbours::Neither,
+            _ => FreeNeighbours::One,
+        }
+    }
+
+    /// Drop `addr` from the mover index, using the category it currently has.
+    /// Must be called *before* the map change that would alter that category.
+    fn unindex(&mut self, addr: Option<u64>) {
+        let Some(addr) = addr else { return };
+        let Some(&e) = self.allocations.get(&addr) else {
+            return;
+        };
+        if !e.id.is_fixed_size() {
+            return;
+        }
+        let slot = self.neighbours_of(addr, e.len).index();
+        let was = self.class_top(e.len);
+        if let Some(sets) = self.live_by_size.get_mut(&e.len) {
+            sets[slot].remove(&addr);
+            if sets.iter().all(BTreeSet::is_empty) {
+                self.live_by_size.remove(&e.len);
+            }
+        }
+        self.refresh_top(e.len, was);
+    }
+
+    /// Add `addr` back to the mover index under its (re-derived) category.
+    fn reindex(&mut self, addr: Option<u64>) {
+        let Some(addr) = addr else { return };
+        let Some(&e) = self.allocations.get(&addr) else {
+            return;
+        };
+        if !e.id.is_fixed_size() {
+            return;
+        }
+        let slot = self.neighbours_of(addr, e.len).index();
+        let was = self.class_top(e.len);
+        self.live_by_size.entry(e.len).or_default()[slot].insert(addr);
+        self.refresh_top(e.len, was);
+    }
+
+    /// The neighbours of `addr`, whose categories an insert or remove at `addr`
+    /// can change. Nothing further away is affected, since a category depends
+    /// only on the immediately adjacent space.
+    fn neighbour_addrs(&self, addr: u64, len: u32) -> (Option<u64>, Option<u64>) {
+        let prev = self.allocations.range(..addr).next_back().map(|(&a, _)| a);
+        let next = self.next_start(addr + len as u64);
+        (prev, next)
+    }
+
     // ---- class-top index (the branch-and-bound key) ----
 
     /// The highest-addressed member of size class `size`, if any.
     fn class_top(&self, size: u32) -> Option<u64> {
-        self.live_by_size.get(&size)?.last().copied()
+        self.live_by_size
+            .get(&size)?
+            .iter()
+            .filter_map(|set| set.last().copied())
+            .max()
     }
 
     /// Re-key `tops` for `size` after its membership changed. `was` is the
@@ -194,6 +382,12 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
 
     /// Record an allocation at `addr`, which must be free and `len` bytes wide.
     fn insert_raw(&mut self, addr: u64, len: u32, id: Id) {
+        // The neighbours' categories change as soon as this lands next to them,
+        // so pull them out of the mover index first and put them back after.
+        let (prev, next) = self.neighbour_addrs(addr, len);
+        self.unindex(prev);
+        self.unindex(next);
+
         let prev_end = self.prev_end(addr);
         match self.next_start(addr) {
             Some(next) => {
@@ -210,32 +404,30 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         }
         self.allocations.insert(addr, Entry { len, id });
         self.by_id.insert(id, addr);
-        if id.is_fixed_size() {
-            let was = self.class_top(len);
-            self.live_by_size.entry(len).or_default().insert(addr);
-            self.refresh_top(len, was);
-        }
         self.live_bytes += len as u64;
+
+        self.reindex(prev);
+        self.reindex(next);
+        self.reindex(Some(addr));
     }
 
     /// Drop the allocation at `addr`, coalescing its range into the neighbouring
     /// gaps (or retreating `end` if it was the topmost).
     fn remove_raw(&mut self, addr: u64) -> Entry<Id> {
-        let e = self
+        let len = self
             .allocations
-            .remove(&addr)
-            .expect("remove_raw on an address with no allocation");
+            .get(&addr)
+            .expect("remove_raw on an address with no allocation")
+            .len;
+        // Same dance as `insert_raw`, and for the same reason -- but this one
+        // must also unindex the departing allocation itself.
+        let (prev, next) = self.neighbour_addrs(addr, len);
+        self.unindex(prev);
+        self.unindex(next);
+        self.unindex(Some(addr));
+
+        let e = self.allocations.remove(&addr).expect("checked above");
         self.by_id.remove(&e.id);
-        if e.id.is_fixed_size() {
-            let was = self.class_top(e.len);
-            if let Some(set) = self.live_by_size.get_mut(&e.len) {
-                set.remove(&addr);
-                if set.is_empty() {
-                    self.live_by_size.remove(&e.len);
-                }
-            }
-            self.refresh_top(e.len, was);
-        }
         self.live_bytes -= e.len as u64;
 
         let prev_end = self.prev_end(addr);
@@ -248,6 +440,9 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             }
             None => self.end = prev_end,
         }
+
+        self.reindex(prev);
+        self.reindex(next);
         e
     }
 
@@ -283,50 +478,92 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
 
     /// The maximal run of contiguous allocations starting at `start`, truncated
     /// to a prefix costing at most `budget` (but always at least one
-    /// allocation). Returns the total byte length.
-    fn run_len_from(&self, start: u64, budget: u64) -> u64 {
+    /// allocation). Returns the byte length and whether the budget cut it short.
+    fn run_len_from(&self, start: u64, budget: u64) -> (u64, bool) {
         let mut cursor = start;
         let mut taken = 0u64;
         for (&addr, e) in self.allocations.range(start..) {
             if addr != cursor {
-                break; // hit a gap: the run ends here
+                return (taken, false); // hit a gap: the run genuinely ends here
             }
             let next = taken + e.len as u64;
             if taken > 0 && next > budget {
-                break; // stay within budget, having taken at least one
+                return (taken, true); // stay within budget, having taken one
             }
             taken = next;
             cursor = addr + e.len as u64;
         }
-        taken
+        (taken, false) // ran off the top of the heap
     }
 
-    /// The evacuation candidate for size class `size`: its highest member
-    /// jumping into the lowest gap that fits.
-    fn evacuation_candidate(&self, size: u32, from: u64) -> Option<(u64, Step<u64>)> {
-        let (to, _) = self.lowest_gap_fitting(size as u64)?;
-        // `then`, not `then_some`: the latter would evaluate `from - to` even
-        // when the gap sits *above* the mover, underflowing.
-        (to < from).then(|| {
-            (
-                from - to,
-                Step {
-                    from,
-                    to,
-                    len: size as u64,
-                },
-            )
-        })
+    /// The best evacuation candidate for size class `size`.
+    ///
+    /// With `α = 0` this is simply the class's highest member jumping into the
+    /// lowest gap that fits. The `α` term widens the search on both sides, but
+    /// only to a fixed handful of possibilities: **three movers**, since the best
+    /// member now maximizes `a + α·r_src/s` and so depends on neighbour category
+    /// (hence the split index), and **two destinations**, since among gaps that
+    /// leave a remainder the lowest maximizes `d`, and among exactly-fitting ones
+    /// likewise -- no third can win.
+    fn evacuation_candidate(&self, size: u32) -> Option<(Gain, Step<u64>)> {
+        let s = size as u64;
+        let sets = self.live_by_size.get(&size)?;
+        let lowest_fitting = self.lowest_gap_fitting(s);
+        let lowest_exact = self
+            .free_by_size
+            .get(&s)
+            .and_then(|starts| starts.first().copied());
+
+        let mut best: Option<(Gain, Step<u64>)> = None;
+        for category in [
+            FreeNeighbours::Both,
+            FreeNeighbours::One,
+            FreeNeighbours::Neither,
+        ] {
+            let Some(&from) = sets[category.index()].last() else {
+                continue;
+            };
+            for (to, r_dest) in [
+                lowest_fitting.map(|(to, len)| (to, i128::from(len == s))),
+                lowest_exact.map(|to| (to, 1)),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if to >= from {
+                    continue;
+                }
+                let gain = Gain::new(from - to, s, category.r_src() + r_dest, self.alpha);
+                if best.is_none_or(|(g, _)| gain > g) {
+                    best = Some((gain, Step { from, to, len: s }));
+                }
+            }
+        }
+        best
     }
 
     /// The slide candidate: the run above the largest gap, shifting down into it.
     /// The only candidate shape that moves resizable allocations.
-    fn slide_candidate(&self, budget: u64) -> Option<(u64, Step<u64>)> {
+    ///
+    /// A *maximal* run is flanked by free space above (a gap, or the top of the
+    /// heap), so sliding it merges that with the range it vacates, or lets `end`
+    /// retreat: `r = +1` either way. That is what guarantees a positive-gain move
+    /// always exists while any gap does, for every `α`. A budget-truncated prefix
+    /// instead leaves the rest of the run above it, so the gap is merely
+    /// relocated: `r = 0`.
+    fn slide_candidate(&self, budget: u64) -> Option<(Gain, Step<u64>)> {
         let (&gap_len, starts) = self.free_by_size.last_key_value()?;
         let to = *starts.first()?;
         let from = to + gap_len;
-        let len = self.run_len_from(from, budget);
-        (len > 0).then_some((gap_len, Step { from, to, len }))
+        let (len, truncated) = self.run_len_from(from, budget);
+        if len == 0 {
+            return None;
+        }
+        let r = if truncated { 0 } else { 1 };
+        Some((
+            Gain::new(gap_len, len, r, self.alpha),
+            Step { from, to, len },
+        ))
     }
 }
 
@@ -426,10 +663,15 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
             best.offer(gain, step, budget);
         }
         for (&top, &size) in self.tops.iter().rev() {
-            if top <= best.bound() {
-                break; // gain <= top, so nothing further down can win
+            if let Some(bound) = best.bound() {
+                // gain <= top + α·r/s <= top + 2α, and the walk is descending in
+                // `top`, so once even that widened bound cannot win, nothing
+                // below it can either. (At α = 0 this is exactly `top <= best`.)
+                if Gain::new(top.saturating_add(2 * self.alpha), 1, 0, 0) <= bound {
+                    break;
+                }
             }
-            if let Some((gain, step)) = self.evacuation_candidate(size, top) {
+            if let Some((gain, step)) = self.evacuation_candidate(size) {
                 best.offer(gain, step, budget);
             }
         }
@@ -481,9 +723,8 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         if let Some((gain, step)) = self.slide_candidate(budget) {
             best.offer(gain, step, budget);
         }
-        for (&size, members) in &self.live_by_size {
-            let top = *members.last().expect("no empty classes");
-            if let Some((gain, step)) = self.evacuation_candidate(size, top) {
+        for &size in self.live_by_size.keys() {
+            if let Some((gain, step)) = self.evacuation_candidate(size) {
                 best.offer(gain, step, budget);
             }
         }
@@ -511,17 +752,26 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         }
         assert_eq!(self.free_by_size, expected_free, "free_by_size drifted");
 
-        let mut expected_live: BTreeMap<u32, BTreeSet<u64>> = BTreeMap::new();
+        let mut expected_live: BTreeMap<u32, [BTreeSet<u64>; FreeNeighbours::COUNT]> =
+            BTreeMap::new();
         for (&addr, e) in &self.allocations {
             if e.id.is_fixed_size() {
-                expected_live.entry(e.len).or_default().insert(addr);
+                let slot = self.neighbours_of(addr, e.len).index();
+                expected_live.entry(e.len).or_default()[slot].insert(addr);
             }
         }
         assert_eq!(self.live_by_size, expected_live, "live_by_size drifted");
 
         let expected_tops: BTreeMap<u64, u32> = expected_live
             .iter()
-            .map(|(&size, members)| (*members.last().expect("no empty classes"), size))
+            .map(|(&size, sets)| {
+                let top = sets
+                    .iter()
+                    .filter_map(|s| s.last().copied())
+                    .max()
+                    .expect("no empty classes");
+                (top, size)
+            })
             .collect();
         assert_eq!(self.tops, expected_tops, "tops drifted");
     }
@@ -797,6 +1047,117 @@ mod tests {
         assert!(step.len > 5, "the caller is the one who gets to say no");
     }
 
+    /// Lay out an exact address map by allocating wall-to-wall, then freeing the
+    /// entries marked as spacers. `(counter, size, is_spacer)`.
+    fn heap_with_layout(plan: &[(u32, u32, bool)]) -> Heap {
+        let mut h = Heap::new();
+        for &(id, size, _) in plan {
+            h.alloc(fixed(id), size).unwrap();
+        }
+        for &(id, _, spacer) in plan {
+            if spacer {
+                h.free(fixed(id)).unwrap();
+            }
+        }
+        h.assert_invariants();
+        h
+    }
+
+    #[test]
+    fn alpha_prefers_extracting_a_plug_over_a_deeper_mover_that_carves_a_new_gap() {
+        // Same size class, same destination, so the only difference is what each
+        // move does to the *gap count*: the lower mover sits between two gaps
+        // (vacating merges them), the higher one between two live neighbours
+        // (vacating mints a gap).
+        let plan = [
+            (1, 10, true),  // gap  0..10   <- the destination (an exact fit)
+            (2, 20, false), //      10..30
+            (3, 10, true),  // gap  30..40
+            (4, 10, false), //      40..50  <- the plug
+            (5, 10, true),  // gap  50..60
+            (6, 20, false), //      60..80
+            (7, 10, false), //      80..90  <- walled in by live neighbours
+            (8, 20, false), //      90..110
+        ];
+
+        let mut h = heap_with_layout(&plan);
+        assert_eq!(h.alpha(), 0, "the fragmentation term ships off");
+        assert_eq!(
+            h.propose_compaction_step(UNBOUNDED).unwrap(),
+            Step {
+                from: 80,
+                to: 0,
+                len: 10
+            },
+            "distance alone picks the higher mover"
+        );
+
+        // The plug is 40 bytes lower, so it needs 2*alpha > 40*10 to win.
+        h.set_alpha(300);
+        assert_eq!(
+            h.propose_compaction_step(UNBOUNDED).unwrap(),
+            Step {
+                from: 40,
+                to: 0,
+                len: 10
+            },
+            "alpha should buy the gap-merging move"
+        );
+    }
+
+    #[test]
+    fn alpha_prefers_an_exact_fit_over_squandering_a_larger_gap_further_down() {
+        // One mover, two destinations: a deep gap three times too big, and a
+        // shallower one that fits exactly. Splitting the big gap leaves a sliver.
+        let plan = [
+            (1, 30, true),  // gap    0..30   <- deep, but leaves a 20-byte sliver
+            (2, 70, false), //        30..100
+            (3, 10, true),  // gap  100..110  <- exact fit
+            (4, 90, false), //       110..200
+            (5, 10, false), //       200..210 <- the mover
+        ];
+
+        let mut h = heap_with_layout(&plan);
+        assert_eq!(
+            h.propose_compaction_step(UNBOUNDED).unwrap(),
+            Step {
+                from: 200,
+                to: 0,
+                len: 10
+            },
+            "distance alone takes the deeper gap and splits it"
+        );
+
+        // Travelling 100 bytes less must be bought back by erasing a gap.
+        h.set_alpha(2000);
+        assert_eq!(
+            h.propose_compaction_step(UNBOUNDED).unwrap(),
+            Step {
+                from: 200,
+                to: 100,
+                len: 10
+            },
+            "alpha should reroute the mover to the exact fit"
+        );
+    }
+
+    #[test]
+    fn compaction_still_converges_under_a_large_alpha() {
+        // Termination does not depend on alpha: a maximal run is always flanked
+        // by free space, so sliding it always merges two gaps (r >= +1) and its
+        // gain stays positive however the term is weighted.
+        for alpha in [0u64, 1, 1000, 1_000_000] {
+            let plan: Vec<(u32, u32, bool)> =
+                (1..=21).map(|i| (i, 8 + (i % 5) * 7, i % 3 == 0)).collect();
+            let mut h = heap_with_layout(&plan);
+            h.set_alpha(alpha);
+            assert!(h.len() > h.live_bytes(), "the layout should start gappy");
+
+            compact_fully(&mut h, UNBOUNDED);
+            assert_eq!(h.len(), h.live_bytes(), "alpha={alpha} failed to compact");
+        }
+    }
+
     #[test]
     fn the_bounded_walk_agrees_with_an_exhaustive_scan() {
         // The branch-and-bound is meant to be a pure optimization, so check it
@@ -828,13 +1189,19 @@ mod tests {
                 h.free(victim).unwrap();
             }
 
-            for budget in [1u64, 16, 64, u64::MAX] {
-                assert_eq!(
-                    h.propose_compaction_step(budget),
-                    h.propose_by_exhaustive_scan(budget),
-                    "bounded walk disagreed with the exhaustive scan at budget {budget}"
-                );
+            // Also across alphas: the walk's stop condition widens by 2*alpha,
+            // and that widening has to be enough to stay exact.
+            for alpha in [0u64, 7, 5000] {
+                h.set_alpha(alpha);
+                for budget in [1u64, 16, 64, u64::MAX] {
+                    assert_eq!(
+                        h.propose_compaction_step(budget),
+                        h.propose_by_exhaustive_scan(budget),
+                        "bounded walk disagreed with the scan at alpha={alpha} budget={budget}"
+                    );
+                }
             }
+            h.set_alpha(0);
             if let Some(step) = h.propose_compaction_step(64) {
                 h.commit_compaction_step(step);
                 h.assert_invariants();
