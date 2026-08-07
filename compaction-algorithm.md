@@ -216,11 +216,28 @@ so the class contributes three candidate movers, the highest one in each of the
 three neighbour categories. Resizable allocations are not grouped, so each is its
 own candidate.
 
-**Searching them.** Candidates are examined in **descending address order**,
-which the gain formula makes a genuine best-first ordering: `d = a − dest ≤ a`
-because destinations are non-negative, so a candidate at address `a` can never
-gain more than `a + 2α`. Once the best gain found so far reaches that bound, the
-search stops — nothing lower can beat it. §5 gives the loop.
+**Searching them.** The search enumerates **destinations**, not movers. For a
+fixed gap the best mover is whichever fits and sits highest, and one index
+descent answers that — so a single visit weighs every allocation in the heap at
+once, where visiting a mover would weigh one allocation against every gap. It
+also front-loads the value: the lowest gap is the most valuable destination there
+is, and it yields a candidate whenever *any* allocation is small enough to fit,
+whereas the topmost mover frequently has nowhere to go at all.
+
+Gaps are examined in **increasing** address, which makes the stopping rule
+monotone. With `T` the topmost allocation's address, a move into the gap at
+`dest` gains at most `T − dest` (plus at most `2α` from the fragmentation term,
+at `s = 1`), and every unexamined gap sits at least as high — so once that
+ceiling can no longer beat the best gain found, nothing deeper can. §5 gives the
+loop.
+
+This is exact at `α = 0`. Above it there is a bounded approximation: for a given
+gap the search takes the highest-addressed allocation that fits, but the gain
+also carries `α·r_src/s`, and neither `r_src` nor `s` is constant across the
+allocations that fit — so the highest-addressed one need not be the best. The
+shortfall is at most `2α` per byte, the same constant that widens the stopping
+rule. Exact-fit destinations are unaffected, since they pin `s` to the gap's
+width and are indexed per neighbour category.
 
 Larger-than-needed gaps are simply **split**: the mover takes the bottom, and the
 remainder becomes an ordinary gap available to the next move. This makes
@@ -298,30 +315,27 @@ propose_step(budget):
                     Step(from = gap_start + gap_len, to = gap_start, len = run_len),
                     budget)
 
-    # ---- candidate 2..n: evacuations, best-first by address ----
-    # Two streams, merged in descending address order: one entry per fixed-size
-    # class (at the class's highest member) and one per resizable allocation.
-    for addr in merge_descending(fixed_class_tops(), resizable_addresses()):
-        if best.within_budget exists and addr + 2*alpha <= gain(best.within_budget):
-            break                         # see below: nothing lower can win
+    # ---- candidate 2..n: evacuations, one visit per destination ----
+    # Gaps in *increasing* address, so the ceiling below only ever falls.
+    T = address of the topmost allocation
+    for (dest, width) in gaps_ascending():
+        if best.within_budget exists and (T - dest) + 2*alpha <= gain(best.within_budget):
+            break                         # see below: nothing deeper can win
 
-        if addr is a fixed-size class top with size s:
-            destinations = [ (lowest_gap_of_width_at_least(s), +1 iff exact),
-                             (lowest_gap_of_width_exactly(s),  +1) ]
-            movers = [ (top member of s with 2 free neighbours, r_src = +1),
-                       (top member of s with 1 free neighbour,  r_src =  0),
-                       (top member of s with 0 free neighbours, r_src = -1) ]
-        else:                             # a resizable allocation, on its own
-            s = size of the allocation at addr
-            destinations = [ (lowest_gap_of_width_at_least(s), 0) ]   # no exact-fit bonus
-            movers = [ (addr, r_src of addr) ]
+        # Inexact: for a fixed destination the gain rises with the mover's
+        # address, so the highest-addressed allocation that fits is the only
+        # one worth trying. One index descent, whatever the heap size.
+        (from, s) = highest_allocation_of_size_at_most(width)
+        if from > dest:
+            offer(best, gain(d = from - dest, s, r_src of from),
+                        Step(from, to = dest, len = s), budget)
 
-        for (mover, r_src) in movers:
-            for (dest, r_dest) in destinations:
-                if dest < mover:
-                    offer(best, gain(d = mover - dest, s, r_src + r_dest),
-                                Step(from = mover, to = dest, len = s),
-                                budget)
+        # Exact: only fixed-size allocations earn the +1, and they are indexed
+        # by size *and* neighbour category, so all three sub-maxima are weighed.
+        for (mover, r_src) in fixed_class_sub_maxima(size = width):
+            if mover > dest:
+                offer(best, gain(d = mover - dest, s = width, r_src + 1),
+                            Step(mover, to = dest, len = width), budget)
 
     return best.within_budget ?? best.overall     # prefer to fit; else the best move
 
@@ -339,20 +353,20 @@ commit_step(step):
         reinsert m at (m.address - (step.from - step.to))
 ```
 
-The `break` deserves a word, since it is what keeps the search from visiting every
-candidate. A mover's gain is `d + α·r/s` with `d ≤ mover`, so a candidate at
-address `a` can never gain more than `a + 2α` (the `2α` is the term's largest
-possible per-byte value, at `s = 1`; the tighter `2α/s` is not monotone in the
-address and so would not be a sound stopping rule for a descending walk). Since
-candidates are visited in descending address, once the best gain found already
-matches that bound, nothing lower can beat it.
+The `break` deserves a word, since it is what keeps the search from examining
+every gap. A move's gain is `d + α·r/s`, and a move into the gap at `dest` has
+`d = mover − dest ≤ T − dest` where `T` is the topmost allocation. So its gain
+cannot exceed `(T − dest) + 2α` — the `2α` being the term's largest possible
+per-byte value, at `s = 1`; the tighter `2α/s` is not monotone and so would not
+be a sound stopping rule. Since gaps are examined in *increasing* address, that
+ceiling only ever falls, and once it no longer beats the best gain found, nothing
+deeper can.
 
 The bound compared against is deliberately the *within-budget* best: it is no
 larger than the overall best, so pruning on it is sound for both tracks. Before
-any within-budget candidate turns up the bound is 0 and nothing is pruned, which
-is no worse than visiting everything. That worst case is real — near quiescence
-every gain is small, so the walk runs long — and bounding it is on the deferred
-list (§6).
+any within-budget candidate turns up the bound is 0 and nothing is pruned. That
+happens when no gap fits anything at all, which is a real state and the one
+remaining case where the search reaches the last gap (§6).
 
 The caller drives it:
 
@@ -392,13 +406,12 @@ Discussed, not implemented:
   class-visiting order changes.
 - **Tuning `α`.** Ships at 0. There is no measurement yet indicating a good value,
   or that a nonzero one pays for itself.
-- **Bounding the candidate walk near quiescence.** The `break` prunes hard while a
-  good move exists high in the file, and degrades toward visiting every candidate
-  only when every gain is small — i.e. near quiescence, where there is little left
-  to do. A visit cap would bound even that, and it would be a principled
-  approximation rather than an arbitrary one: since gain ≤ address and the walk
-  is in descending address, capping at `K` yields the best of the `K` most
-  promising candidates, with the loss bounded by the `K`-th address.
+- **Bounding the number of gaps examined.** The ceiling rule stops the search
+  early whenever a good move exists, but a heap whose gaps are all too narrow for
+  anything to fit establishes no bound at all and the search reaches the last
+  gap. A cap would bound that, and it would be principled rather than arbitrary:
+  gaps are examined deepest-first, so capping at `K` yields the best move among
+  the `K` most valuable destinations.
 - **Rewarding destination gaps that are an integer multiple of the mover.** A gap
   of width `k·s` absorbs an `s`-sized mover and leaves a `(k−1)·s` remainder that
   is *itself* an exact fit for the same class, so no sliver is stranded. Worth
@@ -435,20 +448,18 @@ mutation funnels through (insert one allocation, remove one allocation):
 | `by_id` | `HashMap<Id, u64>` | `lookup(id)` — this *is* the id table's address column |
 | `free_by_size` | `BTreeMap<u64, BTreeSet<u64>>` | the *largest* gap; the lowest gap of a width *exactly* `s` |
 | `gaps` | B+ tree of gaps keyed by address, augmented with each subtree's longest gap | the lowest gap of width *at least* `s` |
-| `live_by_size` | `BTreeMap<u32, [BTreeSet<u64>; 3]>`, fixed-size allocations only | each class's highest member, per neighbour category |
-| `tops` | `BTreeMap<u64, u32>` | fixed-size classes in descending order of top address |
-| `resizable_by_address` | `BTreeSet<u64>` | resizable allocations in descending address order |
+| `live_by_size` | `BTreeMap<u32, [BTreeSet<u64>; 3]>`, fixed-size allocations only | each class's highest member, per neighbour category, for *exact*-fit destinations |
+| `movers` | B+ tree of allocations keyed by address, augmented with each subtree's smallest | the highest-addressed allocation of size *at most* `w` |
 
-The last two are the two streams the candidate walk merges. Descending iteration
-needs no cursor: std's B-tree iterators are `DoubleEndedIterator`, so `.rev()` is
-`O(log n)` to start and `O(1)` per step, and merging two of them is a pair of
-`Peekable`s. Resizable allocations get a plain address set rather than a place in
-`live_by_size` because their sizes are one-off — size classes would degenerate to
-singletons — and they need no neighbour-category split either, since each is
-evaluated individually and its category can be computed on the spot from its
-neighbours in `allocations`.
+`movers` and `gaps` are mirror images, and between them they are the search: the
+loop walks `gaps` ascending and asks `movers` one question per gap. `gaps`
+minimizes an address subject to a *lower* bound on length and descends
+leftmost-first; `movers` maximizes an address subject to an *upper* bound on size
+and descends rightmost-first. Both are 2-D dominance queries that neither an
+address-ordered nor a size-ordered map answers alone, and in both the length has
+to sit in the key because the crate's leaf-level search sees only keys.
 
-Two of the indexes deserve a longer note.
+One of the indexes deserves a longer note.
 
 **`gaps` is an augmented tree because "lowest gap of width ≥ `s`" is a 2-D
 dominance query** — minimize address subject to a size bound — which neither an
@@ -478,12 +489,16 @@ factor in the clustered case.
 **`live_by_size` is split three ways** by whether an allocation has two, one, or
 no free neighbours, because that is what determines `r_src`. A move can change the
 category of the (at most two) allocations adjacent to it, so each insert and
-remove un-indexes its neighbours, mutates, and re-indexes them.
+remove un-indexes its neighbours, mutates, and re-indexes them. It holds only
+fixed-size allocations, because only they earn the exact-fit bonus that this
+index serves.
 
 Costs: every foreground operation (`alloc`, `free`, `resize`) is `O(log n)` and
-touches `O(1)` size classes. `propose_compaction_step` is `O(log n)` per
-candidate visited, with the walk usually stopping after one or two — but see §6
-on bounding it near quiescence, where it does not. Committing a step
-is `O(k log n)` for the `k` allocations it moves — proportional to the work being
-done. All indexes together hold `O(live + gaps)` entries, a constant factor on the
-id table that has to exist anyway.
+touches `O(1)` size classes. `propose_compaction_step` is `O(log n)` per *gap*
+examined, and the ceiling rule usually stops it after one or two. Committing a
+step is `O(k log n)` for the `k` allocations it moves — proportional to the work
+being done. All indexes together hold `O(live + gaps)` entries, a constant factor
+on the id table that has to exist anyway.
+
+Measurements of the search's actual cost, and of what an earlier mover-enumerating
+version cost, are in [`test-results/`](test-results/README.md).

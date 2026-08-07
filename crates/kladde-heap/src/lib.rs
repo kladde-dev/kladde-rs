@@ -29,6 +29,7 @@ mod gap_tree;
 mod heap;
 mod journaled;
 mod mock;
+mod mover_tree;
 mod pointer;
 mod storage;
 mod unjournaled;
@@ -59,4 +60,5 @@ pub use word::Word;
 #[doc(hidden)]
 pub mod bench_support {
     pub use crate::gap_tree::GapTree;
+    pub use crate::mover_tree::MoverTree;
 }
