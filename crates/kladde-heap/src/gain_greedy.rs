@@ -28,15 +28,17 @@
 //!
 //! Two candidate shapes are generated (§4):
 //!
-//! - **Evacuation**, one per fixed-size class: its highest-addressed member
-//!   jumps into the lowest gap that fits it.
+//! - **Evacuation**: an allocation jumps into a gap below it. Fixed-size ones
+//!   are grouped into size classes and contribute their highest member (per
+//!   neighbour category); resizable ones have one-off sizes, so each is its own
+//!   candidate and earns no exact-fit bonus -- a snug fit would only re-open on
+//!   its next growth.
 //! - **Slide**, one overall: the maximal contiguous *run* above the largest gap
-//!   shifts down into it. This is what moves resizable allocations, which are
-//!   deliberately not indexed as movers.
+//!   shifts down into it. This is what guarantees progress when nothing fits.
 //!
-//! The best candidate is found by a bounded walk rather than a full scan of the
-//! classes -- see [`GainGreedyHeap::propose_compaction_step`] for why the search
-//! key is a class's top address and not its gain.
+//! The best candidate is found by a bounded walk rather than a full scan -- see
+//! [`GainGreedyHeap::propose_compaction_step`] for why the search key is an
+//! address and not a gain.
 //!
 //! [`GainGreedyHeap::alpha`] optionally adds a fragmentation term, which is the
 //! only thing that prices the *shape* of the free space rather than just how far
@@ -200,6 +202,12 @@ pub struct GainGreedyHeap<Id> {
     /// from*: with it, the best mover in a class is no longer simply its highest
     /// member, so one sub-maximum per neighbour category is needed.
     live_by_size: BTreeMap<u32, [BTreeSet<u64>; FreeNeighbours::COUNT]>,
+    /// Addresses of the **resizable** allocations, which are movers too but do
+    /// not group usefully by size: their sizes are one-off, so size classes
+    /// would degenerate to singletons. Each is instead evaluated individually
+    /// when the candidate walk reaches it, with its neighbour category computed
+    /// on the spot rather than indexed.
+    resizable_by_address: BTreeSet<u64>,
     /// Each class's highest member address -> its size class. The search key for
     /// the branch-and-bound candidate walk: unlike a gain, a class's top changes
     /// only when that class's own members do, never when a `free` elsewhere
@@ -221,6 +229,7 @@ impl<Id> Default for GainGreedyHeap<Id> {
             free_by_size: BTreeMap::new(),
             gaps: GapTree::default(),
             live_by_size: BTreeMap::new(),
+            resizable_by_address: BTreeSet::new(),
             tops: BTreeMap::new(),
             end: 0,
             live_bytes: 0,
@@ -414,6 +423,9 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         self.allocations.insert(addr, Entry { len, id });
         self.by_id.insert(id, addr);
         self.live_bytes += len as u64;
+        if !id.is_fixed_size() {
+            self.resizable_by_address.insert(addr);
+        }
 
         self.reindex(prev);
         self.reindex(next);
@@ -438,6 +450,9 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         let e = self.allocations.remove(&addr).expect("checked above");
         self.by_id.remove(&e.id);
         self.live_bytes -= e.len as u64;
+        if !e.id.is_fixed_size() {
+            self.resizable_by_address.remove(&addr);
+        }
 
         let prev_end = self.prev_end(addr);
         let above = addr + e.len as u64;
@@ -556,6 +571,33 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         best
     }
 
+    /// The evacuation candidate for the resizable allocation at `addr`.
+    ///
+    /// Simpler than its fixed-size counterpart in two ways, both following from
+    /// `r_dest = 0`. There is no exact-fit reward: a resizable allocation that
+    /// snugly fills a gap has to relocate again the moment it grows, so the gap
+    /// it erased comes straight back, and the reward would be luring the policy
+    /// into a round trip. With `r_dest` pinned, only one destination can win --
+    /// the lowest gap that fits, which maximizes the travel distance. The source
+    /// term still applies in full: vacating a plug between two gaps really does
+    /// merge them, whatever the mover's sizedness.
+    fn resizable_candidate(&self, addr: u64) -> Option<(Gain, Step<u64>)> {
+        let len = self.allocations.get(&addr)?.len;
+        let s = len as u64;
+        let (to, _) = self.lowest_gap_fitting(s)?;
+        (to < addr).then(|| {
+            let r_src = self.neighbours_of(addr, len).r_src();
+            (
+                Gain::new(addr - to, s, r_src, self.alpha),
+                Step {
+                    from: addr,
+                    to,
+                    len: s,
+                },
+            )
+        })
+    }
+
     /// The slide candidate: the run above the largest gap, shifting down into it.
     /// The only candidate shape that moves resizable allocations.
     ///
@@ -654,19 +696,26 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
             .map(|(&addr, e)| (e.id, addr, e.len))
     }
 
-    /// Pick the highest-gain move, **without** evaluating every size class.
+    /// Pick the highest-gain move **without** evaluating every candidate.
     ///
-    /// A naive priority queue over classes keyed by last-computed gain would be
-    /// subtly wrong: when a `free` opens a deep gap, the true gains of every
-    /// class small enough to fit it rise at once, and a max-queue can sit on a
-    /// stale-low key forever. The fix is to key by something *class-locally*
-    /// maintainable. A mover's gain is `top - dest <= top`, since `dest >= 0`,
-    /// and `top(s)` changes only when class `s`'s own members change -- never
-    /// through gap events. So walking `tops` downward, the walk can stop the
-    /// moment the best gain so far reaches the next class's top: no unvisited
-    /// class can beat it.
+    /// The search key is an address, not a gain. Keying on gains would be subtly
+    /// wrong: when a `free` opens a deep gap, the true gains of every mover small
+    /// enough to fit it rise at once, so any cached gain ordering goes stale in
+    /// the direction that matters and can sit on the globally best move
+    /// indefinitely. An address does not have that problem -- it changes only
+    /// when that allocation itself moves.
     ///
-    /// The slide is evaluated first, outside the walk, because it is a single
+    /// And an address bounds a gain: `d = mover - dest <= mover`, since
+    /// `dest >= 0`. So walking candidates in descending address, the walk can
+    /// stop the moment the best gain so far reaches the next candidate's
+    /// address: nothing below it can beat that. (The `2α` widening covers the
+    /// fragmentation term's largest possible per-byte contribution, at `s = 1`.
+    /// The per-class `2α/s` would be tighter but is not monotone in the address,
+    /// so it is not a sound stopping rule for a descending walk.)
+    ///
+    /// Two streams are merged, both descending: one entry per fixed-size class
+    /// (at the class's highest member) and one per resizable allocation. The
+    /// slide is evaluated first, outside the walk, because it is a single
     /// O(log n) lookup and usually seeds a bound straight away.
     fn propose_compaction_step(&self, budget: u64) -> Option<Step<u64>> {
         if self.free_by_size.is_empty() {
@@ -676,16 +725,31 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
         if let Some((gain, step)) = self.slide_candidate(budget) {
             best.offer(gain, step, budget);
         }
-        for (&top, &size) in self.tops.iter().rev() {
+
+        let mut classes = self.tops.iter().rev().peekable();
+        let mut resizables = self.resizable_by_address.iter().rev().peekable();
+        loop {
+            // `Option`'s ordering puts `None` first, so `max` picks whichever
+            // stream still has the higher address. The two never collide: an
+            // address holds one allocation, and it is either fixed or resizable.
+            let class_at = classes.peek().map(|(&addr, _)| addr);
+            let resizable_at = resizables.peek().map(|&&addr| addr);
+            let Some(next) = class_at.max(resizable_at) else {
+                break;
+            };
             if let Some(bound) = best.bound() {
-                // gain <= top + α·r/s <= top + 2α, and the walk is descending in
-                // `top`, so once even that widened bound cannot win, nothing
-                // below it can either. (At α = 0 this is exactly `top <= best`.)
-                if Gain::new(top.saturating_add(2 * self.alpha), 1, 0, 0) <= bound {
+                if Gain::new(next.saturating_add(2 * self.alpha), 1, 0, 0) <= bound {
                     break;
                 }
             }
-            if let Some((gain, step)) = self.evacuation_candidate(size) {
+            let candidate = if class_at == Some(next) {
+                let (_, &size) = classes.next().expect("peeked");
+                self.evacuation_candidate(size)
+            } else {
+                let &addr = resizables.next().expect("peeked");
+                self.resizable_candidate(addr)
+            };
+            if let Some((gain, step)) = candidate {
                 best.offer(gain, step, budget);
             }
         }
@@ -751,6 +815,11 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
                 best.offer(gain, step, budget);
             }
         }
+        for &addr in &self.resizable_by_address {
+            if let Some((gain, step)) = self.resizable_candidate(addr) {
+                best.offer(gain, step, budget);
+            }
+        }
         best.pick()
     }
 
@@ -801,6 +870,17 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             }
         }
         assert_eq!(self.live_by_size, expected_live, "live_by_size drifted");
+
+        let expected_resizable: BTreeSet<u64> = self
+            .allocations
+            .iter()
+            .filter(|(_, e)| !e.id.is_fixed_size())
+            .map(|(&addr, _)| addr)
+            .collect();
+        assert_eq!(
+            self.resizable_by_address, expected_resizable,
+            "resizable_by_address drifted"
+        );
 
         let expected_tops: BTreeMap<u64, u32> = expected_live
             .iter()
@@ -1088,19 +1168,143 @@ mod tests {
     }
 
     /// Lay out an exact address map by allocating wall-to-wall, then freeing the
-    /// entries marked as spacers. `(counter, size, is_spacer)`.
-    fn heap_with_layout(plan: &[(u32, u32, bool)]) -> Heap {
+    /// entries marked as spacers. `(id, size, is_spacer)`.
+    fn heap_of(plan: &[(Pointer<u32>, u32, bool)]) -> Heap {
         let mut h = Heap::new();
         for &(id, size, _) in plan {
-            h.alloc(fixed(id), size).unwrap();
+            h.alloc(id, size).unwrap();
         }
         for &(id, _, spacer) in plan {
             if spacer {
-                h.free(fixed(id)).unwrap();
+                h.free(id).unwrap();
             }
         }
         h.assert_invariants();
         h
+    }
+
+    /// [`heap_of`] with every allocation fixed-size. `(counter, size, is_spacer)`.
+    fn heap_with_layout(plan: &[(u32, u32, bool)]) -> Heap {
+        let owned: Vec<_> = plan
+            .iter()
+            .map(|&(id, size, spacer)| (fixed(id), size, spacer))
+            .collect();
+        heap_of(&owned)
+    }
+
+    #[test]
+    fn a_resizable_tail_is_evacuated_rather_than_sliding_the_whole_heap() {
+        // One small gap at the bottom, a densely packed middle, and a small
+        // resizable allocation at the top. Sliding is available but absurd: it
+        // would copy the whole heap to close a 100-byte gap, where evacuating
+        // the tail copies 50 bytes and travels 10100.
+        let mut h = Heap::new();
+        h.alloc(fixed(1), 100).unwrap(); // 0..100, freed below
+        for i in 0..10 {
+            h.alloc(fixed(10 + i), 1000).unwrap(); // 100..10100
+        }
+        h.alloc(resizable(99), 50).unwrap(); // 10100..10150
+        h.free(fixed(1)).unwrap(); // gap [0, 100)
+
+        let step = h.propose_compaction_step(UNBOUNDED).unwrap();
+        assert_eq!(
+            step,
+            Step {
+                from: 10100,
+                to: 0,
+                len: 50
+            },
+            "the resizable tail is the deepest mover, so it must be considered"
+        );
+        h.commit_compaction_step(step);
+        assert_eq!(h.len(), 10100, "the tail came off for 50 bytes of copying");
+        h.assert_invariants();
+    }
+
+    #[test]
+    fn a_resizable_mover_earns_no_exact_fit_bonus() {
+        // One mover, two destinations: a deeper gap that leaves a sliver, and a
+        // shallower one that fits exactly. The only difference between the two
+        // heaps below is the *sizedness* of the mover, so any difference in the
+        // chosen destination is the exact-fit bonus and nothing else.
+        let layout = |mover| {
+            [
+                (fixed(1), 30, true),  // gap    0..30   <- deeper, leaves a sliver
+                (fixed(2), 70, false), //        30..100
+                (fixed(3), 10, true),  // gap  100..110  <- exact fit
+                (fixed(4), 90, false), //       110..200
+                (mover, 10, false),    //       200..210 <- the mover
+            ]
+        };
+        let mut fixed_mover = heap_of(&layout(fixed(5)));
+        let mut resizable_mover = heap_of(&layout(resizable(5)));
+
+        // Travelling 100 bytes less has to be bought back by erasing a gap, so
+        // with alpha = 0 neither mover takes the exact fit.
+        for h in [&mut fixed_mover, &mut resizable_mover] {
+            assert_eq!(
+                h.propose_compaction_step(UNBOUNDED).unwrap().to,
+                0,
+                "without the fragmentation term, depth decides"
+            );
+        }
+
+        // Turn it on, and only the fixed mover is rerouted.
+        for h in [&mut fixed_mover, &mut resizable_mover] {
+            h.set_alpha(2000);
+        }
+        assert_eq!(
+            fixed_mover.propose_compaction_step(UNBOUNDED).unwrap().to,
+            100,
+            "a fixed mover should take the exact fit"
+        );
+        assert_eq!(
+            resizable_mover
+                .propose_compaction_step(UNBOUNDED)
+                .unwrap()
+                .to,
+            0,
+            "a resizable mover should not: it re-opens that gap on its next growth"
+        );
+    }
+
+    #[test]
+    fn a_resizable_mover_still_earns_the_plug_bonus() {
+        // The *source* half of the fragmentation term applies regardless of
+        // sizedness: vacating an allocation flanked by two gaps really does merge
+        // them, whatever it was that moved out.
+        let plan = [
+            (fixed(1), 10, true),      // gap  0..10   <- destination
+            (fixed(2), 20, false),     //      10..30
+            (fixed(3), 10, true),      // gap 30..40
+            (resizable(4), 10, false), //      40..50  <- the plug
+            (fixed(5), 10, true),      // gap 50..60
+            (fixed(6), 20, false),     //      60..80
+            (resizable(7), 10, false), //      80..90  <- walled in by live neighbours
+            (fixed(8), 20, false),     //      90..110
+        ];
+        let mut h = heap_of(&plan);
+
+        assert_eq!(
+            h.propose_compaction_step(UNBOUNDED).unwrap(),
+            Step {
+                from: 80,
+                to: 0,
+                len: 10
+            },
+            "with alpha = 0 the deeper mover wins"
+        );
+
+        h.set_alpha(300);
+        assert_eq!(
+            h.propose_compaction_step(UNBOUNDED).unwrap(),
+            Step {
+                from: 40,
+                to: 0,
+                len: 10
+            },
+            "the gap-merging source outranks the deeper one once alpha pays for it"
+        );
     }
 
     #[test]
