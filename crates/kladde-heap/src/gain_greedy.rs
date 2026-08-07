@@ -1757,6 +1757,46 @@ mod tests {
     const COMPACTION_INTERVAL: usize = 32;
     const COMPACTION_BUDGET: u64 = 2048;
 
+    /// How much overhead over the live bytes counts as "compact enough".
+    ///
+    /// Driving to a literally gapless heap is not a target any caller has: the
+    /// last fraction of a percent is dominated by narrow gaps bubbling to the
+    /// top one run at a time, which is quadratic in heap size and is exactly the
+    /// work a budget would never buy. Measuring to a threshold keeps the figure
+    /// about the healthy state rather than about the endgame.
+    const COMPACT_ENOUGH_PERCENT: u64 = 1;
+
+    /// The heap's shape at one point in the simulation.
+    #[derive(Clone, Copy)]
+    struct Snapshot {
+        round: usize,
+        allocations: usize,
+        live_bytes: u64,
+        end: u64,
+        gaps: usize,
+    }
+
+    impl Snapshot {
+        fn take(h: &Heap, round: usize) -> Self {
+            Self {
+                round,
+                allocations: h.live_count(),
+                live_bytes: h.live_bytes(),
+                end: h.len(),
+                gaps: h.gaps.len(),
+            }
+        }
+
+        /// Free bytes as a percentage of live bytes.
+        fn overhead_percent(&self) -> f64 {
+            if self.live_bytes == 0 {
+                0.0
+            } else {
+                100.0 * (self.end - self.live_bytes) as f64 / self.live_bytes as f64
+            }
+        }
+    }
+
     /// What one burst achieved.
     #[derive(Default, Clone, Copy)]
     struct BurstStats {
@@ -1790,7 +1830,14 @@ mod tests {
     /// The churny workload the measurement below drives, with compaction
     /// bursts interleaved the way a backend flush does it. Returns the live ids
     /// and what the bursts achieved.
-    fn run_churny_workload_tracked(h: &mut Heap, rounds: usize) -> (Vec<Pointer<u32>>, BurstStats) {
+    fn run_churny_workload_tracked(
+        h: &mut Heap,
+        rounds: usize,
+    ) -> (Vec<Pointer<u32>>, BurstStats, Vec<Snapshot>) {
+        // Sample the heap shape at ~10 points, always immediately after a burst,
+        // so the table shows the state the schedule actually leaves behind.
+        let snapshot_every = (rounds / COMPACTION_INTERVAL / 10).max(1);
+        let mut snapshots = Vec::new();
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut rand = move || {
             state ^= state << 13;
@@ -1834,9 +1881,12 @@ mod tests {
                 bursts.bursts += 1;
                 bursts.steps += steps;
                 bursts.quiesced += u64::from(quiesced);
+                if bursts.bursts % snapshot_every as u64 == 0 {
+                    snapshots.push(Snapshot::take(h, round));
+                }
             }
         }
-        (live, bursts)
+        (live, bursts, snapshots)
     }
 
     fn report_search_stats(label: &str, s: SearchStats) {
@@ -1880,32 +1930,64 @@ mod tests {
     fn candidate_search_cost_over_a_churny_workload() {
         for &rounds in &[400usize, 4_000, 40_000] {
             let mut h = Heap::new();
-            let (_, bursts) = run_churny_workload_tracked(&mut h, rounds);
-            let interleaved = h.search_stats();
+            let (_, bursts, snapshots) = run_churny_workload_tracked(&mut h, rounds);
+            let during_bursts = h.search_stats();
 
-            // Then drive to quiescence: the regime where the search is expected
-            // to be worst, since every remaining gain is small.
+            // Then catch up: compaction with no churn competing, until the file
+            // is within `COMPACT_ENOUGH_PERCENT` of the live bytes. Not to a
+            // gapless heap -- see the constant.
             h.reset_search_stats();
+            let target = h.live_bytes() + h.live_bytes() * COMPACT_ENOUGH_PERCENT / 100;
+            let before = Snapshot::take(&h, rounds);
             let mut steps = 0u64;
-            while let Some(step) = h.propose_compaction_step(4096) {
+            while h.len() > target {
+                let Some(step) = h.propose_compaction_step(4096) else {
+                    break;
+                };
                 h.commit_compaction_step(step);
                 steps += 1;
             }
-            let quiescing = h.search_stats();
+            let catching_up = h.search_stats();
+            let after = Snapshot::take(&h, rounds);
 
             println!(
-                "\n=== {rounds} rounds -> {} live allocations; {steps} steps to quiescence ===",
-                h.live_count()
+                "\n=== {rounds} rounds -> {} live allocations ===",
+                after.allocations
             );
             println!(
                 "  bursts: {} of budget {COMPACTION_BUDGET} every {COMPACTION_INTERVAL} ops; \
-                 {:.1} steps each; {} of them reached quiescence",
+                 {:.1} steps each; {} of them ran out of work",
                 bursts.bursts,
                 bursts.steps as f64 / bursts.bursts.max(1) as f64,
                 bursts.quiesced,
             );
-            report_search_stats("bursts w/ churn", interleaved);
-            report_search_stats("driven to quiescence", quiescing);
+            println!(
+                "  catch-up to <={COMPACT_ENOUGH_PERCENT}% overhead: {steps} steps, \
+                 {:.2}% -> {:.2}% overhead, {} -> {} gaps ({:.4} steps per allocation)",
+                before.overhead_percent(),
+                after.overhead_percent(),
+                before.gaps,
+                after.gaps,
+                steps as f64 / after.allocations.max(1) as f64,
+            );
+            report_search_stats("during bursts", during_bursts);
+            report_search_stats("catching up", catching_up);
+
+            println!(
+                "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>9}",
+                "round", "allocations", "live_bytes", "end", "gaps", "overhead"
+            );
+            for s in &snapshots {
+                println!(
+                    "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8.2}%",
+                    s.round,
+                    s.allocations,
+                    s.live_bytes,
+                    s.end,
+                    s.gaps,
+                    s.overhead_percent()
+                );
+            }
         }
     }
 

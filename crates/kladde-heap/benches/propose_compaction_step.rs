@@ -128,14 +128,19 @@ fn compact_incrementally(h: &mut Heap, budget: u64) {
     }
 }
 
-/// Churn with compaction bursts interleaved: the state a live heap is usually
-/// in, under the schedule a backend actually uses.
+/// Churn with compaction bursts interleaved throughout: the state a live heap is
+/// usually in, under the schedule a backend actually uses.
+///
+/// `n` counts *rounds*, not allocations -- with 60% allocate and 25% free, the
+/// live count settles around a third of it. Compaction never pauses: a state
+/// reached by churning for a long stretch with the compactor switched off is one
+/// no caller can produce, so measuring on it would measure nothing real.
 fn churned(n: usize) -> Heap {
     let mut rand = rng(0x2545_F491);
     let mut h = Heap::new();
     let mut live: Vec<Pointer<u32>> = Vec::new();
     let mut counter = 1u32;
-    for round in 0..(n * 3) {
+    for round in 0..n {
         let roll = rand() % 100;
         if roll < 60 || live.is_empty() {
             let size = [8u32, 16, 16, 64, 250][(rand() % 5) as usize];
@@ -155,11 +160,7 @@ fn churned(n: usize) -> Heap {
         }
 
         // A compaction burst every so often, exactly as a flush would do it.
-        // Capped in total, because each of these steps pays a full search --
-        // the very thing being measured -- and at 100k allocations that is
-        // milliseconds apiece, so an uncapped setup would spend minutes
-        // computing a starting state rather than measuring anything.
-        if round % COMPACTION_INTERVAL == 0 && round < 64_000 {
+        if round % COMPACTION_INTERVAL == 0 {
             compact_incrementally(&mut h, COMPACTION_BUDGET);
         }
     }
