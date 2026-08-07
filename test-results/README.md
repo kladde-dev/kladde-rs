@@ -18,6 +18,31 @@ Environment for every run below: rustc 1.97.1, 11th Gen Intel i7-1165G7 @
 benchmarks from an optimized one, so the two are not directly comparable to each
 other — only across implementations.
 
+### The two phases, and what they do and do not model
+
+The counter runs report two phases separately, because they behave very
+differently:
+
+- **interleaved** — one compaction step every 7 workload operations, budget 128.
+- **quiescing** — no workload at all, budget 4096, repeated until gapless.
+
+**Neither is the schedule the backend actually uses**, and it matters for reading
+the results. The real one is `compact_incrementally(DEFAULT_COMPACTION_BUDGET)`
+on each flush, where the budget is 64 KiB — 512× the interleaved phase's — and
+the call loops internally until that budget is spent. With allocations of 8–300
+bytes, one flush is therefore **hundreds of consecutive steps with no intervening
+mutation**, then a stretch of churn, then another burst.
+
+So the deployed pattern is *bursts*. The interleaved phase models the very start
+of a burst (a freshly mutated heap, one step); the quiescing phase models the
+rest of it (many steps back to back, state evolving only under compaction). The
+two bracket the real behaviour rather than either one being it.
+
+A consequence worth stating plainly: the **call counts in these tables are not
+weights**. The quiescing phase contributes far more calls than the interleaved
+one only because it was run to completion by choice. Do not read "92% of calls
+were in phase X" as "phase X is what matters".
+
 ---
 
 ## Run 1 — mover-first search
@@ -41,10 +66,8 @@ cargo bench -p kladde-heap
 
 ### Counters
 
-`interleaved` = a compaction step every 7 workload ops, budget 128.
-`quiescing` = no churn, budget 4096, run until the heap is gapless.
-`examined` = visited ÷ available, i.e. how much of the candidate space the
-pruning failed to skip.
+Phases as defined above. `examined` = visited ÷ available, i.e. how much of the
+candidate space the pruning failed to skip.
 
 | workload | live allocs | phase | calls | visited | mean/call | max | examined |
 |---|---|---|---|---|---|---|---|
@@ -178,11 +201,24 @@ smaller*, not that the stopping rule fires more often. That was foreseeable in
 hindsight: the ceiling `(T − dest) + 2α` only bites once a high-gain move has been
 found, which is the same condition that defeated the old bound.
 
-**Interleaved churn is slightly worse** — 446 vs 389 items at 40 000 rounds, about
-15%. During active churn there are many gaps and comparatively few of them are
-useful, so enumerating gaps costs a little more than enumerating movers did. The
-regime that dominated total work (quiescing: 66 571 of 72 286 calls) is the one
-that improved, so the aggregate is a clear win, but it is not a win everywhere.
+**The interleaved phase is slightly worse** — 446 vs 389 items at 40 000 rounds,
+about 15%. Immediately after mutation the heap has many gaps and comparatively
+few of them are useful, so enumerating gaps costs a little more there than
+enumerating movers did.
+
+Which of the two phases should carry more weight is a question about the
+*deployed* schedule, and the call counts in the tables above cannot answer it —
+the quiescing phase contributes 66 571 of 72 286 calls only because it was run to
+completion by choice, so citing that split would be circular. The argument has to
+be about shape instead: a real flush spends a 64 KiB budget in one call, which at
+these allocation sizes is hundreds of consecutive steps with no mutation in
+between. That is structurally the quiescing phase, not the interleaved one.
+
+So the expected effect on the real schedule is a small regression at the *start*
+of each flush's burst, and roughly the 6× improvement through the rest of it.
+That is a projection from the shape of the two phases, not something measured
+here — measuring it directly would mean instrumenting the backend's own flush
+loop rather than the heap in isolation.
 
 **`roomy` stays flat** at ~280 ns across all three heap sizes, as it did before:
 when a good move exists, both searches stop almost immediately. Nothing about the
