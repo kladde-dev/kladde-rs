@@ -642,7 +642,16 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     fn offer_evacuations_into(&self, dest: u64, width: u64, budget: u64, best: &mut Best) {
         if let Some((from, size)) = self.movers.highest_fitting(width) {
             if from > dest {
-                let r_src = self.neighbours_of(from, size).r_src();
+                // `r_src` costs two `allocations` range queries -- the mover
+                // arrives from the index as a bare (address, size) with no
+                // neighbour category attached -- and at the shipped `α = 0` the
+                // result is multiplied by zero. This is the search's inner loop,
+                // so skip the lookup rather than pay for a discarded value.
+                let r_src = if self.alpha == 0 {
+                    0
+                } else {
+                    self.neighbours_of(from, size).r_src()
+                };
                 best.offer(
                     Gain::new(from - dest, size as u64, r_src, self.alpha),
                     Step {
