@@ -254,6 +254,10 @@ impl Probe {
 
 /// A relocatable heap over a `u64` address space with `u32` allocation sizes,
 /// compacting by gain-greedy incremental steps. See the module docs.
+///
+/// `Clone` is provided so that a benchmark can measure repeated compaction from
+/// one fixed starting state; it is not cheap (see [`GapTree`]'s `Clone`).
+#[derive(Clone)]
 pub struct GainGreedyHeap<Id> {
     /// Start address -> allocation. Gaps are the space between consecutive
     /// entries; `end` is the last entry's end.
@@ -1754,7 +1758,14 @@ mod tests {
     /// state a burst actually leaves behind, and a burst that compacts fully
     /// would make the "incremental" in the algorithm moot. See
     /// `test-results/README.md` for the measured steps-per-burst this yields.
-    const COMPACTION_INTERVAL: usize = 32;
+    ///
+    /// The interval divides every round count measured here, and a burst fires
+    /// at the *end* of each interval, so a run always stops immediately after
+    /// one. That keeps every measurement at the same phase of the burst cycle --
+    /// otherwise the larger runs would be sampled with more un-compacted churn
+    /// on them than the smaller ones, purely as an artefact of where the loop
+    /// happened to end.
+    const COMPACTION_INTERVAL: usize = 25;
     const COMPACTION_BUDGET: u64 = 2048;
 
     /// How much overhead over the live bytes counts as "compact enough".
@@ -1834,6 +1845,10 @@ mod tests {
         h: &mut Heap,
         rounds: usize,
     ) -> (Vec<Pointer<u32>>, BurstStats, Vec<Snapshot>) {
+        assert!(
+            rounds.is_multiple_of(COMPACTION_INTERVAL),
+            "the run must end on a burst; see COMPACTION_INTERVAL"
+        );
         // Sample the heap shape at ~10 points, always immediately after a burst,
         // so the table shows the state the schedule actually leaves behind.
         let snapshot_every = (rounds / COMPACTION_INTERVAL / 10).max(1);
@@ -1876,7 +1891,7 @@ mod tests {
             // Compact the way a backend does: not one step, but a *burst* --
             // `compact_incrementally` spends a whole budget in one call, so a
             // pause does many consecutive steps with no mutation in between.
-            if round % COMPACTION_INTERVAL == 0 {
+            if (round + 1) % COMPACTION_INTERVAL == 0 {
                 let (steps, quiesced) = compact_incrementally(h, COMPACTION_BUDGET);
                 bursts.bursts += 1;
                 bursts.steps += steps;

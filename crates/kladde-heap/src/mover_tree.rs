@@ -114,6 +114,18 @@ impl Default for MoverTree {
     }
 }
 
+impl Clone for MoverTree {
+    /// Rebuilt entry by entry, for the same reason as [`GapTree`]'s: see
+    /// [`crate::gap_tree::GapTree::clone`].
+    fn clone(&self) -> Self {
+        let mut cloned = Self::default();
+        for (addr, size) in self.iter() {
+            cloned.insert(addr, size);
+        }
+        cloned
+    }
+}
+
 impl MoverTree {
     /// Record a live allocation.
     pub fn insert(&mut self, addr: u64, size: u32) {

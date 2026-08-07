@@ -125,6 +125,20 @@ impl Default for GapTree {
     }
 }
 
+impl Clone for GapTree {
+    /// Rebuilt entry by entry: `sweep-bptree`'s node store is not itself
+    /// `Clone`, so this is `O(n log n)` rather than a copy of the arena. Only
+    /// the benchmark harness clones a heap, and it does so outside the timed
+    /// region.
+    fn clone(&self) -> Self {
+        let mut cloned = Self::default();
+        for (start, len) in self.iter() {
+            cloned.insert(start, len);
+        }
+        cloned
+    }
+}
+
 impl GapTree {
     /// Record a gap. Zero-length gaps are not gaps and are ignored.
     pub fn insert(&mut self, start: u64, len: u64) {
