@@ -8,221 +8,191 @@ budget), but nothing bounds the **candidate search**, so this is where an
 Two independent measurements, recorded for each of two search designs:
 
 - **Counters** — a `#[cfg(test)]` probe counting candidates examined per call
-  over a churny alloc/free/resize workload. Says *how many* items the search
-  touches and what fraction of the available space that is.
+  over a churny alloc/free/resize workload, plus a table of the heap's shape
+  sampled at ~10 points along the run.
 - **Benchmarks** — criterion timings of `propose_compaction_step` alone, with no
-  byte copying and no commit. Says what that costs in wall-clock.
+  byte copying and no commit.
 
-Environment: rustc 1.97.1, 11th Gen Intel i7-1165G7 @ 2.80 GHz, 8 cores.
-Counters come from an **unoptimized** (`cargo test`) build; benchmarks from an
-optimized one, so the two are not comparable to each other — only across designs.
-
-The two designs live on branches, so either can be re-measured:
+Environment: rustc 1.97.1, 11th Gen Intel i7-1165G7 @ 2.80 GHz, 8 cores. Both
+measurements are now **optimized** builds (`cargo test --release`), which cuts
+the counter run from minutes to seconds.
 
 | branch | tip | search |
 |---|---|---|
-| `search-movers` | `63af1af` | enumerates **movers** — one candidate per fixed-size class plus one per resizable allocation, descending address |
-| `search-destinations` | `7a2abee` | enumerates **destinations** — gaps ascending, one `MoverTree` descent per gap |
+| `search-movers` | `e227357` | enumerates **movers** — one candidate per fixed-size class plus one per resizable allocation, descending address |
+| `search-destinations` | `ef4f6ec` | enumerates **destinations** — gaps ascending, one `MoverTree` descent per gap |
 
-Both branches carry the same placement fix (*Score placement against the
-potential, and claim largest-first*) and the same `α = 0` short-circuit, so the
-comparison below is like-for-like.
+Both carry the same placement fix and the same `α = 0` short-circuit, so the
+comparison is like-for-like.
 
 ```sh
-cargo test -p kladde-heap --lib candidate_search_cost -- --ignored --nocapture
-cargo bench -p kladde-heap
+cargo test --release -p kladde-heap --lib candidate_search_cost -- --ignored --nocapture
+cargo bench -p kladde-heap --bench propose_compaction_step
 ```
 
-## The schedule being measured
+## What is measured
 
 Compaction runs in **bursts**, which is what a backend flush does:
 `compact_incrementally(budget)` loops internally until the budget is spent, so
-one pause performs many consecutive steps with no mutation in between.
+one pause performs many consecutive steps with no mutation in between. The
+workload pauses every **32 operations** and spends **2048 bytes**, which yields
+~7.6 steps per burst with only ~4% of bursts running out of work.
 
-The workload pauses every **32 operations** and spends a budget of **2048
-bytes**. Calibrated, not guessed — measured over the 4 000-round workload:
+Afterwards a **catch-up** phase compacts with no churn competing, until `end` is
+within **1%** of `live_bytes`. It deliberately does *not* run to a gapless heap:
+that endgame is narrow gaps bubbling to the top one run at a time, is quadratic
+in heap size, and is work no budget would ever buy. (Earlier rounds did drive to
+zero, so their counter totals are not comparable to these.)
 
-| interval | budget | steps/burst | bursts reaching quiescence | residual gap bytes |
-|---|---|---|---|---|
-| 32 | 512 | 6.0 | 1 / 125 | 1.1% |
-| 32 | 1024 | 7.1 | 3 / 125 | 0.8% |
-| **32** | **2048** | **7.7** | **5 / 125** | **0.8%** |
-| 32 | 4096 | 9.0 | 5 / 125 | 0.6% |
-| 128 | 2048 | 11.7 | 1 / 32 | 0.8% |
-| 128 | 8192 | 15.3 | 2 / 32 | 0.7% |
+## The headline: the burst schedule already stays under 1%
 
-`(32, 2048)` gives several steps per burst while only ~4% of bursts run out of
-work, so incremental behaviour is genuinely exercised rather than degrading into
-a full compaction.
+| workload | catch-up steps | overhead before → after |
+|---|---|---|
+| 400 rounds | 1 | 1.16% → 0.47% |
+| 4 000 rounds | **0** | 0.85% |
+| 40 000 rounds | **0** | 0.89% |
 
-Two caveats on that table, both mine to own:
+Sampling the heap along the 40 000-round run shows why — overhead never drifts:
 
-- It was measured on **`search-destinations` only**, before the branches were
-  split, and carried across unchanged. That turned out to be safe — both branches
-  report identical steps per burst (5.0 / 7.6 / 7.6) and identical
-  bursts-reaching-quiescence (5 / 5 / 5) at every scale — but it was not checked
-  in advance.
-- The "residual gap bytes" column is a **4 000-round** figure and does not hold
-  at larger scale. It is `end − live_bytes` at the end of the run, i.e.
-  `end ≈ 1.008 × live_bytes` there. But steps-to-quiescence per live allocation
-  rises from 791/1397 = 0.57 at 4 000 rounds to 71058/13963 = 5.09 at 40 000 —
-  nine times the backlog per allocation — so a fixed 2048-byte budget stops
-  keeping up as the heap grows. Note also that a move usually *relocates* a gap
-  upward rather than removing it; only `end` retreating reduces total free bytes,
-  which is why ~1% fragmentation and tens of thousands of quiescing steps are
-  consistent rather than contradictory.
+| round | allocations | live_bytes | end | gaps | overhead |
+|---|---|---|---|---|---|
+| 3 968 | 1 381 | 98 992 | 99 695 | 114 | 0.71% |
+| 7 968 | 2 736 | 202 206 | 203 980 | 222 | 0.88% |
+| 11 968 | 4 135 | 311 705 | 314 370 | 345 | 0.85% |
+| 15 968 | 5 536 | 418 547 | 421 938 | 465 | 0.81% |
+| 19 968 | 6 912 | 523 606 | 528 664 | 619 | 0.97% |
+| 23 968 | 8 272 | 618 239 | 623 691 | 727 | 0.88% |
+| 27 968 | 9 746 | 727 619 | 733 457 | 847 | 0.80% |
+| 31 968 | 11 135 | 842 208 | 849 025 | 949 | 0.81% |
+| 35 968 | 12 514 | 954 687 | 963 400 | 1 090 | 0.91% |
+| 39 968 | 13 955 | 1 067 468 | 1 076 970 | 1 205 | 0.89% |
 
-Two phases are reported separately: **bursts** (as above) and **quiescing** (no
-churn, budget 4096, run until gapless). Quiescing is not a schedule any caller
-uses; it is retained as a stress case. The call counts are **not weights** —
-quiescing contributes more calls only because it is run to completion by choice.
+**Overhead is flat at ~0.8–0.9% across a 30× growth in heap size**, and the gap
+count grows linearly with the allocation count (~1 gap per 11.6 allocations). A
+fixed 2048-byte budget every 32 operations keeps up indefinitely at these
+proportions.
 
-## The two designs follow the same trajectory
+That retires the "quiescing is the expensive regime" framing from earlier rounds.
+It was expensive, but it was an artefact of the *target*: those runs measured the
+cost of reaching a gapless heap, which the schedule never approaches and no
+caller wants. The state the schedule actually maintains needs **zero** catch-up
+work.
 
-Both searches are **exact greedy at `α = 0`**: for a fixed mover the best
-destination is the lowest gap that fits, and for a fixed gap the best mover is
-the highest-addressed one that fits — the same maximum of `addr − dest`, reached
-from opposite ends. The only freedom is which of several equally-scoring steps is
-returned, since `Best::offer` keeps strictly-greater and the two iterate in
-opposite orders.
+It also revises the earlier steps-to-quiescence observation (0.57 → 5.09 steps
+per allocation from 4 000 to 40 000 rounds). That superlinearity is real, but it
+lives entirely in the sub-1% endgame — the part now excluded.
 
-Empirically even that does not bite. Across all three workloads the branches
-agree exactly on steps to quiescence (12 / 791 / 71 058), steps per burst
-(5.0 / 7.6 / 7.6) and bursts reaching quiescence (5 / 5 / 5). Three exact
-coincidences at that granularity is not luck: **the trajectories coincide**, and
-the two designs are measured on the same heaps.
-
-An earlier version of this file claimed the designs "pick different moves" and
-listed design-dependent benchmark state as a caveat. That was asserted rather
-than checked, and the evidence above says it was wrong.
+**The tables above are byte-identical on both branches**, which is the third
+independent confirmation that the two designs follow the same trajectory: both
+are exact greedy at `α = 0`, so they can differ only in tie-breaking, and
+empirically they do not differ even there.
 
 ---
 
-## Counters
+## Counters: items examined per call
 
-Mean items examined per `propose_compaction_step` call. `examined` = visited ÷
-available, i.e. how much of the candidate space the pruning failed to skip.
-
-| workload | live allocs | phase | movers | destinations |
-|---|---|---|---|---|
-| 400 rounds | 118 | bursts | 12.99 | **5.45** |
-| | | quiescing | 27.23 | **3.92** |
-| 4 000 rounds | 1 397 | bursts | 117.94 | **60.07** |
-| | | quiescing | 344.80 | **48.95** |
-| 40 000 rounds | 13 963 | bursts | 1 094.13 | **549.77** |
-| | | quiescing | 3 500.56 | **540.24** |
+| workload | live allocs | movers | destinations |
+|---|---|---|---|
+| 400 rounds | 118 | 12.99 | **5.45** |
+| 4 000 rounds | 1 397 | 117.94 | **60.07** |
+| 40 000 rounds | 13 963 | 1 094.13 | **549.77** |
 
 ```
-movers        bursts     calls  10713  visited  11 721 422  max 3510  examined 62.9%
-              quiescing  calls  71059  visited 248 746 245  max 3511  examined 99.7%
-destinations  bursts     calls  10713  visited   5 889 710  max 1206  examined 92.2%
-              quiescing  calls  71059  visited  38 389 249  max 1206  examined 100.0%
+movers        calls  10713  visited  11 721 422  max 3510  examined 62.9%
+destinations  calls  10713  visited   5 889 710  max 1206  examined 92.2%
 ```
 
-By item count destination-first wins: **~2× fewer during bursts, ~6.5× fewer
-while quiescing.** Both still grow roughly linearly in heap size, so neither
-changes the asymptotics.
+Destination-first examines **~2× fewer items** at every scale. Both still grow
+roughly linearly in heap size, so neither changes the asymptotics — consistent
+with the gap count growing linearly above.
 
-Note what the burst schedule does to mover-first. Under the earlier single-step
-schedule its churn phase averaged 389 items per call; under bursts it averages
-1 094. That is the expected direction — after the first step of a burst there is
-no intervening mutation, so the rest of the burst faces the same exhausted state
-that makes quiescing expensive. **A burst looks like quiescing from the second
-step onward**, which is why the single-step phase was a poor model.
+Note the `examined` columns: destination-first walks 92% of its (smaller)
+candidate set, mover-first 63% of its larger one. Neither prune is doing much;
+the difference is the size of the set being enumerated.
 
 ## Benchmark: `propose compaction step`
 
+`roomy` and `slivers` are sized in allocations; `churned` is sized in **rounds**,
+and with 60% allocate / 25% free its live count settles near a third of that.
+
 | shape | n | movers | destinations |
 |---|---|---|---|
-| `roomy` | 1 000 | 280 ns | **187 ns** |
-| | 10 000 | 271 ns | **206 ns** |
-| | 100 000 | 293 ns | **249 ns** |
-| `churned` | 1 000 | **9.70 µs** | 18.4 µs |
-| | 10 000 | **71.4 µs** | 204 µs |
-| | 100 000 | **117 µs** | 1 241 µs |
-| `slivers` | 1 000 | **115 µs** | 128 µs |
-| | 10 000 | 1.215 ms | **580 µs** |
-| | 100 000 | 14.34 ms | **4.51 ms** |
+| `roomy` | 1 000 | 238 ns | **181 ns** |
+| | 10 000 | 240 ns | **218 ns** |
+| | 100 000 | 261 ns | **220 ns** |
+| `churned` | 1 000 | 7.40 µs | **5.58 µs** |
+| | 10 000 | 122 µs | **114 µs** |
+| | 100 000 | **670 µs** | 1 063 µs |
+| `slivers` | 1 000 | **106 µs** | 131 µs |
+| | 10 000 | 1.566 ms | **586 µs** |
+| | 100 000 | 14.58 ms | **4.49 ms** |
 
 ## Reading it
 
-**The counters and the clock still disagree, and the `α = 0` short-circuit did
-not reconcile them.** Removing the two `allocations` range queries that computed
-an `r_src` destined to be multiplied by zero was expected to close the per-item
-gap. It did not: destination-first remains 1.9×, 2.9× and 10.6× slower on
-`churned`. Per-item cost was not the whole story, and the earlier note
-attributing the regression to that lookup was too confident.
+**Removing the compaction pause changed the verdict on `churned`.** The previous
+round had destination-first losing at every size (1.9× / 2.9× / 10.6×), but that
+shape stopped compacting at round 64 000 and then churned for another 236 000 —
+a backlog no caller can produce. With compaction running throughout,
+destination-first now **wins** at 1 000 rounds and roughly ties at 10 000. It
+still loses at 100 000, by 1.6×.
 
-What is left is the **bound**, and it is structural rather than a constant
-factor. Both prunes are monotone but anchored differently:
+So the honest summary is much closer than before, and shape-dependent:
 
-- **Mover-first** stops when `candidate_address ≤ best`, walking *down*. If the
-  topmost allocation has a destination anywhere below, its gain is ≈ `T`, so
-  `best` jumps to ≈ `T` after one item and the next candidate is pruned.
-- **Destination-first** stops when `T − dest ≤ best`, walking *up*. Its ceiling
-  starts at ≈ `T` and falls only as `dest` climbs, so it walks until
-  `dest ≥ T − best`, where `best` comes from the first gap's mover at
-  `f₀ − dest₀`. If `f₀ ≪ T` it walks a number of gaps proportional to `T − f₀`,
-  which **grows with the heap**.
+- **`roomy`** — destination-first wins everywhere, and both stay flat in heap
+  size. When a good move exists both prunes fire immediately.
+- **`slivers`** — destination-first wins by 2.7× and 3.2× at the larger sizes.
+  Nothing fits any gap there, so its `MoverTree` descent fails at the root and
+  its per-gap work collapses.
+- **`churned`** — the realistic shape, and the two are within ~1.3× of each other
+  up to 10 000 rounds. The 1.6× loss at 100 000 rounds is the one clear
+  regression left.
 
-The asymmetry is in which condition is easy to satisfy. Mover-first needs *the
-topmost allocation to have some destination* — common, since any wide-enough gap
-below will do. Destination-first needs *the lowest gap to accommodate a very
-high-addressed allocation* — much rarer, since a narrow low gap admits only small
-allocations, which may sit anywhere. This is the flaw in the original argument
-for destination-first: the lowest gap does almost always yield *a* candidate, but
-yielding a candidate is not enough — it must yield a *high* one to tighten the
-bound.
+**Why the residual loss at scale.** Extrapolating the counters, at 100 000 rounds
+destination-first walks ~2 800 gaps where mover-first walks ~5 500 movers — half
+the items, yet 1.6× slower, so its per-item cost is roughly 3× higher. The
+`α = 0` short-circuit removed one source of that (two range queries for a
+discarded `r_src`); the remaining suspect is the **exact-fit branch**, which runs
+for every gap: a `live_by_size` lookup plus up to three `BTreeSet::last` calls,
+all of it dead work at `α = 0`, since `highest_fitting(w)` already returns the
+highest allocation of size ≤ `w` and the `r_dest = +1` bonus is multiplied by
+zero. That is the obvious next thing to try.
 
-`slivers` is the shape where destination-first wins (2.1× and 3.2× at 10 k and
-100 k), and consistently so: nothing fits any gap there, so the `MoverTree`
-descent fails at the root and the per-gap work is minimal. `roomy` now favours
-destination-first slightly and stays flat in heap size for both — when a good
-move exists, both prunes work and the design barely matters.
-
-**Conclusion, unchanged: mover-first is the better default.** Destination-first's
-lower item count does not survive contact with the clock on the shape that models
-a live heap, and its advantage is confined to pathological fragmentation.
+**Recommendation.** Mover-first remains the safer default — it has no shape where
+it loses badly — but the case against destination-first is now much weaker than
+the previous round suggested, and one identified optimization is still untried.
 
 ### Still open
 
-- **The `α = 0` exact branch is dead work too.** For a gap of width `w`,
-  `highest_fitting(w)` already returns the highest allocation of size ≤ `w`,
-  which includes every exact-fit mover, so the exact branch can only find a
-  lower-addressed one with the same destination — and its `r_dest = +1` is
-  multiplied by zero. Skipping it at `α = 0` would remove a `BTreeMap` lookup and
-  three `BTreeSet::last` calls per gap. Not yet done or measured.
-- **`churned` at 100 000 is the least trustworthy number.** Its setup stops
-  compacting at round 64 000 then churns for another 236 000, producing a backlog
-  the burst schedule would never leave. The 1 000 → 10 000 comparison is the
-  trustworthy one and shows the same direction more modestly.
-- **Item counts and timings come from different workloads** — the counters from
-  the burst workload, the benchmark from its own three shapes — so "fewer items
-  yet slower" is not strictly a contradiction. Instrumenting the benchmark shapes
-  with the same probe would settle whether destination-first really walks more
-  gaps there than mover-first walks movers.
-- **This round changed two things at once.** The placement fix landed alongside
-  the `α = 0` short-circuit, so comparing against the previous run is confounded;
-  only the cross-branch comparison within this run is clean.
+- **Skip the exact-fit branch at `α = 0`** (above). Not yet done or measured.
+- **The benchmark shapes are not instrumented**, so the per-item cost argument is
+  inferred by extrapolating counters from a different workload rather than
+  measured directly. Adding the probe to the bench would settle it.
+- **`α > 0` is unmeasured entirely.** Every number here is at the shipped
+  `α = 0`, where both designs are exact. The `2α` approximation destination-first
+  makes above zero has been tested for correctness but never for cost.
 
 ---
 
 ## Notes on the artifacts
 
+Only `propose_compaction_step` is run now; `lowest_fitting_gap` and
+`btree_point_lookup` are unaffected by this work and were dominating the wall
+clock at criterion's default 100 samples. Their last results are in git history
+at `5ac45eb`.
+
 The criterion reports are committed whole, with every `.svg` gzipped to `.svgz`
-and the HTML references rewritten (`test-results/svgz.sh`). That takes each
-report directory from ~13 MB to ~5.8 MB.
+and the HTML references rewritten (`test-results/svgz.sh`) — 2.1 MB down to
+1.1 MB per report.
 
 **Caveat:** browsers decompress `.svgz` over `file://` inconsistently — Firefox
 does, Chrome generally expects a `Content-Encoding: gzip` header and will show
-broken images. If the plots do not render, either serve the directory over HTTP
-or reverse the compression:
+broken images. If the plots do not render, serve the directory over HTTP or
+reverse the compression:
 
 ```sh
 find test-results -name '*.svgz' -exec sh -c 'gunzip -c "$1" > "${1%z}" && rm "$1"' _ {} \;
 find test-results -name '*.html' -exec sed -i -E 's/\.svgz(["'"'"')])/.svg\1/g' {} +
 ```
 
-Earlier rounds are in git history: the single-step schedule and the reasoning
-about why it modelled the wrong thing at `686912b`, and the first burst-schedule
-round — before the placement fix and the `α = 0` short-circuit — at `0ff1153`.
+Earlier rounds in git history: the single-step schedule at `686912b`, the first
+burst-schedule round at `0ff1153`, and the run-to-gapless round at `5ac45eb`.
