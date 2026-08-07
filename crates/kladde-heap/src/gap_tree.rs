@@ -34,9 +34,25 @@
 //! its values, so anything the leaf-level search must read has to be part of the
 //! key. Hence the internal `Gap` key carries `len` but orders and compares
 //! purely by `start`.
+//!
+//! The length is *also* stored as the value, which is redundant but not idle:
+//! [`sweep_bptree::tree::Cursor`] remembers the key it was **asked for**, not the
+//! key it found, so a cursor seeded by `get_cursor` reports the probe's `len`
+//! (zero) rather than the real one. Reading the length from the value sidesteps
+//! that, and only [`GapTree::iter_from`] needs it.
+//!
+//! # Why the raw `BPlusTree`, not `BPlusTreeMap`
+//!
+//! `BPlusTreeMap` exposes only whole-tree iteration. Bounding the compaction
+//! search means resuming a walk part-way, which needs a cursor -- one descent to
+//! seek, then leaf-to-leaf steps -- and cursors live on the raw tree.
 
 use sweep_bptree::argument::{Argument, SearchArgument};
-use sweep_bptree::BPlusTreeMap;
+use sweep_bptree::tree::Cursor;
+use sweep_bptree::{BPlusTree, NodeStoreVec};
+
+/// The concrete tree behind [`GapTree`].
+type Store = NodeStoreVec<Gap, u64, MaxGapLen>;
 
 /// A gap in the address space: free bytes `[start, start + len)`.
 ///
@@ -114,28 +130,27 @@ impl SearchArgument<Gap> for MaxGapLen {
 
 /// The gap index. See the module docs.
 pub struct GapTree {
-    tree: BPlusTreeMap<Gap, (), MaxGapLen>,
+    tree: BPlusTree<Store>,
 }
 
 impl Default for GapTree {
     fn default() -> Self {
         Self {
-            tree: BPlusTreeMap::new(),
+            tree: BPlusTree::new(Store::default()),
         }
     }
 }
 
 impl Clone for GapTree {
-    /// Rebuilt entry by entry: `sweep-bptree`'s node store is not itself
-    /// `Clone`, so this is `O(n log n)` rather than a copy of the arena. Only
-    /// the benchmark harness clones a heap, and it does so outside the timed
-    /// region.
+    /// `sweep-bptree`'s node store is not itself `Clone`, so the tree is rebuilt
+    /// -- but from already-sorted data, which `bulk_load` turns into a linear
+    /// fill with no comparisons and no node splits. Only the benchmark harness
+    /// clones a heap, and it does so outside the timed region.
     fn clone(&self) -> Self {
-        let mut cloned = Self::default();
-        for (start, len) in self.iter() {
-            cloned.insert(start, len);
+        let data: Vec<(Gap, u64)> = self.tree.iter().map(|(&gap, &len)| (gap, len)).collect();
+        Self {
+            tree: BPlusTree::bulk_load(data),
         }
-        cloned
     }
 }
 
@@ -143,7 +158,7 @@ impl GapTree {
     /// Record a gap. Zero-length gaps are not gaps and are ignored.
     pub fn insert(&mut self, start: u64, len: u64) {
         if len > 0 {
-            self.tree.insert(Gap { start, len }, ());
+            self.tree.insert(Gap { start, len }, len);
         }
     }
 
@@ -159,7 +174,7 @@ impl GapTree {
         // could dead-end in one; every real request is for at least one byte.
         self.tree
             .get_by_argument(min_len.max(1))
-            .map(|(gap, ())| (gap.start, gap.len))
+            .map(|(gap, &len)| (gap.start, len))
     }
 
     /// Number of gaps.
@@ -174,7 +189,50 @@ impl GapTree {
 
     /// Every gap, in ascending address order.
     pub fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        self.tree.iter().map(|(gap, ())| (gap.start, gap.len))
+        self.tree.iter().map(|(gap, &len)| (gap.start, len))
+    }
+
+    /// Every gap at or above `start`, in ascending address order.
+    ///
+    /// One descent to seek, then leaf-to-leaf steps: the cursor caches the leaf
+    /// it is in, so as long as the tree is not mutated mid-walk -- and it is not,
+    /// since the search only reads -- resuming costs `O(log n)` **once**, not per
+    /// item. That is what makes a resumable bounded search worth having.
+    pub fn iter_from(&self, start: u64) -> GapsFrom<'_> {
+        let probe = Gap { start, len: 0 };
+        let next = match self.tree.get_cursor(&probe) {
+            // `start` is itself a gap: the cursor's key is the probe, whose
+            // `len` is a lie, so the real length comes from the value.
+            Some((cursor, Some(&len))) => Some((cursor, len)),
+            // Otherwise the cursor sits at the insertion point; one step lands
+            // on the first gap above `start`, with a key that is real.
+            Some((cursor, None)) => cursor.next_with_value(&self.tree).map(|(c, &l)| (c, l)),
+            None => None,
+        };
+        GapsFrom {
+            tree: &self.tree,
+            next,
+        }
+    }
+}
+
+/// Ascending iteration over [`GapTree`] from an arbitrary address. See
+/// [`GapTree::iter_from`].
+pub struct GapsFrom<'t> {
+    tree: &'t BPlusTree<Store>,
+    /// The cursor to yield next, paired with its length read from the value --
+    /// never from the key, which the seeding cursor gets wrong.
+    next: Option<(Cursor<Gap>, u64)>,
+}
+
+impl Iterator for GapsFrom<'_> {
+    type Item = (u64, u64);
+
+    fn next(&mut self) -> Option<(u64, u64)> {
+        let (cursor, len) = self.next.take()?;
+        let start = cursor.key().start;
+        self.next = cursor.next_with_value(self.tree).map(|(c, &l)| (c, l));
+        Some((start, len))
     }
 }
 
@@ -232,6 +290,81 @@ mod tests {
         assert_eq!(tree.iter().collect::<Vec<_>>(), vec![(20, 5)]);
         tree.remove(999); // absent: a no-op, not a panic
         assert_eq!(tree.len(), 1);
+    }
+
+    #[test]
+    fn iter_from_starts_at_the_first_gap_at_or_above_the_address() {
+        let mut tree = GapTree::default();
+        for (start, len) in [(0u64, 4u64), (100, 64), (200, 8), (300, 32)] {
+            tree.insert(start, len);
+        }
+        let from = |a| tree.iter_from(a).collect::<Vec<_>>();
+
+        // Below everything: the whole tree, same as `iter`.
+        assert_eq!(from(0), tree.iter().collect::<Vec<_>>());
+        // Exactly on a gap: that gap is included, and -- the trap this guards --
+        // with its *real* length, not the zero-length probe's.
+        assert_eq!(from(100), vec![(100, 64), (200, 8), (300, 32)]);
+        assert_eq!(from(300), vec![(300, 32)]);
+        // Between gaps: the next one up.
+        assert_eq!(from(101), vec![(200, 8), (300, 32)]);
+        assert_eq!(from(299), vec![(300, 32)]);
+        // Above everything.
+        assert_eq!(from(301), vec![]);
+        assert_eq!(from(u64::MAX), vec![]);
+        // Empty tree.
+        assert_eq!(GapTree::default().iter_from(0).count(), 0);
+    }
+
+    /// Deep enough to cross leaves repeatedly, which is where a cursor that
+    /// failed to follow the leaf chain -- or re-seeded itself -- would show up.
+    #[test]
+    fn iter_from_agrees_with_a_filtered_full_scan_across_a_deep_tree() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut tree = GapTree::default();
+        let mut start = 0u64;
+        for _ in 0..5_000 {
+            let len = 1 + rand() % 500;
+            tree.insert(start, len);
+            start += len + 1 + rand() % 50;
+        }
+        let all: Vec<(u64, u64)> = tree.iter().collect();
+        let top = all.last().expect("non-empty").0;
+
+        for _ in 0..200 {
+            let from = rand() % (top + 100);
+            let expected: Vec<(u64, u64)> =
+                all.iter().copied().filter(|&(s, _)| s >= from).collect();
+            assert_eq!(
+                tree.iter_from(from).collect::<Vec<_>>(),
+                expected,
+                "iter_from({from}) disagreed with a filtered scan"
+            );
+        }
+    }
+
+    #[test]
+    fn clone_preserves_contents_and_the_augmentation() {
+        let mut tree = GapTree::default();
+        for i in 0..2_000u64 {
+            tree.insert(i * 37, 1 + (i * 7919) % 500);
+        }
+        let cloned = tree.clone();
+        assert_eq!(
+            cloned.iter().collect::<Vec<_>>(),
+            tree.iter().collect::<Vec<_>>()
+        );
+        // The augmentation is rebuilt by `bulk_load`, not copied, so query it.
+        for min_len in (1..=501).step_by(7) {
+            assert_eq!(cloned.lowest_fitting(min_len), tree.lowest_fitting(min_len));
+        }
     }
 
     /// Deep enough to have real inner nodes, so the descent actually branches

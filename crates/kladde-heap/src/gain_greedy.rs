@@ -52,6 +52,56 @@ use crate::heap::{
 };
 use crate::mover_tree::MoverTree;
 
+/// How many candidates one [`GainGreedyHeap::propose_compaction_step`] may
+/// examine, and where its walk starts.
+///
+/// The search visits candidates in **decreasing order of the gain they could
+/// still achieve**, and stops early once the incumbent beats that ceiling. The
+/// prune is exact, but nothing bounds how far it has to walk before it fires:
+/// measurements in `test-results/` show the walk growing linearly with the heap.
+/// Capping it trades exactness for a bound. Because the order is by ceiling, the
+/// prefix kept is precisely the candidates that could have been best -- the loss
+/// is bounded by what the *first unexamined* candidate could have achieved, not
+/// unbounded as it would be for an arbitrary subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchCap {
+    /// Walk until the prune fires or the candidates run out. Exact.
+    #[default]
+    Unbounded,
+    /// Examine at most `k` candidates, always restarting from the extreme end.
+    ///
+    /// Simple, but permanently blind past the `k`-th candidate: the same prefix
+    /// is re-walked on every call, so the tail is never reached.
+    Restart(usize),
+    /// Examine at most `k` candidates, resuming where the previous call left off.
+    ///
+    /// The cursor covers one burst only: [`GainGreedyHeap::compact_incrementally`]
+    /// resets it, as does reaching the end of the walk or the prune firing (both
+    /// mean the walk was exhaustive-equivalent, so there is nothing to resume).
+    /// Across a burst this sweeps a moving window instead of re-walking a fixed
+    /// prefix.
+    Resume(usize),
+}
+
+impl SearchCap {
+    /// The cap as a count, and whether the walk resumes.
+    fn limit(self) -> (usize, bool) {
+        match self {
+            Self::Unbounded => (usize::MAX, false),
+            Self::Restart(k) => (k, false),
+            Self::Resume(k) => (k, true),
+        }
+    }
+
+    /// The `k` this cap allows, if it is capped at all.
+    pub fn k(self) -> Option<usize> {
+        match self {
+            Self::Unbounded => None,
+            Self::Restart(k) | Self::Resume(k) => Some(k),
+        }
+    }
+}
+
 /// One row of the address-keyed table.
 #[derive(Clone, Copy)]
 struct Entry<Id> {
@@ -289,6 +339,12 @@ pub struct GainGreedyHeap<Id> {
     live_bytes: u64,
     /// Weight of the fragmentation term. See [`GainGreedyHeap::alpha`].
     alpha: u64,
+    /// How far the candidate search may walk. See [`SearchCap`].
+    cap: SearchCap,
+    /// Where a [`SearchCap::Resume`] walk should pick up: the address of the
+    /// first candidate the previous call did *not* examine, or `None` to start
+    /// from the extreme end. In a `Cell` because the search takes `&self`.
+    resume_at: std::cell::Cell<Option<u64>>,
     /// Test-only search instrumentation; absent from real builds.
     #[cfg(test)]
     stats: std::cell::Cell<SearchStats>,
@@ -306,6 +362,8 @@ impl<Id> Default for GainGreedyHeap<Id> {
             end: 0,
             live_bytes: 0,
             alpha: 0,
+            cap: SearchCap::Unbounded,
+            resume_at: std::cell::Cell::new(None),
             #[cfg(test)]
             stats: std::cell::Cell::new(SearchStats::default()),
         }
@@ -350,6 +408,50 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// Set the fragmentation weight. See [`alpha`](Self::alpha).
     pub fn set_alpha(&mut self, alpha: u64) {
         self.alpha = alpha;
+    }
+
+    /// How far the candidate search may walk. See [`SearchCap`]. Ships
+    /// [`SearchCap::Unbounded`], which is exact.
+    pub fn search_cap(&self) -> SearchCap {
+        self.cap
+    }
+
+    /// Bound the candidate search. See [`SearchCap`].
+    pub fn set_search_cap(&mut self, cap: SearchCap) {
+        self.cap = cap;
+        self.resume_at.set(None);
+    }
+
+    /// Spend up to `budget` bytes on consecutive compaction steps, returning the
+    /// steps taken and whether the heap ran out of work before the budget did.
+    ///
+    /// This is the caller-side loop of `compaction-algorithm.md` §5 (minus the
+    /// byte copying, which needs a store the bare heap does not have), and it
+    /// lives here rather than in the caller for one reason: a
+    /// [`SearchCap::Resume`] cursor has to span exactly the steps of **one
+    /// burst**. Mutations from outside compaction reshuffle the candidates the
+    /// cursor is walking past, so the cursor is reset on entry; within the loop
+    /// nothing else touches the heap, so it stays meaningful.
+    pub fn compact_incrementally(&mut self, budget: u64) -> (u64, bool) {
+        self.resume_at.set(None);
+        let mut moved = 0u64;
+        let mut steps = 0u64;
+        loop {
+            let Some(step) = self.propose_compaction_step(budget - moved) else {
+                return (steps, true); // ran out of work
+            };
+            // An oversized step is worth taking on its own, but not on top of
+            // steps already paid for: leave it for the next burst.
+            if step.len > budget - moved && steps > 0 {
+                return (steps, false);
+            }
+            self.commit_compaction_step(step);
+            moved += step.len;
+            steps += 1;
+            if moved >= budget {
+                return (steps, false);
+            }
+        }
     }
 
     /// Fold one search's [`Probe`] into the counters. A no-op outside tests.
@@ -826,8 +928,23 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
             .allocations
             .last_key_value()
             .map_or(0, |(&addr, _)| addr);
+        let (limit, resumable) = self.cap.limit();
+        let from = if resumable {
+            self.resume_at.get().unwrap_or(0)
+        } else {
+            0
+        };
+
         let mut probe = Probe::default();
-        for (dest, width) in self.gaps.iter() {
+        // `Some(dest)` only when the *cap* stopped the walk. Stopping because
+        // the prune fired, or because the gaps ran out, means every remaining
+        // candidate was ruled out or seen -- there is nothing left to resume.
+        let mut cut_at = None;
+        for (visited, (dest, width)) in self.gaps.iter_from(from).enumerate() {
+            if visited == limit {
+                cut_at = Some(dest);
+                break;
+            }
             if let Some(bound) = best.bound() {
                 let ceiling = top.saturating_sub(dest).saturating_add(2 * self.alpha);
                 if Gain::new(ceiling, 1, 0, 0) <= bound {
@@ -837,6 +954,8 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
             probe.visit();
             self.offer_evacuations_into(dest, width, budget, &mut best);
         }
+        self.resume_at.set(cut_at);
+
         let chosen = best.pick();
         self.record_search(probe, chosen.is_some());
         chosen
@@ -1777,14 +1896,28 @@ mod tests {
     /// about the healthy state rather than about the endgame.
     const COMPACT_ENOUGH_PERCENT: u64 = 1;
 
-    /// The heap's shape at one point in the simulation.
-    #[derive(Clone, Copy)]
+    /// The candidate caps measured alongside the uncapped search, chosen by
+    /// `search_cap_sweep` as the smallest `k` that holds steady-state overhead
+    /// at the ~1% the uncapped search reaches. See `test-results/`.
+    const CAP_RESTART_K: usize = 16;
+    const CAP_RESUME_K: usize = 16;
+
+    /// The heap's shape at one point in the simulation, plus what the bursts
+    /// since the previous snapshot cost.
+    #[derive(Clone, Copy, Default)]
     struct Snapshot {
         round: usize,
         allocations: usize,
         live_bytes: u64,
         end: u64,
         gaps: usize,
+        /// Mean wall-clock of one burst since the previous snapshot, in
+        /// microseconds. Plotted against `allocations` down the table, this is
+        /// the scaling curve a cap is supposed to flatten.
+        micros_per_burst: f64,
+        /// Mean candidates examined per `propose_compaction_step` since the
+        /// previous snapshot.
+        visited_per_call: f64,
     }
 
     impl Snapshot {
@@ -1795,6 +1928,8 @@ mod tests {
                 live_bytes: h.live_bytes(),
                 end: h.len(),
                 gaps: h.gaps.len(),
+                micros_per_burst: 0.0,
+                visited_per_call: 0.0,
             }
         }
 
@@ -1814,28 +1949,6 @@ mod tests {
         bursts: u64,
         steps: u64,
         quiesced: u64,
-    }
-
-    /// The caller-side loop of `compaction-algorithm.md` §5, minus the byte
-    /// copying (a bare heap has no store). Returns steps taken and whether the
-    /// heap ran out of work before the budget ran out.
-    fn compact_incrementally(h: &mut Heap, budget: u64) -> (u64, bool) {
-        let mut moved = 0u64;
-        let mut steps = 0u64;
-        loop {
-            let Some(step) = h.propose_compaction_step(budget - moved) else {
-                return (steps, true); // quiesced
-            };
-            if step.len > budget - moved && steps > 0 {
-                return (steps, false); // save the oversized step for next time
-            }
-            h.commit_compaction_step(step);
-            moved += step.len;
-            steps += 1;
-            if moved >= budget {
-                return (steps, false);
-            }
-        }
     }
 
     /// The churny workload the measurement below drives, with compaction
@@ -1863,6 +1976,11 @@ mod tests {
         let mut live: Vec<Pointer<u32>> = Vec::new();
         let mut next_counter = 1u32;
         let mut bursts = BurstStats::default();
+        // Reset at each snapshot, so a row reports the interval it ends, not the
+        // run so far -- otherwise growth would be smeared across the table.
+        let mut window = std::time::Duration::ZERO;
+        let mut window_bursts = 0u64;
+        let mut window_start_stats = h.search_stats();
 
         for round in 0..rounds {
             let roll = rand() % 100;
@@ -1892,12 +2010,29 @@ mod tests {
             // `compact_incrementally` spends a whole budget in one call, so a
             // pause does many consecutive steps with no mutation in between.
             if (round + 1) % COMPACTION_INTERVAL == 0 {
-                let (steps, quiesced) = compact_incrementally(h, COMPACTION_BUDGET);
+                let t0 = std::time::Instant::now();
+                let (steps, quiesced) = h.compact_incrementally(COMPACTION_BUDGET);
+                window += t0.elapsed();
+                window_bursts += 1;
                 bursts.bursts += 1;
                 bursts.steps += steps;
                 bursts.quiesced += u64::from(quiesced);
                 if bursts.bursts % snapshot_every as u64 == 0 {
-                    snapshots.push(Snapshot::take(h, round));
+                    let now = h.search_stats();
+                    let calls = now.calls - window_start_stats.calls;
+                    let visited = now.visited - window_start_stats.visited;
+                    let mut snapshot = Snapshot::take(h, round);
+                    snapshot.micros_per_burst =
+                        window.as_secs_f64() * 1e6 / window_bursts.max(1) as f64;
+                    snapshot.visited_per_call = if calls == 0 {
+                        0.0
+                    } else {
+                        visited as f64 / calls as f64
+                    };
+                    snapshots.push(snapshot);
+                    window = std::time::Duration::ZERO;
+                    window_bursts = 0;
+                    window_start_stats = now;
                 }
             }
         }
@@ -1943,67 +2078,245 @@ mod tests {
     #[test]
     #[ignore = "measurement, not a behavioural test; takes minutes"]
     fn candidate_search_cost_over_a_churny_workload() {
-        for &rounds in &[400usize, 4_000, 40_000] {
-            let mut h = Heap::new();
-            let (_, bursts, snapshots) = run_churny_workload_tracked(&mut h, rounds);
-            let during_bursts = h.search_stats();
-
-            // Then catch up: compaction with no churn competing, until the file
-            // is within `COMPACT_ENOUGH_PERCENT` of the live bytes. Not to a
-            // gapless heap -- see the constant.
-            h.reset_search_stats();
-            let target = h.live_bytes() + h.live_bytes() * COMPACT_ENOUGH_PERCENT / 100;
-            let before = Snapshot::take(&h, rounds);
-            let mut steps = 0u64;
-            while h.len() > target {
-                let Some(step) = h.propose_compaction_step(4096) else {
-                    break;
-                };
-                h.commit_compaction_step(step);
-                steps += 1;
-            }
-            let catching_up = h.search_stats();
-            let after = Snapshot::take(&h, rounds);
-
-            println!(
-                "\n=== {rounds} rounds -> {} live allocations ===",
-                after.allocations
-            );
-            println!(
-                "  bursts: {} of budget {COMPACTION_BUDGET} every {COMPACTION_INTERVAL} ops; \
-                 {:.1} steps each; {} of them ran out of work",
-                bursts.bursts,
-                bursts.steps as f64 / bursts.bursts.max(1) as f64,
-                bursts.quiesced,
-            );
-            println!(
-                "  catch-up to <={COMPACT_ENOUGH_PERCENT}% overhead: {steps} steps, \
-                 {:.2}% -> {:.2}% overhead, {} -> {} gaps ({:.4} steps per allocation)",
-                before.overhead_percent(),
-                after.overhead_percent(),
-                before.gaps,
-                after.gaps,
-                steps as f64 / after.allocations.max(1) as f64,
-            );
-            report_search_stats("during bursts", during_bursts);
-            report_search_stats("catching up", catching_up);
-
-            println!(
-                "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>9}",
-                "round", "allocations", "live_bytes", "end", "gaps", "overhead"
-            );
-            for s in &snapshots {
-                println!(
-                    "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8.2}%",
-                    s.round,
-                    s.allocations,
-                    s.live_bytes,
-                    s.end,
-                    s.gaps,
-                    s.overhead_percent()
-                );
+        for cap in [
+            SearchCap::Unbounded,
+            SearchCap::Restart(CAP_RESTART_K),
+            SearchCap::Resume(CAP_RESUME_K),
+        ] {
+            println!("\n\n########## cap = {cap:?} ##########");
+            for &rounds in &[400usize, 4_000, 40_000] {
+                measure_one(cap, rounds);
             }
         }
+    }
+
+    fn measure_one(cap: SearchCap, rounds: usize) {
+        let mut h = Heap::new();
+        h.set_search_cap(cap);
+        let (_, bursts, snapshots) = run_churny_workload_tracked(&mut h, rounds);
+        let during_bursts = h.search_stats();
+
+        // Then catch up: compaction with no churn competing, until the file is
+        // within `COMPACT_ENOUGH_PERCENT` of the live bytes. Not to a gapless
+        // heap -- see the constant. Still one burst at a time, so a `Resume`
+        // cursor is reset at the same points it would be in production.
+        h.reset_search_stats();
+        let target = h.live_bytes() + h.live_bytes() * COMPACT_ENOUGH_PERCENT / 100;
+        let before = Snapshot::take(&h, rounds);
+        let mut steps = 0u64;
+        while h.len() > target {
+            let (took, quiesced) = h.compact_incrementally(4096);
+            steps += took;
+            if quiesced || took == 0 {
+                break;
+            }
+        }
+        let catching_up = h.search_stats();
+        let after = Snapshot::take(&h, rounds);
+
+        println!(
+            "\n=== {rounds} rounds -> {} live allocations ===",
+            after.allocations
+        );
+        println!(
+            "  bursts: {} of budget {COMPACTION_BUDGET} every {COMPACTION_INTERVAL} ops; \
+             {:.1} steps each; {} of them ran out of work",
+            bursts.bursts,
+            bursts.steps as f64 / bursts.bursts.max(1) as f64,
+            bursts.quiesced,
+        );
+        println!(
+            "  catch-up to <={COMPACT_ENOUGH_PERCENT}% overhead: {steps} steps, \
+             {:.2}% -> {:.2}% overhead, {} -> {} gaps ({:.4} steps per allocation)",
+            before.overhead_percent(),
+            after.overhead_percent(),
+            before.gaps,
+            after.gaps,
+            steps as f64 / after.allocations.max(1) as f64,
+        );
+        report_search_stats("during bursts", during_bursts);
+        report_search_stats("catching up", catching_up);
+
+        println!(
+            "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>9}  {:>13}  {:>11}",
+            "round",
+            "allocations",
+            "live_bytes",
+            "end",
+            "gaps",
+            "overhead",
+            "visited/call",
+            "us/burst"
+        );
+        for s in &snapshots {
+            println!(
+                "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8.2}%  {:>13.1}  {:>11.1}",
+                s.round,
+                s.allocations,
+                s.live_bytes,
+                s.end,
+                s.gaps,
+                s.overhead_percent(),
+                s.visited_per_call,
+                s.micros_per_burst,
+            );
+        }
+    }
+
+    /// Which `k` keeps the steady-state overhead near the 1% the uncapped search
+    /// achieves, at the least search cost? Sweeps both cap modes over the
+    /// 40 000-round workload and prints one row each.
+    ///
+    /// The columns that decide it are `peak%` and `final%` -- a `k` that is too
+    /// small does not fail loudly, it just lets overhead drift upward, so the
+    /// peak over the second half matters more than the endpoint.
+    ///
+    /// ```text
+    /// cargo test --release -p kladde-heap --lib search_cap_sweep -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a behavioural test"]
+    fn search_cap_sweep() {
+        const ROUNDS: usize = 40_000;
+        println!(
+            "  {:>16}  {:>8}  {:>8}  {:>8}  {:>13}  {:>11}",
+            "cap", "peak%", "final%", "gaps", "visited/call", "us/burst"
+        );
+        let mut caps = vec![SearchCap::Unbounded];
+        for k in [4usize, 8, 16, 32, 64, 128, 256, 512] {
+            caps.push(SearchCap::Restart(k));
+            caps.push(SearchCap::Resume(k));
+        }
+        for cap in caps {
+            let mut h = Heap::new();
+            h.set_search_cap(cap);
+            let (_, _, snapshots) = run_churny_workload_tracked(&mut h, ROUNDS);
+            // Ignore the burn-in: the first snapshots are a heap so small that
+            // any cap covers all of it, which says nothing about steady state.
+            let steady = &snapshots[snapshots.len() / 2..];
+            let peak = steady
+                .iter()
+                .map(Snapshot::overhead_percent)
+                .fold(0.0f64, f64::max);
+            let last = snapshots.last().copied().unwrap_or_default();
+            println!(
+                "  {:>16}  {:>7.2}%  {:>7.2}%  {:>8}  {:>13.1}  {:>11.1}",
+                format!("{cap:?}"),
+                peak,
+                last.overhead_percent(),
+                last.gaps,
+                last.visited_per_call,
+                last.micros_per_burst,
+            );
+        }
+    }
+
+    /// A cap must not be able to stall compaction. The evacuation walk it bounds
+    /// is only *one* of the two candidate sources -- the slide is offered
+    /// unconditionally -- so every call still returns a move while any gap
+    /// remains, and repeated bursts still drive the heap to gaplessness.
+    #[test]
+    fn a_capped_search_still_compacts_a_churned_heap_to_gaplessness() {
+        for cap in [
+            SearchCap::Unbounded,
+            SearchCap::Restart(1),
+            SearchCap::Resume(1),
+            SearchCap::Restart(8),
+            SearchCap::Resume(8),
+        ] {
+            let mut h = Heap::new();
+            h.set_search_cap(cap);
+            let mut state = 0x2545_F491_4F6C_DD1Du64;
+            let mut rand = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let mut live: Vec<Pointer<u32>> = Vec::new();
+            for i in 1..600u32 {
+                let size = [8u32, 16, 16, 64, 250][(rand() % 5) as usize];
+                let id = if rand() % 4 == 0 {
+                    resizable(i)
+                } else {
+                    fixed(i)
+                };
+                h.alloc(id, size).unwrap();
+                live.push(id);
+                if rand() % 3 == 0 && live.len() > 1 {
+                    let victim = live.swap_remove((rand() % live.len() as u64) as usize);
+                    h.free(victim).unwrap();
+                }
+            }
+            assert!(h.len() > h.live_bytes(), "{cap:?}: nothing to compact");
+
+            // Bounded bursts only -- no unbounded escape hatch.
+            let mut bursts = 0;
+            while h.len() > h.live_bytes() {
+                let (steps, quiesced) = h.compact_incrementally(256);
+                assert!(steps > 0 || quiesced, "{cap:?}: a burst made no progress");
+                bursts += 1;
+                assert!(bursts < 100_000, "{cap:?}: not converging");
+            }
+            h.assert_invariants();
+            assert_eq!(h.len(), h.live_bytes(), "{cap:?}: gaps left over");
+        }
+    }
+
+    /// The resuming cursor must advance across the calls of one burst and start
+    /// over at the next, or it is either re-walking a fixed prefix (the
+    /// `Restart` behaviour it is meant to differ from) or drifting across
+    /// mutations it cannot account for.
+    #[test]
+    fn a_resuming_cursor_sweeps_within_a_burst_and_resets_between_them() {
+        // Every gap narrower than every allocation, so no evacuation is possible
+        // and the prune -- which needs an incumbent big enough to beat
+        // `top - dest` -- never fires. Only the cap can stop the walk, which is
+        // what this test is about.
+        let mut h = Heap::new();
+        h.set_search_cap(SearchCap::Resume(2));
+        let mut spacers = Vec::new();
+        let mut counter = 1u32;
+        for _ in 0..100 {
+            h.alloc(fixed(counter), 200).unwrap();
+            counter += 1;
+            let spacer = fixed(counter);
+            counter += 1;
+            h.alloc(spacer, 8).unwrap();
+            spacers.push(spacer);
+        }
+        for spacer in spacers {
+            h.free(spacer).unwrap();
+        }
+        assert!(h.gaps.len() > 10, "expected a long gap list to sweep");
+
+        // A fresh heap has nothing to resume from.
+        assert_eq!(h.resume_at.get(), None);
+
+        // Successive searches start further and further up.
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            h.propose_compaction_step(64);
+            seen.push(
+                h.resume_at
+                    .get()
+                    .expect("the cap, not the prune, stopped it"),
+            );
+        }
+        assert!(
+            seen.windows(2).all(|w| w[0] < w[1]),
+            "cursor did not advance: {seen:?}"
+        );
+
+        // ...and a new burst starts over from the bottom: its first search cuts
+        // at exactly the address the previous burst's first search cut at.
+        h.compact_incrementally(0);
+        assert_eq!(
+            h.resume_at.get(),
+            Some(seen[0]),
+            "a new burst should resume from the bottom, not from {:?}",
+            seen.last()
+        );
     }
 
     #[test]

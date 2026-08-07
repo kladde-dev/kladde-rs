@@ -18,7 +18,12 @@
 //! sees only the leaf's keys, never its values.
 
 use sweep_bptree::argument::{Argument, SearchArgument};
-use sweep_bptree::BPlusTreeMap;
+use sweep_bptree::{BPlusTree, NodeStoreVec};
+
+/// The concrete tree behind [`MoverTree`]. The raw `BPlusTree` rather than
+/// `BPlusTreeMap` for the same reason as [`GapTree`](crate::gap_tree)'s: only it
+/// exposes `bulk_load`, which is what makes `Clone` linear.
+type Store = NodeStoreVec<Mover, (), MinSize>;
 
 /// A live allocation, as this index sees it: where it starts and how big it is.
 ///
@@ -103,26 +108,26 @@ impl SearchArgument<Mover> for MinSize {
 
 /// The mover index. See the module docs.
 pub struct MoverTree {
-    tree: BPlusTreeMap<Mover, (), MinSize>,
+    tree: BPlusTree<Store>,
 }
 
 impl Default for MoverTree {
     fn default() -> Self {
         Self {
-            tree: BPlusTreeMap::new(),
+            tree: BPlusTree::new(Store::default()),
         }
     }
 }
 
 impl Clone for MoverTree {
-    /// Rebuilt entry by entry, for the same reason as [`GapTree`]'s: see
-    /// [`crate::gap_tree::GapTree::clone`].
+    /// Rebuilt from already-sorted data, for the same reason as
+    /// [`GapTree`](crate::gap_tree)'s: `bulk_load` fills leaves linearly, with
+    /// no comparisons and no node splits.
     fn clone(&self) -> Self {
-        let mut cloned = Self::default();
-        for (addr, size) in self.iter() {
-            cloned.insert(addr, size);
+        let data: Vec<(Mover, ())> = self.tree.iter().map(|(&m, &())| (m, ())).collect();
+        Self {
+            tree: BPlusTree::bulk_load(data),
         }
-        cloned
     }
 }
 

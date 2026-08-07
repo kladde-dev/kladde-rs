@@ -36,7 +36,7 @@ mod unjournaled;
 mod word;
 
 pub use backend::{Backend, BackendError, ReadBackend, WriteBackend};
-pub use gain_greedy::GainGreedyHeap;
+pub use gain_greedy::{GainGreedyHeap, SearchCap};
 pub use heap::{
     AllocationId, CompactionProgress, HeapError, IncrementallyCompactableHeap, RelocatableHeap,
     Relocation, Step,
