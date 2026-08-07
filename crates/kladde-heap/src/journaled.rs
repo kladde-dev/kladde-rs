@@ -90,7 +90,16 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> JournaledWriteBac
     pub fn flush(self) -> JournaledReadBackend<S, H, W> {
         let budget = self.compaction_budget;
         let mut inner = self.inner.into_inner();
-        let pending: Vec<(Pointer<W>, H::Size)> = inner.pending.drain().collect();
+        let mut pending: Vec<(Pointer<W>, H::Size)> = inner.pending.drain().collect();
+        // First-fit-decreasing: serve the large allocations while the large gaps
+        // are still intact, so the placement each one gets is the best available
+        // rather than whatever a smaller one left behind. Sorting also makes the
+        // resulting layout independent of hash iteration order, which would
+        // otherwise leave it -- and how much work compaction then has to do --
+        // unreproducible from one run to the next.
+        pending.sort_unstable_by(|(id_a, size_a), (id_b, size_b)| {
+            size_b.cmp(size_a).then_with(|| id_a.raw().cmp(&id_b.raw()))
+        });
         for (id, size) in pending {
             inner.composed.claim(id, size);
         }
@@ -372,6 +381,47 @@ mod tests {
         let mut buf = [0u8; 4];
         cursor.read_exact(&mut buf).unwrap();
         assert_eq!(buf, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn flush_claims_the_largest_pending_allocations_first() {
+        let wb = write_backend();
+        // Minted small-first, so hash order alone would not produce this layout.
+        let small = wb.alloc_fixed_size(10);
+        let large = wb.alloc_fixed_size(100);
+        let medium = wb.alloc_fixed_size(50);
+        let (s, l, m) = (small.raw(), large.raw(), medium.raw());
+
+        let rb = wb.flush();
+        let addresses = |id| rb.inner.composed.heap.lookup(id).unwrap().0;
+        assert_eq!(addresses(l), 0, "the largest is served first");
+        assert_eq!(addresses(m), 100);
+        assert_eq!(addresses(s), 150);
+        assert_eq!(rb.len(), 160, "and the result is gapless");
+    }
+
+    #[test]
+    fn flush_order_does_not_depend_on_hash_iteration_order() {
+        // Same multiset of sizes, minted in two different orders: the claimed
+        // layout must come out identical.
+        let layout_of = |sizes: &[u32]| {
+            let wb = write_backend();
+            let ids: Vec<_> = sizes
+                .iter()
+                .map(|&s| wb.alloc_fixed_size(s).raw())
+                .collect();
+            let rb = wb.flush();
+            let mut spans: Vec<(u64, u32)> = ids
+                .iter()
+                .map(|&id| rb.inner.composed.heap.lookup(id).unwrap())
+                .collect();
+            spans.sort_unstable();
+            spans
+        };
+        assert_eq!(
+            layout_of(&[7, 64, 7, 200, 31]),
+            layout_of(&[200, 31, 7, 7, 64]),
+        );
     }
 
     #[test]

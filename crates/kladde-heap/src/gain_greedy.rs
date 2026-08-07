@@ -551,16 +551,42 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
 
     /// Where to put a new `size`-byte allocation: an exactly-fitting gap if one
     /// exists (it leaves no sliver), else the lowest gap that fits, else the top.
-    fn place(&self, size: u32) -> Result<u64, HeapError> {
+    fn place(&self, size: u32, is_fixed_size: bool) -> Result<u64, HeapError> {
         let want = size as u64;
-        if let Some(set) = self.free_by_size.get(&want) {
-            if let Some(&start) = set.first() {
-                return Ok(start);
-            }
+        let s = size as i128;
+        let alpha = self.alpha as i128;
+
+        // Placement is scored against the same potential compaction is, but
+        // *without* a cost term: the bytes are written wherever they go, so a
+        // lower address here is free where compaction would pay a full copy for
+        // it. An allocation of size `s` at `a` adds `s·(a + (s−1)/2)` to `Φ`, and
+        // the constant drops out of a comparison; landing in a gap of exactly
+        // `s` additionally erases it, worth `α`.
+        let cost = |addr: u64, width: u64| s * addr as i128 - if width == want { alpha } else { 0 };
+
+        // Only a fixed-size allocation may claim the exact-fit bonus, exactly as
+        // in the compaction search: a resizable one parked in a snug gap has to
+        // move again the moment it grows, re-opening the gap and paying for two
+        // copies, so rewarding the snug fit would be luring it into a round trip.
+        let exact = is_fixed_size
+            .then(|| {
+                self.free_by_size
+                    .get(&want)
+                    .and_then(|starts| starts.first().copied())
+                    .map(|start| (start, want))
+            })
+            .flatten();
+        // Ties go to the exact fit, which is the tidier of two equal outcomes.
+        let best = [exact, self.lowest_gap_fitting(want)]
+            .into_iter()
+            .flatten()
+            .min_by_key(|&(addr, width)| cost(addr, width));
+        if let Some((addr, _)) = best {
+            return Ok(addr);
         }
-        if let Some((start, _)) = self.lowest_gap_fitting(want) {
-            return Ok(start);
-        }
+
+        // Nothing fits: extend. `end` is above every gap, so this is only ever
+        // reached when no gap could have taken the allocation at all.
         self.end
             .checked_add(want)
             .map(|_| self.end)
@@ -691,7 +717,7 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
         if self.by_id.contains_key(&id) {
             return Err(HeapError::DuplicateId);
         }
-        let addr = self.place(size)?;
+        let addr = self.place(size, id.is_fixed_size())?;
         self.insert_raw(addr, size, id);
         Ok(addr)
     }
@@ -726,7 +752,7 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
 
         // Otherwise find the new home *before* releasing the old one, so the two
         // ranges cannot overlap and the caller's copy is unambiguous.
-        let dest = self.place(new_size)?;
+        let dest = self.place(new_size, id.is_fixed_size())?;
         let e = self.remove_raw(addr);
         self.insert_raw(dest, new_size, e.id);
         Ok(Some((addr, dest)))
@@ -1105,6 +1131,102 @@ mod tests {
         assert_eq!(h.resize(p, 10).unwrap(), None);
         assert_eq!(h.lookup(p), Some((0, 10)));
         assert_eq!(h.implied_gaps(), vec![(10, 20)]);
+        h.assert_invariants();
+    }
+
+    #[test]
+    fn placement_takes_the_lowest_fitting_gap_over_a_higher_exact_one() {
+        // A double-width gap low down and an exact-width gap far above it.
+        let plan = [
+            (1, 20, true),  // gap    0..20   <- wide, but 20 bytes lower
+            (2, 80, false), //        20..100
+            (3, 10, true),  // gap  100..110  <- an exact fit for a 10-byte request
+            (4, 80, false), //       110..190
+        ];
+        let mut h = heap_with_layout(&plan);
+        assert_eq!(h.alpha(), 0);
+
+        // At α = 0 only the potential counts, and 0 is lower than 100.
+        assert_eq!(h.alloc(fixed(5), 10).unwrap(), 0);
+        h.assert_invariants();
+    }
+
+    #[test]
+    fn a_large_alpha_buys_the_exact_fit_at_placement_time_too() {
+        let plan = [
+            (1, 20, true),  // gap    0..20
+            (2, 80, false), //        20..100
+            (3, 10, true),  // gap  100..110  <- exact
+            (4, 80, false), //       110..190
+        ];
+        let mut h = heap_with_layout(&plan);
+        // Travelling 100 higher costs 10·100 of potential, so erasing a gap has
+        // to be worth more than that before the exact fit wins.
+        h.set_alpha(999);
+        assert_eq!(h.alloc(fixed(5), 10).unwrap(), 0, "α too small to matter");
+        h.free(fixed(5)).unwrap();
+
+        h.set_alpha(1001);
+        assert_eq!(h.alloc(fixed(6), 10).unwrap(), 100, "α now pays for it");
+        h.assert_invariants();
+    }
+
+    #[test]
+    fn only_a_fixed_size_allocation_is_placed_into_an_exact_fit() {
+        let plan = [
+            (1, 20, true),  // gap    0..20   <- wide, 100 bytes lower
+            (2, 80, false), //        20..100
+            (3, 10, true),  // gap  100..110  <- exact for a 10-byte request
+            (4, 80, false), //       110..190
+        ];
+        let mut h = heap_with_layout(&plan);
+        h.set_alpha(1001); // enough to outweigh travelling 100 higher
+
+        // A resizable allocation would have to move again the moment it grows,
+        // so it never buys the snug fit however large alpha is.
+        assert_eq!(h.alloc(resizable(5), 10).unwrap(), 0);
+        h.free(resizable(5)).unwrap();
+
+        // The same request from a fixed-size allocation does.
+        assert_eq!(h.alloc(fixed(6), 10).unwrap(), 100);
+        h.assert_invariants();
+    }
+
+    #[test]
+    fn a_relocating_resize_lands_in_the_lowest_fitting_gap() {
+        // `resize` only ever runs on resizable allocations, so a relocation must
+        // never be diverted into a higher exact fit.
+        let mut h = Heap::new();
+        let p = resizable(5);
+        h.alloc(fixed(1), 20).unwrap(); //     0..20
+        h.alloc(fixed(2), 80).unwrap(); //    20..100
+        h.alloc(fixed(3), 15).unwrap(); //   100..115
+        h.alloc(fixed(4), 80).unwrap(); //   115..195
+        h.alloc(p, 5).unwrap(); //           195..200
+        h.alloc(fixed(6), 80).unwrap(); //   200..280, walls `p` in from above
+        h.free(fixed(1)).unwrap(); // gap      0..20  <- lowest that fits 15
+        h.free(fixed(3)).unwrap(); // gap    100..115 <- an exact fit for 15
+        h.assert_invariants();
+
+        h.set_alpha(100_000); // far more than enough to outweigh 100 bytes of depth
+        let moved = h.resize(p, 15).unwrap();
+        assert_eq!(
+            moved,
+            Some((195, 0)),
+            "must fall to the lowest fitting gap, not rise into the exact one"
+        );
+        h.assert_invariants();
+    }
+
+    #[test]
+    fn placement_extends_the_heap_only_when_no_gap_fits() {
+        let plan = [
+            (1, 8, true),   // gap  0..8
+            (2, 16, false), //      8..24
+        ];
+        let mut h = heap_with_layout(&plan);
+        assert_eq!(h.alloc(fixed(3), 9).unwrap(), 24, "9 does not fit in 8");
+        assert_eq!(h.alloc(fixed(4), 8).unwrap(), 0, "8 does");
         h.assert_invariants();
     }
 

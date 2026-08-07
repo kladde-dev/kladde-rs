@@ -190,7 +190,7 @@ mover — the lowest gap that fits.
 **Slide.** The maximal run of *contiguous* allocations sitting directly above a
 gap shifts down into it. Every byte in the run travels the gap's width, so the
 gain is the gap size. The slide is what guarantees progress when nothing fits
-anywhere (§4.1), and it is the only move that shifts allocations too large for
+anywhere (§4.2), and it is the only move that shifts allocations too large for
 any gap. The gap chosen is the largest one, which maximizes the distance
 travelled.
 
@@ -244,7 +244,35 @@ remainder becomes an ordinary gap available to the next move. This makes
 "combination fits" fall out for free — a gap of width `3s` absorbs three
 `s`-sized movers one after another.
 
-### 4.1 Why it terminates
+### 4.1 Placement is the free version of the same move
+
+Compaction is not the only thing that moves the potential. Every `alloc` chooses
+an address, and a new allocation of size `s` at address `a` adds
+`s·(a + (s−1)/2)` to `Φ`. So placement is scored against the same potential —
+but **without a cost term**, because the bytes are written wherever they go. The
+same `Φ` reduction that costs compaction a full copy is free at allocation time.
+Placement therefore strictly dominates compaction wherever both could act, and
+the right rule is simply *the lowest address that fits*.
+
+`alloc` weighs the same two candidates the compactor weighs for a destination:
+the lowest gap wide enough, and — for a fixed-size allocation only — the lowest
+gap of exactly the right width, carrying the `α` bonus for erasing a gap
+outright. The sizedness condition is the same one as in §4, and for the same
+reason: a resizable allocation parked in a snug gap has to move again the moment
+it grows, so the bonus would be luring it into a round trip. At `α = 0` the lower
+address always wins either way; a large enough `α` buys a fixed-size allocation
+the exact fit. Only when no gap fits at all does the heap extend past `end`.
+
+`resize` is the exception, and deliberately: it keeps the current address when it
+can — always on a shrink, and on a growth that fits the space immediately above.
+Relocating would cost a copy, which puts it back in gain-versus-cost territory
+rather than the free-win territory above. Nothing is lost permanently: a shrink
+leaves a gap, and the compactor will find whatever move that opened up. When it
+*must* relocate it places the allocation like any other, which — resizable
+allocations earning no exact-fit bonus — means the lowest gap that fits the new
+size.
+
+### 4.2 Why it terminates
 
 While any gap exists, a positive-gain candidate exists: the maximal run above the
 largest gap is by definition flanked by free space above (another gap, or the top
@@ -259,7 +287,7 @@ with no gaps — which is exactly `end == live_bytes`. (A caller that stops earl
 because its budget ran out simply keeps the progress made; nothing is left in an
 intermediate state.)
 
-### 4.2 A worked example
+### 4.3 A worked example
 
 Five allocations, with four gaps between them:
 
@@ -419,11 +447,18 @@ Discussed, not implemented:
 - **A dedicated full-compaction routine.** Today a full compaction is this step in
   a loop. An algorithm that may run to completion could plan the whole permutation
   at once and beat the incremental one on total bytes copied.
-- **Smarter scheduling.** Steps currently run up to a fixed budget whenever the
-  caller flushes its buffered writes. A schedule aware of what is in that buffer
-  could fold compaction into it — for instance placing a newly created allocation
-  directly at the address compaction would have moved it to, so the bytes are
-  written once instead of written and then moved.
+- **Redirecting writes that have not landed yet.** Steps currently run up to a
+  fixed budget whenever the caller flushes its buffered writes, and the compaction
+  loop copies bytes that are already in the store. But an allocation created
+  during the same transaction has its bytes *still in the buffer* when compaction
+  runs. Moving one of those should not be a copy at all — the pending write can
+  simply be re-addressed, saving both a read and a write. This is the part §4.1's
+  placement rule cannot reach, since the move decision comes after placement.
+  (Note that the groundwork is already there: a journaling caller mints ids
+  immediately but assigns addresses at flush, so placement already sees the whole
+  transaction's frees before choosing anywhere to put anything, and claims the
+  largest pending allocation first so the big gaps are still intact when it is
+  served.)
 
 ## 7. The data structures
 
