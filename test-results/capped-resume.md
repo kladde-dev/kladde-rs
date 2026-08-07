@@ -70,7 +70,7 @@ The two branches pay for that seek differently:
 `compact_incrementally` moved onto the heap for this mode: the cursor needs a
 scope, and "one burst" is it. A caller-side loop could not express that.
 
-## The headline: the bound holds cost flat *and* fragmentation improves
+## The headline: the bound holds cost flat, at no cost to fragmentation
 
 | workload | catch-up steps | overhead, uncapped | overhead, `Resume(16)` |
 |---|---|---|---|
@@ -125,26 +125,53 @@ cap — not the prune — stops every walk, and the residual growth is not searc
 is `commit_compaction_step` moving runs, plus `slide_candidate`'s
 budget-bounded walk.
 
-## The surprise: bounding the search *reduces* fragmentation
+## Bounding the search does not cost fragmentation — it slightly improves it
 
-Overhead roughly halves on destination-first (0.82% → 0.43%) and improves on
-mover-first (0.81% → 0.69%), with the gap count falling 1 218 → 606 and
-1 198 → 1 140.
+Overhead falls on destination-first (0.82% → 0.43%) and on mover-first
+(0.81% → 0.69%), with the gap count following, 1 218 → 606 and 1 198 → 1 140.
 
-The mechanism shows up in the steps-per-burst figure, which falls from **7.0 to
-2.5** (destination-first) and **7.0 to 3.4** (mover-first). The bounded search
-finds fewer good evacuations, so the **slide** candidate — offered
-unconditionally, outside the capped walk — wins far more often. A slide moves a
-whole contiguous run into the largest gap, closing it entirely; an evacuation
-moves one allocation and generally splits a gap in two.
+**In absolute terms this is a much smaller effect than "halves" suggests**, and
+the free-space accounting is the way to see it. Every compaction step *conserves*
+free space: it consumes `len` free bytes at the destination and releases `len`
+where the mover was. Free space is created only by freeing something mid-heap,
+and destroyed only two ways — a placement landing in a gap, or a move that
+vacates the top of the heap so the freed bytes end up above `end`. Over the
+40 000-round run:
 
-The two policies optimize different things, and the one we measure is not the one
-the greedy search maximizes. The search is greedy in the potential
-`Φ = Σ address`, and the best `Φ` move is often a small allocation travelling a
-long way — excellent for `Φ`, neutral for the gap count and for `end`.
-Fragmentation is a different objective; clipping the search happens to bias it
-toward the moves that serve *that* one. This is a finding about the cost
-function, not about the cap.
+| bytes, 40 000 rounds | dest. uncapped | dest. `Resume(16)` | movers uncapped | movers `Resume(16)` |
+|---|---|---|---|---|
+| destroyed by placement into a gap | 624 375 | 818 617 | 628 625 | 750 487 |
+| destroyed by truncation at the top | 207 537 | 17 398 | 203 605 | 82 683 |
+| **total destroyed** | **831 912** | **836 015** | **832 230** | **833 170** |
+| standing free space at the end | 8 783 | 4 624 | 8 659 | 7 355 |
+
+All four configurations destroy the same amount of free space to within **0.5%**.
+Standing free space is the small residual between creation and destruction, so a
+sub-percent shift in that balance moves it by a factor of two. The bounded search
+is not removing twice as much free space; it is running a near-identical flow
+about half a percent leaner.
+
+Under this mode both branches shift the same way — away from truncation, toward
+placement absorption — which is tidier than mode (a), where mover-first shifts
+barely at all and still ends leaner. But mode (a) is the counter-example that
+matters: the same benefit arrives there *without* the shift, so the shift cannot
+be the cause. See [`capped-restart.md`](capped-restart.md) for that table.
+
+The widest gap at the end of the run was the obvious candidate for "the bounded
+search leaves more usable gaps" and does not support it: 62 bytes uncapped vs 62
+capped on destination-first, 64 vs 116 on mover-first. No consistent signal.
+
+**So: the effect is real and persistent across all ten snapshots of both runs,
+its size is a ~0.5% shift in the free-space balance, and its cause is not
+established.** See [Still open](#still-open).
+
+What *is* established: at `α = 0` the search does not price the gap count at all.
+`Gain::new(d, s, r, 0)` discards `r`, and `offer_evacuations_into` does not even
+compute it (`if self.alpha == 0 { 0 }`). So whatever an evacuation does to the
+gap count — `FreeNeighbours::Both` merges two gaps and scores `r_src = +1`,
+`Neither` mints one and scores `−1` — is an unpriced side effect of the
+distance-maximizing choice, not something selected for. That is what `α > 0`
+exists to fix, and it remains untested.
 
 ## Choosing `k`
 
@@ -292,11 +319,12 @@ and the cheaper-per-burst figures partly reflect the different step counts rathe
 than a faster search.
 
 The honest conclusion is that **the extra machinery does not pay for itself
-here** — and the reason is the same finding as above. The bias mode (b) was built
-to correct is bias in the *evacuation* search, but once the search is bounded the
-policy is mostly sliding anyway, and the slide is chosen outside the capped walk.
-Correcting which 16 evacuations get considered matters less when evacuations
-account for a smaller share of the work.
+here**, and the step-shape counters suggest why. The bias mode (b) was built to
+correct is bias in the *evacuation* search, but once the search is bounded the
+bytes go almost entirely into slides — 98.9% of moved bytes on destination-first,
+92.2% on mover-first — and the slide is chosen unconditionally, outside the
+capped walk. Correcting which 16 evacuations get considered matters less when
+evacuations move 1% of the bytes.
 
 That is a statement about this workload at this `k`, not a refutation of the
 idea. Mode (b) would be expected to matter where evacuations dominate — a larger
@@ -319,11 +347,28 @@ needs regardless of whether the cap uses it.
   prune fires, which on this workload is most calls at small heaps. A design that
   distinguished "pruned" from "cut" more finely would sweep further per burst;
   whether that helps is untested.
-- **`α > 0` is unmeasured.** Every number here is at the shipped `α = 0`.
-- **Fragmentation is not what the search optimizes.** The halving above says the
-  greedy-in-`Φ` policy is not aligned with the metric that matters. Pricing gaps
-  directly — which is what `α` is for — is the principled fix, and it is
-  untested.
+- **`α > 0` is unmeasured.** Every number here is at the shipped `α = 0`, where
+  the gap count is not priced at all. Since the fragmentation differences above
+  are unpriced side effects, `α > 0` is the obvious next experiment and the one
+  most likely to make them controllable rather than incidental.
+- **Why the bounded search runs leaner is not established.** The free-space
+  decomposition above rules out the two mechanisms that looked plausible —
+  truncating more, and leaving wider gaps. Under this mode both branches do shift
+  toward placement absorption, which looks like an explanation until you check
+  [mode (a)](capped-restart.md), where mover-first gets the same benefit with no
+  shift at all. The remaining candidates, none tested: the *order* in which free
+  space becomes available to placements (these counters are run totals and would
+  hide a timing effect); the interaction with `place`'s own
+  lowest-address-first policy; or a small persistent bias from the different
+  step-size distribution. A per-round free-space time series would probably
+  settle it, and the instrumentation to produce one is already in place.
+- **An earlier version of this document asserted a mechanism here and was wrong
+  twice.** The first claim — that evacuations split gaps — is contradicted by the
+  code: `offer_evacuations_into` emits `to: dest`, the gap's low end, so an
+  evacuation shrinks a gap from below and never splits it. The second — that
+  slides shrink the file by truncating — is contradicted by the table above.
+  Both are recorded because the underlying question is still open and these are
+  the answers already ruled out.
 
 ---
 

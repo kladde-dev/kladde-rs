@@ -222,8 +222,9 @@ above `α = 0` remains the reason to keep the mover-first branch around.
   fragmentation at lower cost is the open problem.
 
   **Followed up**: bounding the walk to `k = 16` candidates holds per-burst cost
-  flat (1.1–1.3× across a 10× heap, against 8× and 32× here) and *improves*
-  fragmentation. Two ways of bounding it are measured in
+  flat (1.1–1.3× across a 10× heap, against 8× and 32× here) at no cost to
+  fragmentation — it improves slightly, by a margin whose cause is not
+  established. Two ways of bounding it are measured in
   [`capped-restart.md`](capped-restart.md) and
   [`capped-resume.md`](capped-resume.md).
 
