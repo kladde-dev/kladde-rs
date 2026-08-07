@@ -246,3 +246,86 @@ or reverse the compression:
 find test-results -name '*.svgz' -exec sh -c 'gunzip -c "$1" > "${1%z}" && rm "$1"' _ {} \;
 find test-results -name '*.html' -exec sed -i -E 's/\.svgz(["'"'"')])/.svg\1/g' {} +
 ```
+
+---
+
+## Details about the measurements
+
+**Mover-first (the old search)** — worse than I'd predicted. At 14 k allocations, driving to quiescence examined **250.6 M candidates over 71 607 calls, skipping 0.3% of the space**. Mean per call grew ~10× per 10× of heap size, i.e. linear, not logarithmic. In wall clock: **12 ms to decide one step** on a 100 k heap.
+
+**Destination-first** — a solid win where it counted:
+
+| | movers | destinations |
+|---|---|---|
+| quiescing, mean items/call @14 k | 3 500 | **588** (5.9×) |
+| total visits, quiescing 40 k rounds | 250.6 M | **39.2 M** |
+| `slivers` @100 k, wall clock | 11.99 ms | **3.51 ms** (3.4×) |
+| `churned` @100 k, wall clock | 6.72 ms | **3.28 ms** (2.0×) |
+
+## Three things I'd flag rather than let the headline stand alone
+
+**It's a constant-factor win, not an asymptotic one.** Mean items per call still grows ~10× per 10× of heap size (4.6 → 63 → 588). The number of *gaps* grows with the heap just as the number of movers did. My earlier framing that this "dissolves the problem" was too strong — it shrinks the constant ~6×, it doesn't change the shape.
+
+**The pruning still barely prunes.** `examined` is 100% while quiescing: every gap gets visited. The entire improvement is that the enumerated set is smaller, not that the stopping rule fires more often. In hindsight that was predictable — the new ceiling `(T − dest) + 2α` bites only once a high-gain move exists, which is the same condition that defeated the old bound.
+
+**Interleaved churn got ~15% *worse*** (446 vs 389 items at 40 k). Active churn leaves many gaps, few of them useful. The regime that dominates total work improved (66 571 of 72 286 calls), so the aggregate is clearly positive — but it isn't uniform, and I've recorded it rather than quietly reporting only the good column.
+- (For explanation, see "2. The paragraph, unpacked" below)
+
+So the deferred cap on gaps examined still earns its place, and is better motivated now: gaps are examined deepest-first, so a cap of `K` yields the best move among the `K` most valuable destinations.
+
+## Two notes on the work itself
+
+The 2α approximation showed up immediately as a failing test — a resizable "plug" can no longer outrank a higher same-size mover, since only one inexact mover is considered per gap. That's the loss in concrete form, so I replaced the test with a randomized one asserting the bound itself against brute force over every (mover, gap) pair: exact at α = 0, within 2α above it.
+
+---
+
+## Clarifications of the above: 1. What the scenarios actually are
+
+### The instrumented test (`run_churny_workload`)
+
+Per round: **60% allocate, 25% free, 15% attempt a resize**. Allocation sizes are drawn from `{8, 16, 16, 64, 250}` and 25% of allocations are resizable. A resize picks a **uniform random** new size in `1..=300`. Every 7th round runs one compaction step with **budget 128**. Then a second phase drives compaction to quiescence with budget 4096.
+
+Four things make this **adversarial toward fragmentation**, not realistic:
+
+- **Frees are uniform-random** (`swap_remove` on a random index). Real workloads have strong lifetime locality — objects allocated together tend to die together. Uniform random death is close to the worst case for gap structure: it scatters holes evenly instead of clearing contiguous regions.
+- **Net monotone growth** (60 alloc vs 25 free) means the heap only accumulates, so those scattered holes never get consolidated by bulk death.
+- **Resize picks a uniform random size**, so resizable allocations end up with ~300 distinct sizes. Real resizable containers grow *geometrically* (doubling), which would produce a handful of sizes. This one detail is **specifically adversarial to the mover-first search**, because that search made one walk entry per resizable allocation.
+- **Budget 128 during churn** is 512× smaller than the real `DEFAULT_COMPACTION_BUDGET` of 64 KiB, so nearly every step is one small move.
+
+It's adversarial to destination-first too, just via a different channel: uniform random frees maximise the *gap count*, which is what that search enumerates. So it's roughly even-handed as a comparison — both variants are stressed near their worst — but neither number should be read as "what kladde will do".
+
+### `roomy` — a deliberate control
+
+16 × 1024-byte allocations at the bottom, freed, leaving one 16 KiB gap; `n` allocations of 200–600 bytes above. The topmost allocation fits the gap, so the first candidate examined sets a bound nothing can beat.
+
+Not realistic — it's the control that proves the stopping rule works at all. It's favourable to both variants, and both stay flat at ~270 ns across all heap sizes.
+
+### `slivers` — purely adversarial, and symmetric
+
+Alternate a 200–600-byte resizable allocation with an 8-byte spacer; free every spacer. Result: `n` gaps of exactly 8 bytes between `n` allocations none of which fit in 8 bytes. No evacuation is ever possible, so no bound is ever established.
+
+No real heap looks like this. Its value is that it's **symmetric by construction** — exactly `n` movers and `n` gaps — so it isolates *cost per item examined* rather than item count. That's why it's the shape where destination-first won most (3.4×): both searches fail at the tree root in O(1), but the mover-first path did an extra `allocations.get()` B-tree lookup per item before the query, which destination-first doesn't need.
+
+### `churned` — the workload, plus partial compaction
+
+Same churn as the test at `3n` rounds, then up to 2000 compaction steps. The most representative of the three, and it inherits every unrealism above.
+
+**Overall:** `roomy` is a best case, `slivers` a worst case, `churned` a stressed middle. The bracket is honest; the middle is not a forecast.
+
+## 2. The paragraph, unpacked
+
+**"Interleaved churn"** = the first measurement phase, where compaction steps are *interleaved* with the mutation workload — one step every 7 allocate/free/resize operations, budget 128. Meant to model a system compacting a little while the application keeps mutating.
+
+**"Active churn"** = the same thing said twice. That was sloppy writing on my part; I meant "while the workload is still mutating the heap", which is exactly the interleaved phase. The substantive claim is that during mutation there are many gaps and few of them are useful, so enumerating gaps costs more than enumerating movers did.
+
+**"The regime that dominates total work"** = of the 72 286 `propose_compaction_step` calls in the 40 000-round measurement, 66 571 (92%) came from the quiescence phase and only 5 715 from the interleaved phase. So summing over all calls, the quiescence phase dominates — and that's the phase that improved ~6×.
+
+### But that sentence was doing work it hadn't earned
+
+The 92/8 split is **an artefact of my test design**: the quiescence phase dominates because I chose to run an unbounded loop until the heap was gapless. The real backend never does that — it calls `compact_incrementally(64 KiB)` per flush and stops. So citing the split as evidence that the improved regime is the important one was circular.
+
+The better argument, which I should have made instead, is about *shape*: a real flush with a 64 KiB budget and 8–250-byte allocations runs **hundreds of consecutive steps with no intervening mutation**. That burst structure is much closer to my quiescence phase than to my interleaved phase (one isolated step every 7 ops with a 128-byte budget). So the ~6× win probably does apply to where the real backend spends its compaction time — but because the *inside of a flush* looks like the quiescence phase, not because 92% of my calls were there.
+
+Neither phase is the real schedule. They bracket it: real behaviour is bursts of consecutive steps separated by churn. The 15% interleaved regression is real and I'd expect it at the *start* of each burst, when the heap has just been mutated; the 6× improvement is what should apply through the rest of the burst.
+
+I'll correct that reasoning in `test-results/README.md` if you'd like — the numbers are right, but that particular justification isn't.
