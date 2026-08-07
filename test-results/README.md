@@ -113,6 +113,88 @@ while the scan degrades with the number of distinct widths.
 
 ---
 
+## Run 2 — destination-first search
+
+The search enumerates **destinations**: gaps in increasing address, asking a
+`MoverTree` descent per gap for the highest-addressed allocation that fits, and
+stopping once `(T − dest) + 2α` can no longer beat the best gain found.
+
+| | |
+|---|---|
+| Heap implementation | [`fd05483`](../../../commit/fd05483) — *Search destinations instead of movers* |
+| Reports | [`search-destinations/report/index.html`](search-destinations/report/index.html) |
+
+Same commands, same workload, same seeds as run 1.
+
+```sh
+cargo test -p kladde-heap --lib candidate_search_cost -- --ignored --nocapture
+cargo bench -p kladde-heap
+```
+
+### Counters
+
+| workload | phase | calls | visited | mean/call | max | examined |
+|---|---|---|---|---|---|---|
+| 400 rounds | interleaved | 58 | 334 | 5.76 | 12 | 83.9% |
+| | quiescing | 16 | 74 | 4.62 | 10 | 100% |
+| 4 000 rounds | interleaved | 572 | 31 848 | 55.68 | 129 | 79.4% |
+| | quiescing | 922 | 58 333 | 63.27 | 131 | 99.8% |
+| 40 000 rounds | interleaved | 5 715 | 2 549 284 | 446.07 | 1 238 | 71.1% |
+| | quiescing | 66 571 | 39 162 862 | 588.29 | 1 265 | 100% |
+
+### Head to head
+
+| workload | phase | movers | destinations | change |
+|---|---|---|---|---|
+| 400 | interleaved | 7.53 | 5.76 | 1.3× better |
+| | quiescing | 28.00 | 4.62 | **6.1× better** |
+| 4 000 | interleaved | 53.46 | 55.68 | 1.04× worse |
+| | quiescing | 343.76 | 63.27 | **5.4× better** |
+| 40 000 | interleaved | 389.04 | 446.07 | 1.15× worse |
+| | quiescing | 3 500.15 | 588.29 | **5.9× better** |
+
+Mean items examined per call. Total visits while quiescing 40 000 rounds fall
+from 250.6 M to 39.2 M.
+
+| shape | movers | destinations | change |
+|---|---|---|---|
+| `roomy` @100k | 332 ns | 278 ns | 1.2× |
+| `churned` @100k | 6.72 ms | 3.28 ms | **2.0×** |
+| `slivers` @100k | 11.99 ms | 3.51 ms | **3.4×** |
+| `churned` @10k | 438 µs | 275 µs | 1.6× |
+| `slivers` @10k | 1.00 ms | 457 µs | 2.2× |
+
+### What this does and does not fix
+
+**It is a constant-factor win, not an asymptotic one.** Mean items per call still
+grows about 10× per 10× of heap size (4.6 → 63 → 588 while quiescing), because
+the number of *gaps* grows with the heap just as the number of movers did. The
+search is still linear in heap size; the constant is ~6× smaller and each item is
+cheaper, giving 2–3.4× in wall clock on the hard shapes.
+
+**The pruning still barely prunes.** `examined` is 100% while quiescing — every
+gap is visited. The improvement is entirely that the *set being enumerated is
+smaller*, not that the stopping rule fires more often. That was foreseeable in
+hindsight: the ceiling `(T − dest) + 2α` only bites once a high-gain move has been
+found, which is the same condition that defeated the old bound.
+
+**Interleaved churn is slightly worse** — 446 vs 389 items at 40 000 rounds, about
+15%. During active churn there are many gaps and comparatively few of them are
+useful, so enumerating gaps costs a little more than enumerating movers did. The
+regime that dominated total work (quiescing: 66 571 of 72 286 calls) is the one
+that improved, so the aggregate is a clear win, but it is not a win everywhere.
+
+**`roomy` stays flat** at ~280 ns across all three heap sizes, as it did before:
+when a good move exists, both searches stop almost immediately. Nothing about the
+easy case needed fixing.
+
+So the deferred cap on how many gaps are examined (see `compaction-algorithm.md`
+§6) is still worth having — this change lowers the constant and makes the cap
+better-motivated, since gaps are examined deepest-first and a cap of `K` yields
+the best move among the `K` most valuable destinations.
+
+---
+
 ## Notes on the artifacts
 
 The criterion reports are committed whole, with every `.svg` gzipped to `.svgz`
