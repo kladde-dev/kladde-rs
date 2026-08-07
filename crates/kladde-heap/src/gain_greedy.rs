@@ -179,6 +179,78 @@ impl Best {
     }
 }
 
+/// Counters for how much work the candidate search does.
+///
+/// Test-only instrumentation: outside `cfg(test)` none of this exists, `Probe`
+/// is a zero-sized type whose methods are empty, and the heap carries no extra
+/// field. See `test-results/` for measurements.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SearchStats {
+    /// Calls to `propose_compaction_step`.
+    pub calls: u64,
+    /// Calls that returned a step (the rest found the heap already compact).
+    pub proposals: u64,
+    /// Search items examined, summed over all calls.
+    pub visited: u64,
+    /// Most items examined in any single call.
+    pub max_visited: u64,
+    /// Items the search *could* have examined, summed over all calls -- the
+    /// denominator that says how much the pruning actually saved.
+    pub available: u64,
+    /// Items examined per call, bucketed by `1, 2, 4, 8, ... , 128+`.
+    pub buckets: [u64; 9],
+}
+
+#[cfg(test)]
+impl SearchStats {
+    fn record(&mut self, visited: u64, available: u64, proposed: bool) {
+        self.calls += 1;
+        self.proposals += u64::from(proposed);
+        self.visited += visited;
+        self.max_visited = self.max_visited.max(visited);
+        self.available += available;
+        let bucket = (u64::BITS - visited.leading_zeros()) as usize;
+        self.buckets[bucket.min(self.buckets.len() - 1)] += 1;
+    }
+
+    /// Mean items examined per call.
+    pub fn mean_visited(&self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            self.visited as f64 / self.calls as f64
+        }
+    }
+
+    /// Fraction of the available search space actually examined.
+    pub fn examined_fraction(&self) -> f64 {
+        if self.available == 0 {
+            0.0
+        } else {
+            self.visited as f64 / self.available as f64
+        }
+    }
+}
+
+/// Counts items examined by one candidate search. A ZST with empty methods
+/// outside tests, so the instrumentation costs real workloads nothing.
+#[derive(Default)]
+struct Probe {
+    #[cfg(test)]
+    visited: u64,
+}
+
+impl Probe {
+    #[inline(always)]
+    fn visit(&mut self) {
+        #[cfg(test)]
+        {
+            self.visited += 1;
+        }
+    }
+}
+
 /// A relocatable heap over a `u64` address space with `u32` allocation sizes,
 /// compacting by gain-greedy incremental steps. See the module docs.
 pub struct GainGreedyHeap<Id> {
@@ -219,6 +291,9 @@ pub struct GainGreedyHeap<Id> {
     live_bytes: u64,
     /// Weight of the fragmentation term. See [`GainGreedyHeap::alpha`].
     alpha: u64,
+    /// Test-only search instrumentation; absent from real builds.
+    #[cfg(test)]
+    stats: std::cell::Cell<SearchStats>,
 }
 
 impl<Id> Default for GainGreedyHeap<Id> {
@@ -234,6 +309,8 @@ impl<Id> Default for GainGreedyHeap<Id> {
             end: 0,
             live_bytes: 0,
             alpha: 0,
+            #[cfg(test)]
+            stats: std::cell::Cell::new(SearchStats::default()),
         }
     }
 }
@@ -276,6 +353,30 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// Set the fragmentation weight. See [`alpha`](Self::alpha).
     pub fn set_alpha(&mut self, alpha: u64) {
         self.alpha = alpha;
+    }
+
+    /// Fold one search's [`Probe`] into the counters. A no-op outside tests.
+    #[cfg(test)]
+    fn record_search(&self, probe: Probe, proposed: bool) {
+        let available = (self.tops.len() + self.resizable_by_address.len()) as u64;
+        let mut stats = self.stats.get();
+        stats.record(probe.visited, available, proposed);
+        self.stats.set(stats);
+    }
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn record_search(&self, _probe: Probe, _proposed: bool) {}
+
+    /// The search counters accumulated so far.
+    #[cfg(test)]
+    pub(crate) fn search_stats(&self) -> SearchStats {
+        self.stats.get()
+    }
+
+    /// Zero the search counters, e.g. to measure one phase of a workload.
+    #[cfg(test)]
+    pub(crate) fn reset_search_stats(&self) {
+        self.stats.set(SearchStats::default());
     }
 
     // ---- gap index maintenance ----
@@ -719,6 +820,7 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
     /// O(log n) lookup and usually seeds a bound straight away.
     fn propose_compaction_step(&self, budget: u64) -> Option<Step<u64>> {
         if self.free_by_size.is_empty() {
+            self.record_search(Probe::default(), false);
             return None; // gapless: compact
         }
         let mut best = Best::default();
@@ -726,6 +828,7 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
             best.offer(gain, step, budget);
         }
 
+        let mut probe = Probe::default();
         let mut classes = self.tops.iter().rev().peekable();
         let mut resizables = self.resizable_by_address.iter().rev().peekable();
         loop {
@@ -742,6 +845,7 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
                     break;
                 }
             }
+            probe.visit();
             let candidate = if class_at == Some(next) {
                 let (_, &size) = classes.next().expect("peeked");
                 self.evacuation_candidate(size)
@@ -753,7 +857,9 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
                 best.offer(gain, step, budget);
             }
         }
-        best.pick()
+        let chosen = best.pick();
+        self.record_search(probe, chosen.is_some());
+        chosen
     }
 
     fn commit_compaction_step(&mut self, step: Step<u64>) {
@@ -1491,6 +1597,117 @@ mod tests {
             bytes <= 200,
             "distance-greed should move ~130 bytes, not slide 1460; moved {bytes}"
         );
+    }
+
+    /// The churny workload the soak test uses, factored out so the
+    /// instrumentation run and the convergence run exercise exactly the same
+    /// sequence of operations.
+    fn run_churny_workload(h: &mut Heap, rounds: usize) -> Vec<Pointer<u32>> {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut live: Vec<Pointer<u32>> = Vec::new();
+        let mut next_counter = 1u32;
+
+        for round in 0..rounds {
+            let roll = rand() % 100;
+            if roll < 60 || live.is_empty() {
+                // Skewed to a few sizes, as kladde's fixed-size classes would be.
+                let size = [8u32, 16, 16, 64, 250][(rand() % 5) as usize];
+                let id = if rand() % 4 == 0 {
+                    resizable(next_counter)
+                } else {
+                    fixed(next_counter)
+                };
+                next_counter += 1;
+                h.alloc(id, size).unwrap();
+                live.push(id);
+            } else if roll < 85 {
+                let victim = live.swap_remove((rand() % live.len() as u64) as usize);
+                h.free(victim).unwrap();
+            } else {
+                let i = (rand() % live.len() as u64) as usize;
+                if !live[i].is_fixed_size() {
+                    let new_size = 1 + (rand() % 300) as u32;
+                    h.resize(live[i], new_size).unwrap();
+                }
+            }
+
+            // Interleave bounded compaction with the workload, as a backend would.
+            if round % 7 == 0 {
+                if let Some(step) = h.propose_compaction_step(128) {
+                    h.commit_compaction_step(step);
+                }
+            }
+        }
+        live
+    }
+
+    fn report_search_stats(label: &str, s: SearchStats) {
+        println!(
+            "  {label:<24} calls {:>7}  visited {:>12}  mean {:>9.2}  max {:>6}  examined {:>6.2}%",
+            s.calls,
+            s.visited,
+            s.mean_visited(),
+            s.max_visited,
+            s.examined_fraction() * 100.0
+        );
+        let labels = [
+            "0", "1", "2-3", "4-7", "8-15", "16-31", "32-63", "64-127", "128+",
+        ];
+        let hist: Vec<String> = labels
+            .iter()
+            .zip(s.buckets)
+            .filter(|(_, n)| *n > 0)
+            .map(|(l, n)| format!("{l}:{n}"))
+            .collect();
+        println!("  {:<24} {}", "", hist.join("  "));
+    }
+
+    /// Not an assertion of behaviour -- a **measurement**, of how much work the
+    /// candidate search does over a realistic churn. That is what decides
+    /// whether the search needs bounding at all, and the answer is recorded in
+    /// `test-results/`.
+    ///
+    /// Two regimes are reported separately, because they behave very
+    /// differently: compaction interleaved with churn (a step every 7 ops, small
+    /// budget), and compaction driven to quiescence (no churn, larger budget).
+    ///
+    /// `#[ignore]`d because the largest case takes minutes -- it is a
+    /// measurement, not part of the suite. Run with:
+    ///
+    /// ```text
+    /// cargo test -p kladde-heap --lib candidate_search_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a behavioural test; takes minutes"]
+    fn candidate_search_cost_over_a_churny_workload() {
+        for &rounds in &[400usize, 4_000, 40_000] {
+            let mut h = Heap::new();
+            run_churny_workload(&mut h, rounds);
+            let interleaved = h.search_stats();
+
+            // Then drive to quiescence: the regime where the search is expected
+            // to be worst, since every remaining gain is small.
+            h.reset_search_stats();
+            let mut steps = 0u64;
+            while let Some(step) = h.propose_compaction_step(4096) {
+                h.commit_compaction_step(step);
+                steps += 1;
+            }
+            let quiescing = h.search_stats();
+
+            println!(
+                "\n=== {rounds} rounds -> {} live allocations; {steps} steps to quiescence ===",
+                h.live_count()
+            );
+            report_search_stats("interleaved w/ churn", interleaved);
+            report_search_stats("driven to quiescence", quiescing);
+        }
     }
 
     #[test]
