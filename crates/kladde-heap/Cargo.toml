@@ -29,3 +29,7 @@ harness = false
 [[bench]]
 name = "lowest_fitting_gap"
 harness = false
+
+[[bench]]
+name = "propose_compaction_step"
+harness = false
