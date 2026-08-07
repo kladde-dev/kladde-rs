@@ -1615,10 +1615,51 @@ mod tests {
         );
     }
 
-    /// The churny workload the soak test uses, factored out so the
-    /// instrumentation run and the convergence run exercise exactly the same
-    /// sequence of operations.
-    fn run_churny_workload(h: &mut Heap, rounds: usize) -> Vec<Pointer<u32>> {
+    /// How often the workload below pauses to compact, and how much it is
+    /// allowed to move when it does.
+    ///
+    /// Chosen so that a burst does *several* steps but does not reach
+    /// quiescence: a single step per pause would not exercise the search in the
+    /// state a burst actually leaves behind, and a burst that compacts fully
+    /// would make the "incremental" in the algorithm moot. See
+    /// `test-results/README.md` for the measured steps-per-burst this yields.
+    const COMPACTION_INTERVAL: usize = 32;
+    const COMPACTION_BUDGET: u64 = 2048;
+
+    /// What one burst achieved.
+    #[derive(Default, Clone, Copy)]
+    struct BurstStats {
+        bursts: u64,
+        steps: u64,
+        quiesced: u64,
+    }
+
+    /// The caller-side loop of `compaction-algorithm.md` §5, minus the byte
+    /// copying (a bare heap has no store). Returns steps taken and whether the
+    /// heap ran out of work before the budget ran out.
+    fn compact_incrementally(h: &mut Heap, budget: u64) -> (u64, bool) {
+        let mut moved = 0u64;
+        let mut steps = 0u64;
+        loop {
+            let Some(step) = h.propose_compaction_step(budget - moved) else {
+                return (steps, true); // quiesced
+            };
+            if step.len > budget - moved && steps > 0 {
+                return (steps, false); // save the oversized step for next time
+            }
+            h.commit_compaction_step(step);
+            moved += step.len;
+            steps += 1;
+            if moved >= budget {
+                return (steps, false);
+            }
+        }
+    }
+
+    /// The churny workload the measurement below drives, with compaction
+    /// bursts interleaved the way a backend flush does it. Returns the live ids
+    /// and what the bursts achieved.
+    fn run_churny_workload_tracked(h: &mut Heap, rounds: usize) -> (Vec<Pointer<u32>>, BurstStats) {
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut rand = move || {
             state ^= state << 13;
@@ -1628,6 +1669,7 @@ mod tests {
         };
         let mut live: Vec<Pointer<u32>> = Vec::new();
         let mut next_counter = 1u32;
+        let mut bursts = BurstStats::default();
 
         for round in 0..rounds {
             let roll = rand() % 100;
@@ -1653,14 +1695,17 @@ mod tests {
                 }
             }
 
-            // Interleave bounded compaction with the workload, as a backend would.
-            if round % 7 == 0 {
-                if let Some(step) = h.propose_compaction_step(128) {
-                    h.commit_compaction_step(step);
-                }
+            // Compact the way a backend does: not one step, but a *burst* --
+            // `compact_incrementally` spends a whole budget in one call, so a
+            // pause does many consecutive steps with no mutation in between.
+            if round % COMPACTION_INTERVAL == 0 {
+                let (steps, quiesced) = compact_incrementally(h, COMPACTION_BUDGET);
+                bursts.bursts += 1;
+                bursts.steps += steps;
+                bursts.quiesced += u64::from(quiesced);
             }
         }
-        live
+        (live, bursts)
     }
 
     fn report_search_stats(label: &str, s: SearchStats) {
@@ -1690,8 +1735,8 @@ mod tests {
     /// `test-results/`.
     ///
     /// Two regimes are reported separately, because they behave very
-    /// differently: compaction interleaved with churn (a step every 7 ops, small
-    /// budget), and compaction driven to quiescence (no churn, larger budget).
+    /// differently: compaction in **bursts** interleaved with churn (what a
+    /// backend does on each flush), and compaction driven to quiescence.
     ///
     /// `#[ignore]`d because the largest case takes minutes -- it is a
     /// measurement, not part of the suite. Run with:
@@ -1704,7 +1749,7 @@ mod tests {
     fn candidate_search_cost_over_a_churny_workload() {
         for &rounds in &[400usize, 4_000, 40_000] {
             let mut h = Heap::new();
-            run_churny_workload(&mut h, rounds);
+            let (_, bursts) = run_churny_workload_tracked(&mut h, rounds);
             let interleaved = h.search_stats();
 
             // Then drive to quiescence: the regime where the search is expected
@@ -1721,7 +1766,14 @@ mod tests {
                 "\n=== {rounds} rounds -> {} live allocations; {steps} steps to quiescence ===",
                 h.live_count()
             );
-            report_search_stats("interleaved w/ churn", interleaved);
+            println!(
+                "  bursts: {} of budget {COMPACTION_BUDGET} every {COMPACTION_INTERVAL} ops; \
+                 {:.1} steps each; {} of them reached quiescence",
+                bursts.bursts,
+                bursts.steps as f64 / bursts.bursts.max(1) as f64,
+                bursts.quiesced,
+            );
+            report_search_stats("bursts w/ churn", interleaved);
             report_search_stats("driven to quiescence", quiescing);
         }
     }

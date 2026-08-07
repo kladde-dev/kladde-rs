@@ -101,13 +101,41 @@ fn roomy(n: usize) -> Heap {
     h
 }
 
-/// Churn, then compaction run partway: the state a live heap is usually in.
+/// How often the churn below pauses to compact, and how much it may move when
+/// it does. Matches the instrumented test in `gain_greedy.rs`.
+const COMPACTION_INTERVAL: usize = 32;
+const COMPACTION_BUDGET: u64 = 2048;
+
+/// The caller-side loop of `compaction-algorithm.md` §5, minus the byte copying.
+/// A pause spends a whole budget, so it is a *burst* of consecutive steps rather
+/// than a single one -- which is what a backend's flush actually does.
+fn compact_incrementally(h: &mut Heap, budget: u64) {
+    let mut moved = 0u64;
+    let mut steps = 0u64;
+    loop {
+        let Some(step) = h.propose_compaction_step(budget - moved) else {
+            return;
+        };
+        if step.len > budget - moved && steps > 0 {
+            return;
+        }
+        h.commit_compaction_step(step);
+        moved += step.len;
+        steps += 1;
+        if moved >= budget {
+            return;
+        }
+    }
+}
+
+/// Churn with compaction bursts interleaved: the state a live heap is usually
+/// in, under the schedule a backend actually uses.
 fn churned(n: usize) -> Heap {
     let mut rand = rng(0x2545_F491);
     let mut h = Heap::new();
     let mut live: Vec<Pointer<u32>> = Vec::new();
     let mut counter = 1u32;
-    for _ in 0..(n * 3) {
+    for round in 0..(n * 3) {
         let roll = rand() % 100;
         if roll < 60 || live.is_empty() {
             let size = [8u32, 16, 16, 64, 250][(rand() % 5) as usize];
@@ -125,19 +153,14 @@ fn churned(n: usize) -> Heap {
                 let _ = h.resize(live[i], new_size);
             }
         }
-    }
-    // Take the easy moves off the table, leaving the regime where the search is
-    // actually asked to work.
-    //
-    // Capped, and not at `n/2`: each of these setup steps pays a full search,
-    // which is the very thing being measured. At 100k allocations that is
-    // milliseconds apiece, so an uncapped setup spends minutes computing a
-    // starting state rather than measuring anything. A couple of thousand steps
-    // is already well past the easy moves.
-    for _ in 0..(n / 2).min(2_000) {
-        match h.propose_compaction_step(4096) {
-            Some(step) => h.commit_compaction_step(step),
-            None => break,
+
+        // A compaction burst every so often, exactly as a flush would do it.
+        // Capped in total, because each of these steps pays a full search --
+        // the very thing being measured -- and at 100k allocations that is
+        // milliseconds apiece, so an uncapped setup would spend minutes
+        // computing a starting state rather than measuring anything.
+        if round % COMPACTION_INTERVAL == 0 && round < 64_000 {
+            compact_incrementally(&mut h, COMPACTION_BUDGET);
         }
     }
     h
