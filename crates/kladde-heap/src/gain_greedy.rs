@@ -251,6 +251,30 @@ pub(crate) struct SearchStats {
     pub available: u64,
     /// Items examined per call, bucketed by `1, 2, 4, 8, ... , 128+`.
     pub buckets: [u64; 9],
+    /// Committed steps that were the slide candidate, and that were an
+    /// evacuation. Which shape wins is what decides whether a burst shrinks the
+    /// file or merely rearranges it -- see `truncated_by_*`.
+    pub slides: u64,
+    pub evacuations: u64,
+    /// Bytes those steps moved.
+    pub slide_bytes: u64,
+    pub evac_bytes: u64,
+    /// Bytes `end` fell by as a result. **This is the only way free space
+    /// leaves the file**: every other move conserves it, taking `len` free bytes
+    /// at the destination and giving `len` back at the source.
+    pub truncated_by_slides: u64,
+    pub truncated_by_evacuations: u64,
+    /// Placements (`alloc`, and the relocating half of `resize`) that found a
+    /// gap to sit in, and those that had to extend `end` because nothing fitted.
+    ///
+    /// The other half of the free-space budget: free bytes are created by
+    /// freeing something mid-heap and destroyed either by truncation at the top
+    /// or by a placement landing in a gap. A heap whose gaps are *usable* runs
+    /// leaner without compaction doing anything more.
+    pub placed_in_gap: u64,
+    pub placed_at_end: u64,
+    pub placed_in_gap_bytes: u64,
+    pub placed_at_end_bytes: u64,
 }
 
 #[cfg(test)]
@@ -263,6 +287,18 @@ impl SearchStats {
         self.available += available;
         let bucket = (u64::BITS - visited.leading_zeros()) as usize;
         self.buckets[bucket.min(self.buckets.len() - 1)] += 1;
+    }
+
+    fn record_step(&mut self, is_slide: bool, len: u64, truncated: u64) {
+        if is_slide {
+            self.slides += 1;
+            self.slide_bytes += len;
+            self.truncated_by_slides += truncated;
+        } else {
+            self.evacuations += 1;
+            self.evac_bytes += len;
+            self.truncated_by_evacuations += truncated;
+        }
     }
 
     /// Mean items examined per call.
@@ -445,7 +481,23 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             if step.len > budget - moved && steps > 0 {
                 return (steps, false);
             }
+            // Which candidate shape won, and what it did to `end`. Recomputing
+            // the slide to identify it is redundant work, which is why it is
+            // test-only; `Step` is small and equality is exact.
+            #[cfg(test)]
+            let provenance = (
+                self.slide_candidate(budget - moved)
+                    .is_some_and(|(_, slide)| slide == step),
+                self.end,
+            );
             self.commit_compaction_step(step);
+            #[cfg(test)]
+            {
+                let (is_slide, before_end) = provenance;
+                let mut stats = self.stats.get();
+                stats.record_step(is_slide, step.len, before_end - self.end);
+                self.stats.set(stats);
+            }
             moved += step.len;
             steps += 1;
             if moved >= budget {
@@ -465,6 +517,23 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     #[cfg(not(test))]
     #[inline(always)]
     fn record_search(&self, _probe: Probe, _proposed: bool) {}
+
+    /// Note where a placement landed. A no-op outside tests.
+    #[cfg(test)]
+    fn record_placement(&self, in_gap: bool, bytes: u64) {
+        let mut stats = self.stats.get();
+        if in_gap {
+            stats.placed_in_gap += 1;
+            stats.placed_in_gap_bytes += bytes;
+        } else {
+            stats.placed_at_end += 1;
+            stats.placed_at_end_bytes += bytes;
+        }
+        self.stats.set(stats);
+    }
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn record_placement(&self, _in_gap: bool, _bytes: u64) {}
 
     /// The search counters accumulated so far.
     #[cfg(test)]
@@ -688,11 +757,13 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             .flatten()
             .min_by_key(|&(addr, width)| cost(addr, width));
         if let Some((addr, _)) = best {
+            self.record_placement(true, want);
             return Ok(addr);
         }
 
         // Nothing fits: extend. `end` is above every gap, so this is only ever
         // reached when no gap could have taken the allocation at all.
+        self.record_placement(false, want);
         self.end
             .checked_add(want)
             .map(|_| self.end)
@@ -1911,6 +1982,9 @@ mod tests {
         live_bytes: u64,
         end: u64,
         gaps: usize,
+        /// The widest gap. A heap with a few wide gaps absorbs new allocations
+        /// without extending `end`; one with many slivers cannot.
+        widest_gap: u64,
         /// Mean wall-clock of one burst since the previous snapshot, in
         /// microseconds. Plotted against `allocations` down the table, this is
         /// the scaling curve a cap is supposed to flatten.
@@ -1928,6 +2002,7 @@ mod tests {
                 live_bytes: h.live_bytes(),
                 end: h.len(),
                 gaps: h.gaps.len(),
+                widest_gap: h.free_by_size.last_key_value().map_or(0, |(&len, _)| len),
                 micros_per_burst: 0.0,
                 visited_per_call: 0.0,
             }
@@ -2060,6 +2135,51 @@ mod tests {
         println!("  {:<24} {}", "", hist.join("  "));
     }
 
+    /// Which candidate shape the bursts actually committed, and -- the column
+    /// that matters -- how many bytes of `end` each one bought.
+    ///
+    /// Every compaction step *conserves* free space: it takes `len` free bytes
+    /// at the destination and gives `len` back where the mover was. The only
+    /// exception is a move that vacates the top of the heap, where the freed
+    /// bytes end up above `end` and stop counting. So the whole of the
+    /// fragmentation result is in `truncated`, and nowhere else.
+    fn report_step_shapes(s: SearchStats) {
+        let row = |label: &str, n: u64, bytes: u64, truncated: u64| {
+            println!(
+                "  {label:<24} steps {:>7}  bytes {:>10}  truncated {:>10}  ({:>5.1}% of bytes moved)",
+                n,
+                bytes,
+                truncated,
+                if bytes == 0 {
+                    0.0
+                } else {
+                    100.0 * truncated as f64 / bytes as f64
+                },
+            );
+        };
+        row("slides", s.slides, s.slide_bytes, s.truncated_by_slides);
+        row(
+            "evacuations",
+            s.evacuations,
+            s.evac_bytes,
+            s.truncated_by_evacuations,
+        );
+        let placements = s.placed_in_gap + s.placed_at_end;
+        println!(
+            "  {:<24} in a gap {:>7} ({:>5.1}%, {:>9} bytes)   extending end {:>7} ({:>9} bytes)",
+            "placements",
+            s.placed_in_gap,
+            if placements == 0 {
+                0.0
+            } else {
+                100.0 * s.placed_in_gap as f64 / placements as f64
+            },
+            s.placed_in_gap_bytes,
+            s.placed_at_end,
+            s.placed_at_end_bytes,
+        );
+    }
+
     /// Not an assertion of behaviour -- a **measurement**, of how much work the
     /// candidate search does over a realistic churn. That is what decides
     /// whether the search needs bounding at all, and the answer is recorded in
@@ -2136,26 +2256,29 @@ mod tests {
         );
         report_search_stats("during bursts", during_bursts);
         report_search_stats("catching up", catching_up);
+        report_step_shapes(during_bursts);
 
         println!(
-            "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>9}  {:>13}  {:>11}",
+            "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>9}  {:>13}  {:>11}",
             "round",
             "allocations",
             "live_bytes",
             "end",
             "gaps",
+            "widest",
             "overhead",
             "visited/call",
             "us/burst"
         );
         for s in &snapshots {
             println!(
-                "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8.2}%  {:>13.1}  {:>11.1}",
+                "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>8.2}%  {:>13.1}  {:>11.1}",
                 s.round,
                 s.allocations,
                 s.live_bytes,
                 s.end,
                 s.gaps,
+                s.widest_gap,
                 s.overhead_percent(),
                 s.visited_per_call,
                 s.micros_per_burst,
