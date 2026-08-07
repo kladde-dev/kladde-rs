@@ -221,6 +221,12 @@ above `α = 0` remains the reason to keep the mover-first branch around.
   flush already costs ~8 ms of pure decision-making. Keeping the sub-1%
   fragmentation at lower cost is the open problem.
 
+  **Followed up**: bounding the walk to `k = 16` candidates holds per-burst cost
+  flat (1.1–1.3× across a 10× heap, against 8× and 32× here) and *improves*
+  fragmentation. Two ways of bounding it are measured in
+  [`capped-restart.md`](capped-restart.md) and
+  [`capped-resume.md`](capped-resume.md).
+
 ---
 
 ## Notes on the artifacts
