@@ -242,13 +242,17 @@ evacuation improves the objective.
 
 **Update.** Each mutation touches a bounded number of entries:
 
-- *Allocate* — remove the gap that was consumed, insert the new allocation,
-  insert the leftover gap if any. Three entries.
+- *Allocate* — remove the gap that was landed in, insert the new allocation, and
+  reinsert the trimmed remainder of the gap if any (a destination always lands at
+  a gap's low end, so a gap is trimmed from the bottom, never split — but both
+  `G.pos` and `G.width` are in the key, so the remainder is still a fresh entry).
+  Three entries.
 - *Free* — remove the allocation, remove up to two adjacent gaps, insert the
   merged gap. Four entries.
 - *Commit an evacuation* — remove the allocation and reinsert it at its new
   address (its size is unchanged, so this is a key change, not just a value
-  change), plus the gap splits and merges at both ends. A handful of entries.
+  change), plus the trim at the destination and the merge with up to two
+  neighbouring gaps at the source. A handful of entries.
 
 Each insert or removal recomputes the augmentation along one root-to-leaf path:
 `O(log_B n)` levels, `O(B)` work each, so `O(B log_B n)` per entry.
@@ -404,7 +408,24 @@ pair has `A.pos − G.pos <= −A.size`, so requiring
 makes every upward pair score `<= 0` and every downward pair score
 `>= s + λ·reward(s) > 0`. The sign test is exact again.
 
-This is adopted. Two consequences worth stating plainly:
+This is adopted, and in the initial implementation it is adopted in its simplest
+possible form: `reward(s) = s`, with `λ` a **bool** — read as `λ = 1` when set
+and `λ = 0` when clear. That sits exactly at the edge of the bound (`λ·s <= s`
+holds with equality), so it is the strongest reward the bound permits, and it
+needs no multiplication and no tuning sweep:
+
+```
+score(A) = A.pos + A.size     if λ            (plus stage 3's α term)
+score(A) = A.pos              otherwise
+```
+
+The two settings are a **benchmark parameter**: run the compaction benchmarks
+across `λ ∈ {true, false}` and compare them on file size and fragmentation.
+Stage 2's entire justification is empirical — it trades exactness in `Φ` for a
+preference the potential does not express — so shipping it without that
+comparison would be adopting a policy change on faith.
+
+Two consequences worth stating plainly:
 
 - **The bound binds at the smallest live allocation, not a typical one.** With
   1-byte allocations in play it degenerates to almost no reward at all. It is
@@ -501,13 +522,56 @@ The main tree then holds:
 - **one entry per non-empty `(fixed class, nc)` bucket**, carrying that bucket's
   highest-addressed member.
 
+Question: do I understand correctly that there is a separate list of one B-Tree per `(fixed class, nc)` bucket that holds all the entries so that we can maintain the highest address in the main tree (see Section"The data structures", Subsection E)? If so, what is the benefit of having the entries in a separate B-tree over having everything (non-deduped) in one (augmented) B-tree?
+
+> **Answer.** Yes — with one correction to the cross-reference: that is
+> subsection **D**, the fixed-size class registry (`HashMap<size, [BTreeSet<address>; 3]>`,
+> one ordered set per `(fixed class, nc)` bucket holding *every* member). E is the
+> tileable-gap index, which is a different thing entirely. The main tree carries
+> only each bucket's maximum.
+>
+> De-duplicating is *sound* because every member of a bucket shares `size`,
+> `is_gap` and every score term but the address, so only the highest-addressed
+> member can ever supply the bucket's `max_alloc_score`; the others can never win
+> a pair and are pure update traffic.
+>
+> The benefit is **not** the entry count — the paragraph below already concedes
+> that the height saving is negligible. It is that a bucket update is a plain
+> `BTreeSet` insert or removal (a binary search per level, one memmove at the
+> leaf, no augmentation), whereas a main-tree update recomputes the augmentation
+> at every node on the path, folding all `B` children at each — `B · log_B n ≈ 96`
+> comparisons against `log₂ n ≈ 12`. Bucketing converts main-tree updates into
+> `BTreeSet` updates for every mutation that leaves the bucket maximum alone.
+>
+> How often that is depends on which mutation, and the accounting is closer than
+> it looks — see the next two paragraphs. The short version: it is roughly a wash
+> for `alloc`/`free`, and a clear win only for stage 3's re-bucketing traffic.
+
 Sized on this project's measured workload — 13 963 allocations, 25% resizable,
 five fixed classes, 1 218 gaps — that is roughly `3 490 + 15 + 1 218 ≈ 4 700`
 entries instead of `15 200`. Three-fold fewer entries is only about 0.4 of a
-level at `B = 32`, so the height saving is negligible; the real gain is that a
-fixed-size allocate or free touches the main tree **only when its bucket's
-maximum changes**, which placement's preference for low addresses makes rare on
-allocation and roughly `1/m` on free.
+level at `B = 32`, so the height saving is negligible; whatever gain there is has
+to come from a fixed-size allocate or free touching the main tree **only when its
+bucket's maximum changes**.
+
+On allocation that gain is largely illusory, and for a reason specific to this
+project: because compaction runs incrementally and keeps the heap nearly
+defragmented, a new allocation very often lands at `end` — which makes it the
+highest-addressed member of its class, hence its bucket's new maximum, on
+essentially every such allocation. Worse, a maximum *change* costs more than a
+plain insert: score and address are both in the key, so it is a delete plus an
+insert — two main-tree updates where an undeduplicated tree would have paid one.
+On the free side the saving is real: the freed allocation is its bucket's maximum
+with probability about `1/m`, giving `2/m` expected main-tree updates against `1`
+undeduplicated.
+
+Netted over an alloc/free pair those two effects roughly cancel. What does not
+cancel is stage 3's re-bucketing traffic, below: a neighbour-count change is a
+move between two `BTreeSet`s and reaches the main tree only when it displaces a
+bucket maximum, where an undeduplicated tree would pay a delete-and-insert in the
+augmented tree *every time*. **So the bucketing earns its keep only at `α > 0`**,
+and the `α = 0` first implementation recommended at the end of this document
+should carry one entry per allocation in the main tree and skip D entirely.
 
 ### What it costs: re-bucketing
 
@@ -589,7 +653,7 @@ Let `C` be the set of distinct **fixed sizes currently live**. This is small and
 nearly static — the whole point of a fixed-size class is that the allocator mints
 many allocations at each of a handful of sizes.
 
-For each `s ∈ C`, two quantities:
+For each `s ∈ C`, three quantities — of which only one needs a new structure:
 
 - `max_alloc_pos[s]` — the highest-addressed live allocation of size `s`. This
   needs **no structure of its own**: it is the maximum over the main tree's key
@@ -598,10 +662,26 @@ For each `s ∈ C`, two quantities:
 - `min_multiple_gap_pos[s]` — the lowest-addressed gap whose width is a positive
   integer multiple of `s`. This one does need its own ordered set, for the reason
   below.
+- `min_exact_gap_pos[s]` — the lowest-addressed gap of width *exactly* `s`. Like
+  the first quantity, this needs **no structure of its own**: gaps of width `s`
+  form a contiguous key block in the main tree with prefix `(s << 1) | 1`,
+  ordered within it by `score = G.pos`, so this is the first entry of that block
+  — the `lowest_exact_gap(s)` query already in the vocabulary.
 
-Then `best_multiple[s] = max_alloc_pos[s] − min_multiple_gap_pos[s] + μ`, with
-`μ = μ₁` if the widths match exactly and `μₖ` otherwise, and a scan over the few
-members of `C` gives the best multiple-fit candidate.
+Then, per class,
+
+```
+best_multiple[s] = max( max_alloc_pos[s] − min_exact_gap_pos[s]    + μ₁ ,
+                        max_alloc_pos[s] − min_multiple_gap_pos[s] + μₖ )
+```
+
+with each term dropped when its gap does not exist, and — importantly — each term
+taken only when that gap lies **below** `max_alloc_pos[s]`. That check is exact
+rather than conservative: if the class's lowest tracked gap sits above its
+highest-addressed allocation, then *every* such gap does, so no downward pair
+exists at all. It is what stops `μ` from rescuing an upward pair, exactly as
+stage 2's bound stops `λ·reward` from doing so. A scan over the few members of
+`C` then gives the best multiple-fit candidate.
 
 **Why an ordered set and not a scalar.** Insertion into a running extremum is
 `O(1)` — `min = min(min, pos)` — and a hash map from `s` to a pair of scalars
@@ -650,9 +730,21 @@ be tuning the wrong term.
   bonus term and not a correctness requirement, a new class simply sees only the
   gaps created after it entered, and converges as the heap churns. The main tree
   still proposes a valid, positive-gain evacuation throughout.
-- **A class leaves** (its last allocation is freed). Drop the entry, or retain it
+- **A class leaves** (its last allocation is freed). **Retain the entry**, empty,
   and let it be reused; keeping a few stale classes costs only their divisibility
-  tests.
+  tests, and a class that re-enters then finds its gaps already tracked instead
+  of starting blind — which is worth more here than the memory, given that
+  entering classes are deliberately not backfilled.
+
+  *TODO in the implementation:* retention is only safe while `|C|` stays a
+  handful, and nothing stops an application from minting fixed-size allocations
+  at hundreds of distinct sizes. Since `|C|` multiplies every gap creation and
+  destruction, it has to be **bounded** rather than merely expected to be small,
+  so the index should eventually cap the number of distinct size classes it
+  tracks. Eviction is benign: the whole mechanism is a bonus term, so an untracked
+  class simply earns no destination-side reward — in `place` as well as in
+  `propose_step` — and every move it does make stays valid. Leave a comment
+  recording this where the map is declared.
 
 ---
 
@@ -818,17 +910,17 @@ gap_starting_at(addr)            -> Option<Gap>
 free_neighbours(addr, size)      -> 0 | 1 | 2
 run_len_from(addr, cap)          -> (len, truncated)  # contiguous, <= cap
 
-# free space
+# free space -- all three answered by the evacuation index, which is keyed by size
 lowest_gap_fitting(width)        -> Option<Gap>       # lowest with G.width >= width
 widest_gap()                     -> Option<Gap>
 lowest_exact_gap(width)          -> Option<Gap>       # G.width == width exactly
-lowest_tileable_gap(s)           -> Option<Gap>       # G.width % s == 0, fixed classes only
 
 # the evacuation index
 best_evacuation()                -> Option<Candidate>
 best_evacuation_within(budget)   -> Option<Candidate> # A.size <= budget
 
 # the tileable-gap index
+lowest_tileable_gap(s)           -> Option<Gap>       # G.width % s == 0, fixed classes only
 best_tiling_evacuation(budget)   -> Option<Candidate>
 ```
 
@@ -846,7 +938,7 @@ fn place(size, is_fixed) -> Address:
     # the same μ weights the compactor uses, so placement and compaction agree
     # about what a good destination is.
     cost(g) = size · g.pos
-              − μ₁ if g.width == size
+              − μ₁ if is_fixed and g.width == size
               − μₖ if is_fixed and g.width % size == 0 and g.width > size
 
     candidates = [ lowest_gap_fitting(size) ]
@@ -859,15 +951,16 @@ fn place(size, is_fixed) -> Address:
         None    -> end                                 # nothing fits: extend
 ```
 
-Only a fixed-size allocation may claim the fit bonuses, for the reason given in
-stage 4. Three candidates suffice: the exact fit and the tileable fit are the
-only gaps that can beat the lowest fitting one, since `cost` is otherwise
-monotone in `g.pos`.
+Only a fixed-size allocation may claim the fit bonuses — both of them, `μ₁` as
+well as `μₖ`, for the reason given in stage 4. Three candidates suffice: the
+exact fit and the tileable fit are the only gaps that can beat the lowest fitting
+one, since `cost` is otherwise monotone in `g.pos`.
 
 ```
 fn alloc(id, size) -> Address:
     addr = place(size, id.is_fixed_size())
-    insert into the layout, splitting the gap it landed in
+    insert into the layout; the gap it landed in is consumed whole if the widths
+    match, and otherwise trimmed from the bottom: G.pos += size, G.width -= size
     return addr
 
 fn resize(id, new_size) -> Relocation:
@@ -884,6 +977,17 @@ fn resize(id, new_size) -> Relocation:
     return Some((addr, new_addr))
 ```
 
+**No destination ever splits a gap.** `place`, an evacuation and a slide all land
+at the gap's *low* end, so a gap is only ever consumed whole or trimmed from the
+bottom — `G.pos += n`, `G.width -= n` — and nothing ever lands in the middle of
+one, leaving free space on both sides. That is worth stating as an invariant
+because it bounds the update fan-out everywhere below: a destination touches one
+gap, never two.
+
+It does not, however, make the trim cheap in the evacuation index: both `G.pos`
+and `G.width` are in the key, so a trim is still a delete-and-insert there rather
+than an in-place edit.
+
 ### Proposing a step
 
 ```
@@ -898,20 +1002,60 @@ fn propose_step(budget) -> Option<Step>:
     #    guarantees progress while any gap exists.
     best = offer(best, slide_candidate(budget))
 
-    # 2. The exact evacuation, from the augmented tree. Two reads: the best that
-    #    fits the budget, and the best overall in case nothing does.
+    # 2. The exact evacuation within the budget, from the augmented tree.
     best = offer(best, best_evacuation_within(budget))
-    best = offer(best, best_evacuation())
 
-    # 3. The tileable evacuation (fixed-size allocations only).
-    best = offer(best, best_tiling_evacuation(budget))
+    # 3. The tileable evacuation (fixed-size allocations only). This can only
+    #    re-rank evacuations step 2 already scored, never contribute one step 2
+    #    could not see, so it cannot be the sole candidate -- see below.
+    if best.is_some():
+        best = offer(best, best_tiling_evacuation(budget))
 
     # 4. Opportunistic run extension -- stage 5's minimal version.
     if best is an evacuation:
         best = extend_into_run(best, budget)
 
-    return best
+    # 5. Nothing fit the budget. `best_evacuation()` is an O(1) root read, not a
+    #    second search, so consulting it is strictly cheaper than making the
+    #    caller re-enter with a larger budget -- but it is returned *flagged as
+    #    over budget*, never merged into the comparison above, so the choice to
+    #    exceed the budget stays the caller's.
+    if best.is_none():
+        return best_evacuation().map(mark_over_budget)
 
+    return best
+```
+
+Three things about that shape are worth spelling out.
+
+**The over-budget fallback stays, because it is not a second search.**
+`best_evacuation()` is `root_argument()` — a single field read at the root, `O(1)`
+— so it can never be more expensive than the caller re-entering `propose_step`
+with a larger budget, which would redo the slide and the budget descent as well.
+What it must *not* do is compete with the in-budget candidates on equal footing,
+or an over-budget evacuation could win outright and silently break the budget.
+Hence it is consulted only once nothing else has been found, and returned marked,
+leaving the accept-or-decline to the caller. That is the same two-track selection
+the current implementation has, and the reason for keeping it is cost, not policy.
+
+**The tiling short-circuit is sound.** A tiling evacuation *is* an ordinary
+evacuation — a fixed-size allocation moving down into a gap at least as wide — so
+step 2 scores that very pair; `μ₁`/`μₖ` change only its rank. So if a downward,
+in-budget tiling candidate exists, step 2 returned *something* (not necessarily
+the same pair), and `best.is_none()` implies there is no tiling candidate either.
+The "downward" qualifier is load-bearing: `best_tiling_evacuation` maximises its
+two sides independently, so it must apply the per-class `min_gap_pos < max_alloc_pos`
+check from stage 4 — without it, `μ` could rescue an upward pair and the
+short-circuit's premise would fail along with the sign test.
+
+**Both guards are defensive rather than hot.** `propose_step` returns early when
+there are no gaps, and if a gap exists there is always at least one allocation
+above it — otherwise it would be trailing free space above `end`, not a gap — so
+`slide_candidate` always yields something and `best` is in practice never `None`
+at steps 3 and 5. The guards cost a branch and buy the invariant that neither
+path can be reached in a state it does not handle.
+
+```
 fn slide_candidate(budget) -> Option<Candidate>:
     g = widest_gap()?
     from = g.pos + g.width
@@ -987,23 +1131,47 @@ structure below is updated from the deltas this one produces, so the update
 protocol is "mutate the layout, then push the resulting entry insertions and
 removals into the derived indexes".
 
-### B. The free-space directory
+### B. The free-space directory — subsumed by C, kept only as a fallback
 
 **Affords:** where the free space is, how wide, and which piece is the widest.
 
-**Composed of:**
-- `BTreeMap<u64 /*width*/, BTreeSet<u64 /*pos*/>>` — gaps grouped by width.
+**All three queries are answerable from C** (since C is keyed by size with gaps sorting last at
+equal size, which is exactly the order a free-space directory wants):
+- `lowest_gap_fitting(w)` — `min_gap_pos` aggregated over the key suffix from
+  `(w << 1) | 1`, one descent.
+- `lowest_exact_gap(w)` — the gaps of width exactly `w` form a contiguous key
+  block with prefix `(w << 1) | 1`, ordered within it by `score = G.pos`, so this
+  is the first entry of that block: one `range(((w << 1) | 1, 0, 0)..).next()`,
+  accepted only if its size field still reads `w`. Feeds `μ₁`.
+- `widest_gap()` — descend rightmost-first, entering the rightmost child whose
+  `min_gap_pos != u64::MAX`. The augmentation already distinguishes "contains a
+  gap" from "contains none", which is precisely the predicate this descent needs.
+  Feeds the slide.
 
-**Queries:**
-- `widest_gap()` — `last_key_value()`, then `first()` of its set. Feeds the slide.
-- `lowest_exact_gap(w)` — `get(&w)?.first()`. Feeds `μ₁`.
-- `lowest_gap_fitting(w)` — **this one is subsumed by the evacuation index**: it
-  is `min_gap_pos` aggregated over the key suffix from `(w << 1) | 1`, one
-  descent. Keeping today's separate address-keyed `GapTree` with a max-width
-  augmentation is the alternative if a suffix-aggregate descent proves awkward to
-  express; the two are redundant with each other and only one is needed.
+So B should not be built at all unless C cannot express these. The caveat is the
+one already flagged in stage 1: all three are custom descents against
+`sweep-bptree`'s `descend_visit`, whose visitor interface has not been verified to
+support them. Today's address-keyed `GapTree` with a max-width augmentation is the
+other fallback for `lowest_gap_fitting` specifically.
 
-**Maintained:** on every gap creation, destruction, split and merge.
+**If a fallback is needed,** it should not be the nested
+`BTreeMap<u64 /*width*/, BTreeSet<u64 /*pos*/>>` this section originally proposed
+— a map of small sets allocates a node per distinct width and leaves most of them
+nearly empty, which is a lot of pointer chasing and slack for a structure holding
+about 1 200 `u64`s. A single flat set does both remaining queries:
+
+```
+BTreeSet<(u64 /*width*/, Reverse<u64> /*pos*/)>
+```
+
+ordered by width ascending and position *descending*. Then `widest_gap()` is
+`last()` — the largest width, and within it the lowest position, which is the one
+the slide wants — and `lowest_exact_gap(w)` is `range(..=(w, Reverse(0))).next_back()`
+filtered on `width == w`. One allocation, one contiguous run of 16-byte elements.
+`lowest_gap_fitting` is not answerable from it and stays with C either way.
+
+**Maintained:** if built at all, on every gap creation, destruction, trim and
+merge.
 
 **Note:** today's `MoverTree` disappears entirely — its query ("the
 highest-addressed allocation that fits in `w` bytes") is what the augmented
@@ -1018,25 +1186,32 @@ budget constraint, in `O(1)` and `O(B log_B n)` respectively.
 - An augmented B+ tree over the key `((size << 1) | is_gap, score, address)`,
   carrying `{ min_gap_pos, max_alloc_score, best, best_pair }` per subtree, merged
   by the right-to-left sweep of stage 1.
-- Its entries: one per gap, one per resizable allocation, and one per non-empty
-  `(fixed class, nc)` bucket (see D).
+- Its entries: one per gap, one per resizable allocation, and — once `α > 0` —
+  one per non-empty `(fixed class, nc)` bucket (see D). At `α = 0`, which is where
+  the first implementation should start, there is no bucketing: simply one entry
+  per fixed-size allocation.
 
 **Queries:**
 - `best_evacuation()` — read `root_argument()`. `O(1)`.
 - `best_evacuation_within(budget)` — the prefix descent of stage 1's "the budget,
   for free": collect canonical prefix and suffix subtrees, take the suffix's
   `min_gap_pos` as a seed, sweep the prefix. `O(B log_B n)`.
-- `lowest_gap_fitting(w)` — as noted in B, a suffix aggregate.
+- `lowest_gap_fitting(w)`, `lowest_exact_gap(w)`, `widest_gap()` — as set out in
+  B, a suffix aggregate, a range lookup and a rightmost-gap descent respectively.
+  These are why B does not need to exist.
 
 **Maintained:** on every layout delta, and additionally whenever a neighbour
 count changes, which re-keys the affected allocation (stage 3). Budget three to
 four entry insertions or removals per mutation, plus up to four more for
 re-bucketing when `α > 0`.
 
-### D. The fixed-size class registry
+### D. The fixed-size class registry — needed only once `α > 0`
 
 **Affords:** for each live fixed size and each neighbour count, the best-scoring
-member — which is what the class's tree entries carry.
+member — which is what the class's tree entries carry. At `α = 0` there is
+nothing to bucket by, the de-duplication does not pay for itself (stage 3), and
+fixed-size allocations should simply be ordinary entries in C; stage 4 then reads
+`max_alloc_pos[s]` from C's key block for size `s` instead of from here.
 
 **Composed of:**
 - `HashMap<u32 /*size*/, [BTreeSet<u64 /*address*/>; 3]>`, indexed by
@@ -1063,34 +1238,51 @@ a positive integer multiple of `s` — the destination-side bonus of stage 4.
 
 **Composed of:**
 - `HashMap<u32 /*size*/, BTreeSet<u64 /*gap pos*/>>`, one set per live class.
-  Again, a small `Vec` is likely better at `|C| ≈ 5`.
+  Again, a small `Vec` is likely better at `|C| ≈ 5`. These are plain
+  (unaugmented) B-trees: they pay `log₂` comparisons on the way down, not the
+  `B`-per-level fold that C's augmentation costs.
+- Nothing for the exact-fit case: the `μ₁` candidate is `lowest_exact_gap(s)`,
+  a range lookup in C.
 
 **Queries:**
 - `lowest_tileable_gap(s)` — `first()` of that class's set. Used by both `place`
   and `propose_step`.
-- `best_tiling_evacuation(budget)` — for each `s ∈ C`, pair D's class maximum with
-  this set's minimum, add `μ₁` or `μₖ` according to whether the widths match
-  exactly, and take the best. `O(|C|)`.
+- `best_tiling_evacuation(budget)` — for each `s ∈ C`, pair the class maximum
+  (from D, or from C's size-`s` key block at `α = 0`) against **two** gaps: the
+  lowest exact fit, worth `μ₁`, and this set's minimum, worth `μₖ`. Take the
+  better, skipping either whose gap does not sit below the class maximum — that
+  test is exact, since if the lowest such gap is above the highest allocation of
+  the class then all of them are. `O(|C|)`.
 
 **Maintained:** when a gap of width `G` is created or destroyed, test each `s ∈ C`
-for `G mod s == 0` and update those sets — `O(|C| · log #gaps)`, which is less
-than one insertion into C. When a class enters, its set starts empty and is **not
-backfilled**.
+for `G mod s == 0` and update those sets — `O(|C| · log #gaps_of_that_class)`,
+which is less than one insertion into C. Typically much less: a width is
+divisible by `s` for only about `1/s` of widths, so the usual gap event is `|C|`
+modulo tests and zero or one set update. When a class enters, its set starts
+empty and is **not backfilled**; when a class leaves, its (now empty) entry is
+retained for reuse.
+
+**TODO:** cap the number of tracked classes. `|C|` multiplies every gap creation
+and destruction, and retaining entries means it never shrinks, so an application
+that mints fixed-size allocations at hundreds of distinct sizes would make this
+unbounded. Eviction is safe — an untracked class just earns no destination-side
+bonus in `place` or `propose_step`, and every move it makes stays valid.
 
 ### Summary of the change against what exists today
 
 | today | becomes |
 |---|---|
 | `allocations` + `by_id` + `end` | A, unchanged |
-| `free_by_size` | B, unchanged |
-| `GapTree` (address-keyed, max-width) | subsumed by C, or retained as B's fitting query |
+| `free_by_size` | **gone** — subsumed by C; B survives only as a fallback if C's descents cannot be expressed, and then as one flat set, not a nested map |
+| `GapTree` (address-keyed, max-width) | subsumed by C; the other fallback for `lowest_gap_fitting` alone |
 | `MoverTree` (address-keyed, min-size) | **gone** — C answers its question globally |
-| `live_by_size` (3-way by neighbours) | D, unchanged in shape |
+| `live_by_size` (3-way by neighbours) | D, unchanged in shape — but only once `α > 0` |
 | — | C, the new augmented index |
 | — | E, the new tileable-gap index |
 
-The net is one structure removed, one repurposed, and two added — and the
-candidate search stops being a walk.
+The net is three of today's five structures removed and two new ones added,
+leaving A, C, D, E — and the candidate search stops being a walk. The `α = 0`
+first implementation drops `live_by_size`/D as well, leaving just A, C and E.
 
 ---
 
@@ -1150,8 +1342,8 @@ Two further advantages are worth weighing:
   of the code, not a measurement.
 - **Stage 3 has a cost stage 2 does not.** Making the score depend on neighbours
   means each mutation re-keys up to four other entries. `α = 0` avoids this
-  entirely and collapses the bucketing, so the two should be measured against
-  each other rather than adopted together on principle.
+  entirely and removes the reason to bucket at all, so the two should be measured
+  against each other rather than adopted together on principle.
 - **Stage 5 is deferred for a reason that may not survive tuning.** Runs need a
   steep reward, and the adopted sign bound forbids one. If `λ · reward(s) <= s`
   proves too tight in practice, the dual-aggregate alternative reopens both
@@ -1175,6 +1367,11 @@ B+ tree, one merge rule used at every level, `MoverTree` deleted, and the existi
 `sweep-bptree` dependency already providing the trait. They replace a linear
 search with a constant-time read and make the budget constraint exact rather than
 heuristic. That is the piece worth building and measuring first, at `α = 0`.
+
+Concretely, the first implementation should be: C with **one entry per
+allocation** (no bucketing, so no D — see stage 3 for why de-duplication does not
+pay at `α = 0`), `free_by_size` and `GapTree` folded into C's descents,
+`reward(s) = s` with `λ` a bool, and the benchmarks run across `λ ∈ {true, false}`.
 
 Stage 4 is a small, self-contained addition whose motivation — keeping free space
 in a shape the allocator can consume without residue — is the one best supported
