@@ -8,14 +8,20 @@
 //! - **scan**: `free_by_size: BTreeMap<len, BTreeSet<start>>`, walked from `n`
 //!   upward taking the minimum first-address. Costs one probe per distinct gap
 //!   *length* at least `n` -- so it is fast exactly when gaps cluster on a few
-//!   lengths, and degrades as they spread out.
-//! - **tree**: `GapTree`, a B+ tree of gaps keyed by address and augmented with
-//!   each subtree's longest gap; one `O(log n)` descent regardless of spread.
+//!   lengths, and degrades as they spread out. This is the structure the heap
+//!   used to keep and no longer does; it survives here as the thing to beat.
+//! - **tree**: [`EvacuationIndex`], keyed by size, where the answer is
+//!   `min_gap_pos` aggregated over a key suffix -- one `O(log n)` descent
+//!   regardless of spread.
 //!
 //! The interesting axis is therefore not the gap *count* but the number of
 //! distinct gap *lengths*, so both are varied. kladde's design bet -- many
 //! allocations at few fixed sizes -- predicts the clustered end; one-off
 //! resizable allocations push toward the spread end.
+//!
+//! Note that the index is carrying live allocations too in the real heap, so its
+//! tree is deeper there than here. That makes this a *lower* bound on its cost
+//! and an exact one on the scan's, which is the conservative direction.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hint::black_box;
@@ -24,7 +30,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-use kladde_heap::bench_support::GapTree;
+use kladde_heap::bench_support::{EvacuationIndex, Key};
 
 /// The size-class scan the augmented tree replaced, kept here verbatim as the
 /// thing being measured against.
@@ -70,10 +76,10 @@ fn bench_lowest_fitting_gap(c: &mut Criterion) {
             let max_len = 8 + (distinct as u64) * 8;
 
             let mut free_by_size: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
-            let mut tree = GapTree::default();
+            let mut tree = EvacuationIndex::default();
             for &(start, len) in &gaps {
                 free_by_size.entry(len).or_default().insert(start);
-                tree.insert(start, len);
+                tree.insert(Key::gap(start, len));
             }
 
             // Ask for sizes spread across the whole range, since a query near the
@@ -86,7 +92,7 @@ fn bench_lowest_fitting_gap(c: &mut Criterion) {
             // Sanity: the two must actually answer the same thing.
             for &q in &queries {
                 assert_eq!(
-                    tree.lowest_fitting(q).map(|(start, _)| start),
+                    tree.lowest_gap_fitting(q),
                     lowest_fitting_by_scan(&free_by_size, q),
                     "the two implementations disagree at min_len={q}"
                 );
@@ -107,7 +113,7 @@ fn bench_lowest_fitting_gap(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::new("augmented tree", &id), &count, |b, _| {
                 b.iter(|| {
                     for &q in &queries {
-                        black_box(tree.lowest_fitting(black_box(q)));
+                        black_box(tree.lowest_gap_fitting(black_box(q)));
                     }
                 });
             });

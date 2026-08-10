@@ -24,8 +24,8 @@
 
 mod backend;
 mod composed;
+mod evacuation_index;
 mod gain_greedy;
-mod gap_tree;
 mod heap;
 mod journaled;
 mod mock;
@@ -58,5 +58,5 @@ pub use word::Word;
 /// vanish without notice. Do not depend on it.
 #[doc(hidden)]
 pub mod bench_support {
-    pub use crate::gap_tree::GapTree;
+    pub use crate::evacuation_index::{EvacuationIndex, Key};
 }

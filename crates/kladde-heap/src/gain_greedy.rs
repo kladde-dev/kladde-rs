@@ -27,21 +27,24 @@
 //!
 //! # Candidate shapes
 //!
-//! - **Slide**: the maximal contiguous *run* above the largest gap shifts down
+//! - **Evacuation**: one allocation jumps down into a gap below it that fits it.
+//!   This is not *searched* for: [`EvacuationIndex`] keeps the best one at its
+//!   root, so proposing it is a field read, and constraining it to a budget is
+//!   one descent. See `augmented-segment-tree.md`.
+//! - **Slide**: the maximal contiguous *run* above the widest gap shifts down
 //!   into it. It does not require the moved bytes to *fit* -- `run.size >
 //!   gap.width` is the normal case and the move is a partial overlapping shift
-//!   -- which is what guarantees progress while any gap exists.
-//! - **Evacuation**: an allocation jumps down into a gap that fits it. **Not
-//!   implemented here yet.** The address-ordered branch-and-bound search this
-//!   module used to carry has been removed wholesale, to be replaced by the
-//!   augmented size-keyed index of `augmented-segment-tree.md`, which keeps the
-//!   best evacuation at a tree root instead of searching for it. Until then the
-//!   slide is the only candidate, so compaction still converges -- just more
-//!   expensively, since a slide copies a whole run to close one gap.
+//!   -- which is what guarantees progress while any gap exists, including on a
+//!   heap whose every gap is too narrow for anything.
+//!
+//! Both are offered and the better one wins. They are comparable because both
+//! are scored by the same quantity, the per-byte gain against `Φ`: for an
+//! evacuation the distance the mover travels, for a slide the width of the gap
+//! it closes, since every byte of the run travels exactly that far.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
-use crate::gap_tree::GapTree;
+use crate::evacuation_index::{EvacuationIndex, Key};
 use crate::heap::{
     AllocationId, HeapError, IncrementallyCompactableHeap, RelocatableHeap, Relocation, Step,
 };
@@ -114,7 +117,8 @@ impl SearchStats {
 /// compacting by gain-greedy incremental steps. See the module docs.
 ///
 /// `Clone` is provided so that a benchmark can measure repeated compaction from
-/// one fixed starting state; it is not cheap (see [`GapTree`]'s `Clone`).
+/// one fixed starting state; it is not cheap (see [`EvacuationIndex`]'s
+/// `Clone`).
 #[derive(Clone)]
 pub struct GainGreedyHeap<Id> {
     /// Start address -> allocation. Gaps are the space between consecutive
@@ -122,14 +126,12 @@ pub struct GainGreedyHeap<Id> {
     allocations: BTreeMap<u64, Entry<Id>>,
     /// The id table's address column (P1: held once, here).
     by_id: HashMap<Id, u64>,
-    /// Gap length -> the start addresses of gaps that long. Answers "the largest
-    /// gap", which is the slide's destination; the by-address view lives in
-    /// `gaps`.
-    free_by_size: BTreeMap<u64, BTreeSet<u64>>,
-    /// The same gaps, address-ordered and augmented with each subtree's longest
-    /// gap, which is what makes "the lowest gap that fits" a single descent
-    /// instead of a scan over size classes. See [`GapTree`].
-    gaps: GapTree,
+    /// Every gap **and** every live allocation, keyed by size, augmented so that
+    /// the best evacuation sits at the root. It also answers the two free-space
+    /// questions the rest of the heap asks -- the widest gap (for the slide) and
+    /// the lowest gap that fits (for placement) -- which is why there is no
+    /// separate free-space directory any more. See [`EvacuationIndex`].
+    index: EvacuationIndex,
     /// One past the highest live byte.
     end: u64,
     /// Sum of all live allocation sizes.
@@ -144,8 +146,7 @@ impl<Id> Default for GainGreedyHeap<Id> {
         Self {
             allocations: BTreeMap::new(),
             by_id: HashMap::new(),
-            free_by_size: BTreeMap::new(),
-            gaps: GapTree::default(),
+            index: EvacuationIndex::default(),
             end: 0,
             live_bytes: 0,
             #[cfg(test)]
@@ -185,7 +186,10 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             // the slide to identify it is redundant work, which is why it is
             // test-only; `Step` is small and equality is exact.
             #[cfg(test)]
-            let provenance = (self.slide_candidate(budget - moved) == Some(step), self.end);
+            let provenance = (
+                self.slide_candidate(budget - moved).map(|(_, s)| s) == Some(step),
+                self.end,
+            );
             self.commit_compaction_step(step);
             #[cfg(test)]
             {
@@ -242,26 +246,41 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         self.stats.set(SearchStats::default());
     }
 
-    // ---- gap index maintenance ----
+    // ---- index maintenance ----
+    //
+    // Gaps and allocations are entries of the *same* tree, so both kinds are
+    // recorded and forgotten here. A zero-length gap is not a gap and is never
+    // recorded, which is what lets these be called unconditionally.
 
     fn gap_record(&mut self, start: u64, len: u64) {
         if len > 0 {
-            self.free_by_size.entry(len).or_default().insert(start);
-            self.gaps.insert(start, len);
+            self.index.insert(Key::gap(start, len));
         }
     }
 
     fn gap_forget(&mut self, start: u64, len: u64) {
-        if len == 0 {
-            return;
+        if len > 0 {
+            self.index.remove(Key::gap(start, len));
         }
-        if let Some(set) = self.free_by_size.get_mut(&len) {
-            set.remove(&start);
-            if set.is_empty() {
-                self.free_by_size.remove(&len);
-            }
-        }
-        self.gaps.remove(start);
+    }
+
+    /// The index key of the allocation at `addr`.
+    ///
+    /// Both removal and insertion go through this, so the score can grow richer
+    /// (stage 2's size reward, stage 3's gap-count term) without any risk of a
+    /// remove computing a different key than the matching insert did.
+    fn alloc_key(&self, addr: u64, len: u32) -> Key {
+        Key::alloc(addr, len, addr)
+    }
+
+    fn alloc_record(&mut self, addr: u64, len: u32) {
+        let key = self.alloc_key(addr, len);
+        self.index.insert(key);
+    }
+
+    fn alloc_forget(&mut self, addr: u64, len: u32) {
+        let key = self.alloc_key(addr, len);
+        self.index.remove(key);
     }
 
     /// End of the allocation immediately below `addr` (0 if there is none).
@@ -298,6 +317,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         self.allocations.insert(addr, Entry { len, id });
         self.by_id.insert(id, addr);
         self.live_bytes += len as u64;
+        self.alloc_record(addr, len);
     }
 
     /// Drop the allocation at `addr`, coalescing its range into the neighbouring
@@ -309,6 +329,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             .expect("remove_raw on an address with no allocation");
         self.by_id.remove(&e.id);
         self.live_bytes -= e.len as u64;
+        self.alloc_forget(addr, e.len);
 
         let prev_end = self.prev_end(addr);
         let above = addr + e.len as u64;
@@ -329,13 +350,13 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// that maximizes travel distance, and so per-byte gain, for a `min_len`-byte
     /// mover.
     ///
-    /// One `O(log n)` descent of the augmented [`GapTree`]. The obvious
-    /// alternative, scanning `free_by_size.range(min_len..)` for the minimum
-    /// address, costs one probe per distinct gap *size* -- fine when gaps cluster
-    /// on a few sizes, but unbounded when they do not. `benches/lowest_fitting_gap.rs`
-    /// measures the difference.
-    fn lowest_gap_fitting(&self, min_len: u64) -> Option<(u64, u64)> {
-        self.gaps.lowest_fitting(min_len)
+    /// One `O(log n)` descent of the index, aggregating `min_gap_pos` over the
+    /// key suffix. The obvious alternative, scanning a size-keyed map upward for
+    /// the minimum address, costs one probe per distinct gap *size* -- fine when
+    /// gaps cluster on a few sizes, but unbounded when they do not.
+    /// `benches/lowest_fitting_gap.rs` measures the difference.
+    fn lowest_gap_fitting(&self, min_len: u64) -> Option<u64> {
+        self.index.lowest_gap_fitting(min_len)
     }
 
     /// Where to put a new `size`-byte allocation: the lowest gap that fits, else
@@ -354,7 +375,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// weights placement and compaction are meant to share.
     fn place(&self, size: u32) -> Result<u64, HeapError> {
         let want = size as u64;
-        if let Some((addr, _)) = self.lowest_gap_fitting(want) {
+        if let Some(addr) = self.lowest_gap_fitting(want) {
             self.record_placement(true, want);
             return Ok(addr);
         }
@@ -390,23 +411,24 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         (taken, false) // ran off the top of the heap
     }
 
-    /// The slide candidate: the run above the largest gap, shifting down into it.
+    /// The slide candidate: the run above the widest gap, shifting down into it,
+    /// paired with its per-byte gain.
     ///
-    /// Currently the *only* candidate shape, so it is also what guarantees
-    /// progress: it does not require the run to fit in the gap, and a maximal run
-    /// is flanked by free space above (a gap, or the top of the heap), so sliding
-    /// it either merges that free space with the range it vacates or lets `end`
-    /// retreat. Every byte in the run travels exactly `gap_len` down, so the
-    /// per-byte gain is `gap_len` -- positive while any gap exists.
-    fn slide_candidate(&self, budget: u64) -> Option<Step<u64>> {
-        let (&gap_len, starts) = self.free_by_size.last_key_value()?;
-        let to = *starts.first()?;
+    /// This is the candidate that guarantees progress. It does not require the
+    /// run to fit in the gap, and a maximal run is flanked by free space above (a
+    /// gap, or the top of the heap), so sliding it either merges that free space
+    /// with the range it vacates or lets `end` retreat. Every byte in the run
+    /// travels exactly `gap_len` down, so its per-byte gain is `gap_len` --
+    /// positive while any gap exists, which is what the evacuation index cannot
+    /// promise on a heap whose every gap is too narrow for anything.
+    fn slide_candidate(&self, budget: u64) -> Option<(u64, Step<u64>)> {
+        let (to, gap_len) = self.index.widest_gap()?;
         let from = to + gap_len;
         let (len, _truncated) = self.run_len_from(from, budget);
         if len == 0 {
             return None;
         }
-        Some(Step { from, to, len })
+        Some((gap_len, Step { from, to, len }))
     }
 }
 
@@ -483,25 +505,37 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
             .map(|(&addr, e)| (e.id, addr, e.len))
     }
 
-    /// The next compaction step: currently the slide, and nothing else.
+    /// The best of the two candidate shapes, both scored by per-byte gain.
     ///
-    /// The evacuation candidate -- an allocation jumping down into a gap that
-    /// fits it -- is not offered here at all; see the module docs. Losing it
-    /// costs *efficiency*, not correctness: the slide already guarantees a
-    /// positive-gain move exists while any gap does, so compaction still
-    /// converges to a gapless heap, but it pays a whole run's worth of copying
-    /// where a well-chosen evacuation would have paid one allocation's.
+    /// No walk: the slide is a root read plus a bounded run scan, and the
+    /// evacuation is the index's budgeted descent. Ties go to the slide, which
+    /// is the shape that can also retire free space at the top of the heap.
     ///
-    /// `budget` is a ranking input, not a cap: a truncated slide is offered when
-    /// the run is too long for it, and an untruncated one is offered whole even
-    /// if that exceeds the budget, since reporting quiescence would strand the
-    /// gap forever.
+    /// `budget` is a ranking input, not a cap. Both candidates respect it where
+    /// they can -- the evacuation exactly, the slide by taking a prefix of the
+    /// run -- but a slide of a single oversized allocation is still offered
+    /// whole, since reporting quiescence would strand its gap forever.
     fn propose_compaction_step(&self, budget: u64) -> Option<Step<u64>> {
-        if self.free_by_size.is_empty() {
-            self.record_search(false);
-            return None; // gapless: compact
+        let mut best: Option<(u64, Step<u64>)> = self.slide_candidate(budget);
+
+        // The evacuation's gain is `A.pos − G.pos`, which the index maximizes
+        // directly, so the winning step's own distance *is* the gain to compare.
+        if let Some(step) = self.index.best_evacuation_within(budget) {
+            let gain = step.from - step.to;
+            if best.is_none_or(|(incumbent, _)| gain > incumbent) {
+                best = Some((gain, step));
+            }
         }
-        let chosen = self.slide_candidate(budget);
+
+        // Defensive, and in practice unreachable: `slide_candidate` yields
+        // something whenever a gap exists, because a gap always has an
+        // allocation above it (free space at the top is not a gap, it is `end`
+        // retreating). Reading the unbudgeted root is `O(1)`, so keeping the
+        // fallback costs nothing next to making the caller re-enter.
+        let chosen = best.map(|(_, step)| step).or_else(|| {
+            debug_assert!(self.index.widest_gap().is_none(), "a gap with no slide");
+            self.index.best_evacuation()
+        });
         self.record_search(chosen.is_some());
         chosen
     }
@@ -540,13 +574,32 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         gaps
     }
 
-    /// The reference `lowest_gap_fitting` must agree with: the size-class scan
-    /// the augmented tree replaced.
-    fn lowest_gap_fitting_by_scan(&self, min_len: u64) -> Option<(u64, u64)> {
-        self.free_by_size
-            .range(min_len..)
-            .filter_map(|(&len, set)| set.first().map(|&start| (start, len)))
-            .min_by_key(|&(start, _)| start)
+    /// The reference `lowest_gap_fitting` must agree with: a scan of the gaps
+    /// the allocation map implies.
+    fn lowest_gap_fitting_by_scan(&self, min_len: u64) -> Option<u64> {
+        self.implied_gaps()
+            .into_iter()
+            .filter(|&(_, len)| len >= min_len)
+            .map(|(start, _)| start)
+            .min()
+    }
+
+    /// The reference the index's root must agree with: every (mover, gap) pair,
+    /// no index and no pruning at all. Returns the winning per-byte gain.
+    fn best_evacuation_by_brute_force(&self, budget: u64) -> Option<u64> {
+        let gaps = self.implied_gaps();
+        let mut best = 0u64;
+        for (&from, e) in &self.allocations {
+            if u64::from(e.len) > budget {
+                continue;
+            }
+            for &(pos, width) in &gaps {
+                if width >= u64::from(e.len) && pos < from {
+                    best = best.max(from - pos);
+                }
+            }
+        }
+        (best > 0).then_some(best)
     }
 
     /// Check that the derived indexes still agree with the source of truth.
@@ -564,17 +617,34 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         assert_eq!(self.live_bytes, live, "live_bytes drifted");
         assert_eq!(self.by_id.len(), self.allocations.len(), "stale by_id rows");
 
+        // The index must hold exactly one entry per gap and one per allocation.
         let gaps = self.implied_gaps();
-        let mut expected_free: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
-        for &(start, len) in &gaps {
-            expected_free.entry(len).or_default().insert(start);
-        }
-        assert_eq!(self.free_by_size, expected_free, "free_by_size drifted");
+        let mut expected: Vec<Key> = gaps
+            .iter()
+            .map(|&(start, len)| Key::gap(start, len))
+            .chain(
+                self.allocations
+                    .iter()
+                    .map(|(&addr, e)| self.alloc_key(addr, e.len)),
+            )
+            .collect();
+        expected.sort();
+        assert_eq!(
+            self.index.iter().collect::<Vec<_>>(),
+            expected,
+            "the evacuation index drifted from the allocation map"
+        );
 
-        // The augmented tree must hold exactly the same gaps...
-        assert_eq!(self.gaps.iter().collect::<Vec<_>>(), gaps, "gaps drifted");
-        // ...and its descent must still agree with the scan it replaced, which
-        // is what would catch a stale augmentation rather than a stale entry.
+        // A stale *augmentation* would survive that check, so every query the
+        // index answers is also checked against a scan.
+        assert_eq!(
+            self.index.widest_gap(),
+            gaps.iter().copied().max_by_key(|&(pos, len)| {
+                // Widest, and among equally wide the lowest-addressed.
+                (len, std::cmp::Reverse(pos))
+            }),
+            "widest_gap disagreed with a scan"
+        );
         for min_len in gaps
             .iter()
             .flat_map(|&(_, len)| [len.saturating_sub(1), len, len + 1])
@@ -583,7 +653,21 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             assert_eq!(
                 self.lowest_gap_fitting(min_len),
                 self.lowest_gap_fitting_by_scan(min_len.max(1)),
-                "the gap tree disagreed with the scan at min_len={min_len}"
+                "lowest_gap_fitting disagreed with a scan at min_len={min_len}"
+            );
+        }
+        for budget in self
+            .allocations
+            .values()
+            .flat_map(|e| [u64::from(e.len).saturating_sub(1), u64::from(e.len)])
+            .chain([0, u64::MAX])
+        {
+            assert_eq!(
+                self.index
+                    .best_evacuation_within(budget)
+                    .map(|s| s.from - s.to),
+                self.best_evacuation_by_brute_force(budget),
+                "the budgeted descent disagreed with brute force at budget={budget}"
             );
         }
     }
@@ -778,6 +862,136 @@ mod tests {
     }
 
     #[test]
+    fn evacuation_beats_sliding_when_a_high_allocation_can_jump_far_down() {
+        let mut h = Heap::new();
+        h.alloc(fixed(1), 10).unwrap(); // 0..10
+        h.alloc(fixed(2), 10).unwrap(); // 10..20  (freed below)
+        h.alloc(resizable(3), 100).unwrap(); // 20..120
+        h.alloc(fixed(4), 10).unwrap(); // 120..130
+        h.free(fixed(2)).unwrap(); // gap 10..20
+
+        // The highest 10-byte allocation is at 120 and the lowest gap that fits
+        // it is at 10, so the evacuation gains 110 -- far better than sliding the
+        // run above the gap down by 10.
+        let step = h.propose_compaction_step(UNBOUNDED).unwrap();
+        assert_eq!(
+            step,
+            Step {
+                from: 120,
+                to: 10,
+                len: 10
+            }
+        );
+        h.commit_compaction_step(step);
+        assert_eq!(h.lookup(fixed(4)), Some((10, 10)));
+        assert_eq!(h.len(), 120);
+        h.assert_invariants();
+    }
+
+    /// Resizable allocations are ordinary entries of the index, with no special
+    /// handling of any kind. The old design excluded them from its size-class
+    /// structure -- they scatter one per class -- and reached them only through a
+    /// second, address-keyed index; keying by size makes the distinction moot.
+    #[test]
+    fn a_resizable_allocation_is_an_ordinary_evacuation_candidate() {
+        // One small gap at the bottom, a densely packed middle, and a small
+        // resizable allocation at the top. Sliding is available but absurd: it
+        // would copy the whole heap to close a 100-byte gap, where evacuating
+        // the tail copies 50 bytes and travels 10100.
+        let mut h = Heap::new();
+        h.alloc(fixed(1), 100).unwrap(); // 0..100, freed below
+        for i in 0..10 {
+            h.alloc(fixed(10 + i), 1000).unwrap(); // 100..10100
+        }
+        h.alloc(resizable(99), 50).unwrap(); // 10100..10150
+        h.free(fixed(1)).unwrap(); // gap [0, 100)
+
+        let step = h.propose_compaction_step(UNBOUNDED).unwrap();
+        assert_eq!(
+            step,
+            Step {
+                from: 10100,
+                to: 0,
+                len: 50
+            },
+            "the resizable tail is the deepest mover, so it must be considered"
+        );
+        h.commit_compaction_step(step);
+        assert_eq!(h.len(), 10100, "the tail came off for 50 bytes of copying");
+        h.assert_invariants();
+    }
+
+    /// The budget is a **prefix of the key order**, so constraining the search by
+    /// it is exact rather than the two-track heuristic it replaced: the best
+    /// affordable move is found even when a far better unaffordable one exists.
+    #[test]
+    fn a_budget_yields_the_best_affordable_evacuation_not_a_near_miss() {
+        let plan = [
+            (1, 100, true),  // gap    0..100  <- fits either mover
+            (2, 50, false),  //      100..150
+            (3, 8, true),    // gap  150..158  <- fits only the small mover
+            (4, 50, false),  //      158..208
+            (5, 8, false),   //      208..216  <- the small mover
+            (6, 100, false), //      216..316  <- the large mover, travels further
+        ];
+        let h = heap_with_layout(&plan);
+
+        // Unconstrained: the 100-byte mover travels 216, beating the 8-byte
+        // mover's 208.
+        assert_eq!(
+            h.propose_compaction_step(UNBOUNDED).unwrap(),
+            Step {
+                from: 216,
+                to: 0,
+                len: 100
+            }
+        );
+        // Priced out of it, the 8-byte mover takes the *lowest* gap that fits
+        // it -- not the nearer one at 150.
+        assert_eq!(
+            h.propose_compaction_step(99).unwrap(),
+            Step {
+                from: 208,
+                to: 0,
+                len: 8
+            }
+        );
+        h.assert_invariants();
+    }
+
+    /// The worked example of `incremental-compaction.md` §4: distance-greed
+    /// finds the cheap interior moves that a truncation-greedy policy misses,
+    /// compacting the file in ~130 bytes where pure sliding would copy 1460.
+    #[test]
+    fn the_worked_example_compacts_without_lookahead() {
+        // Lay out E1..E5 with gaps of 20, 100, 90, 100 between them by allocating
+        // wall-to-wall and then freeing the spacers.
+        let plan: [(u32, u32, bool); 9] = [
+            (1, 1000, false), // E1  0..1000
+            (2, 20, true),    // gap 1000..1020
+            (3, 980, false),  // E2  1020..2000
+            (4, 100, true),   // gap 2000..2100
+            (5, 10, false),   // E3  2100..2110
+            (6, 90, true),    // gap 2110..2200
+            (7, 10, false),   // E4  2200..2210
+            (8, 100, true),   // gap 2210..2310
+            (9, 110, false),  // E5  2310..2420
+        ];
+        let mut h = heap_with_layout(&plan);
+        assert_eq!(h.len(), 2420);
+        assert_eq!(h.live_bytes(), 2110);
+        h.assert_invariants();
+
+        let (_, bytes) = compact_fully(&mut h, UNBOUNDED);
+        assert_eq!(h.len(), 2110, "fully compact");
+        assert_eq!(h.len(), h.live_bytes());
+        assert!(
+            bytes <= 200,
+            "distance-greed should move ~130 bytes, not slide 1460; moved {bytes}"
+        );
+    }
+
+    #[test]
     fn a_slide_moves_a_whole_contiguous_run_as_one_step() {
         let mut h = Heap::new();
         h.alloc(resizable(1), 10).unwrap(); // 0..10, freed below
@@ -785,8 +999,8 @@ mod tests {
         h.alloc(resizable(3), 30).unwrap(); // 30..60
         h.free(resizable(1)).unwrap(); // gap 0..10
 
-        // Resizable allocations generate no evacuation candidates, so the only
-        // candidate is the slide -- and it takes both of them at once.
+        // No allocation fits the 10-byte gap, so there is no evacuation at all
+        // and the slide is the only candidate -- and it takes both at once.
         let step = h.propose_compaction_step(UNBOUNDED).unwrap();
         assert_eq!(
             step,
@@ -963,8 +1177,8 @@ mod tests {
                 allocations: h.live_count(),
                 live_bytes: h.live_bytes(),
                 end: h.len(),
-                gaps: h.gaps.len(),
-                widest_gap: h.free_by_size.last_key_value().map_or(0, |(&len, _)| len),
+                gaps: h.implied_gaps().len(),
+                widest_gap: h.index.widest_gap().map_or(0, |(_, width)| width),
                 micros_per_burst: 0.0,
             }
         }
