@@ -123,10 +123,11 @@ const COMPACTION_BUDGET: u64 = 2048;
 /// `μ` is expected to cost a little *time* (a scan over the live size classes
 /// per proposal, plus divisibility tests per gap event) in exchange for a better
 /// *shape*, so the two numbers have to be read together.
-const POLICIES: [(&str, bool, (u64, u64)); 3] = [
-    ("plain", false, (0, 0)),
-    ("reward", true, (0, 0)),
-    ("tiling", false, (4096, 512)),
+const POLICIES: [(&str, bool, u64, (u64, u64)); 4] = [
+    ("plain", false, 0, (0, 0)),
+    ("reward", true, 0, (0, 0)),
+    ("gapcount", false, 64, (0, 0)),
+    ("tiling", false, 0, (4096, 512)),
 ];
 
 /// Churn with compaction bursts interleaved throughout: the state a live heap is
@@ -145,7 +146,7 @@ const POLICIES: [(&str, bool, (u64, u64)); 3] = [
 /// being measured -- a different policy leaves a measurably different heap
 /// behind, so timing a burst on a state some other policy produced would time a
 /// state no caller can reach.
-fn churned(n: usize, lambda: bool, mu: (u64, u64)) -> Heap {
+fn churned(n: usize, lambda: bool, alpha: u64, mu: (u64, u64)) -> Heap {
     assert!(
         n.is_multiple_of(COMPACTION_INTERVAL),
         "the run must stop exactly where a burst is due"
@@ -153,6 +154,7 @@ fn churned(n: usize, lambda: bool, mu: (u64, u64)) -> Heap {
     let mut rand = rng(0x2545_F491);
     let mut h = Heap::new();
     h.set_lambda(lambda);
+    h.set_alpha(alpha);
     h.set_mu(mu.0, mu.1);
     let mut live: Vec<Pointer<u32>> = Vec::new();
     let mut counter = 1u32;
@@ -191,13 +193,14 @@ fn bench_propose(c: &mut Criterion) {
     group.sample_size(10);
 
     for &n in &[1_000usize, 10_000, 100_000] {
-        for (label, lambda, mu) in POLICIES {
+        for (label, lambda, alpha, mu) in POLICIES {
             // Static shapes: one `propose_compaction_step` call, repeated.
             // Nothing commits, so the heap and the decision are identical on
             // every iteration.
             let mut shapes: [(&str, Heap); 2] = [("roomy", roomy(n)), ("slivers", slivers(n))];
             for (shape, heap) in &mut shapes {
                 heap.set_lambda(lambda);
+                heap.set_alpha(alpha);
                 heap.set_mu(mu.0, mu.1);
                 let id = BenchmarkId::new(format!("{shape}-{label}"), n);
                 group.bench_with_input(id, &n, |b, _| {
@@ -211,7 +214,7 @@ fn bench_propose(c: &mut Criterion) {
             // restored in `setup`, which criterion excludes from the timing.
             // `PerIteration` keeps one clone alive at a time; a batched size
             // would hold hundreds.
-            let pre_burst = churned(n, lambda, mu);
+            let pre_burst = churned(n, lambda, alpha, mu);
             // A burst is far cheaper than the clone that restores its input, so
             // criterion's default measurement time would spend minutes cloning
             // per benchmark. Ten samples of a shorter run say the same thing

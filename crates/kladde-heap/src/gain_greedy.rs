@@ -57,15 +57,62 @@ struct Entry<Id> {
     id: Id,
 }
 
-/// What the index maximizes over allocations. See [`GainGreedyHeap::lambda`].
+/// Which of an allocation's neighbours are free -- the only thing that decides
+/// what *vacating* it does to the number of gaps, and so the only input the `α`
+/// term of [`GainGreedyHeap::alpha`] needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreeNeighbours {
+    /// Free on both sides (or free below and at the top of the heap): vacating
+    /// merges the two gaps and the vacated span into one, or lets `end` retreat.
+    /// The "plug" case, `r = +1`.
+    Both,
+    /// Free on exactly one side: the adjacent gap simply extends. `r = 0`.
+    One,
+    /// Live on both sides: vacating mints a brand-new gap. `r = −1`.
+    Neither,
+}
+
+/// The weights that turn an allocation into the number the index maximizes.
 ///
-/// A free function rather than a method because [`GainGreedyHeap::set_lambda`]
-/// needs it while iterating `allocations`, which already borrows `self`.
-fn alloc_score(addr: u64, len: u32, lambda: bool) -> u64 {
-    if lambda {
-        addr + u64::from(len)
-    } else {
-        addr
+/// A separate type, rather than methods on the heap, because rebuilding the
+/// index needs the scoring function while iterating `allocations` -- which
+/// already borrows `self`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Weights {
+    lambda: bool,
+    alpha: u64,
+}
+
+impl Weights {
+    /// `score(A) = A.pos + λ·A.size + α_eff·(nc − 1)`.
+    ///
+    /// **`α_eff` is capped per allocation**, at whatever `λ` has left of its own
+    /// size, and that is a deliberate departure from the design note. The sign
+    /// test needs `λ·reward(s) + α <= s` for every live size `s`; the note
+    /// applies that as one *global* bound, which therefore binds at the
+    /// **smallest** live allocation -- so a single 1-byte allocation anywhere in
+    /// the heap would make `α` inert for every other. Capping each allocation's
+    /// own term at its own size gives exactly the same guarantee, because the
+    /// sign argument is per-pair and only ever needed to hold for the pair being
+    /// scored, while letting large allocations carry the full weight.
+    ///
+    /// The price is that the gap-count term is no longer uniform across sizes:
+    /// small allocations get proportionally less credit for what they do to the
+    /// gap count. Note too that `λ` and `α` are mutually exclusive under the
+    /// bound -- at `λ = 1` the size reward already saturates it -- so setting both
+    /// leaves `α` with nothing to spend.
+    fn score(self, addr: u64, len: u32, nc: FreeNeighbours) -> u64 {
+        let size = u64::from(len);
+        let base = if self.lambda { addr + size } else { addr };
+        let headroom = if self.lambda { 0 } else { size };
+        let alpha = self.alpha.min(headroom);
+        match nc {
+            FreeNeighbours::Both => base.saturating_add(alpha),
+            FreeNeighbours::One => base,
+            // An allocation at an address below `α` cannot travel far anyway, so
+            // the saturation costs nothing real.
+            FreeNeighbours::Neither => base.saturating_sub(alpha),
+        }
     }
 }
 
@@ -153,8 +200,9 @@ pub struct GainGreedyHeap<Id> {
     end: u64,
     /// Sum of all live allocation sizes.
     live_bytes: u64,
-    /// Stage 2's size reward. See [`GainGreedyHeap::lambda`].
-    lambda: bool,
+    /// The source-side weights: stage 2's size reward and stage 3's gap-count
+    /// term. See [`GainGreedyHeap::lambda`] and [`GainGreedyHeap::alpha`].
+    weights: Weights,
     /// Stage 4's destination-side weights. See [`GainGreedyHeap::mu`].
     mu_exact: u64,
     mu_multiple: u64,
@@ -172,7 +220,7 @@ impl<Id> Default for GainGreedyHeap<Id> {
             classes: SizeClasses::default(),
             end: 0,
             live_bytes: 0,
-            lambda: false,
+            weights: Weights::default(),
             mu_exact: 0,
             mu_multiple: 0,
             #[cfg(test)]
@@ -226,7 +274,34 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// trades exactness in `Φ` for a preference the potential does not express --
     /// and both settings are a benchmark axis rather than a settled default.
     pub fn lambda(&self) -> bool {
-        self.lambda
+        self.weights.lambda
+    }
+
+    /// The weight on what a move does to the **number of gaps at its source**.
+    ///
+    /// Removing an allocation does one of three things to the gap count, decided
+    /// entirely by its immediate neighbours: with both free the two gaps and the
+    /// vacated span merge into one (`r = +1`); with one free the adjacent gap
+    /// simply extends (`r = 0`); with neither, a brand-new gap is minted
+    /// (`r = −1`). The top of the heap counts as free, since vacating the topmost
+    /// allocation lets `end` retreat rather than leaving a trailing gap.
+    ///
+    /// That is a property of the mover **alone**, so it decouples and goes
+    /// straight into the score as `α·(nc − 1)`, leaving the merge, the key order
+    /// and the validity argument all unchanged. The destination side cannot join
+    /// it -- whether a move *closes* a gap depends on `G.width == A.size`, which
+    /// couples the two sides -- and that is what [`mu`](Self::mu) is for.
+    ///
+    /// Note this is an **absolute** term, not the per-byte `α·r/s` an earlier
+    /// design used: the tuning does not transfer between them.
+    ///
+    /// Ships at `0`. It is the term with a cost the others do not have: an
+    /// allocation's score now depends on its neighbours, so every mutation
+    /// re-keys up to two *other* entries (see
+    /// [`set_alpha`](Self::set_alpha)). It should be measured against `α = 0`
+    /// rather than adopted on principle.
+    pub fn alpha(&self) -> u64 {
+        self.weights.alpha
     }
 
     /// The destination-side weights `(μ₁, μₖ)`: what a move is worth for
@@ -262,27 +337,63 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         self.mu_multiple = mu_multiple;
     }
 
-    /// Turn the size reward on or off.
-    ///
-    /// The score is part of the index key, so this rebuilds the index rather
-    /// than mutating it: changing the score in place would leave every existing
-    /// entry unremovable. That makes it `O(n log n)`, which is fine for what it
-    /// is -- a policy knob set once, before the heap is used, or swept by a
-    /// benchmark.
+    /// Turn the size reward on or off. See [`lambda`](Self::lambda).
     pub fn set_lambda(&mut self, lambda: bool) {
-        if lambda == self.lambda {
+        self.set_weights(Weights {
+            lambda,
+            ..self.weights
+        });
+    }
+
+    /// Set the gap-count weight. See [`alpha`](Self::alpha).
+    ///
+    /// Turning this on is what makes an allocation's key depend on its
+    /// *neighbours*, so from here on freeing or allocating next to `A` re-keys
+    /// `A` even though `A` itself did not change -- a delete-and-insert in the
+    /// index for each, up to two per mutation on top of the mutation's own work.
+    /// That price is charged on the mutation path, which runs several times as
+    /// often as the proposal path, which is exactly why `α = 0` is the default
+    /// and why the two should be measured against each other.
+    pub fn set_alpha(&mut self, alpha: u64) {
+        self.set_weights(Weights {
+            alpha,
+            ..self.weights
+        });
+    }
+
+    /// Adopt new source-side weights, rebuilding the index.
+    ///
+    /// The score is part of the index key, so this cannot mutate in place:
+    /// changing scores under the existing entries would leave every one of them
+    /// unremovable. `O(n log n)`, which is fine for what it is -- a policy knob
+    /// set once before the heap is used, or swept by a benchmark.
+    fn set_weights(&mut self, weights: Weights) {
+        if weights == self.weights {
             return;
         }
-        self.lambda = lambda;
+        self.weights = weights;
         self.index = EvacuationIndex::default();
+        // Walk the layout once, minting both kinds of entry in address order.
+        // `nc` is read off this walk rather than re-derived per allocation:
+        // `prev_free` is the gap that has just been emitted, and `next_free`
+        // needs only one lookahead.
         let mut cursor = 0u64;
-        for (&addr, e) in &self.allocations {
-            if addr > cursor {
+        let mut entries = self.allocations.iter().peekable();
+        while let Some((&addr, e)) = entries.next() {
+            let below_free = addr > cursor;
+            if below_free {
                 self.index.insert(Key::gap(cursor, addr - cursor));
             }
-            self.index
-                .insert(Key::alloc(addr, e.len, alloc_score(addr, e.len, lambda)));
             cursor = addr + u64::from(e.len);
+            // The top of the heap counts as free.
+            let above_free = entries.peek().is_none_or(|(&next, _)| next > cursor);
+            let nc = match (below_free, above_free) {
+                (true, true) => FreeNeighbours::Both,
+                (false, false) => FreeNeighbours::Neither,
+                _ => FreeNeighbours::One,
+            };
+            self.index
+                .insert(Key::alloc(addr, e.len, weights.score(addr, e.len, nc)));
         }
     }
 
@@ -387,13 +498,58 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         }
     }
 
+    /// How `addr` sits between its neighbours, derived from the current map.
+    /// Being at the top of the heap counts as free above: vacating there lets
+    /// `end` retreat rather than minting a gap.
+    fn neighbours_of(&self, addr: u64, len: u32) -> FreeNeighbours {
+        let below_free = self.prev_end(addr) < addr;
+        let above = addr + len as u64;
+        let above_free = self.next_start(above).is_none_or(|next| next > above);
+        match (below_free, above_free) {
+            (true, true) => FreeNeighbours::Both,
+            (false, false) => FreeNeighbours::Neither,
+            _ => FreeNeighbours::One,
+        }
+    }
+
     /// The index key of the allocation at `addr`.
     ///
-    /// Both removal and insertion go through this, so the score can grow richer
-    /// (stage 2's size reward, stage 3's gap-count term) without any risk of a
-    /// remove computing a different key than the matching insert did.
+    /// Both removal and insertion go through this, so a remove can never compute
+    /// a different key than the matching insert did -- which matters more than it
+    /// looks once the score depends on the *neighbours*, since the map has to be
+    /// in the same state both times. That is what the `unindex`/`reindex` dance
+    /// below is for.
     fn alloc_key(&self, addr: u64, len: u32) -> Key {
-        Key::alloc(addr, len, alloc_score(addr, len, self.lambda))
+        let nc = self.neighbours_of(addr, len);
+        Key::alloc(addr, len, self.weights.score(addr, len, nc))
+    }
+
+    /// The addresses whose neighbour category an insert or removal at `addr` can
+    /// change. Nothing further away is affected, since the category depends only
+    /// on the immediately adjacent space.
+    fn neighbour_addrs(&self, addr: u64, len: u32) -> (Option<u64>, Option<u64>) {
+        let prev = self.allocations.range(..addr).next_back().map(|(&a, _)| a);
+        let next = self.next_start(addr + len as u64);
+        (prev, next)
+    }
+
+    /// Drop `addr` from the index under the category it *currently* has. Must be
+    /// called before the map change that would alter that category.
+    fn unindex(&mut self, addr: Option<u64>) {
+        let Some(addr) = addr else { return };
+        let Some(&e) = self.allocations.get(&addr) else {
+            return;
+        };
+        self.index.remove(self.alloc_key(addr, e.len));
+    }
+
+    /// Put `addr` back under its re-derived category.
+    fn reindex(&mut self, addr: Option<u64>) {
+        let Some(addr) = addr else { return };
+        let Some(&e) = self.allocations.get(&addr) else {
+            return;
+        };
+        self.index.insert(self.alloc_key(addr, e.len));
     }
 
     /// Record an allocation in the index, and -- if it is fixed-size -- in its
@@ -433,6 +589,15 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
 
     /// Record an allocation at `addr`, which must be free and `len` bytes wide.
     fn insert_raw(&mut self, addr: u64, len: u32, id: Id) {
+        // The neighbours' categories change the moment this lands next to them,
+        // and their keys carry those categories -- so pull them out of the index
+        // first, while their old keys are still computable, and put them back
+        // after. At `α = 0` the score ignores the category and both calls are
+        // pure overhead, which is precisely the cost `α` is measured against.
+        let (prev, next) = self.neighbour_addrs(addr, len);
+        self.unindex(prev);
+        self.unindex(next);
+
         let prev_end = self.prev_end(addr);
         match self.next_start(addr) {
             Some(next) => {
@@ -451,18 +616,31 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         self.by_id.insert(id, addr);
         self.live_bytes += len as u64;
         self.alloc_record(addr, len, id);
+
+        self.reindex(prev);
+        self.reindex(next);
     }
 
     /// Drop the allocation at `addr`, coalescing its range into the neighbouring
     /// gaps (or retreating `end` if it was the topmost).
     fn remove_raw(&mut self, addr: u64) -> Entry<Id> {
-        let e = self
+        let len = self
             .allocations
-            .remove(&addr)
-            .expect("remove_raw on an address with no allocation");
+            .get(&addr)
+            .expect("remove_raw on an address with no allocation")
+            .len;
+        // Same dance as `insert_raw`, and for the same reason -- but this one has
+        // to unindex the departing allocation itself too, and all three before
+        // the map changes underneath their keys.
+        let (prev, next) = self.neighbour_addrs(addr, len);
+        self.unindex(prev);
+        self.unindex(next);
+        let e = self.allocations[&addr];
+        self.alloc_forget(addr, e.len, e.id);
+
+        self.allocations.remove(&addr);
         self.by_id.remove(&e.id);
         self.live_bytes -= e.len as u64;
-        self.alloc_forget(addr, e.len, e.id);
 
         let prev_end = self.prev_end(addr);
         let above = addr + e.len as u64;
@@ -474,6 +652,9 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             }
             None => self.end = prev_end,
         }
+
+        self.reindex(prev);
+        self.reindex(next);
         e
     }
 
@@ -664,7 +845,11 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         if len == 0 {
             return None;
         }
-        let reward = if self.lambda { len.min(gap_len) } else { 0 };
+        let reward = if self.weights.lambda {
+            len.min(gap_len)
+        } else {
+            0
+        };
         Some((gap_len + reward, Step { from, to, len }))
     }
 }
@@ -774,12 +959,18 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
         // the guard is what makes that reasoning load-bearing rather than
         // incidental.
         if best.is_some() {
-            let lambda = self.lambda;
+            // The mover a class nominates is scored exactly as the index would
+            // score it -- neighbour category included -- so that `+ μ` is the only
+            // difference between the two candidates and the values stay
+            // comparable.
             let tiling = self.classes.best_tiling_evacuation(
                 budget,
                 self.mu_exact,
                 self.mu_multiple,
-                |addr, size| alloc_score(addr, size, lambda),
+                |addr, size| {
+                    self.weights
+                        .score(addr, size, self.neighbours_of(addr, size))
+                },
             );
             if let Some((gain, from, to, size)) = tiling {
                 if best.is_none_or(|(incumbent, _)| gain > incumbent) {
@@ -856,8 +1047,8 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     }
 
     /// The reference the index's root must agree with: every (mover, gap) pair,
-    /// no index and no pruning at all. Returns the winning objective value,
-    /// which carries `λ` -- so this checks the reward as well as the search.
+    /// no index and no pruning at all. Returns the winning objective value, which
+    /// carries the full score -- so this checks `λ` and `α` as well as the search.
     fn best_evacuation_by_brute_force(&self, budget: u64) -> Option<u64> {
         let gaps = self.implied_gaps();
         let mut best = 0u64;
@@ -865,9 +1056,12 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             if u64::from(e.len) > budget {
                 continue;
             }
+            let score = self
+                .weights
+                .score(from, e.len, self.neighbours_of(from, e.len));
             for &(pos, width) in &gaps {
                 if width >= u64::from(e.len) && pos < from {
-                    best = best.max(alloc_score(from, e.len, self.lambda) - pos);
+                    best = best.max(score.saturating_sub(pos));
                 }
             }
         }
@@ -960,19 +1154,25 @@ mod tests {
 
     const UNBOUNDED: u64 = u64::MAX;
 
-    /// The policy settings the randomized tests sweep: `(λ, (μ₁, μₖ))`.
+    /// The policy settings the randomized tests sweep: `(λ, α, (μ₁, μₖ))`.
     ///
     /// Every one of them must converge to a gapless heap and must never propose
     /// an invalid step -- none of these knobs is allowed to buy correctness with
-    /// tuning. The shipped default is first; the last is deliberately extreme, to
-    /// check that a weight large enough to dominate the distance term still
-    /// cannot stall compaction or produce an upward move.
-    const POLICIES: [(bool, (u64, u64)); 5] = [
-        (false, (0, 0)),
-        (true, (0, 0)),
-        (false, (4096, 512)),
-        (true, (4096, 512)),
-        (true, (1 << 40, 1 << 36)),
+    /// tuning. The shipped default is first; the last two are deliberately
+    /// extreme, to check that weights large enough to dominate the distance term
+    /// still cannot stall compaction or produce an upward move.
+    ///
+    /// `λ` and `α` never appear together with both non-zero, because they cannot
+    /// both bite: the sign bound gives an allocation `A.size` to spend and `λ`
+    /// spends all of it. See [`Weights::score`].
+    const POLICIES: [(bool, u64, (u64, u64)); 7] = [
+        (false, 0, (0, 0)),
+        (true, 0, (0, 0)),
+        (false, 64, (0, 0)),
+        (false, 0, (4096, 512)),
+        (true, 0, (4096, 512)),
+        (false, 64, (4096, 512)),
+        (false, u64::MAX, (1 << 40, 1 << 36)),
     ];
 
     type Heap = GainGreedyHeap<Pointer<u32>>;
@@ -1257,6 +1457,113 @@ mod tests {
         h.assert_invariants();
     }
 
+    /// `α` prices what *vacating* a mover does to the gap count: extracting a
+    /// "plug" between two gaps merges them, where carving a mover out of a solid
+    /// run mints a new one.
+    ///
+    /// The layout below is elaborate, and that is the finding rather than an
+    /// accident of test-writing. Under the sign bound, `α_eff <= A.size`, so the
+    /// term can only reorder candidates whose scores are already within
+    /// `α_plug + α_walled` of each other -- and the geometry fights back hard:
+    ///
+    /// - A plug can **never** outrank a walled allocation above it *into the same
+    ///   destination*. Making the plug's top neighbour free requires a gap above
+    ///   it, and the allocation just above that gap has free space below it, so
+    ///   it scores un-penalised at `>= plug.pos + plug.size + 1` -- already more
+    ///   than `plug.pos + α_eff`. Every intermediate allocation must therefore be
+    ///   too large to fit the destination at all, which pushes the walled one
+    ///   further away than `α` can reach.
+    /// - So the two must aim at **different** destinations, which is what this
+    ///   layout arranges: `Z` and `W` fit no gap in the heap, so they are not
+    ///   candidates and merely serve to wall `B` in.
+    ///
+    /// The conclusion worth carrying: `α` is a near-tie-breaker, not a policy
+    /// lever, and the sign bound is what makes it one.
+    #[test]
+    fn alpha_prefers_extracting_a_plug_over_carving_a_new_gap() {
+        let plan = [
+            (1, 250, true),   // gap    0..250   <- A's destination
+            (2, 250, false),  // X    250..500
+            (3, 300, true),   // gap  500..800   <- B's destination
+            (4, 200, false),  // Y    800..1000
+            (5, 10, true),    // gap 1000..1010
+            (6, 250, false),  // A   1010..1260  <- the plug: free on both sides
+            (7, 10, true),    // gap 1260..1270
+            (8, 400, false),  // Z   1270..1670  <- fits no gap; walls B from below
+            (9, 300, false),  // B   1670..1970  <- walled in: live on both sides
+            (10, 400, false), // W   1970..2370  <- fits no gap; walls B from above
+        ];
+        let mut h = heap_with_layout(&plan);
+        assert_eq!(h.alpha(), 0, "the gap-count term ships off");
+
+        // Distance alone: B travels 1670 − 500 = 1170, beating A's 1010.
+        assert_eq!(
+            h.propose_compaction_step(UNBOUNDED).unwrap(),
+            Step {
+                from: 1670,
+                to: 500,
+                len: 300
+            },
+            "distance alone takes the move that carves a new gap"
+        );
+
+        // With α, A gains its own size and B loses B's: 1260 against 920.
+        h.set_alpha(250);
+        assert_eq!(
+            h.propose_compaction_step(UNBOUNDED).unwrap(),
+            Step {
+                from: 1010,
+                to: 0,
+                len: 250
+            },
+            "α should buy the gap-merging move"
+        );
+        h.assert_invariants();
+    }
+
+    /// `α` makes an allocation's key depend on its *neighbours*, so a mutation
+    /// next to `A` has to re-key `A` even though `A` did not change. If that
+    /// bookkeeping were wrong the index would hold entries under keys nobody can
+    /// recompute, which `assert_invariants` catches on the very next call.
+    #[test]
+    fn alpha_rekeys_the_neighbours_of_every_mutation() {
+        let mut h = Heap::new();
+        h.set_alpha(64);
+
+        // Build a run, then punch holes in it: every free changes the category of
+        // both survivors beside it.
+        for i in 1..=9u32 {
+            h.alloc(fixed(i), 64).unwrap();
+            h.assert_invariants();
+        }
+        for i in [2u32, 5, 8, 4] {
+            h.free(fixed(i)).unwrap();
+            h.assert_invariants();
+        }
+        // Re-filling those holes flips the categories back.
+        for i in 20..=23u32 {
+            h.alloc(fixed(i), 64).unwrap();
+            h.assert_invariants();
+        }
+        compact_fully(&mut h, UNBOUNDED);
+        assert_eq!(h.len(), h.live_bytes());
+    }
+
+    #[test]
+    fn toggling_alpha_rebuilds_the_index_consistently() {
+        let plan: Vec<(u32, u32, bool)> = (1..=41)
+            .map(|i| (i, 8 + (i % 7) * 11, i % 3 == 0))
+            .collect();
+        let mut h = heap_with_layout(&plan);
+        for alpha in [64u64, 0, 1_000_000] {
+            h.set_alpha(alpha);
+            assert_eq!(h.alpha(), alpha);
+            h.assert_invariants();
+        }
+        compact_fully(&mut h, UNBOUNDED);
+        assert_eq!(h.len(), h.live_bytes(), "α must not stall compaction");
+    }
+
     /// `μ₁` should reroute a mover into a gap it fills exactly, giving up some
     /// travel distance to erase a gap outright rather than leave a sliver.
     #[test]
@@ -1460,9 +1767,10 @@ mod tests {
             state ^= state << 17;
             state
         };
-        for (lambda, mu) in POLICIES {
+        for (lambda, alpha, mu) in POLICIES {
             let mut h = Heap::new();
             h.set_lambda(lambda);
+            h.set_alpha(alpha);
             h.set_mu(mu.0, mu.1);
             let mut live: Vec<Pointer<u32>> = Vec::new();
             let mut counter = 1u32;
@@ -1502,7 +1810,7 @@ mod tests {
             assert_eq!(
                 h.len(),
                 h.live_bytes(),
-                "lambda={lambda} mu={mu:?}: gaps left over"
+                "lambda={lambda} alpha={alpha} mu={mu:?}: gaps left over"
             );
         }
     }
@@ -2014,17 +2322,18 @@ mod tests {
     #[test]
     #[ignore = "measurement, not a behavioural test; takes minutes"]
     fn candidate_search_cost_over_a_churny_workload() {
-        for (lambda, mu) in POLICIES {
-            println!("\n\n########## lambda = {lambda}, mu = {mu:?} ##########");
+        for (lambda, alpha, mu) in POLICIES {
+            println!("\n\n########## lambda = {lambda}, alpha = {alpha}, mu = {mu:?} ##########");
             for &rounds in &[400usize, 4_000, 40_000] {
-                measure_one(rounds, lambda, mu);
+                measure_one(rounds, lambda, alpha, mu);
             }
         }
     }
 
-    fn measure_one(rounds: usize, lambda: bool, mu: (u64, u64)) {
+    fn measure_one(rounds: usize, lambda: bool, alpha: u64, mu: (u64, u64)) {
         let mut h = Heap::new();
         h.set_lambda(lambda);
+        h.set_alpha(alpha);
         h.set_mu(mu.0, mu.1);
         let (_, bursts, snapshots) = run_churny_workload_tracked(&mut h, rounds);
         let during_bursts = h.search_stats();
@@ -2092,12 +2401,12 @@ mod tests {
 
     #[test]
     fn compaction_converges_from_a_randomized_workload() {
-        for (lambda, mu) in POLICIES {
-            converges_under(lambda, mu);
+        for (lambda, alpha, mu) in POLICIES {
+            converges_under(lambda, alpha, mu);
         }
     }
 
-    fn converges_under(lambda: bool, mu: (u64, u64)) {
+    fn converges_under(lambda: bool, alpha: u64, mu: (u64, u64)) {
         // A tiny xorshift keeps this deterministic without a dev-dependency.
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut rand = move || {
@@ -2109,6 +2418,7 @@ mod tests {
 
         let mut h = Heap::new();
         h.set_lambda(lambda);
+        h.set_alpha(alpha);
         h.set_mu(mu.0, mu.1);
         let mut live: Vec<Pointer<u32>> = Vec::new();
         let mut next_counter = 1u32;
