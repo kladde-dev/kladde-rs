@@ -29,14 +29,13 @@ mod gap_tree;
 mod heap;
 mod journaled;
 mod mock;
-mod mover_tree;
 mod pointer;
 mod storage;
 mod unjournaled;
 mod word;
 
 pub use backend::{Backend, BackendError, ReadBackend, WriteBackend};
-pub use gain_greedy::{GainGreedyHeap, SearchCap};
+pub use gain_greedy::GainGreedyHeap;
 pub use heap::{
     AllocationId, CompactionProgress, HeapError, IncrementallyCompactableHeap, RelocatableHeap,
     Relocation, Step,
@@ -60,5 +59,4 @@ pub use word::Word;
 #[doc(hidden)]
 pub mod bench_support {
     pub use crate::gap_tree::GapTree;
-    pub use crate::mover_tree::MoverTree;
 }

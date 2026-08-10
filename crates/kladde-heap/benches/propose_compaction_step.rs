@@ -5,17 +5,13 @@
 //! **finding** the move. This benchmark times the search -- no byte copying --
 //! across heap shapes chosen to span the range of its pruning.
 //!
-//! The pruning rests on `gain <= address`: candidates are examined from the top
-//! down and the search stops once the best gain found reaches the next
-//! candidate's address. So the shapes that matter are distinguished by whether a
-//! *high-gain move exists at all*:
+//! Three shapes, chosen when the decision was a branch-and-bound walk over
+//! candidates and kept because they still span the interesting range -- whether
+//! a *high-gain move exists at all*, and how much free space is reachable:
 //!
-//! - `roomy` -- a wide gap low down that the topmost allocation fits, so the
-//!   first candidate examined sets a bound nothing else can beat. The pruning's
-//!   best case: a couple of candidates.
-//! - `slivers` -- every gap narrower than every allocation, so no candidate has
-//!   a destination, no bound is ever established, and the search examines
-//!   everything. The pruning's worst case.
+//! - `roomy` -- a wide gap low down that the topmost allocation fits.
+//! - `slivers` -- every gap narrower than every allocation, so nothing can
+//!   evacuate anywhere and only the slide has anything to offer.
 //! - `churned` -- alloc/free/resize churn with compaction bursts interleaved,
 //!   which is the state a real heap spends most of its time in.
 //!
@@ -27,17 +23,13 @@
 //! iteration. That is what a backend flush actually pays, and unlike the
 //! repeated-single-call form it also covers the later calls of a burst, which
 //! run on a progressively more compacted heap than the first one does.
-//!
-//! Note what sets the scale: one entry per fixed-size *class* but one entry per
-//! *resizable allocation*, so these shapes are built resizable-heavy, which is
-//! what the instrumented workload in `test-results/` also shows dominating.
 
 use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 
-use kladde_heap::{GainGreedyHeap, Pointer, RelocatableHeap, SearchCap, Sizedness};
+use kladde_heap::{GainGreedyHeap, Pointer, RelocatableHeap, Sizedness};
 
 type Heap = GainGreedyHeap<Pointer<u32>>;
 
@@ -120,18 +112,6 @@ fn roomy(n: usize) -> Heap {
 const COMPACTION_INTERVAL: usize = 25;
 const COMPACTION_BUDGET: u64 = 2048;
 
-/// The `k` measured for both bounded modes, chosen by `search_cap_sweep` in
-/// `gain_greedy.rs` and recorded in `test-results/`.
-const CAP_K: usize = 16;
-
-/// The settings compared on every shape. `uncapped` is the exact search; the
-/// other two bound its walk. See [`SearchCap`].
-const CAPS: [(&str, SearchCap); 3] = [
-    ("uncapped", SearchCap::Unbounded),
-    ("restart", SearchCap::Restart(CAP_K)),
-    ("resume", SearchCap::Resume(CAP_K)),
-];
-
 /// Churn with compaction bursts interleaved throughout: the state a live heap is
 /// usually in, under the schedule a backend actually uses.
 ///
@@ -144,18 +124,17 @@ const CAPS: [(&str, SearchCap); 3] = [
 /// is due to trigger. That final burst is what the benchmark measures, so it is
 /// deliberately left un-run.
 ///
-/// `cap` applies to the bursts *building* the state, not just to the one being
-/// measured: a bounded search leaves a measurably different heap behind (see
-/// `test-results/`), so timing a bounded burst on a state an unbounded one
-/// produced would time a state no caller can reach.
-fn churned(n: usize, cap: SearchCap) -> Heap {
+/// The bursts that *build* the state run under the same policy as the one being
+/// measured -- a different policy leaves a measurably different heap behind (see
+/// `test-results/`), so timing a burst on a state some other policy produced
+/// would time a state no caller can reach.
+fn churned(n: usize) -> Heap {
     assert!(
         n.is_multiple_of(COMPACTION_INTERVAL),
         "the run must stop exactly where a burst is due"
     );
     let mut rand = rng(0x2545_F491);
     let mut h = Heap::new();
-    h.set_search_cap(cap);
     let mut live: Vec<Pointer<u32>> = Vec::new();
     let mut counter = 1u32;
     for round in 0..n {
@@ -193,45 +172,39 @@ fn bench_propose(c: &mut Criterion) {
     group.sample_size(10);
 
     for &n in &[1_000usize, 10_000, 100_000] {
-        for (label, cap) in CAPS {
-            // Static shapes: one `propose_compaction_step` call, repeated.
-            // Nothing commits, so under `uncapped` and `restart` the heap and
-            // the decision are identical on every iteration. Under `resume` the
-            // cursor advances, so the repeated calls sweep the candidate space
-            // instead -- which is what they do inside a burst too.
-            let mut shapes: [(&str, Heap); 2] = [("roomy", roomy(n)), ("slivers", slivers(n))];
-            for (shape, heap) in &mut shapes {
-                heap.set_search_cap(cap);
-                let id = BenchmarkId::new(format!("{shape}-{label}"), n);
-                group.bench_with_input(id, &n, |b, _| {
-                    b.iter(|| black_box(heap.propose_compaction_step(black_box(4096))));
-                });
-            }
-
-            // The realistic shape: one whole burst, from the state this cap's
-            // own schedule leaves just before it. The burst mutates the heap, so
-            // each iteration starts from a fresh clone of that saved state --
-            // restored in `setup`, which criterion excludes from the timing.
-            // `PerIteration` keeps one clone alive at a time; a batched size
-            // would hold hundreds.
-            let pre_burst = churned(n, cap);
-            // A bounded burst is ~50x cheaper than the clone that restores its
-            // input, so criterion's default measurement time would spend
-            // minutes cloning per benchmark. Ten samples of a shorter run say
-            // the same thing about a routine this repeatable.
-            group.measurement_time(Duration::from_millis(750));
-            group.warm_up_time(Duration::from_millis(250));
-            let id = BenchmarkId::new(format!("churned-{label}"), n);
+        // Static shapes: one `propose_compaction_step` call, repeated. Nothing
+        // commits, so the heap and the decision are identical on every
+        // iteration.
+        let shapes: [(&str, Heap); 2] = [("roomy", roomy(n)), ("slivers", slivers(n))];
+        for (shape, heap) in &shapes {
+            let id = BenchmarkId::new(*shape, n);
             group.bench_with_input(id, &n, |b, _| {
-                b.iter_batched_ref(
-                    || pre_burst.clone(),
-                    |h| black_box(h.compact_incrementally(black_box(COMPACTION_BUDGET))),
-                    BatchSize::PerIteration,
-                );
+                b.iter(|| black_box(heap.propose_compaction_step(black_box(4096))));
             });
-            group.measurement_time(Duration::from_secs(5));
-            group.warm_up_time(Duration::from_secs(3));
         }
+
+        // The realistic shape: one whole burst, from the state the schedule
+        // leaves just before it. The burst mutates the heap, so each iteration
+        // starts from a fresh clone of that saved state -- restored in `setup`,
+        // which criterion excludes from the timing. `PerIteration` keeps one
+        // clone alive at a time; a batched size would hold hundreds.
+        let pre_burst = churned(n);
+        // A burst is far cheaper than the clone that restores its input, so
+        // criterion's default measurement time would spend minutes cloning per
+        // benchmark. Ten samples of a shorter run say the same thing about a
+        // routine this repeatable.
+        group.measurement_time(Duration::from_millis(750));
+        group.warm_up_time(Duration::from_millis(250));
+        let id = BenchmarkId::new("churned", n);
+        group.bench_with_input(id, &n, |b, _| {
+            b.iter_batched_ref(
+                || pre_burst.clone(),
+                |h| black_box(h.compact_incrementally(black_box(COMPACTION_BUDGET))),
+                BatchSize::PerIteration,
+            );
+        });
+        group.measurement_time(Duration::from_secs(5));
+        group.warm_up_time(Duration::from_secs(3));
     }
 
     group.finish();
