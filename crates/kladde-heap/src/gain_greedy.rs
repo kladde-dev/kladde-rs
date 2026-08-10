@@ -488,6 +488,78 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         (taken, false) // ran off the top of the heap
     }
 
+    /// Grow a chosen step into a **run**, in both directions, as far as the
+    /// destination gap and the budget allow -- stage 5's minimal version.
+    ///
+    /// Full run support would mean *indexing* runs, which costs `O(k_max²)`
+    /// point updates per allocation inserted or removed and multiplies the tree
+    /// by `k_max`, all charged to the mutation path. This gets a cheap fraction
+    /// of the benefit for nothing: it runs once per proposal, after the winner is
+    /// already known, and needs no new entries at all.
+    ///
+    /// It is safe and weakly profitable in **every** case, which follows from the
+    /// distance bound. Let the step move `[from, from+len)` into a gap at `to` of
+    /// width `w`, and let `d = from − to`; a gap and an allocation never overlap,
+    /// so `d >= w` always.
+    ///
+    /// - Absorbing the neighbour *above* leaves `from` alone and adds `c` bytes
+    ///   that each travel the full `d`, so the potential drops by a further `c·d`.
+    /// - Absorbing the neighbour *below* lowers `from` by `b` and changes the drop
+    ///   by `b·(d − S)`, where `S` is the new total size. That is non-negative
+    ///   because the run must still fit the gap (`S <= w`) and must still sit
+    ///   above it (`d >= w`), so `d >= S` throughout.
+    ///
+    /// Capping at `min(w, budget)` is therefore the whole rule. Note that the
+    /// downward extension degenerates gracefully: if it reaches the allocation
+    /// immediately above the gap, the step has quietly become a slide.
+    ///
+    /// Applied to *every* chosen step, because it is a no-op on a slide -- that
+    /// run is already maximal up to the budget, and nothing ends exactly at its
+    /// `from`, which is the far side of the gap.
+    fn extend_into_run(&self, mut step: Step<u64>, budget: u64) -> Step<u64> {
+        // The gap the step lands in runs from `to` to the next allocation.
+        let Some(gap_end) = self.next_start(step.to) else {
+            return step; // no allocation above it at all: nothing to absorb
+        };
+        let cap = (gap_end - step.to).min(budget);
+
+        // Upward: absorb the allocation starting exactly where the run ends.
+        //
+        // This cannot currently fire on an evacuation, and the reason is worth
+        // recording. Absorbing `N` requires `step.len + N.size <= cap <= w`, so
+        // `N` fits the gap on its own; and `N` sits above the run, so it scores
+        // strictly higher than the mover under any score of the form
+        // `A.pos + f(A.size)` -- meaning the index would have returned `N` in the
+        // first place. Nor does the budget separate them, since `N.size <= cap
+        // <= budget`. On a slide it is equally inert: that run is already
+        // maximal up to the budget.
+        //
+        // It is kept because stage 4 breaks the premise. A tiling candidate is
+        // chosen by `score + mu`, so a *lower* allocation with an exact fit can
+        // win, and then the allocation above it is both absorbable and not the
+        // one that was chosen.
+        while let Some(next) = self.allocations.get(&(step.from + step.len)) {
+            if step.len + u64::from(next.len) > cap {
+                break;
+            }
+            step.len += u64::from(next.len);
+        }
+
+        // Downward: absorb the allocation ending exactly where the run starts.
+        while let Some((&addr, e)) = self.allocations.range(..step.from).next_back() {
+            if addr + u64::from(e.len) != step.from || addr <= step.to {
+                break;
+            }
+            if step.len + u64::from(e.len) > cap {
+                break;
+            }
+            step.len += u64::from(e.len);
+            step.from = addr;
+        }
+
+        step
+    }
+
     /// The slide candidate: the run above the widest gap, shifting down into it,
     /// paired with its per-byte gain.
     ///
@@ -625,6 +697,9 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
             debug_assert!(self.index.widest_gap().is_none(), "a gap with no slide");
             self.index.best_evacuation().map(|(_, step)| step)
         });
+        // Opportunistic, after the winner is known: never changes *which* move is
+        // taken, only how much of the neighbourhood rides along with it.
+        let chosen = chosen.map(|step| self.extend_into_run(step, budget));
         self.record_search(chosen.is_some());
         chosen
     }
@@ -1016,22 +1091,25 @@ mod tests {
     /// affordable move is found even when a far better unaffordable one exists.
     #[test]
     fn a_budget_yields_the_best_affordable_evacuation_not_a_near_miss() {
+        // The neighbours are deliberately too large to be absorbed at this
+        // budget, so `extend_into_run` is a no-op and this stays a test about
+        // *choosing* a mover rather than about growing one.
         let plan = [
             (1, 100, true),  // gap    0..100  <- fits either mover
             (2, 50, false),  //      100..150
             (3, 8, true),    // gap  150..158  <- fits only the small mover
-            (4, 50, false),  //      158..208
-            (5, 8, false),   //      208..216  <- the small mover
-            (6, 100, false), //      216..316  <- the large mover, travels further
+            (4, 92, false),  //      158..250
+            (5, 8, false),   //      250..258  <- the small mover
+            (6, 100, false), //      258..358  <- the large mover, travels further
         ];
         let h = heap_with_layout(&plan);
 
-        // Unconstrained: the 100-byte mover travels 216, beating the 8-byte
-        // mover's 208.
+        // Unconstrained: the 100-byte mover travels 258, beating the 8-byte
+        // mover's 250.
         assert_eq!(
             h.propose_compaction_step(UNBOUNDED).unwrap(),
             Step {
-                from: 216,
+                from: 258,
                 to: 0,
                 len: 100
             }
@@ -1041,12 +1119,134 @@ mod tests {
         assert_eq!(
             h.propose_compaction_step(99).unwrap(),
             Step {
-                from: 208,
+                from: 250,
                 to: 0,
                 len: 8
             }
         );
         h.assert_invariants();
+    }
+
+    /// The chosen move drags its lower neighbours along when they fit -- stage
+    /// 5's opportunistic run extension.
+    ///
+    /// Only *downward* is exercised, because the upward direction provably
+    /// cannot fire on a step this proposer chooses; see `extend_into_run`.
+    ///
+    /// The layout below is arranged so that the top allocation fits no gap at
+    /// all, which is what stops it from being the mover and leaves the mover
+    /// with room beneath it.
+    #[test]
+    fn a_chosen_evacuation_absorbs_neighbours_that_fit_the_gap() {
+        let plan = [
+            (1, 100, true),  // gap    0..100  <- 100 bytes of room
+            (2, 30, false),  //      100..130
+            (3, 8, true),    // gap  130..138
+            (4, 20, false),  //      138..158  <- absorbed second
+            (5, 10, false),  //      158..168  <- absorbed first
+            (6, 20, false),  //      168..188  <- the mover: travels 168, the most
+            (7, 200, false), //     188..388  <- fits no gap, so never the mover
+        ];
+        let mut h = heap_with_layout(&plan);
+
+        let step = h.propose_compaction_step(UNBOUNDED).unwrap();
+        assert_eq!(
+            step,
+            Step {
+                from: 138,
+                to: 0,
+                len: 50
+            },
+            "the run should grow downward to 20 + 10 + 20 = 50 bytes"
+        );
+        h.commit_compaction_step(step);
+        // All three landed, in order, at the bottom.
+        assert_eq!(h.lookup(fixed(4)), Some((0, 20)));
+        assert_eq!(h.lookup(fixed(5)), Some((20, 10)));
+        assert_eq!(h.lookup(fixed(6)), Some((30, 20)));
+        h.assert_invariants();
+    }
+
+    #[test]
+    fn run_extension_respects_the_budget_as_well_as_the_gap() {
+        let plan = [
+            (1, 100, true),  // gap    0..100
+            (2, 30, false),  //      100..130
+            (3, 8, true),    // gap  130..138
+            (4, 20, false),  //      138..158
+            (5, 10, false),  //      158..168
+            (6, 20, false),  //      168..188  <- the mover
+            (7, 200, false), //     188..388
+        ];
+        let h = heap_with_layout(&plan);
+
+        // The gap would take all 50 bytes; a 35-byte budget stops after 30.
+        let step = h.propose_compaction_step(35).unwrap();
+        assert_eq!(
+            step,
+            Step {
+                from: 158,
+                to: 0,
+                len: 30
+            },
+            "extension must stop at the budget, not at the gap's width"
+        );
+        assert!(step.len <= 35, "{step:?} exceeded the budget");
+    }
+
+    /// Extension must never turn a profitable move into an unprofitable one, and
+    /// must never produce a step that spans a gap -- `commit` would then move
+    /// bytes it does not re-key. It is applied to every chosen step, including
+    /// slides, where it should simply do nothing.
+    #[test]
+    fn run_extension_never_produces_an_invalid_step() {
+        let mut state = 0x0BAD_C0DE_D15E_A5E1u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for lambda in [false, true] {
+            let mut h = Heap::new();
+            h.set_lambda(lambda);
+            let mut live: Vec<Pointer<u32>> = Vec::new();
+            let mut counter = 1u32;
+
+            for round in 0..800 {
+                if rand() % 100 < 60 || live.is_empty() {
+                    let size = [8u32, 16, 16, 64, 250][(rand() % 5) as usize];
+                    let id = if rand() % 4 == 0 {
+                        resizable(counter)
+                    } else {
+                        fixed(counter)
+                    };
+                    counter += 1;
+                    h.alloc(id, size).unwrap();
+                    live.push(id);
+                } else {
+                    let victim = live.swap_remove((rand() % live.len() as u64) as usize);
+                    h.free(victim).unwrap();
+                }
+
+                if round % 5 == 0 {
+                    let Some(step) = h.propose_compaction_step(128) else {
+                        continue;
+                    };
+                    assert!(step.to < step.from, "{step:?} is not downward");
+                    let (run, _) = h.run_len_from(step.from, u64::MAX);
+                    assert!(
+                        run >= step.len,
+                        "{step:?} spans a gap: the run from {} is only {run}",
+                        step.from
+                    );
+                    h.commit_compaction_step(step);
+                    h.assert_invariants();
+                }
+            }
+            compact_fully(&mut h, 128);
+            assert_eq!(h.len(), h.live_bytes(), "lambda={lambda}: gaps left over");
+        }
     }
 
     /// The worked example of `incremental-compaction.md` §4: distance-greed
