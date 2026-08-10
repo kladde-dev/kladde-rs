@@ -30,6 +30,7 @@ mod heap;
 mod journaled;
 mod mock;
 mod pointer;
+mod size_classes;
 mod storage;
 mod unjournaled;
 mod word;

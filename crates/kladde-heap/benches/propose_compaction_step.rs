@@ -112,13 +112,22 @@ fn roomy(n: usize) -> Heap {
 const COMPACTION_INTERVAL: usize = 25;
 const COMPACTION_BUDGET: u64 = 2048;
 
-/// Stage 2's size reward, measured both ways. It ships off, and the case for
-/// turning it on is entirely empirical -- it trades exactness in `Φ` for a
-/// preference the potential does not express -- so both settings are an axis
-/// here rather than a settled default. Timing is only half the answer: the
-/// fragmentation it leaves behind is measured by the workload tests in
-/// `gain_greedy.rs`.
-const LAMBDAS: [(&str, bool); 2] = [("plain", false), ("reward", true)];
+/// The policy settings measured, as `(label, λ, (μ₁, μₖ))`.
+///
+/// All of them ship off, and the case for turning any of them on is entirely
+/// empirical -- they trade exactness in `Φ` for preferences the potential does
+/// not express -- so they are an axis here rather than settled defaults. Timing
+/// is only half the answer: the fragmentation they leave behind is what the
+/// workload measurements in `gain_greedy.rs` report.
+///
+/// `μ` is expected to cost a little *time* (a scan over the live size classes
+/// per proposal, plus divisibility tests per gap event) in exchange for a better
+/// *shape*, so the two numbers have to be read together.
+const POLICIES: [(&str, bool, (u64, u64)); 3] = [
+    ("plain", false, (0, 0)),
+    ("reward", true, (0, 0)),
+    ("tiling", false, (4096, 512)),
+];
 
 /// Churn with compaction bursts interleaved throughout: the state a live heap is
 /// usually in, under the schedule a backend actually uses.
@@ -136,7 +145,7 @@ const LAMBDAS: [(&str, bool); 2] = [("plain", false), ("reward", true)];
 /// being measured -- a different policy leaves a measurably different heap
 /// behind, so timing a burst on a state some other policy produced would time a
 /// state no caller can reach.
-fn churned(n: usize, lambda: bool) -> Heap {
+fn churned(n: usize, lambda: bool, mu: (u64, u64)) -> Heap {
     assert!(
         n.is_multiple_of(COMPACTION_INTERVAL),
         "the run must stop exactly where a burst is due"
@@ -144,6 +153,7 @@ fn churned(n: usize, lambda: bool) -> Heap {
     let mut rand = rng(0x2545_F491);
     let mut h = Heap::new();
     h.set_lambda(lambda);
+    h.set_mu(mu.0, mu.1);
     let mut live: Vec<Pointer<u32>> = Vec::new();
     let mut counter = 1u32;
     for round in 0..n {
@@ -181,13 +191,14 @@ fn bench_propose(c: &mut Criterion) {
     group.sample_size(10);
 
     for &n in &[1_000usize, 10_000, 100_000] {
-        for (label, lambda) in LAMBDAS {
+        for (label, lambda, mu) in POLICIES {
             // Static shapes: one `propose_compaction_step` call, repeated.
             // Nothing commits, so the heap and the decision are identical on
             // every iteration.
             let mut shapes: [(&str, Heap); 2] = [("roomy", roomy(n)), ("slivers", slivers(n))];
             for (shape, heap) in &mut shapes {
                 heap.set_lambda(lambda);
+                heap.set_mu(mu.0, mu.1);
                 let id = BenchmarkId::new(format!("{shape}-{label}"), n);
                 group.bench_with_input(id, &n, |b, _| {
                     b.iter(|| black_box(heap.propose_compaction_step(black_box(4096))));
@@ -200,7 +211,7 @@ fn bench_propose(c: &mut Criterion) {
             // restored in `setup`, which criterion excludes from the timing.
             // `PerIteration` keeps one clone alive at a time; a batched size
             // would hold hundreds.
-            let pre_burst = churned(n, lambda);
+            let pre_burst = churned(n, lambda, mu);
             // A burst is far cheaper than the clone that restores its input, so
             // criterion's default measurement time would spend minutes cloning
             // per benchmark. Ten samples of a shorter run say the same thing

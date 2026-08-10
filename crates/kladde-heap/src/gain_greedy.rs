@@ -48,6 +48,7 @@ use crate::evacuation_index::{EvacuationIndex, Key};
 use crate::heap::{
     AllocationId, HeapError, IncrementallyCompactableHeap, RelocatableHeap, Relocation, Step,
 };
+use crate::size_classes::SizeClasses;
 
 /// One row of the address-keyed table.
 #[derive(Clone, Copy)]
@@ -144,12 +145,19 @@ pub struct GainGreedyHeap<Id> {
     /// the lowest gap that fits (for placement) -- which is why there is no
     /// separate free-space directory any more. See [`EvacuationIndex`].
     index: EvacuationIndex,
+    /// Per fixed size: its live allocations, and the gaps its size tiles. This
+    /// is what prices a destination by what it leaves behind, which the
+    /// size-monotone merge in `index` structurally cannot. See [`SizeClasses`].
+    classes: SizeClasses,
     /// One past the highest live byte.
     end: u64,
     /// Sum of all live allocation sizes.
     live_bytes: u64,
     /// Stage 2's size reward. See [`GainGreedyHeap::lambda`].
     lambda: bool,
+    /// Stage 4's destination-side weights. See [`GainGreedyHeap::mu`].
+    mu_exact: u64,
+    mu_multiple: u64,
     /// Test-only instrumentation; absent from real builds.
     #[cfg(test)]
     stats: std::cell::Cell<SearchStats>,
@@ -161,9 +169,12 @@ impl<Id> Default for GainGreedyHeap<Id> {
             allocations: BTreeMap::new(),
             by_id: HashMap::new(),
             index: EvacuationIndex::default(),
+            classes: SizeClasses::default(),
             end: 0,
             live_bytes: 0,
             lambda: false,
+            mu_exact: 0,
+            mu_multiple: 0,
             #[cfg(test)]
             stats: std::cell::Cell::new(SearchStats::default()),
         }
@@ -216,6 +227,39 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// and both settings are a benchmark axis rather than a settled default.
     pub fn lambda(&self) -> bool {
         self.lambda
+    }
+
+    /// The destination-side weights `(μ₁, μₖ)`: what a move is worth for
+    /// *erasing* a gap, and for leaving one still exactly tileable by its own
+    /// size class.
+    ///
+    /// These price the shape of the free space rather than how far bytes travel,
+    /// and they are the one term the measurements this project already has argue
+    /// for most directly: around three quarters of the free space that leaves
+    /// this heap is consumed by new allocations landing in gaps, not by
+    /// truncation, so what compaction mostly decides is what *shape* the gaps are
+    /// in when the allocator next needs one.
+    ///
+    /// `μ₁` prices gap erasure, a countable event. `μₖ` prices tileability, a
+    /// fragmentation property that only pays if the rest of the class actually
+    /// arrives, so it should be weighted well below `μ₁`.
+    ///
+    /// Both ship at `0`, which makes the whole mechanism inert: the index and the
+    /// tiling candidate are still maintained, but a tiling candidate can then
+    /// never outscore what the index already found. Like `λ` they are a benchmark
+    /// axis, not a settled default -- every fragmentation number this project has
+    /// was produced under distance-greed, so the effect has to be measured.
+    pub fn mu(&self) -> (u64, u64) {
+        (self.mu_exact, self.mu_multiple)
+    }
+
+    /// Set the destination-side weights. See [`mu`](Self::mu).
+    ///
+    /// Unlike [`set_lambda`](Self::set_lambda) this needs no rebuild: `μ` is
+    /// applied when a candidate is *scored*, not stored in any key.
+    pub fn set_mu(&mut self, mu_exact: u64, mu_multiple: u64) {
+        self.mu_exact = mu_exact;
+        self.mu_multiple = mu_multiple;
     }
 
     /// Turn the size reward on or off.
@@ -332,12 +376,14 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     fn gap_record(&mut self, start: u64, len: u64) {
         if len > 0 {
             self.index.insert(Key::gap(start, len));
+            self.classes.add_gap(start, len);
         }
     }
 
     fn gap_forget(&mut self, start: u64, len: u64) {
         if len > 0 {
             self.index.remove(Key::gap(start, len));
+            self.classes.remove_gap(start, len);
         }
     }
 
@@ -350,14 +396,24 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         Key::alloc(addr, len, alloc_score(addr, len, self.lambda))
     }
 
-    fn alloc_record(&mut self, addr: u64, len: u32) {
+    /// Record an allocation in the index, and -- if it is fixed-size -- in its
+    /// size class. Resizable ones are deliberately absent from `classes`: a snug
+    /// fit would only re-open on their next growth, so they earn no
+    /// destination-side reward at all.
+    fn alloc_record(&mut self, addr: u64, len: u32, id: Id) {
         let key = self.alloc_key(addr, len);
         self.index.insert(key);
+        if id.is_fixed_size() {
+            self.classes.add_alloc(len, addr);
+        }
     }
 
-    fn alloc_forget(&mut self, addr: u64, len: u32) {
+    fn alloc_forget(&mut self, addr: u64, len: u32, id: Id) {
         let key = self.alloc_key(addr, len);
         self.index.remove(key);
+        if id.is_fixed_size() {
+            self.classes.remove_alloc(len, addr);
+        }
     }
 
     /// End of the allocation immediately below `addr` (0 if there is none).
@@ -394,7 +450,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         self.allocations.insert(addr, Entry { len, id });
         self.by_id.insert(id, addr);
         self.live_bytes += len as u64;
-        self.alloc_record(addr, len);
+        self.alloc_record(addr, len, id);
     }
 
     /// Drop the allocation at `addr`, coalescing its range into the neighbouring
@@ -406,7 +462,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             .expect("remove_raw on an address with no allocation");
         self.by_id.remove(&e.id);
         self.live_bytes -= e.len as u64;
-        self.alloc_forget(addr, e.len);
+        self.alloc_forget(addr, e.len, e.id);
 
         let prev_end = self.prev_end(addr);
         let above = addr + e.len as u64;
@@ -436,23 +492,44 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         self.index.lowest_gap_fitting(min_len)
     }
 
-    /// Where to put a new `size`-byte allocation: the lowest gap that fits, else
-    /// the top.
+    /// Where to put a new `size`-byte allocation.
     ///
     /// Placement is scored against the same potential compaction is, but
     /// *without* a cost term: the bytes are written wherever they go, so a lower
     /// address here is free where compaction would pay a full copy for it. An
     /// allocation of size `s` at `a` adds `s·(a + (s−1)/2)` to `Φ`, and the
-    /// constant drops out of a comparison -- so with nothing else in the
-    /// objective, the lowest fitting gap simply wins.
+    /// constant drops out of a comparison.
     ///
-    /// Nothing here yet prices the *shape* of what is left behind: an exact fit
-    /// erases a gap outright and a near-fit leaves a sliver, and this cannot tell
-    /// them apart. That is stage 4 of `augmented-segment-tree.md`, whose μ
-    /// weights placement and compaction are meant to share.
-    fn place(&self, size: u32) -> Result<u64, HeapError> {
+    /// Consuming a gap cleanly is worth the same `μ` weights the compactor uses,
+    /// so placement and compaction agree about what a good destination is --
+    /// which matters here more than it does there, since it is *placement* that
+    /// destroys most of this heap's free space.
+    ///
+    /// Three candidates suffice: `cost` is otherwise monotone in the address, so
+    /// the only gaps that can beat the lowest fitting one are the two that carry
+    /// a bonus. Only a fixed-size allocation may claim either, for the reason
+    /// given in [`SizeClasses`].
+    fn place(&self, size: u32, is_fixed_size: bool) -> Result<u64, HeapError> {
         let want = size as u64;
-        if let Some(addr) = self.lowest_gap_fitting(want) {
+        let s = i128::from(size);
+        let cost = |addr: u64, bonus: u64| s * i128::from(addr) - i128::from(bonus);
+
+        let mut best = self
+            .lowest_gap_fitting(want)
+            .map(|addr| (cost(addr, 0), addr));
+        if is_fixed_size {
+            for (gap, mu) in [
+                (self.classes.lowest_exact_gap(size), self.mu_exact),
+                (self.classes.lowest_multiple_gap(size), self.mu_multiple),
+            ] {
+                let Some(addr) = gap else { continue };
+                let scored = (cost(addr, mu), addr);
+                if best.is_none_or(|incumbent| scored < incumbent) {
+                    best = Some(scored);
+                }
+            }
+        }
+        if let Some((_, addr)) = best {
             self.record_placement(true, want);
             return Ok(addr);
         }
@@ -601,7 +678,7 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
         if self.by_id.contains_key(&id) {
             return Err(HeapError::DuplicateId);
         }
-        let addr = self.place(size)?;
+        let addr = self.place(size, id.is_fixed_size())?;
         self.insert_raw(addr, size, id);
         Ok(addr)
     }
@@ -635,8 +712,10 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
         }
 
         // Otherwise find the new home *before* releasing the old one, so the two
-        // ranges cannot overlap and the caller's copy is unambiguous.
-        let dest = self.place(new_size)?;
+        // ranges cannot overlap and the caller's copy is unambiguous. A relocating
+        // `resize` only ever runs on a resizable allocation, which claims no fit
+        // bonus -- it would only re-open the gap on its next growth.
+        let dest = self.place(new_size, false)?;
         let e = self.remove_raw(addr);
         self.insert_raw(dest, new_size, e.id);
         Ok(Some((addr, dest)))
@@ -685,6 +764,34 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
         if let Some((gain, step)) = self.index.best_evacuation_within(budget) {
             if best.is_none_or(|(incumbent, _)| gain > incumbent) {
                 best = Some((gain, step));
+            }
+        }
+
+        // The tiling candidate re-ranks evacuations the index already scored --
+        // it never contributes a move the index could not see, since a tiling
+        // evacuation *is* an ordinary evacuation and `μ` changes only its rank.
+        // So if `best` is still empty there is no tiling candidate either, and
+        // the guard is what makes that reasoning load-bearing rather than
+        // incidental.
+        if best.is_some() {
+            let lambda = self.lambda;
+            let tiling = self.classes.best_tiling_evacuation(
+                budget,
+                self.mu_exact,
+                self.mu_multiple,
+                |addr, size| alloc_score(addr, size, lambda),
+            );
+            if let Some((gain, from, to, size)) = tiling {
+                if best.is_none_or(|(incumbent, _)| gain > incumbent) {
+                    best = Some((
+                        gain,
+                        Step {
+                            from,
+                            to,
+                            len: u64::from(size),
+                        },
+                    ));
+                }
             }
         }
 
@@ -821,6 +928,14 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
                 "lowest_gap_fitting disagreed with a scan at min_len={min_len}"
             );
         }
+        let fixed: Vec<(u64, u32)> = self
+            .allocations
+            .iter()
+            .filter(|(_, e)| e.id.is_fixed_size())
+            .map(|(&addr, e)| (addr, e.len))
+            .collect();
+        self.classes.assert_consistent(&gaps, &fixed);
+
         for budget in self
             .allocations
             .values()
@@ -844,6 +959,21 @@ mod tests {
     use crate::pointer::{Pointer, Sizedness};
 
     const UNBOUNDED: u64 = u64::MAX;
+
+    /// The policy settings the randomized tests sweep: `(λ, (μ₁, μₖ))`.
+    ///
+    /// Every one of them must converge to a gapless heap and must never propose
+    /// an invalid step -- none of these knobs is allowed to buy correctness with
+    /// tuning. The shipped default is first; the last is deliberately extreme, to
+    /// check that a weight large enough to dominate the distance term still
+    /// cannot stall compaction or produce an upward move.
+    const POLICIES: [(bool, (u64, u64)); 5] = [
+        (false, (0, 0)),
+        (true, (0, 0)),
+        (false, (4096, 512)),
+        (true, (4096, 512)),
+        (true, (1 << 40, 1 << 36)),
+    ];
 
     type Heap = GainGreedyHeap<Pointer<u32>>;
 
@@ -1127,6 +1257,129 @@ mod tests {
         h.assert_invariants();
     }
 
+    /// `μ₁` should reroute a mover into a gap it fills exactly, giving up some
+    /// travel distance to erase a gap outright rather than leave a sliver.
+    #[test]
+    fn mu_reroutes_a_fixed_size_mover_into_an_exact_fit() {
+        let plan = [
+            (1, 30, true),  // gap    0..30   <- deeper, but leaves a 20-byte sliver
+            (2, 70, false), //       30..100
+            (3, 10, true),  // gap  100..110  <- an exact fit for the mover
+            (4, 90, false), //      110..200
+            (5, 10, false), //      200..210  <- the mover
+        ];
+        let mut h = heap_with_layout(&plan);
+        assert_eq!(h.mu(), (0, 0), "the destination weights ship off");
+
+        // Off, depth decides and the 30-byte gap is carved up.
+        assert_eq!(
+            h.propose_compaction_step(UNBOUNDED).unwrap().to,
+            0,
+            "with no destination weight, depth decides"
+        );
+
+        // Travelling 100 bytes less has to be bought back by erasing a gap.
+        h.set_mu(2000, 0);
+        let step = h.propose_compaction_step(UNBOUNDED).unwrap();
+        assert_eq!(
+            step,
+            Step {
+                from: 200,
+                to: 100,
+                len: 10
+            },
+            "μ₁ should reroute the mover into the exact fit"
+        );
+        h.commit_compaction_step(step);
+        h.assert_invariants();
+    }
+
+    /// A resizable allocation earns no destination-side reward at any `k`: parked
+    /// in a snug gap it would have to move again the moment it grows, re-opening
+    /// the gap and paying for two copies.
+    #[test]
+    fn a_resizable_mover_earns_no_fit_bonus() {
+        // The two heaps differ *only* in the sizedness of the mover, so any
+        // difference in the destination chosen is the fit bonus and nothing else.
+        let layout = |mover| {
+            [
+                (fixed(1), 30, true),  // gap    0..30   <- deeper, leaves a sliver
+                (fixed(2), 70, false), //       30..100
+                (fixed(3), 10, true),  // gap  100..110  <- exact fit
+                (fixed(4), 90, false), //      110..200
+                (mover, 10, false),    //      200..210  <- the mover
+            ]
+        };
+        let mut fixed_mover = heap_of(&layout(fixed(5)));
+        let mut resizable_mover = heap_of(&layout(resizable(5)));
+
+        for h in [&mut fixed_mover, &mut resizable_mover] {
+            h.set_mu(2000, 0);
+        }
+        assert_eq!(
+            fixed_mover.propose_compaction_step(UNBOUNDED).unwrap().to,
+            100,
+            "a fixed mover should take the exact fit"
+        );
+        assert_eq!(
+            resizable_mover
+                .propose_compaction_step(UNBOUNDED)
+                .unwrap()
+                .to,
+            0,
+            "a resizable mover should not: it re-opens that gap on its next growth"
+        );
+    }
+
+    /// Placement and compaction share the `μ` weights, which matters more at
+    /// placement time than at compaction time: most of this heap's free space is
+    /// destroyed by new allocations landing in gaps, not by truncation.
+    #[test]
+    fn mu_buys_the_exact_fit_at_placement_time_too() {
+        let plan = [
+            (1, 20, true),  // gap    0..20
+            (2, 80, false), //       20..100
+            (3, 10, true),  // gap  100..110  <- exact for a 10-byte request
+            (4, 80, false), //      110..190
+        ];
+        let mut h = heap_with_layout(&plan);
+        // Travelling 100 higher costs 10·100 of potential, so erasing a gap has
+        // to be worth more than that before the exact fit wins.
+        h.set_mu(999, 0);
+        assert_eq!(h.alloc(fixed(5), 10).unwrap(), 0, "μ₁ too small to matter");
+        h.free(fixed(5)).unwrap();
+
+        h.set_mu(1001, 0);
+        assert_eq!(h.alloc(fixed(6), 10).unwrap(), 100, "μ₁ now pays for it");
+        h.assert_invariants();
+
+        // ...and a resizable request still takes the lowest fitting gap.
+        h.free(fixed(6)).unwrap();
+        assert_eq!(h.alloc(resizable(7), 10).unwrap(), 0);
+        h.assert_invariants();
+    }
+
+    /// `μₖ` is speculative and priced below `μ₁`, so a gap that is merely
+    /// *tileable* must not outrank one that is erased outright.
+    #[test]
+    fn a_proper_multiple_is_worth_less_than_an_exact_fit() {
+        let plan = [
+            (1, 20, true),  // gap    0..20   <- a proper multiple of 10
+            (2, 80, false), //       20..100
+            (3, 10, true),  // gap  100..110  <- an exact fit
+            (4, 80, false), //      110..190
+            (5, 10, false), //      190..200  <- the mover
+        ];
+        let mut h = heap_with_layout(&plan);
+
+        // Weighted equally, the deeper (merely tileable) gap wins on distance.
+        h.set_mu(2000, 2000);
+        assert_eq!(h.propose_compaction_step(UNBOUNDED).unwrap().to, 0);
+        // Priced properly -- erasure above tileability -- the exact fit wins.
+        h.set_mu(2000, 10);
+        assert_eq!(h.propose_compaction_step(UNBOUNDED).unwrap().to, 100);
+    }
+
     /// The chosen move drags its lower neighbours along when they fit -- stage
     /// 5's opportunistic run extension.
     ///
@@ -1207,9 +1460,10 @@ mod tests {
             state ^= state << 17;
             state
         };
-        for lambda in [false, true] {
+        for (lambda, mu) in POLICIES {
             let mut h = Heap::new();
             h.set_lambda(lambda);
+            h.set_mu(mu.0, mu.1);
             let mut live: Vec<Pointer<u32>> = Vec::new();
             let mut counter = 1u32;
 
@@ -1245,7 +1499,11 @@ mod tests {
                 }
             }
             compact_fully(&mut h, 128);
-            assert_eq!(h.len(), h.live_bytes(), "lambda={lambda}: gaps left over");
+            assert_eq!(
+                h.len(),
+                h.live_bytes(),
+                "lambda={lambda} mu={mu:?}: gaps left over"
+            );
         }
     }
 
@@ -1756,17 +2014,18 @@ mod tests {
     #[test]
     #[ignore = "measurement, not a behavioural test; takes minutes"]
     fn candidate_search_cost_over_a_churny_workload() {
-        for lambda in [false, true] {
-            println!("\n\n########## lambda = {lambda} ##########");
+        for (lambda, mu) in POLICIES {
+            println!("\n\n########## lambda = {lambda}, mu = {mu:?} ##########");
             for &rounds in &[400usize, 4_000, 40_000] {
-                measure_one(rounds, lambda);
+                measure_one(rounds, lambda, mu);
             }
         }
     }
 
-    fn measure_one(rounds: usize, lambda: bool) {
+    fn measure_one(rounds: usize, lambda: bool, mu: (u64, u64)) {
         let mut h = Heap::new();
         h.set_lambda(lambda);
+        h.set_mu(mu.0, mu.1);
         let (_, bursts, snapshots) = run_churny_workload_tracked(&mut h, rounds);
         let during_bursts = h.search_stats();
 
@@ -1833,6 +2092,12 @@ mod tests {
 
     #[test]
     fn compaction_converges_from_a_randomized_workload() {
+        for (lambda, mu) in POLICIES {
+            converges_under(lambda, mu);
+        }
+    }
+
+    fn converges_under(lambda: bool, mu: (u64, u64)) {
         // A tiny xorshift keeps this deterministic without a dev-dependency.
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut rand = move || {
@@ -1843,6 +2108,8 @@ mod tests {
         };
 
         let mut h = Heap::new();
+        h.set_lambda(lambda);
+        h.set_mu(mu.0, mu.1);
         let mut live: Vec<Pointer<u32>> = Vec::new();
         let mut next_counter = 1u32;
 
