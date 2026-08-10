@@ -14,15 +14,23 @@
 //!   evacuate anywhere and only the slide has anything to offer.
 //! - `churned` -- alloc/free/resize churn with compaction bursts interleaved,
 //!   which is the state a real heap spends most of its time in.
+//! - `shrinking` -- the same, continued with allocate and free swapped so the
+//!   heap nets *smaller*. A different regime rather than a different size: free
+//!   space arrives faster than the allocator consumes it, so there are more
+//!   gaps and far more coalescing.
 //!
-//! **The two shapes measure different quantities.** `roomy` and `slivers` are
-//! static states, so they time a single `propose_compaction_step` call, repeated
-//! on an unchanging heap. `churned` instead times a whole
+//! **The shapes measure different quantities.** `roomy` and `slivers` are static
+//! states, so they time a single `propose_compaction_step` call, repeated on an
+//! unchanging heap. `churned` and `shrinking` instead time a whole
 //! `compact_incrementally` **burst** -- propose *and* commit until the budget is
 //! spent -- from a saved pre-burst state, restored by cloning before each
 //! iteration. That is what a backend flush actually pays, and unlike the
 //! repeated-single-call form it also covers the later calls of a burst, which
 //! run on a progressively more compacted heap than the first one does.
+//!
+//! Timing is only half of what decides a policy; the *fragmentation* each one
+//! leaves behind is measured by the workload tests in `gain_greedy.rs`, which
+//! report overhead per burst over the same two workloads.
 
 use std::hint::black_box;
 use std::time::Duration;
@@ -147,6 +155,20 @@ const POLICIES: [(&str, bool, u64, (u64, u64)); 4] = [
 /// behind, so timing a burst on a state some other policy produced would time a
 /// state no caller can reach.
 fn churned(n: usize, lambda: bool, alpha: u64, mu: (u64, u64)) -> Heap {
+    churn(n, lambda, alpha, mu, false).0
+}
+
+/// The growing workload. `run_last_burst` says whether the burst due on the
+/// final round is executed: the benchmark wants it left un-run so it can time
+/// it, and [`shrinking`] wants it run so its own schedule starts from a settled
+/// state.
+fn churn(
+    n: usize,
+    lambda: bool,
+    alpha: u64,
+    mu: (u64, u64),
+    run_last_burst: bool,
+) -> (Heap, Vec<Pointer<u32>>, u32) {
     assert!(
         n.is_multiple_of(COMPACTION_INTERVAL),
         "the run must stop exactly where a burst is due"
@@ -177,9 +199,58 @@ fn churned(n: usize, lambda: bool, alpha: u64, mu: (u64, u64)) -> Heap {
             }
         }
 
-        // A compaction burst every so often, exactly as a flush would do it --
-        // all but the last, which is the benchmark's routine.
-        if (round + 1) % COMPACTION_INTERVAL == 0 && round + 1 < n {
+        // A compaction burst every so often, exactly as a flush would do it.
+        if (round + 1) % COMPACTION_INTERVAL == 0 && (run_last_burst || round + 1 < n) {
+            h.compact_incrementally(COMPACTION_BUDGET);
+        }
+    }
+    (h, live, counter)
+}
+
+/// The mirror image of [`churned`]: allocate and free swapped, so the heap nets
+/// *smaller*, started from the state the growing workload leaves behind.
+///
+/// Worth measuring separately because it is a different regime for the
+/// compactor, not just a different size. While shrinking, free space appears
+/// faster than the allocator consumes it, so there are more gaps, the widest is
+/// wider, and far more of the work is coalescing and retreating `end`. It is
+/// also where `α`'s neighbour re-keying runs hardest, since gaps are being
+/// created and merged constantly.
+///
+/// Allocation does not stop -- 25% of rounds still allocate, mirroring the 25%
+/// of the growing workload that frees -- because a pure drain would be a much
+/// easier and less representative problem: nothing would ever be placed into a
+/// gap, and placement is where most of this heap's free space is destroyed.
+///
+/// Like [`churned`], the returned heap sits **just before** a due burst.
+fn shrinking(n: usize, lambda: bool, alpha: u64, mu: (u64, u64)) -> Heap {
+    let (mut h, mut live, mut counter) = churn(n, lambda, alpha, mu, true);
+    // Enough to be unambiguously in the shrinking regime -- the mix nets about
+    // 0.35 removals per round, so this retires roughly a sixth of the heap --
+    // while leaving it comparable in size to what `churned` measures at the
+    // same `n`.
+    let rounds = (live.len() / 2).next_multiple_of(COMPACTION_INTERVAL) + COMPACTION_INTERVAL;
+    let mut rand = rng(0x9E37_79B9);
+    for round in 0..rounds {
+        let roll = rand() % 100;
+        if roll < 60 && !live.is_empty() {
+            let victim = live.swap_remove((rand() % live.len() as u64) as usize);
+            h.free(victim).expect("free");
+        } else if roll < 85 || live.is_empty() {
+            let size = [8u32, 16, 16, 64, 250][(rand() % 5) as usize];
+            let this = id(counter, !rand().is_multiple_of(4));
+            counter += 1;
+            h.alloc(this, size).expect("alloc");
+            live.push(this);
+        } else {
+            let i = (rand() % live.len() as u64) as usize;
+            let new_size = 1 + (rand() % 300) as u32;
+            if h.lookup(live[i]).is_some() {
+                let _ = h.resize(live[i], new_size);
+            }
+        }
+
+        if (round + 1) % COMPACTION_INTERVAL == 0 && round + 1 < rounds {
             h.compact_incrementally(COMPACTION_BUDGET);
         }
     }
@@ -208,27 +279,35 @@ fn bench_propose(c: &mut Criterion) {
                 });
             }
 
-            // The realistic shape: one whole burst, from the state this policy's
-            // own schedule leaves just before it. The burst mutates the heap, so
-            // each iteration starts from a fresh clone of that saved state --
-            // restored in `setup`, which criterion excludes from the timing.
-            // `PerIteration` keeps one clone alive at a time; a batched size
-            // would hold hundreds.
-            let pre_burst = churned(n, lambda, alpha, mu);
+            // The realistic shapes: one whole burst, from the state this policy's
+            // own schedule leaves just before it -- once while the heap is
+            // growing and once while it is draining, which are different regimes
+            // for the compactor and not merely different sizes. The burst mutates
+            // the heap, so each iteration starts from a fresh clone of that saved
+            // state, restored in `setup`, which criterion excludes from the
+            // timing. `PerIteration` keeps one clone alive at a time; a batched
+            // size would hold hundreds.
+            //
             // A burst is far cheaper than the clone that restores its input, so
             // criterion's default measurement time would spend minutes cloning
             // per benchmark. Ten samples of a shorter run say the same thing
             // about a routine this repeatable.
+            let states: [(&str, Heap); 2] = [
+                ("churned", churned(n, lambda, alpha, mu)),
+                ("shrinking", shrinking(n, lambda, alpha, mu)),
+            ];
             group.measurement_time(Duration::from_millis(750));
             group.warm_up_time(Duration::from_millis(250));
-            let id = BenchmarkId::new(format!("churned-{label}"), n);
-            group.bench_with_input(id, &n, |b, _| {
-                b.iter_batched_ref(
-                    || pre_burst.clone(),
-                    |h| black_box(h.compact_incrementally(black_box(COMPACTION_BUDGET))),
-                    BatchSize::PerIteration,
-                );
-            });
+            for (shape, pre_burst) in &states {
+                let id = BenchmarkId::new(format!("{shape}-{label}"), n);
+                group.bench_with_input(id, &n, |b, _| {
+                    b.iter_batched_ref(
+                        || pre_burst.clone(),
+                        |h| black_box(h.compact_incrementally(black_box(COMPACTION_BUDGET))),
+                        BatchSize::PerIteration,
+                    );
+                });
+            }
             group.measurement_time(Duration::from_secs(5));
             group.warm_up_time(Duration::from_secs(3));
         }

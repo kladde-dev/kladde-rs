@@ -2247,6 +2247,239 @@ mod tests {
         (live, bursts, snapshots)
     }
 
+    /// How many bursts at the start of a shrinking run are discarded before the
+    /// timings are averaged.
+    ///
+    /// The first bursts of a shrink are not representative: they run on a heap
+    /// the *growing* schedule left behind, and they are the ones that clear the
+    /// backlog of gaps the transition creates. What is wanted is the cost of a
+    /// burst in the steady state of shrinking, so the burn-in is dropped.
+    const SHRINK_BURN_IN_BURSTS: usize = 4;
+
+    /// The mirror image of [`run_churny_workload_tracked`]: the same operation
+    /// mix with allocate and free **swapped**, so the heap nets *smaller* over
+    /// the run instead of larger.
+    ///
+    /// This is the case the growing workload cannot reach, and the interesting
+    /// one for compaction: a shrinking heap is one where free space appears
+    /// faster than the allocator consumes it, so the gaps are many and the
+    /// competition for a destination is weak. Whether the file actually follows
+    /// the live bytes down, or is left held up by a few stranded allocations near
+    /// `end`, is exactly what the `overhead` column reports.
+    ///
+    /// Allocation does not stop -- 25% of rounds still allocate, mirroring the
+    /// 25% of the growing workload that frees -- because a pure drain would be a
+    /// different and much easier problem: no new allocation would ever land in a
+    /// gap, and placement is where most of this heap's free space is normally
+    /// destroyed.
+    ///
+    /// Returns what the bursts achieved and **one snapshot per burst**, which is
+    /// the resolution the fragmentation question needs.
+    fn run_shrinking_workload_tracked(
+        h: &mut Heap,
+        mut live: Vec<Pointer<u32>>,
+        rounds: usize,
+        next_counter: u32,
+    ) -> (BurstStats, Vec<Snapshot>) {
+        assert!(
+            rounds.is_multiple_of(COMPACTION_INTERVAL),
+            "the run must end on a burst; see COMPACTION_INTERVAL"
+        );
+        let mut snapshots = Vec::new();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut next_counter = next_counter;
+        let mut bursts = BurstStats::default();
+
+        for round in 0..rounds {
+            let roll = rand() % 100;
+            if roll < 60 && !live.is_empty() {
+                let victim = live.swap_remove((rand() % live.len() as u64) as usize);
+                h.free(victim).unwrap();
+            } else if roll < 85 || live.is_empty() {
+                let size = [8u32, 16, 16, 64, 250][(rand() % 5) as usize];
+                let id = if rand() % 4 == 0 {
+                    resizable(next_counter)
+                } else {
+                    fixed(next_counter)
+                };
+                next_counter += 1;
+                h.alloc(id, size).unwrap();
+                live.push(id);
+            } else {
+                let i = (rand() % live.len() as u64) as usize;
+                if !live[i].is_fixed_size() {
+                    let new_size = 1 + (rand() % 300) as u32;
+                    h.resize(live[i], new_size).unwrap();
+                }
+            }
+
+            if (round + 1) % COMPACTION_INTERVAL == 0 {
+                let t0 = std::time::Instant::now();
+                let (steps, quiesced) = h.compact_incrementally(COMPACTION_BUDGET);
+                let elapsed = t0.elapsed();
+                bursts.bursts += 1;
+                bursts.steps += steps;
+                bursts.quiesced += u64::from(quiesced);
+                let mut snapshot = Snapshot::take(h, round);
+                snapshot.micros_per_burst = elapsed.as_secs_f64() * 1e6;
+                snapshots.push(snapshot);
+            }
+        }
+        (bursts, snapshots)
+    }
+
+    /// Fragmentation and burst cost over a heap that is **shrinking**, starting
+    /// from the state the growing workload leaves behind.
+    ///
+    /// Every burst is recorded; the table is subsampled to keep the output
+    /// readable at the larger sizes, but the summary lines below it are computed
+    /// over *all* of them, after [`SHRINK_BURN_IN_BURSTS`].
+    ///
+    /// ```text
+    /// cargo test --release -p kladde-heap --lib compaction_cost_over_a_shrinking -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a behavioural test; takes minutes"]
+    fn compaction_cost_over_a_shrinking_workload() {
+        for (lambda, alpha, mu) in POLICIES {
+            println!("\n\n########## lambda = {lambda}, alpha = {alpha}, mu = {mu:?} ##########");
+            for &rounds in &[400usize, 4_000, 40_000] {
+                measure_shrinking(rounds, lambda, alpha, mu);
+            }
+        }
+    }
+
+    fn measure_shrinking(churn_rounds: usize, lambda: bool, alpha: u64, mu: (u64, u64)) {
+        let mut h = Heap::new();
+        h.set_lambda(lambda);
+        h.set_alpha(alpha);
+        h.set_mu(mu.0, mu.1);
+        let (live, _, _) = run_churny_workload_tracked(&mut h, churn_rounds);
+        let before = Snapshot::take(&h, 0);
+        h.reset_search_stats();
+
+        // Long enough to drain most of what the churn built: the mix nets about
+        // 0.35 removals per round, so ~2.5 rounds per live allocation takes it
+        // down to roughly a tenth of its size.
+        let shrink_rounds =
+            (live.len() * 5 / 2).next_multiple_of(COMPACTION_INTERVAL) + COMPACTION_INTERVAL;
+        let next_counter = u32::try_from(churn_rounds).unwrap() + 1_000_000;
+        let (bursts, snapshots) =
+            run_shrinking_workload_tracked(&mut h, live, shrink_rounds, next_counter);
+        let after = Snapshot::take(&h, shrink_rounds);
+
+        println!(
+            "\n=== shrink from {} live allocations ({churn_rounds} churn rounds), \
+             {shrink_rounds} rounds, {} bursts ===",
+            before.allocations, bursts.bursts,
+        );
+        println!(
+            "  {} -> {} allocations, {} -> {} live bytes, {} -> {} end",
+            before.allocations,
+            after.allocations,
+            before.live_bytes,
+            after.live_bytes,
+            before.end,
+            after.end,
+        );
+        println!(
+            "  bursts: budget {COMPACTION_BUDGET} every {COMPACTION_INTERVAL} ops; \
+             {:.1} steps each; {} of them ran out of work",
+            bursts.steps as f64 / bursts.bursts.max(1) as f64,
+            bursts.quiesced,
+        );
+        report_step_shapes(h.search_stats());
+
+        // Summaries over every burst past the burn-in, not over the printed rows.
+        let steady = snapshots.get(SHRINK_BURN_IN_BURSTS..).unwrap_or(&[]);
+        if !steady.is_empty() {
+            let overheads: Vec<f64> = steady.iter().map(Snapshot::overhead_percent).collect();
+            let micros: Vec<f64> = steady.iter().map(|s| s.micros_per_burst).collect();
+            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+            let max = |v: &[f64]| v.iter().copied().fold(f64::MIN, f64::max);
+            println!(
+                "  steady state over {} bursts (burn-in {SHRINK_BURN_IN_BURSTS} dropped): \
+                 overhead mean {:.2}% peak {:.2}%; {:.1} us/burst mean, {:.1} peak",
+                steady.len(),
+                mean(&overheads),
+                max(&overheads),
+                mean(&micros),
+                max(&micros),
+            );
+        }
+
+        // Every burst is recorded; print at most ~40 rows so the larger runs stay
+        // readable, always including the last.
+        let stride = (snapshots.len() / 40).max(1);
+        println!(
+            "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>9}  {:>11}",
+            "round", "allocations", "live_bytes", "end", "gaps", "widest", "overhead", "us/burst"
+        );
+        for (i, s) in snapshots.iter().enumerate() {
+            if i % stride != 0 && i + 1 != snapshots.len() {
+                continue;
+            }
+            println!(
+                "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>8.2}%  {:>11.1}",
+                s.round,
+                s.allocations,
+                s.live_bytes,
+                s.end,
+                s.gaps,
+                s.widest_gap,
+                s.overhead_percent(),
+                s.micros_per_burst,
+            );
+        }
+    }
+
+    /// The behavioural half of the shrinking measurement: a draining heap must
+    /// stay consistent under every policy and must still compact.
+    ///
+    /// A shrink is where the invariants are most likely to break -- gaps are
+    /// created faster than they are consumed, so coalescing, `end` retreating and
+    /// the neighbour re-keying of `α` all run far more often than they do while
+    /// growing.
+    #[test]
+    fn a_shrinking_workload_stays_consistent_and_compacts() {
+        for (lambda, alpha, mu) in POLICIES {
+            let mut h = Heap::new();
+            h.set_lambda(lambda);
+            h.set_alpha(alpha);
+            h.set_mu(mu.0, mu.1);
+            let (live, _, _) = run_churny_workload_tracked(&mut h, 400);
+            assert!(
+                h.live_count() > 50,
+                "the churn should build something first"
+            );
+            h.assert_invariants();
+
+            let start = h.live_count();
+            let (_, snapshots) = run_shrinking_workload_tracked(&mut h, live, 800, 900_000);
+            h.assert_invariants();
+            assert!(
+                h.live_count() < start / 2,
+                "lambda={lambda} alpha={alpha} mu={mu:?}: the heap did not shrink \
+                 ({start} -> {})",
+                h.live_count()
+            );
+            assert!(!snapshots.is_empty(), "no bursts were recorded");
+
+            compact_fully(&mut h, COMPACTION_BUDGET);
+            assert_eq!(
+                h.len(),
+                h.live_bytes(),
+                "lambda={lambda} alpha={alpha} mu={mu:?}: gaps left over after a shrink"
+            );
+        }
+    }
+
     fn report_search_stats(label: &str, s: SearchStats) {
         println!(
             "  {label:<24} calls {:>7}  proposals {:>7}",
