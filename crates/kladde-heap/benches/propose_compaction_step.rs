@@ -112,6 +112,14 @@ fn roomy(n: usize) -> Heap {
 const COMPACTION_INTERVAL: usize = 25;
 const COMPACTION_BUDGET: u64 = 2048;
 
+/// Stage 2's size reward, measured both ways. It ships off, and the case for
+/// turning it on is entirely empirical -- it trades exactness in `Φ` for a
+/// preference the potential does not express -- so both settings are an axis
+/// here rather than a settled default. Timing is only half the answer: the
+/// fragmentation it leaves behind is measured by the workload tests in
+/// `gain_greedy.rs`.
+const LAMBDAS: [(&str, bool); 2] = [("plain", false), ("reward", true)];
+
 /// Churn with compaction bursts interleaved throughout: the state a live heap is
 /// usually in, under the schedule a backend actually uses.
 ///
@@ -124,17 +132,18 @@ const COMPACTION_BUDGET: u64 = 2048;
 /// is due to trigger. That final burst is what the benchmark measures, so it is
 /// deliberately left un-run.
 ///
-/// The bursts that *build* the state run under the same policy as the one being
-/// measured -- a different policy leaves a measurably different heap behind (see
-/// `test-results/`), so timing a burst on a state some other policy produced
-/// would time a state no caller can reach.
-fn churned(n: usize) -> Heap {
+/// The bursts that *build* the state run under the same `lambda` as the one
+/// being measured -- a different policy leaves a measurably different heap
+/// behind, so timing a burst on a state some other policy produced would time a
+/// state no caller can reach.
+fn churned(n: usize, lambda: bool) -> Heap {
     assert!(
         n.is_multiple_of(COMPACTION_INTERVAL),
         "the run must stop exactly where a burst is due"
     );
     let mut rand = rng(0x2545_F491);
     let mut h = Heap::new();
+    h.set_lambda(lambda);
     let mut live: Vec<Pointer<u32>> = Vec::new();
     let mut counter = 1u32;
     for round in 0..n {
@@ -172,39 +181,43 @@ fn bench_propose(c: &mut Criterion) {
     group.sample_size(10);
 
     for &n in &[1_000usize, 10_000, 100_000] {
-        // Static shapes: one `propose_compaction_step` call, repeated. Nothing
-        // commits, so the heap and the decision are identical on every
-        // iteration.
-        let shapes: [(&str, Heap); 2] = [("roomy", roomy(n)), ("slivers", slivers(n))];
-        for (shape, heap) in &shapes {
-            let id = BenchmarkId::new(*shape, n);
-            group.bench_with_input(id, &n, |b, _| {
-                b.iter(|| black_box(heap.propose_compaction_step(black_box(4096))));
-            });
-        }
+        for (label, lambda) in LAMBDAS {
+            // Static shapes: one `propose_compaction_step` call, repeated.
+            // Nothing commits, so the heap and the decision are identical on
+            // every iteration.
+            let mut shapes: [(&str, Heap); 2] = [("roomy", roomy(n)), ("slivers", slivers(n))];
+            for (shape, heap) in &mut shapes {
+                heap.set_lambda(lambda);
+                let id = BenchmarkId::new(format!("{shape}-{label}"), n);
+                group.bench_with_input(id, &n, |b, _| {
+                    b.iter(|| black_box(heap.propose_compaction_step(black_box(4096))));
+                });
+            }
 
-        // The realistic shape: one whole burst, from the state the schedule
-        // leaves just before it. The burst mutates the heap, so each iteration
-        // starts from a fresh clone of that saved state -- restored in `setup`,
-        // which criterion excludes from the timing. `PerIteration` keeps one
-        // clone alive at a time; a batched size would hold hundreds.
-        let pre_burst = churned(n);
-        // A burst is far cheaper than the clone that restores its input, so
-        // criterion's default measurement time would spend minutes cloning per
-        // benchmark. Ten samples of a shorter run say the same thing about a
-        // routine this repeatable.
-        group.measurement_time(Duration::from_millis(750));
-        group.warm_up_time(Duration::from_millis(250));
-        let id = BenchmarkId::new("churned", n);
-        group.bench_with_input(id, &n, |b, _| {
-            b.iter_batched_ref(
-                || pre_burst.clone(),
-                |h| black_box(h.compact_incrementally(black_box(COMPACTION_BUDGET))),
-                BatchSize::PerIteration,
-            );
-        });
-        group.measurement_time(Duration::from_secs(5));
-        group.warm_up_time(Duration::from_secs(3));
+            // The realistic shape: one whole burst, from the state this policy's
+            // own schedule leaves just before it. The burst mutates the heap, so
+            // each iteration starts from a fresh clone of that saved state --
+            // restored in `setup`, which criterion excludes from the timing.
+            // `PerIteration` keeps one clone alive at a time; a batched size
+            // would hold hundreds.
+            let pre_burst = churned(n, lambda);
+            // A burst is far cheaper than the clone that restores its input, so
+            // criterion's default measurement time would spend minutes cloning
+            // per benchmark. Ten samples of a shorter run say the same thing
+            // about a routine this repeatable.
+            group.measurement_time(Duration::from_millis(750));
+            group.warm_up_time(Duration::from_millis(250));
+            let id = BenchmarkId::new(format!("churned-{label}"), n);
+            group.bench_with_input(id, &n, |b, _| {
+                b.iter_batched_ref(
+                    || pre_burst.clone(),
+                    |h| black_box(h.compact_incrementally(black_box(COMPACTION_BUDGET))),
+                    BatchSize::PerIteration,
+                );
+            });
+            group.measurement_time(Duration::from_secs(5));
+            group.warm_up_time(Duration::from_secs(3));
+        }
     }
 
     group.finish();

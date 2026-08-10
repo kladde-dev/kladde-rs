@@ -56,6 +56,18 @@ struct Entry<Id> {
     id: Id,
 }
 
+/// What the index maximizes over allocations. See [`GainGreedyHeap::lambda`].
+///
+/// A free function rather than a method because [`GainGreedyHeap::set_lambda`]
+/// needs it while iterating `allocations`, which already borrows `self`.
+fn alloc_score(addr: u64, len: u32, lambda: bool) -> u64 {
+    if lambda {
+        addr + u64::from(len)
+    } else {
+        addr
+    }
+}
+
 /// Counters for what compaction and placement actually did.
 ///
 /// Test-only instrumentation: outside `cfg(test)` none of this exists and the
@@ -136,6 +148,8 @@ pub struct GainGreedyHeap<Id> {
     end: u64,
     /// Sum of all live allocation sizes.
     live_bytes: u64,
+    /// Stage 2's size reward. See [`GainGreedyHeap::lambda`].
+    lambda: bool,
     /// Test-only instrumentation; absent from real builds.
     #[cfg(test)]
     stats: std::cell::Cell<SearchStats>,
@@ -149,6 +163,7 @@ impl<Id> Default for GainGreedyHeap<Id> {
             index: EvacuationIndex::default(),
             end: 0,
             live_bytes: 0,
+            lambda: false,
             #[cfg(test)]
             stats: std::cell::Cell::new(SearchStats::default()),
         }
@@ -163,6 +178,68 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// Number of live allocations.
     pub fn live_count(&self) -> usize {
         self.allocations.len()
+    }
+
+    /// Whether the compactor rewards moving *large* allocations.
+    ///
+    /// "Cost = bytes copied" models the copying well and the *step* badly: a step
+    /// also costs a proposal, a commit, and -- once a store is attached -- an I/O
+    /// boundary and a journal record. Under a realistic `cost = c₀ + A.size`, ten
+    /// 100-byte moves are strictly worse than one 1000-byte move of equal total
+    /// distance.
+    ///
+    /// The exact objective for that cost is `w(A.size)·(A.pos − G.pos)`, which
+    /// breaks the index: the coefficient on `G.pos` would depend on which
+    /// allocation is chosen, and the merge's `O(1)` crossing case needs the two
+    /// sides to be independent. So the preference is expressed *additively*
+    /// instead, as `f(A, G) = (A.pos − G.pos) + λ·reward(A.size)`, which keeps
+    /// the form `U(A) − V(G)` and so keeps the merge.
+    ///
+    /// `reward(s) = s` and `λ` a bool is the whole of it. The sign test needs
+    /// `λ·reward(s) <= s` -- otherwise an allocation whose only size-valid gaps
+    /// lie *above* it could win outright and propose a move that raises `Φ` --
+    /// and `λ·s <= s` sits exactly at that edge, so this is the strongest reward
+    /// the bound permits, and it needs no multiplication:
+    ///
+    /// ```text
+    /// score(A) = A.pos + A.size   if λ,   else   A.pos
+    /// ```
+    ///
+    /// Two consequences worth stating plainly. The bound binds at the *smallest*
+    /// live allocation, not a typical one, so 1-byte allocations would degenerate
+    /// it to almost no reward at all. And it caps the reward at the allocation's
+    /// own size, so `f` lies between `d` and `2d`: on a heap where distances run
+    /// to `10^5` and sizes to `10^2`, this can only ever reorder near-ties.
+    ///
+    /// Ships **off**, because stage 2's justification is entirely empirical -- it
+    /// trades exactness in `Φ` for a preference the potential does not express --
+    /// and both settings are a benchmark axis rather than a settled default.
+    pub fn lambda(&self) -> bool {
+        self.lambda
+    }
+
+    /// Turn the size reward on or off.
+    ///
+    /// The score is part of the index key, so this rebuilds the index rather
+    /// than mutating it: changing the score in place would leave every existing
+    /// entry unremovable. That makes it `O(n log n)`, which is fine for what it
+    /// is -- a policy knob set once, before the heap is used, or swept by a
+    /// benchmark.
+    pub fn set_lambda(&mut self, lambda: bool) {
+        if lambda == self.lambda {
+            return;
+        }
+        self.lambda = lambda;
+        self.index = EvacuationIndex::default();
+        let mut cursor = 0u64;
+        for (&addr, e) in &self.allocations {
+            if addr > cursor {
+                self.index.insert(Key::gap(cursor, addr - cursor));
+            }
+            self.index
+                .insert(Key::alloc(addr, e.len, alloc_score(addr, e.len, lambda)));
+            cursor = addr + u64::from(e.len);
+        }
     }
 
     /// Spend up to `budget` bytes on consecutive compaction steps, returning the
@@ -270,7 +347,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// (stage 2's size reward, stage 3's gap-count term) without any risk of a
     /// remove computing a different key than the matching insert did.
     fn alloc_key(&self, addr: u64, len: u32) -> Key {
-        Key::alloc(addr, len, addr)
+        Key::alloc(addr, len, alloc_score(addr, len, self.lambda))
     }
 
     fn alloc_record(&mut self, addr: u64, len: u32) {
@@ -421,6 +498,16 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// travels exactly `gap_len` down, so its per-byte gain is `gap_len` --
     /// positive while any gap exists, which is what the evacuation index cannot
     /// promise on a heap whose every gap is too narrow for anything.
+    ///
+    /// Under `λ` it earns the same size reward an evacuation does, **capped at
+    /// the distance travelled**. That cap is not an extra rule but the invariant
+    /// the sign bound already forces on evacuations: there `d >= s >= λ·reward(s)`,
+    /// so `f` lies in `[d, 2d]`. Applying it here keeps the two shapes on one
+    /// scale. Uncapped it would not: a slide's run is budget-sized (thousands of
+    /// bytes) against an evacuation's single allocation (hundreds), so `λ·len`
+    /// alone would usually exceed any evacuation's entire score and the reward
+    /// would stop being a tie-breaker and become a standing preference for
+    /// sliding.
     fn slide_candidate(&self, budget: u64) -> Option<(u64, Step<u64>)> {
         let (to, gap_len) = self.index.widest_gap()?;
         let from = to + gap_len;
@@ -428,7 +515,8 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         if len == 0 {
             return None;
         }
-        Some((gap_len, Step { from, to, len }))
+        let reward = if self.lambda { len.min(gap_len) } else { 0 };
+        Some((gap_len + reward, Step { from, to, len }))
     }
 }
 
@@ -505,7 +593,7 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
             .map(|(&addr, e)| (e.id, addr, e.len))
     }
 
-    /// The best of the two candidate shapes, both scored by per-byte gain.
+    /// The best of the two candidate shapes, both scored by the same objective.
     ///
     /// No walk: the slide is a root read plus a bounded run scan, and the
     /// evacuation is the index's budgeted descent. Ties go to the slide, which
@@ -518,10 +606,11 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
     fn propose_compaction_step(&self, budget: u64) -> Option<Step<u64>> {
         let mut best: Option<(u64, Step<u64>)> = self.slide_candidate(budget);
 
-        // The evacuation's gain is `A.pos − G.pos`, which the index maximizes
-        // directly, so the winning step's own distance *is* the gain to compare.
-        if let Some(step) = self.index.best_evacuation_within(budget) {
-            let gain = step.from - step.to;
+        // The index maximizes `score(A) − G.pos` directly and reports it, which
+        // matters once `λ` is on: the objective is then no longer the travel
+        // distance, so re-deriving it from the step would silently compare the
+        // wrong quantity against the slide's.
+        if let Some((gain, step)) = self.index.best_evacuation_within(budget) {
             if best.is_none_or(|(incumbent, _)| gain > incumbent) {
                 best = Some((gain, step));
             }
@@ -534,7 +623,7 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
         // fallback costs nothing next to making the caller re-enter.
         let chosen = best.map(|(_, step)| step).or_else(|| {
             debug_assert!(self.index.widest_gap().is_none(), "a gap with no slide");
-            self.index.best_evacuation()
+            self.index.best_evacuation().map(|(_, step)| step)
         });
         self.record_search(chosen.is_some());
         chosen
@@ -585,7 +674,8 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     }
 
     /// The reference the index's root must agree with: every (mover, gap) pair,
-    /// no index and no pruning at all. Returns the winning per-byte gain.
+    /// no index and no pruning at all. Returns the winning objective value,
+    /// which carries `λ` -- so this checks the reward as well as the search.
     fn best_evacuation_by_brute_force(&self, budget: u64) -> Option<u64> {
         let gaps = self.implied_gaps();
         let mut best = 0u64;
@@ -595,7 +685,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             }
             for &(pos, width) in &gaps {
                 if width >= u64::from(e.len) && pos < from {
-                    best = best.max(from - pos);
+                    best = best.max(alloc_score(from, e.len, self.lambda) - pos);
                 }
             }
         }
@@ -665,7 +755,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             assert_eq!(
                 self.index
                     .best_evacuation_within(budget)
-                    .map(|s| s.from - s.to),
+                    .map(|(gain, _)| gain),
                 self.best_evacuation_by_brute_force(budget),
                 "the budgeted descent disagreed with brute force at budget={budget}"
             );
@@ -989,6 +1079,118 @@ mod tests {
             bytes <= 200,
             "distance-greed should move ~130 bytes, not slide 1460; moved {bytes}"
         );
+    }
+
+    /// `λ` ships off, and turning it on rebuilds the index rather than mutating
+    /// it -- the score is part of the key, so a half-converted index would hold
+    /// entries nobody could remove. This checks the rebuild lands somewhere the
+    /// invariants still hold, in both directions and with a non-trivial heap.
+    #[test]
+    fn toggling_lambda_rebuilds_the_index_consistently() {
+        let plan: Vec<(u32, u32, bool)> = (1..=41)
+            .map(|i| (i, 8 + (i % 7) * 11, i % 3 == 0))
+            .collect();
+        let mut h = heap_with_layout(&plan);
+        assert!(!h.lambda(), "the size reward ships off");
+
+        for lambda in [true, false, true] {
+            h.set_lambda(lambda);
+            assert_eq!(h.lambda(), lambda);
+            h.assert_invariants();
+        }
+        // And it still compacts from there.
+        h.set_lambda(true);
+        compact_fully(&mut h, UNBOUNDED);
+        assert_eq!(h.len(), h.live_bytes(), "λ must not stall compaction");
+    }
+
+    /// What the reward is *for*: at equal travel distance, prefer to move the
+    /// larger allocation, because a step costs more than the bytes it copies.
+    ///
+    /// Constructing a genuine tie takes a little care, because the low wide gap
+    /// that serves a large mover serves a small one too -- so the small mover's
+    /// best distance is never *less* than the large one's simply by being
+    /// higher. The two therefore need different destinations: a narrow gap at
+    /// the bottom that only the small mover fits, and a wide one above it.
+    #[test]
+    fn lambda_breaks_a_tie_towards_the_larger_mover() {
+        let plan = [
+            (1, 8, true),   // gap    0..8    <- only the 8-byte mover fits
+            (2, 42, false), //        8..50
+            (3, 64, true),  // gap   50..114  <- the lowest gap fitting 64 bytes
+            (4, 86, false), //      114..200
+            (5, 8, false),  //      200..208  <- small mover: 200 - 0   = 200
+            (6, 42, false), //      208..250
+            (7, 64, false), //      250..314  <- large mover: 250 - 50  = 200
+        ];
+        let mut h = heap_with_layout(&plan);
+
+        // Off, the two are genuinely indistinguishable and either is correct.
+        let plain = h.propose_compaction_step(UNBOUNDED).unwrap();
+        assert_eq!(plain.from - plain.to, 200, "both movers travel 200");
+        assert!(
+            plain.from == 200 || plain.from == 250,
+            "expected one of the two tied movers, got {plain:?}"
+        );
+
+        // On, the reward `+A.size` separates them: 200 + 64 beats 200 + 8.
+        h.set_lambda(true);
+        assert_eq!(
+            h.propose_compaction_step(UNBOUNDED).unwrap(),
+            Step {
+                from: 250,
+                to: 50,
+                len: 64
+            },
+            "the reward should break the tie towards the larger mover"
+        );
+        h.assert_invariants();
+    }
+
+    /// The bound `λ·reward(s) <= s` exists so that `f > 0` still implies a
+    /// *downward* move. Without it an allocation whose only size-valid gaps sit
+    /// above it could win outright and propose a step that raises `Φ` -- which
+    /// `commit_compaction_step` asserts against, so this would be a panic rather
+    /// than a silent regression.
+    #[test]
+    fn lambda_never_proposes_an_upward_move() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut h = Heap::new();
+        h.set_lambda(true);
+        let mut live: Vec<Pointer<u32>> = Vec::new();
+        let mut counter = 1u32;
+
+        for round in 0..600 {
+            if rand() % 100 < 60 || live.is_empty() {
+                let size = [1u32, 2, 8, 16, 250][(rand() % 5) as usize];
+                let id = if rand() % 4 == 0 {
+                    resizable(counter)
+                } else {
+                    fixed(counter)
+                };
+                counter += 1;
+                h.alloc(id, size).unwrap();
+                live.push(id);
+            } else {
+                let victim = live.swap_remove((rand() % live.len() as u64) as usize);
+                h.free(victim).unwrap();
+            }
+            // Sizes down to 1 byte are deliberate: the bound binds at the
+            // *smallest* live allocation, so this is where it is tightest.
+            if round % 5 == 0 {
+                if let Some(step) = h.propose_compaction_step(128) {
+                    assert!(step.to < step.from, "{step:?} raises the potential");
+                    h.commit_compaction_step(step);
+                    h.assert_invariants();
+                }
+            }
+        }
     }
 
     #[test]
@@ -1331,31 +1533,40 @@ mod tests {
         );
     }
 
-    /// Not an assertion of behaviour -- a **measurement**, of how much work the
-    /// candidate search does over a realistic churn. That is what decides
-    /// whether the search needs bounding at all, and the answer is recorded in
+    /// Not an assertion of behaviour -- a **measurement**, of what compaction
+    /// costs and what it achieves over a realistic churn, recorded in
     /// `test-results/`.
     ///
     /// Two regimes are reported separately, because they behave very
     /// differently: compaction in **bursts** interleaved with churn (what a
     /// backend does on each flush), and compaction driven to quiescence.
     ///
+    /// Swept across `λ`, because that is the only way to settle stage 2: the
+    /// reward buys a preference the potential does not express, so its effect on
+    /// fragmentation has to be *measured* rather than argued for. The columns
+    /// that decide it are `overhead` down the table and the `truncated` share of
+    /// the bytes moved -- truncation is the only way free space leaves the file.
+    ///
     /// `#[ignore]`d because the largest case takes minutes -- it is a
     /// measurement, not part of the suite. Run with:
     ///
     /// ```text
-    /// cargo test -p kladde-heap --lib candidate_search_cost -- --ignored --nocapture
+    /// cargo test --release -p kladde-heap --lib candidate_search_cost -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore = "measurement, not a behavioural test; takes minutes"]
     fn candidate_search_cost_over_a_churny_workload() {
-        for &rounds in &[400usize, 4_000, 40_000] {
-            measure_one(rounds);
+        for lambda in [false, true] {
+            println!("\n\n########## lambda = {lambda} ##########");
+            for &rounds in &[400usize, 4_000, 40_000] {
+                measure_one(rounds, lambda);
+            }
         }
     }
 
-    fn measure_one(rounds: usize) {
+    fn measure_one(rounds: usize, lambda: bool) {
         let mut h = Heap::new();
+        h.set_lambda(lambda);
         let (_, bursts, snapshots) = run_churny_workload_tracked(&mut h, rounds);
         let during_bursts = h.search_stats();
 

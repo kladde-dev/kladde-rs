@@ -1,13 +1,20 @@
 //! [`EvacuationIndex`]: one augmented B+ tree over allocation and gap **sizes**
 //! that keeps the best evacuation at its root, instead of searching for it.
 //!
-//! This is stage 1 of `augmented-segment-tree.md`. The query it answers is
+//! See `augmented-segment-tree.md`. The query it answers is
 //!
-//! > among all pairs `(A, G)` with `G.width >= A.size`, maximize `A.pos − G.pos`
+//! > among all pairs `(A, G)` with `G.width >= A.size`, maximize
+//! > `score(A) − G.pos`
 //!
-//! -- the best evacuation under the potential `Φ = Σ_{live bytes} address` with
-//! cost measured in bytes copied, where the size cancels and the per-byte gain is
-//! simply the distance travelled.
+//! The index does not know what a score *is*; it maximizes whatever it is handed
+//! in the key, and the caller decides. With `score(A) = A.pos` that is the best
+//! evacuation under the potential `Φ = Σ_{live bytes} address` with cost measured
+//! in bytes copied, where the size cancels and the per-byte gain is simply the
+//! distance travelled. Richer scores (the size reward of stage 2, the gap-count
+//! term of stage 3) are additive in `A` alone, which is exactly the condition for
+//! leaving the merge below untouched -- see [`GainGreedyHeap::lambda`].
+//!
+//! [`GainGreedyHeap::lambda`]: crate::GainGreedyHeap::lambda
 //!
 //! # Why a size-keyed tree answers it in `O(1)`
 //!
@@ -225,12 +232,19 @@ impl Aggregate {
         }
     }
 
-    /// The step this aggregate's `best` describes, if it describes one.
-    fn step(&self) -> Option<Step<u64>> {
-        (self.best > 0).then(|| Step {
-            from: self.best_from,
-            to: self.best_to,
-            len: u64::from(self.best_len),
+    /// The step this aggregate's `best` describes, with the objective value it
+    /// scored -- which is *not* the travel distance once the score carries more
+    /// than the address, so the caller must not re-derive it from the step.
+    fn scored_step(&self) -> Option<(u64, Step<u64>)> {
+        (self.best > 0).then(|| {
+            (
+                self.best,
+                Step {
+                    from: self.best_from,
+                    to: self.best_to,
+                    len: u64::from(self.best_len),
+                },
+            )
         })
     }
 
@@ -296,9 +310,10 @@ impl EvacuationIndex {
         self.tree.iter().map(|(&k, _)| k)
     }
 
-    /// The best evacuation in the whole heap. One field read at the root.
-    pub fn best_evacuation(&self) -> Option<Step<u64>> {
-        self.tree.root_argument().step()
+    /// The best evacuation in the whole heap, as `(objective value, step)`. One
+    /// field read at the root.
+    pub fn best_evacuation(&self) -> Option<(u64, Step<u64>)> {
+        self.tree.root_argument().scored_step()
     }
 
     /// The widest gap, as `(pos, width)`, taking the lowest-addressed one when
@@ -341,7 +356,7 @@ impl EvacuationIndex {
     /// Seeding the ordinary right-to-left sweep of the prefix with that scalar is
     /// what offers each prefix allocation both the gaps above it *within* the
     /// prefix and the best gap in the entire suffix.
-    pub fn best_evacuation_within(&self, budget: u64) -> Option<Step<u64>> {
+    pub fn best_evacuation_within(&self, budget: u64) -> Option<(u64, Step<u64>)> {
         // Sizes are `u32`, so a budget at or above that ceiling constrains
         // nothing -- and taking the root read here also keeps `budget + 1` from
         // overflowing the shifted key below.
@@ -359,7 +374,7 @@ impl EvacuationIndex {
             min_gap_pos: visit.suffix_min_gap_pos,
             ..Aggregate::default()
         };
-        Aggregate::sweep(seed, visit.prefix.iter().rev()).step()
+        Aggregate::sweep(seed, visit.prefix.iter().rev()).scored_step()
     }
 }
 
@@ -454,13 +469,26 @@ mod tests {
     struct Layout {
         allocs: Vec<(u64, u32)>,
         gaps: Vec<(u64, u64)>,
+        /// Stage 2's size reward, as the bool the heap actually ships. The index
+        /// itself knows nothing about it -- it maximizes whatever score it is
+        /// handed -- so this rides along only to build keys and to tell the
+        /// brute-force reference what it is checking against.
+        lambda: bool,
     }
 
     impl Layout {
+        fn score(&self, addr: u64, size: u32) -> u64 {
+            if self.lambda {
+                addr + u64::from(size)
+            } else {
+                addr
+            }
+        }
+
         fn index(&self) -> EvacuationIndex {
             let mut ix = EvacuationIndex::default();
             for &(addr, size) in &self.allocs {
-                ix.insert(Key::alloc(addr, size, addr));
+                ix.insert(Key::alloc(addr, size, self.score(addr, size)));
             }
             for &(pos, width) in &self.gaps {
                 ix.insert(Key::gap(pos, width));
@@ -478,7 +506,7 @@ mod tests {
                 }
                 for &(pos, width) in &self.gaps {
                     if width >= u64::from(size) && pos < from {
-                        best = best.max(from - pos);
+                        best = best.max(self.score(from, size) - pos);
                     }
                 }
             }
@@ -550,9 +578,10 @@ mod tests {
         let layout = Layout {
             allocs: vec![(100, 10)],
             gaps: vec![(0, 10)],
+            lambda: false,
         };
         assert_eq!(
-            layout.index().best_evacuation(),
+            layout.index().best_evacuation().map(|(_, s)| s),
             Some(Step {
                 from: 100,
                 to: 0,
@@ -566,6 +595,7 @@ mod tests {
         let layout = Layout {
             allocs: vec![(100, 10)],
             gaps: vec![(0, 9)],
+            lambda: false,
         };
         assert_eq!(layout.index().best_evacuation(), None);
     }
@@ -577,6 +607,7 @@ mod tests {
         let layout = Layout {
             allocs: vec![(0, 10)],
             gaps: vec![(50, 100)],
+            lambda: false,
         };
         assert_eq!(layout.index().best_evacuation(), None);
     }
@@ -586,11 +617,12 @@ mod tests {
         let layout = Layout {
             allocs: vec![(10, 8), (500, 4), (900, 100)],
             gaps: vec![(0, 4), (200, 100)],
+            lambda: false,
         };
         // 900 -> 200 travels 700; 500 -> 0 travels 500; 900 -> 0 is invalid
         // (a 100-byte allocation does not fit a 4-byte gap).
         assert_eq!(
-            layout.index().best_evacuation(),
+            layout.index().best_evacuation().map(|(_, s)| s),
             Some(Step {
                 from: 900,
                 to: 200,
@@ -604,6 +636,7 @@ mod tests {
         let layout = Layout {
             allocs: vec![(10, 8)],
             gaps: vec![(300, 64), (100, 64), (500, 8)],
+            lambda: false,
         };
         assert_eq!(layout.index().widest_gap(), Some((100, 64)));
     }
@@ -613,14 +646,18 @@ mod tests {
         let layout = Layout {
             allocs: vec![(900, 100), (500, 4)],
             gaps: vec![(0, 4), (200, 100)],
+            lambda: false,
         };
         let ix = layout.index();
         // Unconstrained, the 100-byte allocation travelling 700 wins.
-        assert_eq!(ix.best_evacuation_within(4096).map(|s| s.from), Some(900));
+        assert_eq!(
+            ix.best_evacuation_within(4096).map(|(_, s)| s.from),
+            Some(900)
+        );
         // At a budget of 99 it is out of reach, and the 4-byte one is all that
         // is left -- into the *lowest* gap that fits it, not the nearest.
         assert_eq!(
-            ix.best_evacuation_within(99),
+            ix.best_evacuation_within(99).map(|(_, s)| s),
             Some(Step {
                 from: 500,
                 to: 0,
@@ -637,35 +674,64 @@ mod tests {
     #[test]
     fn every_query_agrees_with_brute_force_across_deep_trees() {
         let mut rand = rng(0x51E7_E123_4F6C_DD1D);
-        for n in [1usize, 2, 5, 60, 65, 200, 2_000] {
-            let layout = random_layout(&mut rand, n);
-            let ix = layout.index();
+        for lambda in [false, true] {
+            for n in [1usize, 2, 5, 60, 65, 200, 2_000] {
+                let mut layout = random_layout(&mut rand, n);
+                layout.lambda = lambda;
+                let ix = layout.index();
 
-            assert_eq!(
-                ix.best_evacuation().map(|s| s.from - s.to),
-                layout.best_by_brute_force(u64::MAX),
-                "n={n}: the root disagreed with brute force"
-            );
-            assert_eq!(
-                ix.widest_gap(),
-                layout.widest_gap_by_scan(),
-                "n={n}: widest_gap disagreed with a scan"
-            );
+                assert_eq!(
+                    ix.best_evacuation().map(|(gain, _)| gain),
+                    layout.best_by_brute_force(u64::MAX),
+                    "lambda={lambda} n={n}: the root disagreed with brute force"
+                );
+                assert_eq!(
+                    ix.widest_gap(),
+                    layout.widest_gap_by_scan(),
+                    "lambda={lambda} n={n}: widest_gap disagreed with a scan"
+                );
 
-            for budget in [0u64, 1, 8, 15, 16, 63, 64, 249, 250, 251, 10_000] {
-                assert_eq!(
-                    ix.best_evacuation_within(budget).map(|s| s.from - s.to),
-                    layout.best_by_brute_force(budget),
-                    "n={n} budget={budget}: the budgeted descent disagreed"
-                );
+                for budget in [0u64, 1, 8, 15, 16, 63, 64, 249, 250, 251, 10_000] {
+                    assert_eq!(
+                        ix.best_evacuation_within(budget).map(|(gain, _)| gain),
+                        layout.best_by_brute_force(budget),
+                        "lambda={lambda} n={n} budget={budget}: the budgeted descent disagreed"
+                    );
+                }
+                for min_len in [1u64, 2, 8, 16, 64, 250, 300, 301, 1_000] {
+                    assert_eq!(
+                        ix.lowest_gap_fitting(min_len),
+                        layout.lowest_gap_fitting_by_scan(min_len),
+                        "lambda={lambda} n={n} min_len={min_len}: lowest_gap_fitting disagreed"
+                    );
+                }
             }
-            for min_len in [1u64, 2, 8, 16, 64, 250, 300, 301, 1_000] {
-                assert_eq!(
-                    ix.lowest_gap_fitting(min_len),
-                    layout.lowest_gap_fitting_by_scan(min_len),
-                    "n={n} min_len={min_len}: lowest_gap_fitting disagreed"
-                );
+        }
+    }
+
+    /// The sign test has to stay exact once the score carries the reward: an
+    /// *upward* pair now earns `+A.size` and could in principle come out
+    /// positive, which would propose a move that raises `Φ`. The bound
+    /// `lambda*reward(s) <= s` is what forbids it, and `reward(s) = s` with
+    /// `lambda` a bool sits exactly at its edge.
+    #[test]
+    fn the_reward_can_never_rescue_an_upward_pair() {
+        let mut rand = rng(0xD15E_A5E1_0BAD_C0DE);
+        for _ in 0..20 {
+            let mut layout = random_layout(&mut rand, 200);
+            layout.lambda = true;
+            // Keep only the gaps above every allocation, so *no* downward pair
+            // exists at all and any proposal is a bug.
+            let top = layout.allocs.iter().map(|&(a, _)| a).max().unwrap();
+            layout.gaps.retain(|&(pos, _)| pos > top);
+            if layout.gaps.is_empty() {
+                continue;
             }
+            assert_eq!(
+                layout.index().best_evacuation(),
+                None,
+                "an upward pair was proposed"
+            );
         }
     }
 
@@ -678,7 +744,7 @@ mod tests {
             let layout = random_layout(&mut rand, 300);
             let ix = layout.index();
             for budget in [4u64, 16, 64, 250, 4_096] {
-                let Some(step) = ix.best_evacuation_within(budget) else {
+                let Some((_, step)) = ix.best_evacuation_within(budget) else {
                     continue;
                 };
                 assert!(step.to < step.from, "{step:?} is not downward");
@@ -706,14 +772,15 @@ mod tests {
         let mut layout = random_layout(&mut rand, 500);
         let mut ix = layout.index();
 
-        while let Some(step) = ix.best_evacuation() {
+        while let Some((gain, step)) = ix.best_evacuation() {
             assert_eq!(
-                Some(step.from - step.to),
+                Some(gain),
                 layout.best_by_brute_force(u64::MAX),
                 "the root drifted from brute force after removals"
             );
             // Retire the winning mover from both the index and the reference.
-            ix.remove(Key::alloc(step.from, step.len as u32, step.from));
+            let size = step.len as u32;
+            ix.remove(Key::alloc(step.from, size, layout.score(step.from, size)));
             layout.allocs.retain(|&(a, _)| a != step.from);
         }
         assert_eq!(layout.best_by_brute_force(u64::MAX), None);
