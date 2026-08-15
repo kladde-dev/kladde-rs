@@ -144,6 +144,18 @@ struct Aggregate {
     ///
     /// [`GainGreedyHeap::slide_candidate`]: crate::GainGreedyHeap
     min_gap_pos: u64,
+    /// Highest `G.pos` over gaps in the subtree. At the root, the gap the top
+    /// run sits on -- the only gap whose closure retires `end`, which is the
+    /// quantity the potential is blind to. See
+    /// [`GainGreedyHeap::end_slide_candidate`].
+    ///
+    /// Its identity is `0`, which is *not* a usable "no gap here" sentinel,
+    /// because a gap at address 0 is perfectly ordinary. `min_gap_pos` carries
+    /// the emptiness predicate for both, and `highest_gap()` reads this field
+    /// only once that says a gap exists.
+    ///
+    /// [`GainGreedyHeap::end_slide_candidate`]: crate::GainGreedyHeap
+    max_gap_pos: u64,
     /// Highest `score` over allocations in the subtree, and the allocation
     /// achieving it. The witness rides along because the merge has to be able to
     /// name the mover of a crossing pair, and `from_inner` never sees keys of
@@ -163,6 +175,7 @@ impl Default for Aggregate {
     fn default() -> Self {
         Self {
             min_gap_pos: u64::MAX,
+            max_gap_pos: 0,
             max_alloc_score: 0,
             max_alloc_addr: 0,
             max_alloc_size: 0,
@@ -180,6 +193,7 @@ impl Aggregate {
         let mut a = Self::default();
         if key.is_gap() {
             a.min_gap_pos = key.score;
+            a.max_gap_pos = key.score;
         } else {
             a.max_alloc_score = key.score;
             a.max_alloc_addr = key.addr;
@@ -215,6 +229,9 @@ impl Aggregate {
 
         if lower.min_gap_pos < self.min_gap_pos {
             self.min_gap_pos = lower.min_gap_pos;
+        }
+        if lower.max_gap_pos > self.max_gap_pos {
+            self.max_gap_pos = lower.max_gap_pos;
         }
         if lower.max_alloc_score > self.max_alloc_score {
             self.max_alloc_score = lower.max_alloc_score;
@@ -320,6 +337,19 @@ impl EvacuationIndex {
     pub fn lowest_gap(&self) -> Option<u64> {
         let pos = self.tree.root_argument().min_gap_pos;
         (pos != u64::MAX).then_some(pos)
+    }
+
+    /// The highest-addressed gap, or `None` when the heap is gapless. A root
+    /// read.
+    ///
+    /// This is the only gap the top run sits on, so it is the only one whose
+    /// closure lets `end` retreat -- the destination of
+    /// [`GainGreedyHeap::end_slide_candidate`].
+    ///
+    /// [`GainGreedyHeap::end_slide_candidate`]: crate::GainGreedyHeap
+    pub fn highest_gap(&self) -> Option<u64> {
+        let a = self.tree.root_argument();
+        (a.min_gap_pos != u64::MAX).then_some(a.max_gap_pos)
     }
 
     /// The widest gap, as `(pos, width)`, taking the **highest**-addressed one
@@ -570,6 +600,10 @@ mod tests {
         fn lowest_gap_by_scan(&self) -> Option<u64> {
             self.gaps.iter().map(|&(pos, _)| pos).min()
         }
+
+        fn highest_gap_by_scan(&self) -> Option<u64> {
+            self.gaps.iter().map(|&(pos, _)| pos).max()
+        }
     }
 
     /// A deterministic xorshift, so every case is reproducible run to run.
@@ -692,7 +726,9 @@ mod tests {
             lambda: false,
         };
         assert_eq!(layout.index().lowest_gap(), Some(100));
+        assert_eq!(layout.index().highest_gap(), Some(500));
         assert_eq!(EvacuationIndex::default().lowest_gap(), None);
+        assert_eq!(EvacuationIndex::default().highest_gap(), None);
     }
 
     #[test]
@@ -748,6 +784,11 @@ mod tests {
                     ix.lowest_gap(),
                     layout.lowest_gap_by_scan(),
                     "lambda={lambda} n={n}: lowest_gap disagreed with a scan"
+                );
+                assert_eq!(
+                    ix.highest_gap(),
+                    layout.highest_gap_by_scan(),
+                    "lambda={lambda} n={n}: highest_gap disagreed with a scan"
                 );
 
                 for budget in [0u64, 1, 8, 15, 16, 63, 64, 249, 250, 251, 10_000] {

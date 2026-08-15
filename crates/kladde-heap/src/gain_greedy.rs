@@ -140,18 +140,25 @@ pub(crate) struct SearchStats {
     pub calls: u64,
     /// Calls that returned a step (the rest found the heap already compact).
     pub proposals: u64,
-    /// Committed steps that were the slide candidate, and that were an
-    /// evacuation. Which shape wins is what decides whether a burst shrinks the
-    /// file or merely rearranges it -- see `truncated_by_*`.
+    /// Committed steps by candidate shape: the frontier slide, the end slide,
+    /// and the evacuation. Which shape wins is what decides whether a burst
+    /// shrinks the file or merely rearranges it -- see `truncated_by_*`.
     pub slides: u64,
+    pub end_slides: u64,
     pub evacuations: u64,
     /// Bytes those steps moved.
     pub slide_bytes: u64,
+    pub end_slide_bytes: u64,
     pub evac_bytes: u64,
     /// Bytes `end` fell by as a result. **This is the only way free space
     /// leaves the file**: every other move conserves it, taking `len` free bytes
     /// at the destination and giving `len` back at the source.
+    ///
+    /// `truncated_by_end_slides` should equal the top gap's width on every end
+    /// slide, since that shape exists to retire exactly that much -- which is
+    /// what makes it the column to read when judging `ν`.
     pub truncated_by_slides: u64,
+    pub truncated_by_end_slides: u64,
     pub truncated_by_evacuations: u64,
     /// Placements (`alloc`, and the relocating half of `resize`) that found a
     /// gap to sit in, and those that had to extend `end` because nothing fitted.
@@ -173,17 +180,36 @@ impl SearchStats {
         self.proposals += u64::from(proposed);
     }
 
-    fn record_step(&mut self, is_slide: bool, len: u64, truncated: u64) {
-        if is_slide {
-            self.slides += 1;
-            self.slide_bytes += len;
-            self.truncated_by_slides += truncated;
-        } else {
-            self.evacuations += 1;
-            self.evac_bytes += len;
-            self.truncated_by_evacuations += truncated;
+    fn record_step(&mut self, shape: Shape, len: u64, truncated: u64) {
+        match shape {
+            Shape::Slide => {
+                self.slides += 1;
+                self.slide_bytes += len;
+                self.truncated_by_slides += truncated;
+            }
+            Shape::EndSlide => {
+                self.end_slides += 1;
+                self.end_slide_bytes += len;
+                self.truncated_by_end_slides += truncated;
+            }
+            Shape::Evacuation => {
+                self.evacuations += 1;
+                self.evac_bytes += len;
+                self.truncated_by_evacuations += truncated;
+            }
         }
     }
+}
+
+/// Which candidate a committed step came from. Test-only, and recovered by
+/// recomputing the two slides rather than threaded through the return value --
+/// see [`GainGreedyHeap::compact_bounded`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shape {
+    Slide,
+    EndSlide,
+    Evacuation,
 }
 
 /// A relocatable heap over a `u64` address space with `u32` allocation sizes,
@@ -219,6 +245,9 @@ pub struct GainGreedyHeap<Id> {
     /// Stage 4's destination-side weights. See [`GainGreedyHeap::mu`].
     mu_exact: u64,
     mu_multiple: u64,
+    /// The exchange rate between potential and **file size**. See
+    /// [`GainGreedyHeap::nu`].
+    nu: u64,
     /// Test-only instrumentation; absent from real builds.
     #[cfg(test)]
     stats: std::cell::Cell<SearchStats>,
@@ -236,6 +265,7 @@ impl<Id> Default for GainGreedyHeap<Id> {
             weights: Weights::default(),
             mu_exact: 0,
             mu_multiple: 0,
+            nu: 0,
             #[cfg(test)]
             stats: std::cell::Cell::new(SearchStats::default()),
         }
@@ -350,6 +380,50 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         self.mu_multiple = mu_multiple;
     }
 
+    /// How much a byte of **file size** is worth, against a byte of potential.
+    ///
+    /// Every other weight in this heap prices a move by what it does to
+    /// `Φ = Σ_{live bytes} address`, and `Φ` is indifferent to whether free space
+    /// sits below `end` or vanishes above it. But `end` is what is actually read
+    /// off the heap, and truncation is the only way compaction reduces it. `ν` is
+    /// the first term that says so.
+    ///
+    /// It prices exactly one candidate, [`Self::end_slide_candidate`], because
+    /// that is the only step shape whose product is `end` rather than `Φ`.
+    ///
+    /// # The scale
+    ///
+    /// Every candidate is ranked **per byte copied**, so the end slide's own
+    /// product has to be expressed that way too: it retires `w` bytes of `end`
+    /// while copying `r`, a **rate** in `[0, 1]`. Per-byte potential gain lives in
+    /// `[0, end)` -- a byte can travel at most the height of the heap. So
+    /// multiplying the rate by `end` puts the two on the same range, and
+    ///
+    /// ```text
+    /// score = w  +  ν · end · w / r
+    /// ```
+    ///
+    /// leaves `ν` **dimensionless**, which is what makes it a knob rather than a
+    /// constant needing re-tuning per heap size. Read it as: *`ν = 1` says a move
+    /// that retires a byte of `end` for every byte it copies is worth as much as
+    /// the best move the heap could possibly offer* -- one that carries a byte
+    /// the full height of the address space. That is the natural unit, and it is
+    /// the default the initial experiment uses.
+    ///
+    /// `ν = 0` disables the candidate outright, recovering best-of-two.
+    ///
+    /// # Why this needs a knob at all, rather than a fixed rule
+    ///
+    /// Because the trade is genuinely uncertain. An end slide is the one move
+    /// that is *guaranteed* to shrink the file, and also the one whose bytes are
+    /// guaranteed to move again -- everything it touches sits above every gap, so
+    /// the frontier will reach it eventually. It buys a certain gain now against a
+    /// certain cost later, and only measurement can say at what rate that is worth
+    /// doing.
+    pub fn set_nu(&mut self, nu: u64) {
+        self.nu = nu;
+    }
+
     /// Turn the size reward on or off. See [`lambda`](Self::lambda).
     pub fn set_lambda(&mut self, lambda: bool) {
         self.set_weights(Weights {
@@ -446,16 +520,26 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             // the slide to identify it is redundant work, which is why it is
             // test-only; `Step` is small and equality is exact.
             #[cfg(test)]
-            let provenance = (
-                self.slide_candidate(budget - moved).map(|(_, s)| s) == Some(step),
-                self.end,
-            );
+            let provenance = {
+                let remaining = budget - moved;
+                // Frontier first, so that a step both shapes could have produced
+                // -- a heap with one gap, whose run fits the budget -- is
+                // attributed the same way the ranking resolved it.
+                let shape = if self.slide_candidate(remaining).map(|(_, s)| s) == Some(step) {
+                    Shape::Slide
+                } else if self.end_slide_candidate(remaining).map(|(_, s)| s) == Some(step) {
+                    Shape::EndSlide
+                } else {
+                    Shape::Evacuation
+                };
+                (shape, self.end)
+            };
             self.commit_compaction_step(step);
             #[cfg(test)]
             {
-                let (is_slide, before_end) = provenance;
+                let (shape, before_end) = provenance;
                 let mut stats = self.stats.get();
-                stats.record_step(is_slide, step.len, before_end - self.end);
+                stats.record_step(shape, step.len, before_end - self.end);
                 self.stats.set(stats);
             }
             moved += step.len;
@@ -934,6 +1018,60 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// alone would usually exceed any evacuation's entire score and the reward
     /// would stop being a tie-breaker and become a standing preference for
     /// sliding.
+    /// The **end slide**: the top run shifted down onto the highest gap, which is
+    /// the only step shape that is guaranteed to shrink the file.
+    ///
+    /// The highest gap is the only one with no gap above it, so the run sitting
+    /// on it reaches `end`. Sliding that run down by the gap's width `w` retires
+    /// exactly `w` bytes of `end` and destroys the gap. Nothing else has that
+    /// property: a frontier slide moves free space upward without retiring any of
+    /// it, and an evacuation retires `end` only in the special case that its
+    /// mover happens to be the topmost allocation.
+    ///
+    /// # The guard, which is not optional
+    ///
+    /// **Only offered when the whole run fits the remaining budget.** A
+    /// budget-truncated slide retires nothing at all -- it shifts a prefix down
+    /// and leaves the gap re-formed above it, `w` bytes wide as before, one
+    /// budget higher up. Repeat that and the gap walks the entire heap at a cost
+    /// of one full copy per budget, reclaiming `w` bytes at the end of it. That
+    /// is not a hypothetical: it is precisely the 157 MB the widest-gap slide
+    /// spent in the measured endgame, where the top gap was 16 bytes and the run
+    /// above it hundreds of kilobytes.
+    ///
+    /// With the guard, an end slide copies at most one budget and always destroys
+    /// a gap, so total end-slide copying over a compaction run is bounded by
+    /// `gaps · budget` -- linear, and it degrades to *silence* exactly in the
+    /// regime that broke the old policy, since a long top run simply fails the
+    /// test and the frontier slide finishes the job instead.
+    ///
+    /// # The score
+    ///
+    /// Per-byte potential gain is `w`, as for any slide. The `ν` term prices what
+    /// the potential cannot see; see [`Self::set_nu`] for why it is scaled by
+    /// `end`. Both are computed here rather than in the index because neither the
+    /// top run's length nor `end` is a function of a single key.
+    fn end_slide_candidate(&self, budget: u64) -> Option<(u64, Step<u64>)> {
+        if self.nu == 0 {
+            return None;
+        }
+        let to = self.index.highest_gap()?;
+        let from = self.next_start(to)?;
+        let w = from - to;
+        let r = self.end - from; // no gaps above `to`, so the run reaches `end`
+        if r == 0 || r > budget {
+            return None;
+        }
+        // `end · w / r` in `u128`: `end · w` alone can exceed `u64` on a large
+        // heap with a wide top gap, though the quotient never does.
+        let rate = u128::from(self.nu) * u128::from(self.end) * u128::from(w) / u128::from(r);
+        let reward = if self.weights.lambda { r.min(w) } else { 0 };
+        let gain = w
+            .saturating_add(reward)
+            .saturating_add(u64::try_from(rate).unwrap_or(u64::MAX));
+        Some((gain, Step { from, to, len: r }))
+    }
+
     fn slide_candidate(&self, budget: u64) -> Option<(u64, Step<u64>)> {
         let to = self.index.lowest_gap()?;
         // A gap always has an allocation above it -- free space at the top is
@@ -1041,6 +1179,14 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
     /// whole, since reporting quiescence would strand its gap forever.
     fn propose_compaction_step(&self, budget: u64) -> Option<Step<u64>> {
         let mut best: Option<(u64, Step<u64>)> = self.slide_candidate(budget);
+
+        // The end slide, at `ν > 0`. Offered second so that a tie keeps the
+        // frontier slide, which is the shape that guarantees termination.
+        if let Some((gain, step)) = self.end_slide_candidate(budget) {
+            if best.is_none_or(|(incumbent, _)| gain > incumbent) {
+                best = Some((gain, step));
+            }
+        }
 
         // The index maximizes `score(A) − G.pos` directly and reports it, which
         // matters once `λ` is on: the objective is then no longer the travel
@@ -1215,6 +1361,11 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             gaps.iter().map(|&(pos, _)| pos).min(),
             "lowest_gap disagreed with a scan"
         );
+        assert_eq!(
+            self.index.highest_gap(),
+            gaps.iter().map(|&(pos, _)| pos).max(),
+            "highest_gap disagreed with a scan"
+        );
         for min_len in gaps
             .iter()
             .flat_map(|&(_, len)| [len.saturating_sub(1), len, len + 1])
@@ -1258,25 +1409,37 @@ mod tests {
 
     const UNBOUNDED: u64 = u64::MAX;
 
-    /// The policy settings the randomized tests sweep: `(λ, α, (μ₁, μₖ))`.
+    /// The policy settings the randomized tests sweep: `(λ, α, (μ₁, μₖ), ν)`.
     ///
     /// Every one of them must converge to a gapless heap and must never propose
     /// an invalid step -- none of these knobs is allowed to buy correctness with
-    /// tuning. The shipped default is first; the last two are deliberately
-    /// extreme, to check that weights large enough to dominate the distance term
-    /// still cannot stall compaction or produce an upward move.
+    /// tuning. The shipped default is first; the extreme entries exist to check
+    /// that weights large enough to dominate the distance term still cannot stall
+    /// compaction or produce an upward move.
     ///
     /// `λ` and `α` never appear together with both non-zero, because they cannot
     /// both bite: the sign bound gives an allocation `A.size` to spend and `λ`
     /// spends all of it. See [`Weights::score`].
-    const POLICIES: [(bool, u64, (u64, u64)); 7] = [
-        (false, 0, (0, 0)),
-        (true, 0, (0, 0)),
-        (false, 64, (0, 0)),
-        (false, 0, (4096, 512)),
-        (true, 0, (4096, 512)),
-        (false, 64, (4096, 512)),
-        (false, u64::MAX, (1 << 40, 1 << 36)),
+    ///
+    /// The `ν` rungs vary **only** `ν`, against the otherwise-default policy, so
+    /// that the end slide's effect is not confounded with anything else -- which
+    /// the α/μ rungs of the original sweep are, and which cost that comparison
+    /// most of its force. `ν = 1` is the natural unit (see
+    /// [`GainGreedyHeap::set_nu`]); the rungs bracket it by a factor of eight
+    /// either way, and `u64::MAX` checks that a `ν` big enough to make the end
+    /// slide win whenever it is offered still converges.
+    const POLICIES: [(bool, u64, (u64, u64), u64); 11] = [
+        (false, 0, (0, 0), 0),
+        (true, 0, (0, 0), 0),
+        (false, 64, (0, 0), 0),
+        (false, 0, (4096, 512), 0),
+        (true, 0, (4096, 512), 0),
+        (false, 64, (4096, 512), 0),
+        (false, u64::MAX, (1 << 40, 1 << 36), 0),
+        (false, 0, (0, 0), 1),
+        (false, 0, (0, 0), 8),
+        (false, 0, (0, 0), 64),
+        (false, 0, (0, 0), u64::MAX),
     ];
 
     type Heap = GainGreedyHeap<Pointer<u32>>;
@@ -1939,11 +2102,12 @@ mod tests {
             state ^= state << 17;
             state
         };
-        for (lambda, alpha, mu) in POLICIES {
+        for (lambda, alpha, mu, nu) in POLICIES {
             let mut h = Heap::new();
             h.set_lambda(lambda);
             h.set_alpha(alpha);
             h.set_mu(mu.0, mu.1);
+            h.set_nu(nu);
             let mut live: Vec<Pointer<u32>> = Vec::new();
             let mut counter = 1u32;
 
@@ -2222,6 +2386,84 @@ mod tests {
         assert_eq!(h.index.widest_gap(), Some((40, 38)));
     }
 
+    /// A three-gap-free layout with two gaps, neither wide enough for any
+    /// survivor, so no evacuation competes and the two slides are on show
+    /// against each other:
+    ///
+    /// ```text
+    ///   0..40   alloc      40..48  gap (8)   <- frontier
+    ///  48..88   alloc      88..104 gap (16)  <- highest, `end` sits above it
+    /// 104..144  alloc                        <- the top run, 40 bytes
+    /// ```
+    fn two_gap_heap() -> Heap {
+        let mut h = Heap::new();
+        h.alloc(resizable(1), 40).unwrap(); //   0..40
+        h.alloc(resizable(2), 8).unwrap(); //   40..48   freed
+        h.alloc(resizable(3), 40).unwrap(); //  48..88
+        h.alloc(resizable(4), 16).unwrap(); //  88..104  freed
+        h.alloc(resizable(5), 40).unwrap(); // 104..144
+        h.free(resizable(2)).unwrap();
+        h.free(resizable(4)).unwrap();
+        assert_eq!(h.len(), 144);
+        h
+    }
+
+    /// At `ν > 0` the end slide beats the frontier slide even though its gap is
+    /// no more valuable per byte travelled -- because it is the only one of the
+    /// two that shrinks the file, and `ν` is what says so.
+    #[test]
+    fn the_end_slide_retires_end_where_the_frontier_slide_only_moves_free_space() {
+        let mut h = two_gap_heap();
+        h.set_nu(1);
+
+        let step = h.propose_compaction_step(UNBOUNDED).unwrap();
+        assert_eq!(
+            step,
+            Step {
+                from: 104,
+                to: 88,
+                len: 40
+            },
+            "the top run should slide onto the highest gap"
+        );
+        h.commit_compaction_step(step);
+        h.assert_invariants();
+        assert_eq!(h.len(), 128, "`end` retired exactly the top gap's 16 bytes");
+        assert_eq!(h.index.highest_gap(), Some(40), "only the frontier is left");
+
+        // At `ν = 0` the candidate is not offered at all, and the frontier slide
+        // takes the step -- which moves the same amount of free space upward
+        // while leaving `end` exactly where it was.
+        let mut h = two_gap_heap();
+        let step = h.propose_compaction_step(UNBOUNDED).unwrap();
+        assert_eq!(step.to, 40, "the frontier");
+        h.commit_compaction_step(step);
+        assert_eq!(h.len(), 144, "nothing retired");
+    }
+
+    /// The guard, which is the whole reason this candidate is safe: a top run
+    /// that does not fit the budget would be *truncated*, and a truncated end
+    /// slide retires nothing -- it shifts a prefix down and re-forms the gap one
+    /// budget higher. Repeat that and the gap walks the heap at a cost of one
+    /// full copy per budget, which is exactly the 157 MB the widest-gap slide
+    /// used to spend. So it is declined rather than truncated.
+    #[test]
+    fn an_end_slide_that_would_be_truncated_is_not_offered_at_all() {
+        let mut h = two_gap_heap();
+        h.set_nu(u64::MAX); // however much it is wanted, the guard still binds
+
+        let step = h.propose_compaction_step(32).unwrap();
+        assert_eq!(
+            step.to, 40,
+            "the 40-byte top run does not fit a 32-byte budget, so the \
+             frontier slide takes the step instead"
+        );
+
+        // One more byte of budget and it is affordable, so it is taken.
+        let step = h.propose_compaction_step(40).unwrap();
+        assert_eq!(step.to, 88, "now the whole top run fits");
+    }
+
     /// The property the whole change exists for: compacting a heap riddled with
     /// gaps copies each live byte **once**, not once per gap below it.
     ///
@@ -2420,10 +2662,12 @@ mod tests {
         /// Whether the burst ran out of work before it ran out of budget.
         quiesced: bool,
         /// Which candidate shape the burst's steps took, and how many bytes each
-        /// moved. `slides + evacuations` is the step count.
+        /// moved. `slides + end_slides + evacuations` is the step count.
         slides: u64,
+        end_slides: u64,
         evacuations: u64,
         slide_bytes: u64,
+        end_slide_bytes: u64,
         evac_bytes: u64,
         /// How many bytes of `end` each shape bought. Every compaction step
         /// *conserves* free space -- it takes `len` free bytes at the destination
@@ -2433,6 +2677,7 @@ mod tests {
         /// nowhere else, which is why it is split by shape where
         /// `end_before − end_after` (necessarily their sum) is not.
         truncated_by_slides: u64,
+        truncated_by_end_slides: u64,
         truncated_by_evacuations: u64,
         /// Placements since the *previous* burst -- workload activity rather than
         /// compaction, but the other half of the free-space budget: free bytes
@@ -2490,10 +2735,14 @@ mod tests {
             micros,
             quiesced,
             slides: stats.slides - stats_before.slides,
+            end_slides: stats.end_slides - stats_before.end_slides,
             evacuations: stats.evacuations - stats_before.evacuations,
             slide_bytes: stats.slide_bytes - stats_before.slide_bytes,
+            end_slide_bytes: stats.end_slide_bytes - stats_before.end_slide_bytes,
             evac_bytes: stats.evac_bytes - stats_before.evac_bytes,
             truncated_by_slides: stats.truncated_by_slides - stats_before.truncated_by_slides,
+            truncated_by_end_slides: stats.truncated_by_end_slides
+                - stats_before.truncated_by_end_slides,
             truncated_by_evacuations: stats.truncated_by_evacuations
                 - stats_before.truncated_by_evacuations,
             placed_in_gap: stats.placed_in_gap - stats_before.placed_in_gap,
@@ -2511,6 +2760,7 @@ mod tests {
         lambda: bool,
         alpha: u64,
         mu: (u64, u64),
+        nu: u64,
         churn_rounds: usize,
     }
 
@@ -2518,22 +2768,24 @@ mod tests {
     /// overheads, rates and percentages are all derivable downstream, and a
     /// measurement file that has already done the arithmetic cannot be
     /// re-interrogated.
-    const CSV_HEADER: &str = "workload,phase,lambda,alpha,mu_exact,mu_multiple,churn_rounds,\
+    const CSV_HEADER: &str = "workload,phase,lambda,alpha,mu_exact,mu_multiple,nu,churn_rounds,\
 burst,round,allocations,live_bytes_before,end_before,live_bytes_after,end_after,\
-gaps_after,widest_gap_after,micros,quiesced,slides,evacuations,slide_bytes,evac_bytes,\
-truncated_by_slides,truncated_by_evacuations,\
+gaps_after,widest_gap_after,micros,quiesced,\
+slides,end_slides,evacuations,slide_bytes,end_slide_bytes,evac_bytes,\
+truncated_by_slides,truncated_by_end_slides,truncated_by_evacuations,\
 placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
 
     fn print_csv(run: Run, bursts: &[Burst]) {
         for b in bursts {
             println!(
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 run.workload,
                 run.phase,
                 u8::from(run.lambda),
                 run.alpha,
                 run.mu.0,
                 run.mu.1,
+                run.nu,
                 run.churn_rounds,
                 b.burst,
                 b.round,
@@ -2547,10 +2799,13 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
                 b.micros,
                 u8::from(b.quiesced),
                 b.slides,
+                b.end_slides,
                 b.evacuations,
                 b.slide_bytes,
+                b.end_slide_bytes,
                 b.evac_bytes,
                 b.truncated_by_slides,
+                b.truncated_by_end_slides,
                 b.truncated_by_evacuations,
                 b.placed_in_gap,
                 b.placed_at_end,
@@ -2711,18 +2966,19 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
     #[ignore = "measurement, not a behavioural test; takes minutes"]
     fn compaction_cost_over_a_shrinking_workload() {
         println!("{CSV_HEADER}");
-        for (lambda, alpha, mu) in POLICIES {
+        for (lambda, alpha, mu, nu) in POLICIES {
             for &rounds in &[400usize, 4_000, 40_000] {
-                measure_shrinking(rounds, lambda, alpha, mu);
+                measure_shrinking(rounds, lambda, alpha, mu, nu);
             }
         }
     }
 
-    fn measure_shrinking(churn_rounds: usize, lambda: bool, alpha: u64, mu: (u64, u64)) {
+    fn measure_shrinking(churn_rounds: usize, lambda: bool, alpha: u64, mu: (u64, u64), nu: u64) {
         let mut h = Heap::new();
         h.set_lambda(lambda);
         h.set_alpha(alpha);
         h.set_mu(mu.0, mu.1);
+        h.set_nu(nu);
         // The churn only builds the starting state here; its bursts are the
         // growing measurement's business and are dropped rather than emitted
         // twice under two different workload labels.
@@ -2743,6 +2999,7 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
                 lambda,
                 alpha,
                 mu,
+                nu,
                 churn_rounds,
             },
             &bursts,
@@ -2789,18 +3046,19 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
     #[ignore = "measurement, not a behavioural test; takes minutes"]
     fn compaction_cost_when_the_workload_stops() {
         println!("{CSV_HEADER}");
-        for (lambda, alpha, mu) in POLICIES {
+        for (lambda, alpha, mu, nu) in POLICIES {
             for &rounds in &[400usize, 4_000, 40_000] {
-                measure_quiescing(rounds, lambda, alpha, mu);
+                measure_quiescing(rounds, lambda, alpha, mu, nu);
             }
         }
     }
 
-    fn measure_quiescing(churn_rounds: usize, lambda: bool, alpha: u64, mu: (u64, u64)) {
+    fn measure_quiescing(churn_rounds: usize, lambda: bool, alpha: u64, mu: (u64, u64), nu: u64) {
         let mut h = Heap::new();
         h.set_lambda(lambda);
         h.set_alpha(alpha);
         h.set_mu(mu.0, mu.1);
+        h.set_nu(nu);
         let (live, next_counter, _) = run_churny_workload_tracked(&mut h, churn_rounds);
 
         // Shrink to about half, checked only at burst boundaries. The round cap
@@ -2818,6 +3076,7 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
             lambda,
             alpha,
             mu,
+            nu,
             churn_rounds,
         };
         print_csv(run, &shrink_bursts);
@@ -2828,7 +3087,7 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
         loop {
             let n = rows.len();
             let row = timed_steps(&mut h, last_round, n, QUIESCE_STEPS_PER_ROW);
-            let done = row.quiesced || row.slides + row.evacuations == 0;
+            let done = row.quiesced || row.slides + row.end_slides + row.evacuations == 0;
             rows.push(row);
             if done || rows.len() >= QUIESCE_ROW_CAP {
                 break;
@@ -2852,11 +3111,12 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
     /// growing.
     #[test]
     fn a_shrinking_workload_stays_consistent_and_compacts() {
-        for (lambda, alpha, mu) in POLICIES {
+        for (lambda, alpha, mu, nu) in POLICIES {
             let mut h = Heap::new();
             h.set_lambda(lambda);
             h.set_alpha(alpha);
             h.set_mu(mu.0, mu.1);
+            h.set_nu(nu);
             let (live, _, _) = run_churny_workload_tracked(&mut h, 400);
             assert!(
                 h.live_count() > 50,
@@ -2911,18 +3171,19 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
     #[ignore = "measurement, not a behavioural test; takes minutes"]
     fn candidate_search_cost_over_a_churny_workload() {
         println!("{CSV_HEADER}");
-        for (lambda, alpha, mu) in POLICIES {
+        for (lambda, alpha, mu, nu) in POLICIES {
             for &rounds in &[400usize, 4_000, 40_000] {
-                measure_one(rounds, lambda, alpha, mu);
+                measure_one(rounds, lambda, alpha, mu, nu);
             }
         }
     }
 
-    fn measure_one(rounds: usize, lambda: bool, alpha: u64, mu: (u64, u64)) {
+    fn measure_one(rounds: usize, lambda: bool, alpha: u64, mu: (u64, u64), nu: u64) {
         let mut h = Heap::new();
         h.set_lambda(lambda);
         h.set_alpha(alpha);
         h.set_mu(mu.0, mu.1);
+        h.set_nu(nu);
         let (_, _, churn_bursts) = run_churny_workload_tracked(&mut h, rounds);
 
         // Then catch up: compaction with no churn competing, until the file is
@@ -2935,7 +3196,7 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
         while h.len() > target {
             let n = catchup_bursts.len();
             let burst = timed_burst(&mut h, rounds, n, CATCH_UP_BUDGET);
-            let done = burst.quiesced || burst.slides + burst.evacuations == 0;
+            let done = burst.quiesced || burst.slides + burst.end_slides + burst.evacuations == 0;
             catchup_bursts.push(burst);
             if done {
                 break;
@@ -2948,6 +3209,7 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
             lambda,
             alpha,
             mu,
+            nu,
             churn_rounds: rounds,
         };
         print_csv(run, &churn_bursts);
@@ -2962,12 +3224,12 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
 
     #[test]
     fn compaction_converges_from_a_randomized_workload() {
-        for (lambda, alpha, mu) in POLICIES {
-            converges_under(lambda, alpha, mu);
+        for (lambda, alpha, mu, nu) in POLICIES {
+            converges_under(lambda, alpha, mu, nu);
         }
     }
 
-    fn converges_under(lambda: bool, alpha: u64, mu: (u64, u64)) {
+    fn converges_under(lambda: bool, alpha: u64, mu: (u64, u64), nu: u64) {
         // A tiny xorshift keeps this deterministic without a dev-dependency.
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut rand = move || {
@@ -2981,6 +3243,7 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
         h.set_lambda(lambda);
         h.set_alpha(alpha);
         h.set_mu(mu.0, mu.1);
+        h.set_nu(nu);
         let mut live: Vec<Pointer<u32>> = Vec::new();
         let mut next_counter = 1u32;
 
