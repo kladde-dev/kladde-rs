@@ -132,13 +132,18 @@ impl Key {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Aggregate {
     /// Lowest `G.pos` over gaps in the subtree.
+    ///
+    /// At the root this is the **compaction frontier**: everything below it is
+    /// at its final address, since the gapless layout moves every byte above the
+    /// lowest gap down and every byte below it not at all. That is what
+    /// `lowest_gap()` reads, and it is the slide's destination -- see
+    /// [`GainGreedyHeap::slide_candidate`].
+    ///
+    /// It doubles as the "does this subtree hold a gap at all" predicate
+    /// (`!= u64::MAX`), which is what [`WidestGap`]'s descent steers by.
+    ///
+    /// [`GainGreedyHeap::slide_candidate`]: crate::GainGreedyHeap
     min_gap_pos: u64,
-    /// Widest gap in the subtree, and the *lowest* position achieving that
-    /// width. Together they answer `widest_gap()` at the root in `O(1)`, which
-    /// is what the slide candidate needs -- and what an entire separate
-    /// `BTreeMap<width, BTreeSet<pos>>` used to be kept for.
-    max_gap_width: u64,
-    widest_gap_pos: u64,
     /// Highest `score` over allocations in the subtree, and the allocation
     /// achieving it. The witness rides along because the merge has to be able to
     /// name the mover of a crossing pair, and `from_inner` never sees keys of
@@ -158,8 +163,6 @@ impl Default for Aggregate {
     fn default() -> Self {
         Self {
             min_gap_pos: u64::MAX,
-            max_gap_width: 0,
-            widest_gap_pos: u64::MAX,
             max_alloc_score: 0,
             max_alloc_addr: 0,
             max_alloc_size: 0,
@@ -177,8 +180,6 @@ impl Aggregate {
         let mut a = Self::default();
         if key.is_gap() {
             a.min_gap_pos = key.score;
-            a.max_gap_width = key.size();
-            a.widest_gap_pos = key.score;
         } else {
             a.max_alloc_score = key.score;
             a.max_alloc_addr = key.addr;
@@ -214,16 +215,6 @@ impl Aggregate {
 
         if lower.min_gap_pos < self.min_gap_pos {
             self.min_gap_pos = lower.min_gap_pos;
-        }
-        // Ties on width go to the lower position: among equally wide gaps the
-        // slide wants the deepest one, since every byte it moves then travels
-        // the same distance from a lower place.
-        if lower.max_gap_width > self.max_gap_width
-            || (lower.max_gap_width == self.max_gap_width
-                && lower.widest_gap_pos < self.widest_gap_pos)
-        {
-            self.max_gap_width = lower.max_gap_width;
-            self.widest_gap_pos = lower.widest_gap_pos;
         }
         if lower.max_alloc_score > self.max_alloc_score {
             self.max_alloc_score = lower.max_alloc_score;
@@ -316,11 +307,31 @@ impl EvacuationIndex {
         self.tree.root_argument().scored_step()
     }
 
-    /// The widest gap, as `(pos, width)`, taking the lowest-addressed one when
-    /// several are equally wide. Also a root read.
+    /// The **compaction frontier**: the lowest-addressed gap in the heap, or
+    /// `None` when the heap is gapless. A root read.
+    ///
+    /// This is the slide's destination. Everything below it is already at its
+    /// final address, so a slide into it settles the bytes it moves for good --
+    /// which is the whole reason compaction terminates in a linear number of
+    /// copied bytes rather than a quadratic one. See
+    /// [`GainGreedyHeap::slide_candidate`].
+    ///
+    /// [`GainGreedyHeap::slide_candidate`]: crate::GainGreedyHeap
+    pub fn lowest_gap(&self) -> Option<u64> {
+        let pos = self.tree.root_argument().min_gap_pos;
+        (pos != u64::MAX).then_some(pos)
+    }
+
+    /// The widest gap, as `(pos, width)`, taking the **highest**-addressed one
+    /// when several are equally wide.
+    ///
+    /// Nothing in the compactor needs this any more -- it is a diagnostic, read
+    /// by the measurement harness and by `assert_consistent`. So it is a descent
+    /// (`O(B log_B n)`) rather than the two extra `Aggregate` fields it used to
+    /// be, which were paid for on every merge at every level of every update.
+    /// Cold-path cost in exchange for a smaller hot path.
     pub fn widest_gap(&self) -> Option<(u64, u64)> {
-        let a = self.tree.root_argument();
-        (a.max_gap_width > 0).then_some((a.widest_gap_pos, a.max_gap_width))
+        self.tree.descend_visit(WidestGap)
     }
 
     /// The lowest-addressed gap at least `min_len` bytes wide.
@@ -382,6 +393,37 @@ impl Key {
     fn with_sized(mut self, sized: u64) -> Self {
         self.sized = sized;
         self
+    }
+}
+
+/// Descends to the last gap in key order, which -- since the key leads with
+/// `(width << 1) | 1` -- is the widest one.
+///
+/// The steering predicate is `min_gap_pos != u64::MAX`, "this subtree holds a
+/// gap": entering the *rightmost* child that holds one and repeating is exactly
+/// a descent to the last gap. Allocations are not in the way even though a large
+/// allocation outranks a small gap, because a child holding only allocations is
+/// skipped outright.
+struct WidestGap;
+
+impl DescendVisit<Key, (), Aggregate> for WidestGap {
+    type Result = (u64, u64);
+
+    fn visit_inner(
+        &mut self,
+        _keys: &[Key],
+        arguments: &[Aggregate],
+    ) -> DescendVisitResult<Self::Result> {
+        match arguments.iter().rposition(|a| a.min_gap_pos != u64::MAX) {
+            Some(child) => DescendVisitResult::GoDown(child),
+            None => DescendVisitResult::Cancel,
+        }
+    }
+
+    fn visit_leaf(&mut self, keys: &[Key], _values: &[()]) -> Option<Self::Result> {
+        keys.iter()
+            .rfind(|k| k.is_gap())
+            .map(|k| (k.score, k.size()))
     }
 }
 
@@ -522,14 +564,11 @@ mod tests {
         }
 
         fn widest_gap_by_scan(&self) -> Option<(u64, u64)> {
-            let widest = self.gaps.iter().map(|&(_, w)| w).max()?;
-            let pos = self
-                .gaps
-                .iter()
-                .filter(|&&(_, w)| w == widest)
-                .map(|&(p, _)| p)
-                .min()?;
-            Some((pos, widest))
+            self.gaps.iter().copied().max_by_key(|&(pos, w)| (w, pos))
+        }
+
+        fn lowest_gap_by_scan(&self) -> Option<u64> {
+            self.gaps.iter().map(|&(pos, _)| pos).min()
         }
     }
 
@@ -632,13 +671,28 @@ mod tests {
     }
 
     #[test]
-    fn the_widest_gap_query_breaks_ties_towards_the_lowest_address() {
+    fn the_widest_gap_query_finds_the_widest_past_larger_allocations() {
         let layout = Layout {
-            allocs: vec![(10, 8)],
+            // The 4096-byte allocation outranks every gap in key order, so a
+            // descent that merely walked right would land on it.
+            allocs: vec![(10, 8), (2000, 4096)],
             gaps: vec![(300, 64), (100, 64), (500, 8)],
             lambda: false,
         };
-        assert_eq!(layout.index().widest_gap(), Some((100, 64)));
+        // Widest, and among equally wide the highest-addressed.
+        assert_eq!(layout.index().widest_gap(), Some((300, 64)));
+    }
+
+    #[test]
+    fn the_frontier_is_the_lowest_gap_whatever_its_width() {
+        let layout = Layout {
+            allocs: vec![(10, 8)],
+            // The lowest gap is the narrowest one: width must not enter into it.
+            gaps: vec![(300, 64), (100, 1), (500, 8)],
+            lambda: false,
+        };
+        assert_eq!(layout.index().lowest_gap(), Some(100));
+        assert_eq!(EvacuationIndex::default().lowest_gap(), None);
     }
 
     #[test]
@@ -689,6 +743,11 @@ mod tests {
                     ix.widest_gap(),
                     layout.widest_gap_by_scan(),
                     "lambda={lambda} n={n}: widest_gap disagreed with a scan"
+                );
+                assert_eq!(
+                    ix.lowest_gap(),
+                    layout.lowest_gap_by_scan(),
+                    "lambda={lambda} n={n}: lowest_gap disagreed with a scan"
                 );
 
                 for budget in [0u64, 1, 8, 15, 16, 63, 64, 249, 250, 251, 10_000] {

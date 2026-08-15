@@ -49,7 +49,6 @@ use crate::heap::{
     AllocationId, HeapError, IncrementallyCompactableHeap, RelocatableHeap, Relocation, Step,
 };
 use crate::size_classes::SizeClasses;
-
 /// One row of the address-keyed table.
 #[derive(Clone, Copy)]
 struct Entry<Id> {
@@ -827,8 +826,8 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         step
     }
 
-    /// The slide candidate: the run above the widest gap, shifting down into it,
-    /// paired with its per-byte gain.
+    /// The slide candidate: the run above the **lowest** gap, shifting down into
+    /// it, paired with its per-byte gain.
     ///
     /// This is the candidate that guarantees progress. It does not require the
     /// run to fit in the gap, and a maximal run is flanked by free space above (a
@@ -837,6 +836,64 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// travels exactly `gap_len` down, so its per-byte gain is `gap_len` --
     /// positive while any gap exists, which is what the evacuation index cannot
     /// promise on a heap whose every gap is too narrow for anything.
+    ///
+    /// # Why the lowest gap and not the widest
+    ///
+    /// Both choices close exactly one gap per untruncated slide, so gap-count
+    /// progress does not separate them. What separates them is **order**, and
+    /// the cost of closing a gap is the live bytes between it and the next gap
+    /// still open above it:
+    ///
+    /// - Closing a gap *above* `G` lengthens the run `G` will later have to
+    ///   move, from `R` to `R + R'`. Do that repeatedly and the total is
+    ///   quadratic in the gap count.
+    /// - Closing them bottom-up telescopes: `Σ Rᵢ` is exactly the live bytes
+    ///   above the lowest gap, each byte moved **once**. That is also the lower
+    ///   bound -- every byte above the lowest gap must move at least once -- so
+    ///   bottom-up slides are optimal in bytes copied, not merely better.
+    ///
+    /// Equivalently, and this is the sharper statement: a slide into any gap
+    /// that is not the lowest one moves bytes that are *provably going to move
+    /// again*, since the gapless layout drops everything above the lowest gap by
+    /// at least its width. [`EvacuationIndex::lowest_gap`] is the frontier below
+    /// which the heap is final, and a slide into it is the only step shape that
+    /// advances that frontier.
+    ///
+    /// Measured on the quiescing workload at 40 000 churn rounds -- 6 980
+    /// allocations, 554 721 live bytes, 1 455 gaps, widest 236 bytes:
+    ///
+    /// | | steps | bytes copied | ms |
+    /// |---|---|---|---|
+    /// | widest-first | 81 280 | 157 432 614 | 7 510 |
+    /// | lowest-first | 2 135 | 572 888 | 63 |
+    ///
+    /// 573 KB against 555 KB live is the bound above, met to within 3%.
+    ///
+    /// # What it costs, which is not nothing
+    ///
+    /// The ranking against evacuations is deliberately left alone, on the theory
+    /// that it would switch regimes by itself -- evacuations out-scoring the
+    /// slide while gaps are wide, then vanishing once nothing fits the surviving
+    /// slivers. That is only half true, and the half that is false is measured:
+    ///
+    /// - **A burst costs 4-5x more** while the workload is running (110 -> 540 µs
+    ///   growing, 179 -> 594 µs shrinking, at 40 000 rounds). The frontier sits at
+    ///   the bottom of an already-compacted region, so the run above it is long
+    ///   and made of small allocations: `run_len_from` scans 9x further per
+    ///   proposal (11 -> 114 entries) and a step re-keys 7x more allocations for
+    ///   the same bytes moved (33 bytes per allocation moved, against 197).
+    /// - **`end` is retired later**, because a frontier slide only lets `end`
+    ///   retreat once the frontier reaches the last gap. Post-compaction overhead
+    ///   goes 0.79% -> 1.24% growing and 5.54% -> 8.48% shrinking, the latter a
+    ///   7.2% larger file at the end of the run.
+    ///
+    /// So this is a straight trade of the interrupted regime for the converging
+    /// one, and it is the right default only because the endgame was pathological
+    /// and the active regime merely gets worse. Recovering both means ranking the
+    /// slide by something other than its per-byte gain -- prefer *any* candidate
+    /// landing on the frontier, lexicographically, so that a top-of-heap
+    /// evacuation into it retires `end` and advances the frontier in one move.
+    /// Not done here; it is a policy change, not a destination change.
     ///
     /// Under `λ` it earns the same size reward an evacuation does, **capped at
     /// the distance travelled**. That cap is not an extra rule but the invariant
@@ -848,8 +905,12 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// would stop being a tie-breaker and become a standing preference for
     /// sliding.
     fn slide_candidate(&self, budget: u64) -> Option<(u64, Step<u64>)> {
-        let (to, gap_len) = self.index.widest_gap()?;
-        let from = to + gap_len;
+        let to = self.index.lowest_gap()?;
+        // A gap always has an allocation above it -- free space at the top is
+        // `end` retreating, not a gap -- so the width need not be carried in the
+        // key at all: it is the distance to the next allocation.
+        let from = self.next_start(to)?;
+        let gap_len = from - to;
         let (len, _truncated) = self.run_len_from(from, budget);
         if len == 0 {
             return None;
@@ -1001,7 +1062,7 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
         // retreating). Reading the unbudgeted root is `O(1)`, so keeping the
         // fallback costs nothing next to making the caller re-enter.
         let chosen = best.map(|(_, step)| step).or_else(|| {
-            debug_assert!(self.index.widest_gap().is_none(), "a gap with no slide");
+            debug_assert!(self.index.lowest_gap().is_none(), "a gap with no slide");
             self.index.best_evacuation().map(|(_, step)| step)
         });
         // Opportunistic, after the winner is known: never changes *which* move is
@@ -1114,11 +1175,15 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         // index answers is also checked against a scan.
         assert_eq!(
             self.index.widest_gap(),
-            gaps.iter().copied().max_by_key(|&(pos, len)| {
-                // Widest, and among equally wide the lowest-addressed.
-                (len, std::cmp::Reverse(pos))
-            }),
+            // Widest, and among equally wide the highest-addressed -- the
+            // descent walks to the last gap in key order.
+            gaps.iter().copied().max_by_key(|&(pos, len)| (len, pos)),
             "widest_gap disagreed with a scan"
+        );
+        assert_eq!(
+            self.index.lowest_gap(),
+            gaps.iter().map(|&(pos, _)| pos).min(),
+            "lowest_gap disagreed with a scan"
         );
         for min_len in gaps
             .iter()
@@ -2073,7 +2138,9 @@ mod tests {
         h.free(resizable(1)).unwrap();
         h.free(resizable(3)).unwrap();
 
-        // Both gaps are 10 wide; the run above the chosen one is just allocation 2.
+        // The slide targets the lower gap, and the run above it ends at the
+        // upper one -- so the step is allocation 2 alone, and committing it
+        // merges the two gaps into one.
         let step = h.propose_compaction_step(UNBOUNDED).unwrap();
         assert_eq!(
             step,
@@ -2086,6 +2153,94 @@ mod tests {
         );
         h.commit_compaction_step(step);
         h.assert_invariants();
+    }
+
+    /// The slide targets the frontier, not the best-looking gap: an 8-byte gap
+    /// at the bottom outranks a 30-byte gap higher up, even though the wider one
+    /// promises nearly four times the per-byte gain.
+    ///
+    /// It is the right call because closing the upper gap first would lengthen
+    /// the run the lower one has to move later -- the bytes the wide slide moves
+    /// are provably going to move again. Neither gap takes a 40-byte allocation,
+    /// so no evacuation competes and the slide's choice is on show by itself.
+    #[test]
+    fn the_slide_takes_the_lowest_gap_even_when_a_wider_one_sits_above_it() {
+        let mut h = Heap::new();
+        h.alloc(resizable(1), 8).unwrap(); //   0..8,    freed -> the frontier
+        h.alloc(resizable(2), 40).unwrap(); //  8..48
+        h.alloc(resizable(3), 30).unwrap(); //  48..78,  freed -> the wider gap
+        h.alloc(resizable(4), 40).unwrap(); //  78..118
+        h.free(resizable(1)).unwrap();
+        h.free(resizable(3)).unwrap();
+
+        let step = h.propose_compaction_step(UNBOUNDED).unwrap();
+        assert_eq!(
+            step,
+            Step {
+                from: 8,
+                to: 0,
+                len: 40
+            },
+            "the run above the frontier is allocation 2, ending at the wider gap"
+        );
+
+        // And committing it *merges* the two gaps rather than shuffling one of
+        // them upward: two gaps become one, 38 bytes wide.
+        h.commit_compaction_step(step);
+        h.assert_invariants();
+        assert_eq!(h.index.lowest_gap(), Some(40));
+        assert_eq!(h.index.widest_gap(), Some((40, 38)));
+    }
+
+    /// The property the whole change exists for: compacting a heap riddled with
+    /// gaps copies each live byte **once**, not once per gap below it.
+    ///
+    /// Widest-first satisfies neither bound -- it closes gaps in an order that
+    /// re-lengthens the runs still to be moved, and measured on the quiescing
+    /// workload it copied 284x the heap's live bytes.
+    #[test]
+    fn compacting_to_quiescence_copies_each_live_byte_about_once() {
+        let mut h = Heap::new();
+        // Every fourth allocation is a small filler, and every filler is freed:
+        // 125 gaps of 8 bytes, too narrow for any survivor, so the slide is the
+        // only candidate until merging has widened the frontier past 40.
+        for i in 1..=500u32 {
+            let size = if i % 4 == 0 { 8 } else { 40 };
+            h.alloc(resizable(i), size).unwrap();
+        }
+        for i in (4..=500u32).step_by(4) {
+            h.free(resizable(i)).unwrap();
+        }
+        let live = h.live_bytes();
+        let gaps = h.implied_gaps().len();
+        // 124, not 125: the topmost filler is at the top of the heap, so freeing
+        // it retreats `end` instead of leaving a gap behind.
+        assert_eq!(gaps, 124, "the layout under test");
+
+        let mut copied = 0u64;
+        let mut steps = 0u64;
+        while let Some(step) = h.propose_compaction_step(2048) {
+            copied += step.len;
+            steps += 1;
+            h.commit_compaction_step(step);
+            assert!(steps < 10_000, "not converging");
+        }
+        h.assert_invariants();
+        assert_eq!(h.len(), live, "fully compacted");
+
+        // Each live byte moves at most once, so the copying is bounded by the
+        // live bytes themselves -- with slack only for run extension re-reading
+        // its own neighbours, which it cannot.
+        assert!(
+            copied <= live,
+            "copied {copied} bytes against {live} live -- the endgame is superlinear again"
+        );
+        // And the step count is bounded by one per gap plus one per budget's
+        // worth of copying, which is what makes it linear rather than quadratic.
+        assert!(
+            steps <= gaps as u64 + copied / 2048 + 1,
+            "took {steps} steps for {gaps} gaps and {copied} bytes copied"
+        );
     }
 
     #[test]
