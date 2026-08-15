@@ -1521,6 +1521,74 @@ mod tests {
         h.assert_invariants();
     }
 
+    /// **The case `α` was introduced for, which it cannot buy.** Pinned as a test
+    /// because it is a limitation of the adopted design, not a bug: if this ever
+    /// starts failing, the sign bound has been relaxed and that should be a
+    /// deliberate decision.
+    ///
+    /// Two movers of the same size, both fitting the same destination:
+    ///
+    /// ```text
+    ///   [0,10)   gap G   <- the destination
+    ///   [10,30)  X (20)  <- too big for G, so never a candidate
+    ///   [30,40)  gap
+    ///   [40,50)  P (10)  <- free on both sides: vacating merges three gaps into one
+    ///   [50,60)  gap
+    ///   [60,70)  M (10)  <- free below, live above: vacating merely extends a gap
+    ///   [70,90)  Y (20)
+    /// ```
+    ///
+    /// Moving `P` leaves the heap with **one** gap; moving `M` leaves two. That
+    /// is exactly the preference `α` exists to express, and no value of `α` can
+    /// express it -- because the gap that makes `P` a plug is the same gap that
+    /// gives `M` a free neighbour below. So `M` carries no penalty at all, and
+    /// sits at `P.pos + P.size + gap >= P.pos + P.size + 1`, while the sign bound
+    /// caps `P`'s bonus at `P.size`. `P` is beaten by one byte more than `α` is
+    /// ever allowed to be worth, and the argument does not depend on the numbers.
+    #[test]
+    fn alpha_cannot_prefer_a_plug_over_the_allocation_above_its_own_gap() {
+        let plan = [
+            (1, 10, true),  // gap  0..10  <- destination
+            (2, 20, false), //     10..30
+            (3, 10, true),  // gap 30..40
+            (4, 10, false), //     40..50  <- P, the plug
+            (5, 10, true),  // gap 50..60
+            (6, 10, false), //     60..70  <- M, one free neighbour
+            (7, 20, false), //     70..90
+        ];
+
+        // First: moving P really is the better move for the gap count, so the
+        // preference is a real one and not a misreading of the layout.
+        let gaps_after = |from: u64| {
+            let mut h = heap_with_layout(&plan);
+            h.commit_compaction_step(Step {
+                from,
+                to: 0,
+                len: 10,
+            });
+            h.assert_invariants();
+            h.implied_gaps().len()
+        };
+        assert_eq!(
+            gaps_after(40),
+            1,
+            "extracting the plug should merge them all"
+        );
+        assert_eq!(gaps_after(60), 2, "extracting M should leave two gaps");
+
+        // Second: no weight buys it. `α` is capped at the mover's own size by the
+        // sign bound, and 40 + 10 is still less than 60.
+        let mut h = heap_with_layout(&plan);
+        for alpha in [0u64, 1, 9, 10, 11, 1_000, u64::MAX] {
+            h.set_alpha(alpha);
+            assert_eq!(
+                h.propose_compaction_step(UNBOUNDED).unwrap().from,
+                60,
+                "α={alpha} still cannot prefer the plug at 40"
+            );
+        }
+    }
+
     /// `α` makes an allocation's key depend on its *neighbours*, so a mutation
     /// next to `A` has to re-key `A` even though `A` did not change. If that
     /// bookkeeping were wrong the index would hold entries under keys nobody can
@@ -2136,6 +2204,15 @@ mod tests {
         /// microseconds. Plotted against `allocations` down the table, this is
         /// the scaling curve the compactor is judged on.
         micros_per_burst: f64,
+        /// `end` as it stood **before** the burst this snapshot follows.
+        ///
+        /// Every snapshot is taken *after* a burst, so `overhead_percent` is the
+        /// overhead compaction **left behind**, not the one it found. Without
+        /// this field the two are indistinguishable in the table, and "overhead
+        /// is 6%" would not say whether the burst had done anything at all.
+        /// Compaction never changes `live_bytes`, so the pair of `end` values is
+        /// the whole difference.
+        end_before: u64,
     }
 
     impl Snapshot {
@@ -2148,15 +2225,27 @@ mod tests {
                 gaps: h.implied_gaps().len(),
                 widest_gap: h.index.widest_gap().map_or(0, |(_, width)| width),
                 micros_per_burst: 0.0,
+                end_before: h.len(),
             }
         }
 
-        /// Free bytes as a percentage of live bytes.
+        /// Free bytes as a percentage of live bytes, **after** the burst this
+        /// snapshot follows.
         fn overhead_percent(&self) -> f64 {
+            self.overhead_of(self.end)
+        }
+
+        /// The same, as the burst *found* it. The difference between the two is
+        /// what the burst actually bought.
+        fn overhead_before_percent(&self) -> f64 {
+            self.overhead_of(self.end_before)
+        }
+
+        fn overhead_of(&self, end: u64) -> f64 {
             if self.live_bytes == 0 {
                 0.0
             } else {
-                100.0 * (self.end - self.live_bytes) as f64 / self.live_bytes as f64
+                100.0 * end.saturating_sub(self.live_bytes) as f64 / self.live_bytes as f64
             }
         }
     }
@@ -2227,6 +2316,7 @@ mod tests {
             // `compact_incrementally` spends a whole budget in one call, so a
             // pause does many consecutive steps with no mutation in between.
             if (round + 1) % COMPACTION_INTERVAL == 0 {
+                let end_before = h.len();
                 let t0 = std::time::Instant::now();
                 let (steps, quiesced) = h.compact_incrementally(COMPACTION_BUDGET);
                 window += t0.elapsed();
@@ -2238,6 +2328,7 @@ mod tests {
                     let mut snapshot = Snapshot::take(h, round);
                     snapshot.micros_per_burst =
                         window.as_secs_f64() * 1e6 / window_bursts.max(1) as f64;
+                    snapshot.end_before = end_before;
                     snapshots.push(snapshot);
                     window = std::time::Duration::ZERO;
                     window_bursts = 0;
@@ -2320,6 +2411,7 @@ mod tests {
             }
 
             if (round + 1) % COMPACTION_INTERVAL == 0 {
+                let end_before = h.len();
                 let t0 = std::time::Instant::now();
                 let (steps, quiesced) = h.compact_incrementally(COMPACTION_BUDGET);
                 let elapsed = t0.elapsed();
@@ -2328,6 +2420,7 @@ mod tests {
                 bursts.quiesced += u64::from(quiesced);
                 let mut snapshot = Snapshot::take(h, round);
                 snapshot.micros_per_burst = elapsed.as_secs_f64() * 1e6;
+                snapshot.end_before = end_before;
                 snapshots.push(snapshot);
             }
         }
@@ -2399,16 +2492,26 @@ mod tests {
         // Summaries over every burst past the burn-in, not over the printed rows.
         let steady = snapshots.get(SHRINK_BURN_IN_BURSTS..).unwrap_or(&[]);
         if !steady.is_empty() {
-            let overheads: Vec<f64> = steady.iter().map(Snapshot::overhead_percent).collect();
+            let before: Vec<f64> = steady
+                .iter()
+                .map(Snapshot::overhead_before_percent)
+                .collect();
+            let after: Vec<f64> = steady.iter().map(Snapshot::overhead_percent).collect();
             let micros: Vec<f64> = steady.iter().map(|s| s.micros_per_burst).collect();
             let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
             let max = |v: &[f64]| v.iter().copied().fold(f64::MIN, f64::max);
             println!(
-                "  steady state over {} bursts (burn-in {SHRINK_BURN_IN_BURSTS} dropped): \
-                 overhead mean {:.2}% peak {:.2}%; {:.1} us/burst mean, {:.1} peak",
+                "  steady state over {} bursts (burn-in {SHRINK_BURN_IN_BURSTS} dropped):\n    \
+                 overhead before a burst  mean {:.2}%  peak {:.2}%\n    \
+                 overhead after  a burst  mean {:.2}%  peak {:.2}%   <- what compaction leaves\n    \
+                 removed by a burst       mean {:.2}pp\n    \
+                 burst cost               mean {:.1} us  peak {:.1} us",
                 steady.len(),
-                mean(&overheads),
-                max(&overheads),
+                mean(&before),
+                max(&before),
+                mean(&after),
+                max(&after),
+                mean(&before) - mean(&after),
                 mean(&micros),
                 max(&micros),
             );
@@ -2418,21 +2521,30 @@ mod tests {
         // readable, always including the last.
         let stride = (snapshots.len() / 40).max(1);
         println!(
-            "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>9}  {:>11}",
-            "round", "allocations", "live_bytes", "end", "gaps", "widest", "overhead", "us/burst"
+            "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>9}  {:>9}  {:>11}",
+            "round",
+            "allocations",
+            "live_bytes",
+            "end",
+            "gaps",
+            "widest",
+            "before",
+            "after",
+            "us/burst"
         );
         for (i, s) in snapshots.iter().enumerate() {
             if i % stride != 0 && i + 1 != snapshots.len() {
                 continue;
             }
             println!(
-                "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>8.2}%  {:>11.1}",
+                "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>8.2}%  {:>8.2}%  {:>11.1}",
                 s.round,
                 s.allocations,
                 s.live_bytes,
                 s.end,
                 s.gaps,
                 s.widest_gap,
+                s.overhead_before_percent(),
                 s.overhead_percent(),
                 s.micros_per_burst,
             );
@@ -2613,19 +2725,31 @@ mod tests {
         report_search_stats("catching up", catching_up);
         report_step_shapes(during_bursts);
 
+        // `before`/`after` bracket the burst this row follows, so the pair says
+        // how much of the overhead the burst actually removed -- `after` alone
+        // cannot distinguish "little to do" from "did nothing".
         println!(
-            "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>9}  {:>11}",
-            "round", "allocations", "live_bytes", "end", "gaps", "widest", "overhead", "us/burst"
+            "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>9}  {:>9}  {:>11}",
+            "round",
+            "allocations",
+            "live_bytes",
+            "end",
+            "gaps",
+            "widest",
+            "before",
+            "after",
+            "us/burst"
         );
         for s in &snapshots {
             println!(
-                "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>8.2}%  {:>11.1}",
+                "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>8.2}%  {:>8.2}%  {:>11.1}",
                 s.round,
                 s.allocations,
                 s.live_bytes,
                 s.end,
                 s.gaps,
                 s.widest_gap,
+                s.overhead_before_percent(),
                 s.overhead_percent(),
                 s.micros_per_burst,
             );
