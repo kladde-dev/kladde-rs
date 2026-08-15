@@ -403,9 +403,24 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// This is the caller-side loop of `compaction-algorithm.md` §5, minus the
     /// byte copying, which needs a store the bare heap does not have.
     pub fn compact_incrementally(&mut self, budget: u64) -> (u64, bool) {
+        self.compact_bounded(budget, u64::MAX)
+    }
+
+    /// The same loop, additionally capped at `max_steps`.
+    ///
+    /// The cap exists for measurement: a burst is bounded by *bytes*, which is
+    /// what a flush actually budgets, but observing how compaction converges
+    /// once a workload stops wants a fixed number of **steps** between
+    /// observations instead. Splitting the loop here rather than reimplementing
+    /// it in the test keeps the two measuring the same thing -- including the
+    /// step-shape bookkeeping below, which only exists on this path.
+    fn compact_bounded(&mut self, budget: u64, max_steps: u64) -> (u64, bool) {
         let mut moved = 0u64;
         let mut steps = 0u64;
         loop {
+            if steps >= max_steps {
+                return (steps, false);
+            }
             let Some(step) = self.propose_compaction_step(budget - moved) else {
                 return (steps, true); // ran out of work
             };
@@ -2250,12 +2265,30 @@ mod tests {
     /// the same way -- including the growing workload's catch-up phase, which is
     /// the same burst under a different schedule.
     fn timed_burst(h: &mut Heap, round: usize, burst: usize, budget: u64) -> Burst {
+        timed_compaction(h, round, burst, budget, u64::MAX)
+    }
+
+    /// The same, but stopping after `max_steps` steps rather than when the byte
+    /// budget runs out -- the granularity a quiescing heap is observed at, where
+    /// there is no flush to budget against and what matters is how many *moves*
+    /// convergence takes.
+    fn timed_steps(h: &mut Heap, round: usize, chunk: usize, max_steps: u64) -> Burst {
+        timed_compaction(h, round, chunk, COMPACTION_BUDGET, max_steps)
+    }
+
+    fn timed_compaction(
+        h: &mut Heap,
+        round: usize,
+        burst: usize,
+        budget: u64,
+        max_steps: u64,
+    ) -> Burst {
         let stats_before = h.search_stats();
         let live_bytes_before = h.live_bytes();
         let end_before = h.len();
 
         let t0 = std::time::Instant::now();
-        let (_, quiesced) = h.compact_incrementally(budget);
+        let (_, quiesced) = h.compact_bounded(budget, max_steps);
         let micros = t0.elapsed().as_secs_f64() * 1e6;
 
         let stats = h.search_stats();
@@ -2415,12 +2448,18 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
     /// different and much easier problem: no new allocation would ever land in a
     /// gap, and placement is where most of this heap's free space is normally
     /// destroyed.
+    ///
+    /// `stop_below`, if given, ends the run early -- but only ever at a burst
+    /// boundary, so a run always stops at the same phase of the burst cycle
+    /// whichever way it terminated. Returns the bursts and the round it stopped
+    /// on, which is what a following phase reports its rows against.
     fn run_shrinking_workload_tracked(
         h: &mut Heap,
         mut live: Vec<Pointer<u32>>,
         rounds: usize,
         next_counter: u32,
-    ) -> Vec<Burst> {
+        stop_below: Option<usize>,
+    ) -> (Vec<Burst>, usize) {
         assert!(
             rounds.is_multiple_of(COMPACTION_INTERVAL),
             "the run must end on a burst; see COMPACTION_INTERVAL"
@@ -2461,9 +2500,12 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
             if (round + 1) % COMPACTION_INTERVAL == 0 {
                 let n = bursts.len();
                 bursts.push(timed_burst(h, round, n, COMPACTION_BUDGET));
+                if stop_below.is_some_and(|floor| h.live_count() <= floor) {
+                    return (bursts, round);
+                }
             }
         }
-        bursts
+        (bursts, rounds.saturating_sub(1))
     }
 
     /// Fragmentation and burst cost over a heap that is **shrinking**, starting
@@ -2506,7 +2548,8 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
         // down to roughly a tenth of its size.
         let shrink_rounds =
             (live.len() * 5 / 2).next_multiple_of(COMPACTION_INTERVAL) + COMPACTION_INTERVAL;
-        let bursts = run_shrinking_workload_tracked(&mut h, live, shrink_rounds, next_counter);
+        let (bursts, _) =
+            run_shrinking_workload_tracked(&mut h, live, shrink_rounds, next_counter, None);
 
         print_csv(
             Run {
@@ -2518,6 +2561,100 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
                 churn_rounds,
             },
             &bursts,
+        );
+    }
+
+    /// How many steps a quiescing heap runs between observations. The workload
+    /// has stopped by then, so there is no flush cadence to follow and the
+    /// natural unit is the *move* rather than the byte budget.
+    const QUIESCE_STEPS_PER_ROW: u64 = 10;
+
+    /// A safety net, not a policy: convergence to a gapless heap is quadratic in
+    /// the worst case -- narrow gaps bubble to the top one run at a time -- so a
+    /// run that has not finished by here is reported as unfinished rather than
+    /// left to spin. The last row's `quiesced` column says which happened.
+    const QUIESCE_ROW_CAP: usize = 200_000;
+
+    /// What happens to a heap when the workload **stops**.
+    ///
+    /// The first phase is the shrinking workload, reported exactly as
+    /// [`compaction_cost_over_a_shrinking_workload`] reports it, run until the
+    /// heap is down to about half the allocations the churn built. Then every
+    /// mutation ceases and nothing runs but compaction, observed every
+    /// [`QUIESCE_STEPS_PER_ROW`] steps until the heap is gapless.
+    ///
+    /// This is the regime the other two measurements cannot see. While a
+    /// workload runs, compaction is always working against an allocator that is
+    /// re-fragmenting the heap behind it, so a residual overhead says nothing
+    /// about whether compaction *can* converge -- only that it has not been left
+    /// alone long enough to try. Cutting the workload off separates the two: the
+    /// `shrink` rows show the steady state under competition, and the `quiesce`
+    /// rows show how many moves, and how many bytes copied, it costs to go from
+    /// there to nothing.
+    ///
+    /// Emits one CSV row per observation on stdout, and nothing else -- see
+    /// [`CSV_HEADER`]. Capture it with:
+    ///
+    /// ```text
+    /// cargo test --release -p kladde-heap --lib compaction_cost_when_the_workload_stops \
+    ///     -- --ignored --nocapture \
+    ///   | grep -E '^(workload|quiescing),' > quiescing.csv
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a behavioural test; takes minutes"]
+    fn compaction_cost_when_the_workload_stops() {
+        println!("{CSV_HEADER}");
+        for (lambda, alpha, mu) in POLICIES {
+            for &rounds in &[400usize, 4_000, 40_000] {
+                measure_quiescing(rounds, lambda, alpha, mu);
+            }
+        }
+    }
+
+    fn measure_quiescing(churn_rounds: usize, lambda: bool, alpha: u64, mu: (u64, u64)) {
+        let mut h = Heap::new();
+        h.set_lambda(lambda);
+        h.set_alpha(alpha);
+        h.set_mu(mu.0, mu.1);
+        let (live, next_counter, _) = run_churny_workload_tracked(&mut h, churn_rounds);
+
+        // Shrink to about half, checked only at burst boundaries. The round cap
+        // is generous -- the mix nets ~0.35 removals per round, so half should
+        // arrive in ~1.5 rounds per allocation -- and exists so a policy that
+        // somehow fails to shrink ends the phase rather than looping.
+        let half = live.len() / 2;
+        let cap = (live.len() * 3).next_multiple_of(COMPACTION_INTERVAL);
+        let (shrink_bursts, last_round) =
+            run_shrinking_workload_tracked(&mut h, live, cap, next_counter, Some(half));
+
+        let run = Run {
+            workload: "quiescing",
+            phase: "shrink",
+            lambda,
+            alpha,
+            mu,
+            churn_rounds,
+        };
+        print_csv(run, &shrink_bursts);
+
+        // Now nothing but compaction, in fixed-size chunks of steps, until the
+        // heap reports it has run out of work.
+        let mut rows = Vec::new();
+        loop {
+            let n = rows.len();
+            let row = timed_steps(&mut h, last_round, n, QUIESCE_STEPS_PER_ROW);
+            let done = row.quiesced || row.slides + row.evacuations == 0;
+            rows.push(row);
+            if done || rows.len() >= QUIESCE_ROW_CAP {
+                break;
+            }
+        }
+        print_csv(
+            Run {
+                phase: "quiesce",
+                ..run
+            },
+            &rows,
         );
     }
 
@@ -2543,7 +2680,7 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
             h.assert_invariants();
 
             let start = h.live_count();
-            let snapshots = run_shrinking_workload_tracked(&mut h, live, 800, 900_000);
+            let (snapshots, _) = run_shrinking_workload_tracked(&mut h, live, 800, 900_000, None);
             h.assert_invariants();
             assert!(
                 h.live_count() < start / 2,
