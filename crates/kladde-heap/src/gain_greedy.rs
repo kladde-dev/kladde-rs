@@ -100,6 +100,20 @@ impl Weights {
     /// gap count. Note too that `λ` and `α` are mutually exclusive under the
     /// bound -- at `λ = 1` the size reward already saturates it -- so setting both
     /// leaves `α` with nothing to spend.
+    /// Whether an allocation's key depends on its neighbours at all.
+    ///
+    /// It does not when the effective `α` is zero for *every* size, which is the
+    /// case both at `α = 0` and -- because the cap gives `λ` first claim on the
+    /// headroom -- at `λ = 1` whatever `α` says. When it is false, a mutation
+    /// next door cannot change a neighbour's score, so the delete-and-reinsert
+    /// that keeps that score current is pure overhead and
+    /// [`GainGreedyHeap::unindex`]/[`reindex`] skip it.
+    ///
+    /// [`reindex`]: GainGreedyHeap::reindex
+    fn neighbours_matter(self) -> bool {
+        !self.lambda && self.alpha > 0
+    }
+
     fn score(self, addr: u64, len: u32, nc: FreeNeighbours) -> u64 {
         let size = u64::from(len);
         let base = if self.lambda { addr + size } else { addr };
@@ -543,7 +557,19 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
 
     /// Drop `addr` from the index under the category it *currently* has. Must be
     /// called before the map change that would alter that category.
+    ///
+    /// Costed: this and [`Self::reindex`] fire up to four times per allocation
+    /// inserted or removed, and each is a full augmented-tree removal or
+    /// insertion -- `O(B log_B n)` with the augmentation refolded over all `B`
+    /// children at every level on the path. On a run move that is four re-keys
+    /// per member, and the members are each other's neighbours, so the same
+    /// entries churn repeatedly. All of it buys exactly one thing: keeping a
+    /// neighbour's `α` term current. When `α` is inert the whole dance is dead
+    /// weight, so it is skipped.
     fn unindex(&mut self, addr: Option<u64>) {
+        if !self.weights.neighbours_matter() {
+            return;
+        }
         let Some(addr) = addr else { return };
         let Some(&e) = self.allocations.get(&addr) else {
             return;
@@ -551,8 +577,12 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         self.index.remove(self.alloc_key(addr, e.len));
     }
 
-    /// Put `addr` back under its re-derived category.
+    /// Put `addr` back under its re-derived category. Skipped exactly when
+    /// [`Self::unindex`] is, so the two stay paired.
     fn reindex(&mut self, addr: Option<u64>) {
+        if !self.weights.neighbours_matter() {
+            return;
+        }
         let Some(addr) = addr else { return };
         let Some(&e) = self.allocations.get(&addr) else {
             return;
