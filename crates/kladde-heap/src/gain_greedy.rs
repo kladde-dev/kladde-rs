@@ -407,10 +407,27 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// constant needing re-tuning per heap size. Read it as: *`ν = 1` says a move
     /// that retires a byte of `end` for every byte it copies is worth as much as
     /// the best move the heap could possibly offer* -- one that carries a byte
-    /// the full height of the address space. That is the natural unit, and it is
-    /// the default the initial experiment uses.
+    /// the full height of the address space.
     ///
     /// `ν = 0` disables the candidate outright, recovering best-of-two.
+    ///
+    /// # Why it is fixed-point, in units of [`NU_ONE`]
+    ///
+    /// Because `ν = 1` anchors on the *best conceivable* move, not a typical one,
+    /// and the two are far apart. The measured end-slide rate is about `0.19`, so
+    /// at `ν = 1` its bonus is `0.19 · end` -- larger than the travel distance of
+    /// a typical winning evacuation, which means the end slide wins nearly
+    /// whenever it is offered. The interesting range, where the two terms
+    /// actually trade, is **entirely below one**.
+    ///
+    /// An integer `ν` therefore has exactly two useful settings, off and
+    /// saturated, and a sweep over `1, 8, 64, u64::MAX` measures the same policy
+    /// four times -- which is what the first sweep did, and why it wrongly
+    /// concluded the knob was inert. Fixed point costs one division and makes the
+    /// sub-unit range expressible.
+    ///
+    /// So `nu` is passed in units of [`Self::NU_ONE`]: `NU_ONE` is `ν = 1`,
+    /// `NU_ONE / 2` is `ν = 0.5`, and the useful settings are the small ones.
     ///
     /// # Why this needs a knob at all, rather than a fixed rule
     ///
@@ -423,6 +440,10 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     pub fn set_nu(&mut self, nu: u64) {
         self.nu = nu;
     }
+
+    /// The fixed-point unit `ν = 1` is expressed in. See [`Self::set_nu`] for why
+    /// the settings worth trying are all fractions of it.
+    pub const NU_ONE: u64 = 256;
 
     /// Turn the size reward on or off. See [`lambda`](Self::lambda).
     pub fn set_lambda(&mut self, lambda: bool) {
@@ -1064,11 +1085,15 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         }
         // `end · w / r` in `u128`: `end · w` alone can exceed `u64` on a large
         // heap with a wide top gap, though the quotient never does.
-        let rate = u128::from(self.nu) * u128::from(self.end) * u128::from(w) / u128::from(r);
+        // `end · w / r` first, so that the product cannot overflow `u128` for a
+        // large `ν`; the quotient is bounded by `end · w`, and only then is the
+        // rate applied and the fixed-point scale divided out.
+        let rate = u128::from(self.end) * u128::from(w) / u128::from(r);
+        let bonus = rate.saturating_mul(u128::from(self.nu)) / u128::from(Self::NU_ONE);
         let reward = if self.weights.lambda { r.min(w) } else { 0 };
         let gain = w
             .saturating_add(reward)
-            .saturating_add(u64::try_from(rate).unwrap_or(u64::MAX));
+            .saturating_add(u64::try_from(bonus).unwrap_or(u64::MAX));
         Some((gain, Step { from, to, len: r }))
     }
 
@@ -1424,11 +1449,18 @@ mod tests {
     /// The `ν` rungs vary **only** `ν`, against the otherwise-default policy, so
     /// that the end slide's effect is not confounded with anything else -- which
     /// the α/μ rungs of the original sweep are, and which cost that comparison
-    /// most of its force. `ν = 1` is the natural unit (see
-    /// [`GainGreedyHeap::set_nu`]); the rungs bracket it by a factor of eight
-    /// either way, and `u64::MAX` checks that a `ν` big enough to make the end
-    /// slide win whenever it is offered still converges.
-    const POLICIES: [(bool, u64, (u64, u64), u64); 11] = [
+    /// most of its force.
+    ///
+    /// They are **geometric below `ν = 1`**, because that is where the end term
+    /// and the distance term actually trade: at `ν = 1` an end slide's bonus is
+    /// about `0.19 · end`, already bigger than a typical winning evacuation's
+    /// travel distance. A first sweep over `1, 8, 64, u64::MAX` measured the
+    /// saturated policy four times over and concluded the knob was inert; these
+    /// rungs are placed to find the crossover instead of straddling it. `ν = 1`
+    /// and `u64::MAX` stay as the upper anchor and as a check that a `ν` big
+    /// enough to win every comparison still converges.
+    const NU: u64 = GainGreedyHeap::<Pointer<u32>>::NU_ONE;
+    const POLICIES: [(bool, u64, (u64, u64), u64); 13] = [
         (false, 0, (0, 0), 0),
         (true, 0, (0, 0), 0),
         (false, 64, (0, 0), 0),
@@ -1436,9 +1468,11 @@ mod tests {
         (true, 0, (4096, 512), 0),
         (false, 64, (4096, 512), 0),
         (false, u64::MAX, (1 << 40, 1 << 36), 0),
-        (false, 0, (0, 0), 1),
-        (false, 0, (0, 0), 8),
-        (false, 0, (0, 0), 64),
+        (false, 0, (0, 0), NU / 64),
+        (false, 0, (0, 0), NU / 16),
+        (false, 0, (0, 0), NU / 4),
+        (false, 0, (0, 0), NU / 2),
+        (false, 0, (0, 0), NU),
         (false, 0, (0, 0), u64::MAX),
     ];
 
@@ -2414,7 +2448,7 @@ mod tests {
     #[test]
     fn the_end_slide_retires_end_where_the_frontier_slide_only_moves_free_space() {
         let mut h = two_gap_heap();
-        h.set_nu(1);
+        h.set_nu(Heap::NU_ONE);
 
         let step = h.propose_compaction_step(UNBOUNDED).unwrap();
         assert_eq!(
