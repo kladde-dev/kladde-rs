@@ -145,10 +145,12 @@ pub(crate) struct SearchStats {
     /// shrinks the file or merely rearranges it -- see `truncated_by_*`.
     pub slides: u64,
     pub end_slides: u64,
+    pub end_evacuations: u64,
     pub evacuations: u64,
     /// Bytes those steps moved.
     pub slide_bytes: u64,
     pub end_slide_bytes: u64,
+    pub end_evac_bytes: u64,
     pub evac_bytes: u64,
     /// Bytes `end` fell by as a result. **This is the only way free space
     /// leaves the file**: every other move conserves it, taking `len` free bytes
@@ -159,6 +161,7 @@ pub(crate) struct SearchStats {
     /// what makes it the column to read when judging `ν`.
     pub truncated_by_slides: u64,
     pub truncated_by_end_slides: u64,
+    pub truncated_by_end_evacuations: u64,
     pub truncated_by_evacuations: u64,
     /// Placements (`alloc`, and the relocating half of `resize`) that found a
     /// gap to sit in, and those that had to extend `end` because nothing fitted.
@@ -192,6 +195,11 @@ impl SearchStats {
                 self.end_slide_bytes += len;
                 self.truncated_by_end_slides += truncated;
             }
+            Shape::EndEvacuation => {
+                self.end_evacuations += 1;
+                self.end_evac_bytes += len;
+                self.truncated_by_end_evacuations += truncated;
+            }
             Shape::Evacuation => {
                 self.evacuations += 1;
                 self.evac_bytes += len;
@@ -209,6 +217,7 @@ impl SearchStats {
 pub(crate) enum Shape {
     Slide,
     EndSlide,
+    EndEvacuation,
     Evacuation,
 }
 
@@ -388,7 +397,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// off the heap, and truncation is the only way compaction reduces it. `ν` is
     /// the first term that says so.
     ///
-    /// It prices exactly one candidate, [`Self::end_slide_candidate`], because
+    /// It prices exactly one candidate, `end_slide_candidate`, because
     /// that is the only step shape whose product is `end` rather than `Φ`.
     ///
     /// # The scale
@@ -411,7 +420,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     ///
     /// `ν = 0` disables the candidate outright, recovering best-of-two.
     ///
-    /// # Why it is fixed-point, in units of [`NU_ONE`]
+    /// # Why it is fixed-point, in units of [`Self::NU_ONE`]
     ///
     /// Because `ν = 1` anchors on the *best conceivable* move, not a typical one,
     /// and the two are far apart. The measured end-slide rate is about `0.19`, so
@@ -550,6 +559,8 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
                     Shape::Slide
                 } else if self.end_slide_candidate(remaining).map(|(_, s)| s) == Some(step) {
                     Shape::EndSlide
+                } else if self.end_evacuation_candidate(remaining).map(|(_, s)| s) == Some(step) {
+                    Shape::EndEvacuation
                 } else {
                     Shape::Evacuation
                 };
@@ -1068,10 +1079,9 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     ///
     /// # The score
     ///
-    /// Per-byte potential gain is `w`, as for any slide. The `ν` term prices what
-    /// the potential cannot see; see [`Self::set_nu`] for why it is scaled by
-    /// `end`. Both are computed here rather than in the index because neither the
-    /// top run's length nor `end` is a function of a single key.
+    /// Per-byte potential gain is `w`, as for any slide, plus the `ν` term every
+    /// candidate now carries -- see [`Self::end_bonus`].
+    #[inline]
     fn end_slide_candidate(&self, budget: u64) -> Option<(u64, Step<u64>)> {
         if self.nu == 0 {
             return None;
@@ -1083,18 +1093,100 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         if r == 0 || r > budget {
             return None;
         }
-        // `end · w / r` in `u128`: `end · w` alone can exceed `u64` on a large
-        // heap with a wide top gap, though the quotient never does.
-        // `end · w / r` first, so that the product cannot overflow `u128` for a
-        // large `ν`; the quotient is bounded by `end · w`, and only then is the
-        // rate applied and the fixed-point scale divided out.
-        let rate = u128::from(self.end) * u128::from(w) / u128::from(r);
-        let bonus = rate.saturating_mul(u128::from(self.nu)) / u128::from(Self::NU_ONE);
         let reward = if self.weights.lambda { r.min(w) } else { 0 };
+        // A slide leaves the moved bytes contiguous with what was below the gap,
+        // so the top falls by exactly the gap's width.
         let gain = w
             .saturating_add(reward)
-            .saturating_add(u64::try_from(bonus).unwrap_or(u64::MAX));
+            .saturating_add(self.end_bonus(w, r));
         Some((gain, Step { from, to, len: r }))
+    }
+
+    /// The **end evacuation**: the topmost allocation, into the lowest gap that
+    /// takes it.
+    ///
+    /// This is the fourth candidate, and it exists because the quantity that
+    /// makes it valuable is a property of exactly **one** allocation. "Is the
+    /// topmost" cannot go in the index's key without re-keying on every change to
+    /// `end`, which is every mutation; but there is only ever one such
+    /// allocation, so enumerating it directly costs one `next_back()` and beats
+    /// indexing it outright.
+    ///
+    /// It matters because it dominates the end slide at the job `ν` rewards.
+    /// Vacating the topmost allocation drops `end` all the way to the end of the
+    /// allocation below, so it retires `>= s` bytes while copying `s` -- a rate of
+    /// at least **1**, against the end slide's measured **0.19**. Before this
+    /// candidate existed, `ν` credited only the end slide, so it promoted the
+    /// weaker of the two moves; the measured consequence was that every `ν > 0`
+    /// *lost* more `end` retirement from displaced evacuations than the end
+    /// slides it bought.
+    ///
+    /// It is **not** in general a two-finger move: the destination is the lowest
+    /// gap that *fits*, which is at or above the frontier, so the mover is left
+    /// permanently placed only when that gap happens to be the frontier itself.
+    #[inline]
+    fn end_evacuation_candidate(&self, budget: u64) -> Option<(u64, Step<u64>)> {
+        if self.nu == 0 {
+            return None;
+        }
+        let (&from, e) = self.allocations.iter().next_back()?;
+        let len = u64::from(e.len);
+        if len > budget {
+            return None;
+        }
+        let to = self.index.lowest_gap_fitting(len)?;
+        if to >= from {
+            return None; // nothing below it fits: this would be an upward move
+        }
+        // Vacated entirely, so `end` falls to the top of whatever is below --
+        // which is at least `len`, and more when a gap sits under the mover too.
+        let retired = self.end - self.prev_end(from);
+        let gain = self
+            .weights
+            .score(from, e.len, self.neighbours_of(from, e.len))
+            .saturating_sub(to)
+            .saturating_add(self.end_bonus(retired, len));
+        Some((gain, Step { from, to, len }))
+    }
+
+    /// How much `end` a step of `len` bytes starting at `from` would retire, if
+    /// the mover is vacated outright rather than slid.
+    ///
+    /// Zero unless the range reaches the top of the heap. This is what credits
+    /// the *classic* evacuation for a truncation it was not chosen for: the index
+    /// ranks by potential alone, so the best it can do is be paid afterwards for
+    /// a top-of-heap move it happened to pick. Finding the best such move is
+    /// [`Self::end_evacuation_candidate`]'s job.
+    #[inline]
+    fn evacuation_retirement(&self, from: u64, len: u64) -> u64 {
+        if from + len != self.end {
+            return 0;
+        }
+        self.end - self.prev_end(from)
+    }
+
+    /// The `ν` term, uniform across all four candidates: what retiring `retired`
+    /// bytes of `end` is worth, given that it costs `copied` bytes to do it.
+    ///
+    /// `retired / copied` is a **rate** in end-bytes per byte copied. Scaling it
+    /// by `end` puts it on the same range as per-byte potential gain, which is
+    /// bounded by the height of the heap -- see [`Self::set_nu`].
+    ///
+    /// Applying this to *every* candidate rather than one is the whole point of
+    /// the four-candidate rule. With it on the end slide alone, `ν` was not a
+    /// price on file size but a thumb on one step shape, and it promoted a move
+    /// with a rate of 0.19 over moves running at 0.5 and better.
+    #[inline]
+    fn end_bonus(&self, retired: u64, copied: u64) -> u64 {
+        if self.nu == 0 || retired == 0 {
+            return 0;
+        }
+        // `end · retired / copied` first, so the product cannot overflow `u128`
+        // for a large `ν`; only then is the rate scaled and the fixed point
+        // divided out.
+        let rate = u128::from(self.end) * u128::from(retired) / u128::from(copied);
+        let bonus = rate.saturating_mul(u128::from(self.nu)) / u128::from(Self::NU_ONE);
+        u64::try_from(bonus).unwrap_or(u64::MAX)
     }
 
     fn slide_candidate(&self, budget: u64) -> Option<(u64, Step<u64>)> {
@@ -1113,7 +1205,18 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         } else {
             0
         };
-        Some((gap_len + reward, Step { from, to, len }))
+        // The frontier slide normally retires nothing -- that is the whole
+        // complaint against it. It does when the frontier is also the *highest*
+        // gap and the run above it is not budget-truncated, in which case it is
+        // an end slide too and deserves the same credit; `from + len == end`
+        // tests both conditions at once.
+        let retired = if from + len == self.end { gap_len } else { 0 };
+        Some((
+            gap_len
+                .saturating_add(reward)
+                .saturating_add(self.end_bonus(retired, len)),
+            Step { from, to, len },
+        ))
     }
 }
 
@@ -1213,10 +1316,34 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
             }
         }
 
+        // The end evacuation: the topmost allocation into the lowest gap that
+        // takes it. Offered before the index's evacuation so that when the two
+        // agree -- the index's winner already being the topmost allocation --
+        // the shape is attributed to the candidate that sought it deliberately.
+        if let Some((gain, step)) = self.end_evacuation_candidate(budget) {
+            if best.is_none_or(|(incumbent, _)| gain > incumbent) {
+                best = Some((gain, step));
+            }
+        }
+
         // The index maximizes `score(A) − G.pos` directly and reports it, which
         // matters once `λ` is on: the objective is then no longer the travel
         // distance, so re-deriving it from the step would silently compare the
         // wrong quantity against the slide's.
+        //
+        // It earns **no** `ν` term, and does not need one: the only evacuation
+        // that retires `end` is one whose mover is the topmost allocation, since
+        // that is what `from + len == end` means, and there is exactly one such
+        // allocation. For a fixed mover the index maximizes `score(A) − G.pos` by
+        // minimizing `G.pos` over gaps that fit -- which is `lowest_gap_fitting`,
+        // the destination the candidate above already chose. Same mover, same
+        // destination, same `retired`, same `len`: the two produce an identical
+        // step with an identical gain, and that one is offered first.
+        //
+        // So crediting here could never change the outcome. That is a property of
+        // the *index's* objective, though, not of evacuations in general -- see
+        // the tiling candidate below, which picks its destination by fit rather
+        // than by position and therefore does need the term.
         if let Some((gain, step)) = self.index.best_evacuation_within(budget) {
             if best.is_none_or(|(incumbent, _)| gain > incumbent) {
                 best = Some((gain, step));
@@ -1244,15 +1371,17 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
                 },
             );
             if let Some((gain, from, to, size)) = tiling {
+                // Unlike the index's evacuation, this one does need the `ν` term.
+                // It picks its destination by *fit* -- the lowest exact or
+                // tileable gap -- which is generally not the lowest gap that
+                // fits, so a tiling evacuation of the topmost allocation is a
+                // genuinely different step from the end evacuation, kept in
+                // contention only by `μ`.
+                let len = u64::from(size);
+                let gain =
+                    gain.saturating_add(self.end_bonus(self.evacuation_retirement(from, len), len));
                 if best.is_none_or(|(incumbent, _)| gain > incumbent) {
-                    best = Some((
-                        gain,
-                        Step {
-                            from,
-                            to,
-                            len: u64::from(size),
-                        },
-                    ));
+                    best = Some((gain, Step { from, to, len }));
                 }
             }
         }
@@ -1460,7 +1589,7 @@ mod tests {
     /// and `u64::MAX` stay as the upper anchor and as a check that a `ν` big
     /// enough to win every comparison still converges.
     const NU: u64 = GainGreedyHeap::<Pointer<u32>>::NU_ONE;
-    const POLICIES: [(bool, u64, (u64, u64), u64); 13] = [
+    const POLICIES: [(bool, u64, (u64, u64), u64); 14] = [
         (false, 0, (0, 0), 0),
         (true, 0, (0, 0), 0),
         (false, 64, (0, 0), 0),
@@ -1471,8 +1600,9 @@ mod tests {
         (false, 0, (0, 0), NU / 64),
         (false, 0, (0, 0), NU / 16),
         (false, 0, (0, 0), NU / 4),
-        (false, 0, (0, 0), NU / 2),
         (false, 0, (0, 0), NU),
+        (false, 0, (0, 0), NU * 4),
+        (false, 0, (0, 0), NU * 16),
         (false, 0, (0, 0), u64::MAX),
     ];
 
@@ -2475,6 +2605,139 @@ mod tests {
         assert_eq!(h.len(), 144, "nothing retired");
     }
 
+    /// The point of the fourth candidate: when both can retire `end`, the
+    /// evacuation of the topmost allocation must win, because it retires more
+    /// per byte copied.
+    ///
+    /// ```text
+    ///   0..64   gap (64)                     <- frontier, fits the top allocation
+    ///  64..104  alloc
+    /// 104..168  gap (64)                     <- highest gap
+    /// 168..208  alloc                        <- the top run, 40 bytes
+    /// ```
+    ///
+    /// The end slide copies 40 bytes to retire 64: rate 1.6. The end evacuation
+    /// copies the same 40 bytes but drops `end` from 208 to 104 -- it takes the
+    /// adjacent gap with it -- for a rate of 2.6. Before the fourth candidate
+    /// existed, `ν` credited only the slide and the weaker move won.
+    #[test]
+    fn the_end_evacuation_outbids_the_end_slide_when_both_retire_end() {
+        let mut h = Heap::new();
+        h.alloc(resizable(1), 64).unwrap(); //    0..64   freed
+        h.alloc(resizable(2), 40).unwrap(); //   64..104
+        h.alloc(resizable(3), 64).unwrap(); //  104..168  freed
+        h.alloc(resizable(4), 40).unwrap(); //  168..208
+        h.free(resizable(1)).unwrap();
+        h.free(resizable(3)).unwrap();
+        h.set_nu(Heap::NU_ONE);
+
+        let step = h.propose_compaction_step(UNBOUNDED).unwrap();
+        assert_eq!(
+            step,
+            Step {
+                from: 168,
+                to: 0,
+                len: 40
+            },
+            "the topmost allocation should evacuate to the frontier, not slide"
+        );
+        h.commit_compaction_step(step);
+        h.assert_invariants();
+        assert_eq!(
+            h.len(),
+            104,
+            "`end` fell by 104 -- the mover's 40 bytes and the 64-byte gap below it"
+        );
+
+        // And it wins on the `ν` term specifically: the end slide is a perfectly
+        // good candidate here -- it moves the same 40 bytes and retires 64 -- but
+        // it is outscored because it retires less per byte copied.
+        let mut h = Heap::new();
+        h.alloc(resizable(1), 64).unwrap();
+        h.alloc(resizable(2), 40).unwrap();
+        h.alloc(resizable(3), 64).unwrap();
+        h.alloc(resizable(4), 40).unwrap();
+        h.free(resizable(1)).unwrap();
+        h.free(resizable(3)).unwrap();
+        h.set_nu(Heap::NU_ONE);
+        let (slide_gain, slide) = h.end_slide_candidate(UNBOUNDED).unwrap();
+        let (evac_gain, _) = h.end_evacuation_candidate(UNBOUNDED).unwrap();
+        assert_eq!(
+            slide,
+            Step {
+                from: 168,
+                to: 104,
+                len: 40
+            },
+            "the end slide is offered, and is a real candidate"
+        );
+        assert!(
+            evac_gain > slide_gain,
+            "end evacuation {evac_gain} should outscore end slide {slide_gain}"
+        );
+    }
+
+    /// The index's evacuation earns no `ν` term because it cannot need one, and
+    /// this is the property that makes that true: whenever the index's winning
+    /// mover is the topmost allocation -- the only case in which an evacuation
+    /// retires `end` at all -- its step is *identical* to the end evacuation's.
+    ///
+    /// For a fixed mover the index maximizes `score(A) − G.pos`, so it minimizes
+    /// `G.pos` over gaps that fit, which is `lowest_gap_fitting`. If that ever
+    /// stopped holding -- a change to the index's objective, or to how ties are
+    /// witnessed -- the credit would have to come back, and this test is what
+    /// would notice.
+    #[test]
+    fn an_index_evacuation_that_retires_end_is_the_end_evacuation() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut h = Heap::new();
+        h.set_nu(Heap::NU_ONE / 4);
+        let mut live: Vec<Pointer<u32>> = Vec::new();
+        let mut next = 1u32;
+        let mut checked = 0;
+
+        for round in 0..3_000 {
+            if rand() % 100 < 55 || live.is_empty() {
+                let size = [8u32, 16, 40, 64, 250][(rand() % 5) as usize];
+                let id = resizable(next);
+                next += 1;
+                h.alloc(id, size).unwrap();
+                live.push(id);
+            } else {
+                let victim = live.swap_remove((rand() % live.len() as u64) as usize);
+                h.free(victim).unwrap();
+            }
+
+            if round % 3 == 0 {
+                if let Some((_, step)) = h.index.best_evacuation_within(COMPACTION_BUDGET) {
+                    if step.from + step.len == h.len() {
+                        checked += 1;
+                        assert_eq!(
+                            h.end_evacuation_candidate(COMPACTION_BUDGET)
+                                .map(|(_, s)| s),
+                            Some(step),
+                            "round {round}: the index found a top-of-heap evacuation the \
+                             end-evacuation candidate did not reproduce"
+                        );
+                    }
+                }
+                if let Some(step) = h.propose_compaction_step(COMPACTION_BUDGET) {
+                    h.commit_compaction_step(step);
+                }
+            }
+        }
+        assert!(
+            checked >= 20,
+            "only {checked} top-of-heap evacuations arose; the test proved little"
+        );
+    }
+
     /// The guard, which is the whole reason this candidate is safe: a top run
     /// that does not fit the budget would be *truncated*, and a truncated end
     /// slide retires nothing -- it shifts a prefix down and re-forms the gap one
@@ -2696,12 +2959,14 @@ mod tests {
         /// Whether the burst ran out of work before it ran out of budget.
         quiesced: bool,
         /// Which candidate shape the burst's steps took, and how many bytes each
-        /// moved. `slides + end_slides + evacuations` is the step count.
+        /// moved. `slides + end_slides + end_evacuations + evacuations` is the step count.
         slides: u64,
         end_slides: u64,
+        end_evacuations: u64,
         evacuations: u64,
         slide_bytes: u64,
         end_slide_bytes: u64,
+        end_evac_bytes: u64,
         evac_bytes: u64,
         /// How many bytes of `end` each shape bought. Every compaction step
         /// *conserves* free space -- it takes `len` free bytes at the destination
@@ -2712,6 +2977,7 @@ mod tests {
         /// `end_before − end_after` (necessarily their sum) is not.
         truncated_by_slides: u64,
         truncated_by_end_slides: u64,
+        truncated_by_end_evacuations: u64,
         truncated_by_evacuations: u64,
         /// Placements since the *previous* burst -- workload activity rather than
         /// compaction, but the other half of the free-space budget: free bytes
@@ -2770,13 +3036,17 @@ mod tests {
             quiesced,
             slides: stats.slides - stats_before.slides,
             end_slides: stats.end_slides - stats_before.end_slides,
+            end_evacuations: stats.end_evacuations - stats_before.end_evacuations,
             evacuations: stats.evacuations - stats_before.evacuations,
             slide_bytes: stats.slide_bytes - stats_before.slide_bytes,
             end_slide_bytes: stats.end_slide_bytes - stats_before.end_slide_bytes,
+            end_evac_bytes: stats.end_evac_bytes - stats_before.end_evac_bytes,
             evac_bytes: stats.evac_bytes - stats_before.evac_bytes,
             truncated_by_slides: stats.truncated_by_slides - stats_before.truncated_by_slides,
             truncated_by_end_slides: stats.truncated_by_end_slides
                 - stats_before.truncated_by_end_slides,
+            truncated_by_end_evacuations: stats.truncated_by_end_evacuations
+                - stats_before.truncated_by_end_evacuations,
             truncated_by_evacuations: stats.truncated_by_evacuations
                 - stats_before.truncated_by_evacuations,
             placed_in_gap: stats.placed_in_gap - stats_before.placed_in_gap,
@@ -2805,14 +3075,15 @@ mod tests {
     const CSV_HEADER: &str = "workload,phase,lambda,alpha,mu_exact,mu_multiple,nu,churn_rounds,\
 burst,round,allocations,live_bytes_before,end_before,live_bytes_after,end_after,\
 gaps_after,widest_gap_after,micros,quiesced,\
-slides,end_slides,evacuations,slide_bytes,end_slide_bytes,evac_bytes,\
-truncated_by_slides,truncated_by_end_slides,truncated_by_evacuations,\
+slides,end_slides,end_evacuations,evacuations,\
+slide_bytes,end_slide_bytes,end_evac_bytes,evac_bytes,\
+truncated_by_slides,truncated_by_end_slides,truncated_by_end_evacuations,truncated_by_evacuations,\
 placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
 
     fn print_csv(run: Run, bursts: &[Burst]) {
         for b in bursts {
             println!(
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 run.workload,
                 run.phase,
                 u8::from(run.lambda),
@@ -2834,12 +3105,15 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
                 u8::from(b.quiesced),
                 b.slides,
                 b.end_slides,
+                b.end_evacuations,
                 b.evacuations,
                 b.slide_bytes,
                 b.end_slide_bytes,
+                b.end_evac_bytes,
                 b.evac_bytes,
                 b.truncated_by_slides,
                 b.truncated_by_end_slides,
+                b.truncated_by_end_evacuations,
                 b.truncated_by_evacuations,
                 b.placed_in_gap,
                 b.placed_at_end,
@@ -3121,7 +3395,8 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
         loop {
             let n = rows.len();
             let row = timed_steps(&mut h, last_round, n, QUIESCE_STEPS_PER_ROW);
-            let done = row.quiesced || row.slides + row.end_slides + row.evacuations == 0;
+            let done = row.quiesced
+                || row.slides + row.end_slides + row.end_evacuations + row.evacuations == 0;
             rows.push(row);
             if done || rows.len() >= QUIESCE_ROW_CAP {
                 break;
@@ -3230,7 +3505,8 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
         while h.len() > target {
             let n = catchup_bursts.len();
             let burst = timed_burst(&mut h, rounds, n, CATCH_UP_BUDGET);
-            let done = burst.quiesced || burst.slides + burst.end_slides + burst.evacuations == 0;
+            let done = burst.quiesced
+                || burst.slides + burst.end_slides + burst.end_evacuations + burst.evacuations == 0;
             catchup_bursts.push(burst);
             if done {
                 break;
