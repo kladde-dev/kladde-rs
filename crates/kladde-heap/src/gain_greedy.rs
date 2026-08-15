@@ -472,12 +472,6 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         self.stats.get()
     }
 
-    /// Zero the search counters, e.g. to measure one phase of a workload.
-    #[cfg(test)]
-    pub(crate) fn reset_search_stats(&self) {
-        self.stats.set(SearchStats::default());
-    }
-
     // ---- index maintenance ----
     //
     // Gaps and allocations are entries of the *same* tree, so both kinds are
@@ -2188,91 +2182,178 @@ mod tests {
     /// about the healthy state rather than about the endgame.
     const COMPACT_ENOUGH_PERCENT: u64 = 1;
 
-    /// The heap's shape at one point in the simulation, plus what the bursts
-    /// since the previous snapshot cost.
+    /// The budget a catch-up burst gets. Larger than [`COMPACTION_BUDGET`]
+    /// because nothing is competing for the free space in that phase -- the
+    /// question there is how fast compaction converges when left alone, not how
+    /// it shares a flush with a workload.
+    const CATCH_UP_BUDGET: u64 = 4096;
+
+    /// One compaction burst, bracketed: what it found, what it left, and what it
+    /// did in between.
+    ///
+    /// The `_before`/`_after` pairs are the point of the record. A burst is
+    /// timed and then the heap is measured, so an "after" figure alone cannot
+    /// distinguish a burst that had nothing to do from one that did nothing --
+    /// and the difference between the two is the only thing that says whether
+    /// compaction is keeping up with the workload.
+    ///
+    /// `live_bytes` is carried on both sides even though compaction cannot
+    /// change it: a step moves bytes without allocating or freeing any. Emitting
+    /// both makes each row self-contained for whatever reads the CSV, and any
+    /// row where they differ is a bug in the heap rather than in the workload.
     #[derive(Clone, Copy, Default)]
-    struct Snapshot {
+    struct Burst {
+        /// Which workload round triggered this burst, and its index in the run.
         round: usize,
+        burst: usize,
         allocations: usize,
-        live_bytes: u64,
-        end: u64,
-        gaps: usize,
-        /// The widest gap. A heap with a few wide gaps absorbs new allocations
-        /// without extending `end`; one with many slivers cannot.
-        widest_gap: u64,
-        /// Mean wall-clock of one burst since the previous snapshot, in
-        /// microseconds. Plotted against `allocations` down the table, this is
-        /// the scaling curve the compactor is judged on.
-        micros_per_burst: f64,
-        /// `end` as it stood **before** the burst this snapshot follows.
-        ///
-        /// Every snapshot is taken *after* a burst, so `overhead_percent` is the
-        /// overhead compaction **left behind**, not the one it found. Without
-        /// this field the two are indistinguishable in the table, and "overhead
-        /// is 6%" would not say whether the burst had done anything at all.
-        /// Compaction never changes `live_bytes`, so the pair of `end` values is
-        /// the whole difference.
+        live_bytes_before: u64,
         end_before: u64,
+        live_bytes_after: u64,
+        end_after: u64,
+        gaps_after: usize,
+        /// The widest gap left. A heap with a few wide gaps absorbs new
+        /// allocations without extending `end`; one with many slivers cannot.
+        widest_gap_after: u64,
+        /// Wall-clock of this one burst, in microseconds.
+        micros: f64,
+        /// Whether the burst ran out of work before it ran out of budget.
+        quiesced: bool,
+        /// Which candidate shape the burst's steps took, and how many bytes each
+        /// moved. `slides + evacuations` is the step count.
+        slides: u64,
+        evacuations: u64,
+        slide_bytes: u64,
+        evac_bytes: u64,
+        /// How many bytes of `end` each shape bought. Every compaction step
+        /// *conserves* free space -- it takes `len` free bytes at the destination
+        /// and gives `len` back where the mover was -- except when it vacates the
+        /// top of the heap, where the freed bytes end up above `end` and stop
+        /// counting. So this is the whole of the fragmentation result, and
+        /// nowhere else, which is why it is split by shape where
+        /// `end_before − end_after` (necessarily their sum) is not.
+        truncated_by_slides: u64,
+        truncated_by_evacuations: u64,
+        /// Placements since the *previous* burst -- workload activity rather than
+        /// compaction, but the other half of the free-space budget: free bytes
+        /// are created by freeing something mid-heap and destroyed either by
+        /// truncation here or by a placement landing in a gap.
+        placed_in_gap: u64,
+        placed_at_end: u64,
+        placed_in_gap_bytes: u64,
+        placed_at_end_bytes: u64,
     }
 
-    impl Snapshot {
-        fn take(h: &Heap, round: usize) -> Self {
-            Self {
-                round,
-                allocations: h.live_count(),
-                live_bytes: h.live_bytes(),
-                end: h.len(),
-                gaps: h.implied_gaps().len(),
-                widest_gap: h.index.widest_gap().map_or(0, |(_, width)| width),
-                micros_per_burst: 0.0,
-                end_before: h.len(),
-            }
-        }
+    /// Run one compaction burst on `h` and record it.
+    ///
+    /// Shared by every workload below so that all of them measure the same thing
+    /// the same way -- including the growing workload's catch-up phase, which is
+    /// the same burst under a different schedule.
+    fn timed_burst(h: &mut Heap, round: usize, burst: usize, budget: u64) -> Burst {
+        let stats_before = h.search_stats();
+        let live_bytes_before = h.live_bytes();
+        let end_before = h.len();
 
-        /// Free bytes as a percentage of live bytes, **after** the burst this
-        /// snapshot follows.
-        fn overhead_percent(&self) -> f64 {
-            self.overhead_of(self.end)
-        }
+        let t0 = std::time::Instant::now();
+        let (_, quiesced) = h.compact_incrementally(budget);
+        let micros = t0.elapsed().as_secs_f64() * 1e6;
 
-        /// The same, as the burst *found* it. The difference between the two is
-        /// what the burst actually bought.
-        fn overhead_before_percent(&self) -> f64 {
-            self.overhead_of(self.end_before)
-        }
-
-        fn overhead_of(&self, end: u64) -> f64 {
-            if self.live_bytes == 0 {
-                0.0
-            } else {
-                100.0 * end.saturating_sub(self.live_bytes) as f64 / self.live_bytes as f64
-            }
+        let stats = h.search_stats();
+        Burst {
+            round,
+            burst,
+            allocations: h.live_count(),
+            live_bytes_before,
+            end_before,
+            live_bytes_after: h.live_bytes(),
+            end_after: h.len(),
+            gaps_after: h.implied_gaps().len(),
+            widest_gap_after: h.index.widest_gap().map_or(0, |(_, width)| width),
+            micros,
+            quiesced,
+            slides: stats.slides - stats_before.slides,
+            evacuations: stats.evacuations - stats_before.evacuations,
+            slide_bytes: stats.slide_bytes - stats_before.slide_bytes,
+            evac_bytes: stats.evac_bytes - stats_before.evac_bytes,
+            truncated_by_slides: stats.truncated_by_slides - stats_before.truncated_by_slides,
+            truncated_by_evacuations: stats.truncated_by_evacuations
+                - stats_before.truncated_by_evacuations,
+            placed_in_gap: stats.placed_in_gap - stats_before.placed_in_gap,
+            placed_at_end: stats.placed_at_end - stats_before.placed_at_end,
+            placed_in_gap_bytes: stats.placed_in_gap_bytes - stats_before.placed_in_gap_bytes,
+            placed_at_end_bytes: stats.placed_at_end_bytes - stats_before.placed_at_end_bytes,
         }
     }
 
-    /// What one burst achieved.
-    #[derive(Default, Clone, Copy)]
-    struct BurstStats {
-        bursts: u64,
-        steps: u64,
-        quiesced: u64,
+    /// Which run a row belongs to: everything held fixed across a whole sweep.
+    #[derive(Clone, Copy)]
+    struct Run {
+        workload: &'static str,
+        phase: &'static str,
+        lambda: bool,
+        alpha: u64,
+        mu: (u64, u64),
+        churn_rounds: usize,
+    }
+
+    /// The columns both measurements emit, in order. Every figure is raw --
+    /// overheads, rates and percentages are all derivable downstream, and a
+    /// measurement file that has already done the arithmetic cannot be
+    /// re-interrogated.
+    const CSV_HEADER: &str = "workload,phase,lambda,alpha,mu_exact,mu_multiple,churn_rounds,\
+burst,round,allocations,live_bytes_before,end_before,live_bytes_after,end_after,\
+gaps_after,widest_gap_after,micros,quiesced,slides,evacuations,slide_bytes,evac_bytes,\
+truncated_by_slides,truncated_by_evacuations,\
+placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
+
+    fn print_csv(run: Run, bursts: &[Burst]) {
+        for b in bursts {
+            println!(
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{},{},{},{},{},{},{},{},{},{}",
+                run.workload,
+                run.phase,
+                u8::from(run.lambda),
+                run.alpha,
+                run.mu.0,
+                run.mu.1,
+                run.churn_rounds,
+                b.burst,
+                b.round,
+                b.allocations,
+                b.live_bytes_before,
+                b.end_before,
+                b.live_bytes_after,
+                b.end_after,
+                b.gaps_after,
+                b.widest_gap_after,
+                b.micros,
+                u8::from(b.quiesced),
+                b.slides,
+                b.evacuations,
+                b.slide_bytes,
+                b.evac_bytes,
+                b.truncated_by_slides,
+                b.truncated_by_evacuations,
+                b.placed_in_gap,
+                b.placed_at_end,
+                b.placed_in_gap_bytes,
+                b.placed_at_end_bytes,
+            );
+        }
     }
 
     /// The churny workload the measurement below drives, with compaction
-    /// bursts interleaved the way a backend flush does it. Returns the live ids
-    /// and what the bursts achieved.
+    /// bursts interleaved the way a backend flush does it. Returns the live ids,
+    /// the next unused id counter, and **every** burst.
     fn run_churny_workload_tracked(
         h: &mut Heap,
         rounds: usize,
-    ) -> (Vec<Pointer<u32>>, BurstStats, Vec<Snapshot>) {
+    ) -> (Vec<Pointer<u32>>, u32, Vec<Burst>) {
         assert!(
             rounds.is_multiple_of(COMPACTION_INTERVAL),
             "the run must end on a burst; see COMPACTION_INTERVAL"
         );
-        // Sample the heap shape at ~10 points, always immediately after a burst,
-        // so the table shows the state the schedule actually leaves behind.
-        let snapshot_every = (rounds / COMPACTION_INTERVAL / 10).max(1);
-        let mut snapshots = Vec::new();
+        let mut bursts = Vec::new();
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut rand = move || {
             state ^= state << 13;
@@ -2282,11 +2363,6 @@ mod tests {
         };
         let mut live: Vec<Pointer<u32>> = Vec::new();
         let mut next_counter = 1u32;
-        let mut bursts = BurstStats::default();
-        // Reset at each snapshot, so a row reports the interval it ends, not the
-        // run so far -- otherwise growth would be smeared across the table.
-        let mut window = std::time::Duration::ZERO;
-        let mut window_bursts = 0u64;
 
         for round in 0..rounds {
             let roll = rand() % 100;
@@ -2316,36 +2392,12 @@ mod tests {
             // `compact_incrementally` spends a whole budget in one call, so a
             // pause does many consecutive steps with no mutation in between.
             if (round + 1) % COMPACTION_INTERVAL == 0 {
-                let end_before = h.len();
-                let t0 = std::time::Instant::now();
-                let (steps, quiesced) = h.compact_incrementally(COMPACTION_BUDGET);
-                window += t0.elapsed();
-                window_bursts += 1;
-                bursts.bursts += 1;
-                bursts.steps += steps;
-                bursts.quiesced += u64::from(quiesced);
-                if bursts.bursts % snapshot_every as u64 == 0 {
-                    let mut snapshot = Snapshot::take(h, round);
-                    snapshot.micros_per_burst =
-                        window.as_secs_f64() * 1e6 / window_bursts.max(1) as f64;
-                    snapshot.end_before = end_before;
-                    snapshots.push(snapshot);
-                    window = std::time::Duration::ZERO;
-                    window_bursts = 0;
-                }
+                let n = bursts.len();
+                bursts.push(timed_burst(h, round, n, COMPACTION_BUDGET));
             }
         }
-        (live, bursts, snapshots)
+        (live, next_counter, bursts)
     }
-
-    /// How many bursts at the start of a shrinking run are discarded before the
-    /// timings are averaged.
-    ///
-    /// The first bursts of a shrink are not representative: they run on a heap
-    /// the *growing* schedule left behind, and they are the ones that clear the
-    /// backlog of gaps the transition creates. What is wanted is the cost of a
-    /// burst in the steady state of shrinking, so the burn-in is dropped.
-    const SHRINK_BURN_IN_BURSTS: usize = 4;
 
     /// The mirror image of [`run_churny_workload_tracked`]: the same operation
     /// mix with allocate and free **swapped**, so the heap nets *smaller* over
@@ -2356,27 +2408,24 @@ mod tests {
     /// faster than the allocator consumes it, so the gaps are many and the
     /// competition for a destination is weak. Whether the file actually follows
     /// the live bytes down, or is left held up by a few stranded allocations near
-    /// `end`, is exactly what the `overhead` column reports.
+    /// `end`, is exactly what the `end_before`/`end_after` pair reports.
     ///
     /// Allocation does not stop -- 25% of rounds still allocate, mirroring the
     /// 25% of the growing workload that frees -- because a pure drain would be a
     /// different and much easier problem: no new allocation would ever land in a
     /// gap, and placement is where most of this heap's free space is normally
     /// destroyed.
-    ///
-    /// Returns what the bursts achieved and **one snapshot per burst**, which is
-    /// the resolution the fragmentation question needs.
     fn run_shrinking_workload_tracked(
         h: &mut Heap,
         mut live: Vec<Pointer<u32>>,
         rounds: usize,
         next_counter: u32,
-    ) -> (BurstStats, Vec<Snapshot>) {
+    ) -> Vec<Burst> {
         assert!(
             rounds.is_multiple_of(COMPACTION_INTERVAL),
             "the run must end on a burst; see COMPACTION_INTERVAL"
         );
-        let mut snapshots = Vec::new();
+        let mut bursts = Vec::new();
         let mut state = 0x9E37_79B9_7F4A_7C15u64;
         let mut rand = move || {
             state ^= state << 13;
@@ -2385,7 +2434,6 @@ mod tests {
             state
         };
         let mut next_counter = next_counter;
-        let mut bursts = BurstStats::default();
 
         for round in 0..rounds {
             let roll = rand() % 100;
@@ -2411,37 +2459,32 @@ mod tests {
             }
 
             if (round + 1) % COMPACTION_INTERVAL == 0 {
-                let end_before = h.len();
-                let t0 = std::time::Instant::now();
-                let (steps, quiesced) = h.compact_incrementally(COMPACTION_BUDGET);
-                let elapsed = t0.elapsed();
-                bursts.bursts += 1;
-                bursts.steps += steps;
-                bursts.quiesced += u64::from(quiesced);
-                let mut snapshot = Snapshot::take(h, round);
-                snapshot.micros_per_burst = elapsed.as_secs_f64() * 1e6;
-                snapshot.end_before = end_before;
-                snapshots.push(snapshot);
+                let n = bursts.len();
+                bursts.push(timed_burst(h, round, n, COMPACTION_BUDGET));
             }
         }
-        (bursts, snapshots)
+        bursts
     }
 
     /// Fragmentation and burst cost over a heap that is **shrinking**, starting
     /// from the state the growing workload leaves behind.
     ///
-    /// Every burst is recorded; the table is subsampled to keep the output
-    /// readable at the larger sizes, but the summary lines below it are computed
-    /// over *all* of them, after [`SHRINK_BURN_IN_BURSTS`].
+    /// Emits one CSV row per burst on stdout, and nothing else -- see
+    /// [`CSV_HEADER`]. Capture it with:
     ///
     /// ```text
-    /// cargo test --release -p kladde-heap --lib compaction_cost_over_a_shrinking -- --ignored --nocapture
+    /// cargo test --release -p kladde-heap --lib compaction_cost_over_a_shrinking \
+    ///     -- --ignored --nocapture \
+    ///   | grep -E '^(workload|shrinking),' > shrinking.csv
     /// ```
+    ///
+    /// The `grep` is only there to drop the lines the test harness itself prints
+    /// around the output; every line the test emits is a CSV record.
     #[test]
     #[ignore = "measurement, not a behavioural test; takes minutes"]
     fn compaction_cost_over_a_shrinking_workload() {
+        println!("{CSV_HEADER}");
         for (lambda, alpha, mu) in POLICIES {
-            println!("\n\n########## lambda = {lambda}, alpha = {alpha}, mu = {mu:?} ##########");
             for &rounds in &[400usize, 4_000, 40_000] {
                 measure_shrinking(rounds, lambda, alpha, mu);
             }
@@ -2453,102 +2496,29 @@ mod tests {
         h.set_lambda(lambda);
         h.set_alpha(alpha);
         h.set_mu(mu.0, mu.1);
-        let (live, _, _) = run_churny_workload_tracked(&mut h, churn_rounds);
-        let before = Snapshot::take(&h, 0);
-        h.reset_search_stats();
+        // The churn only builds the starting state here; its bursts are the
+        // growing measurement's business and are dropped rather than emitted
+        // twice under two different workload labels.
+        let (live, next_counter, _) = run_churny_workload_tracked(&mut h, churn_rounds);
 
         // Long enough to drain most of what the churn built: the mix nets about
         // 0.35 removals per round, so ~2.5 rounds per live allocation takes it
         // down to roughly a tenth of its size.
         let shrink_rounds =
             (live.len() * 5 / 2).next_multiple_of(COMPACTION_INTERVAL) + COMPACTION_INTERVAL;
-        let next_counter = u32::try_from(churn_rounds).unwrap() + 1_000_000;
-        let (bursts, snapshots) =
-            run_shrinking_workload_tracked(&mut h, live, shrink_rounds, next_counter);
-        let after = Snapshot::take(&h, shrink_rounds);
+        let bursts = run_shrinking_workload_tracked(&mut h, live, shrink_rounds, next_counter);
 
-        println!(
-            "\n=== shrink from {} live allocations ({churn_rounds} churn rounds), \
-             {shrink_rounds} rounds, {} bursts ===",
-            before.allocations, bursts.bursts,
+        print_csv(
+            Run {
+                workload: "shrinking",
+                phase: "shrink",
+                lambda,
+                alpha,
+                mu,
+                churn_rounds,
+            },
+            &bursts,
         );
-        println!(
-            "  {} -> {} allocations, {} -> {} live bytes, {} -> {} end",
-            before.allocations,
-            after.allocations,
-            before.live_bytes,
-            after.live_bytes,
-            before.end,
-            after.end,
-        );
-        println!(
-            "  bursts: budget {COMPACTION_BUDGET} every {COMPACTION_INTERVAL} ops; \
-             {:.1} steps each; {} of them ran out of work",
-            bursts.steps as f64 / bursts.bursts.max(1) as f64,
-            bursts.quiesced,
-        );
-        report_step_shapes(h.search_stats());
-
-        // Summaries over every burst past the burn-in, not over the printed rows.
-        let steady = snapshots.get(SHRINK_BURN_IN_BURSTS..).unwrap_or(&[]);
-        if !steady.is_empty() {
-            let before: Vec<f64> = steady
-                .iter()
-                .map(Snapshot::overhead_before_percent)
-                .collect();
-            let after: Vec<f64> = steady.iter().map(Snapshot::overhead_percent).collect();
-            let micros: Vec<f64> = steady.iter().map(|s| s.micros_per_burst).collect();
-            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-            let max = |v: &[f64]| v.iter().copied().fold(f64::MIN, f64::max);
-            println!(
-                "  steady state over {} bursts (burn-in {SHRINK_BURN_IN_BURSTS} dropped):\n    \
-                 overhead before a burst  mean {:.2}%  peak {:.2}%\n    \
-                 overhead after  a burst  mean {:.2}%  peak {:.2}%   <- what compaction leaves\n    \
-                 removed by a burst       mean {:.2}pp\n    \
-                 burst cost               mean {:.1} us  peak {:.1} us",
-                steady.len(),
-                mean(&before),
-                max(&before),
-                mean(&after),
-                max(&after),
-                mean(&before) - mean(&after),
-                mean(&micros),
-                max(&micros),
-            );
-        }
-
-        // Every burst is recorded; print at most ~40 rows so the larger runs stay
-        // readable, always including the last.
-        let stride = (snapshots.len() / 40).max(1);
-        println!(
-            "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>9}  {:>9}  {:>11}",
-            "round",
-            "allocations",
-            "live_bytes",
-            "end",
-            "gaps",
-            "widest",
-            "before",
-            "after",
-            "us/burst"
-        );
-        for (i, s) in snapshots.iter().enumerate() {
-            if i % stride != 0 && i + 1 != snapshots.len() {
-                continue;
-            }
-            println!(
-                "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>8.2}%  {:>8.2}%  {:>11.1}",
-                s.round,
-                s.allocations,
-                s.live_bytes,
-                s.end,
-                s.gaps,
-                s.widest_gap,
-                s.overhead_before_percent(),
-                s.overhead_percent(),
-                s.micros_per_burst,
-            );
-        }
     }
 
     /// The behavioural half of the shrinking measurement: a draining heap must
@@ -2573,7 +2543,7 @@ mod tests {
             h.assert_invariants();
 
             let start = h.live_count();
-            let (_, snapshots) = run_shrinking_workload_tracked(&mut h, live, 800, 900_000);
+            let snapshots = run_shrinking_workload_tracked(&mut h, live, 800, 900_000);
             h.assert_invariants();
             assert!(
                 h.live_count() < start / 2,
@@ -2592,83 +2562,34 @@ mod tests {
         }
     }
 
-    fn report_search_stats(label: &str, s: SearchStats) {
-        println!(
-            "  {label:<24} calls {:>7}  proposals {:>7}",
-            s.calls, s.proposals,
-        );
-    }
-
-    /// Which candidate shape the bursts actually committed, and -- the column
-    /// that matters -- how many bytes of `end` each one bought.
-    ///
-    /// Every compaction step *conserves* free space: it takes `len` free bytes
-    /// at the destination and gives `len` back where the mover was. The only
-    /// exception is a move that vacates the top of the heap, where the freed
-    /// bytes end up above `end` and stop counting. So the whole of the
-    /// fragmentation result is in `truncated`, and nowhere else.
-    fn report_step_shapes(s: SearchStats) {
-        let row = |label: &str, n: u64, bytes: u64, truncated: u64| {
-            println!(
-                "  {label:<24} steps {:>7}  bytes {:>10}  truncated {:>10}  ({:>5.1}% of bytes moved)",
-                n,
-                bytes,
-                truncated,
-                if bytes == 0 {
-                    0.0
-                } else {
-                    100.0 * truncated as f64 / bytes as f64
-                },
-            );
-        };
-        row("slides", s.slides, s.slide_bytes, s.truncated_by_slides);
-        row(
-            "evacuations",
-            s.evacuations,
-            s.evac_bytes,
-            s.truncated_by_evacuations,
-        );
-        let placements = s.placed_in_gap + s.placed_at_end;
-        println!(
-            "  {:<24} in a gap {:>7} ({:>5.1}%, {:>9} bytes)   extending end {:>7} ({:>9} bytes)",
-            "placements",
-            s.placed_in_gap,
-            if placements == 0 {
-                0.0
-            } else {
-                100.0 * s.placed_in_gap as f64 / placements as f64
-            },
-            s.placed_in_gap_bytes,
-            s.placed_at_end,
-            s.placed_at_end_bytes,
-        );
-    }
-
     /// Not an assertion of behaviour -- a **measurement**, of what compaction
-    /// costs and what it achieves over a realistic churn, recorded in
-    /// `test-results/`.
+    /// costs and what it achieves over a realistic churn.
     ///
-    /// Two regimes are reported separately, because they behave very
-    /// differently: compaction in **bursts** interleaved with churn (what a
-    /// backend does on each flush), and compaction driven to quiescence.
+    /// Two phases are reported, distinguished by the `phase` column, because
+    /// they behave very differently: compaction in **bursts** interleaved with
+    /// churn (what a backend does on each flush), and compaction driven to
+    /// quiescence afterwards with no churn competing for the free space.
     ///
-    /// Swept across `λ`, because that is the only way to settle stage 2: the
-    /// reward buys a preference the potential does not express, so its effect on
-    /// fragmentation has to be *measured* rather than argued for. The columns
-    /// that decide it are `overhead` down the table and the `truncated` share of
-    /// the bytes moved -- truncation is the only way free space leaves the file.
+    /// Swept across every policy, because that is the only way to settle stages
+    /// 2 to 4: each buys a preference the potential does not express, so the
+    /// effect on fragmentation has to be *measured* rather than argued for.
     ///
-    /// `#[ignore]`d because the largest case takes minutes -- it is a
-    /// measurement, not part of the suite. Run with:
+    /// Emits one CSV row per burst on stdout, and nothing else -- see
+    /// [`CSV_HEADER`]. Capture it with:
     ///
     /// ```text
-    /// cargo test --release -p kladde-heap --lib candidate_search_cost -- --ignored --nocapture
+    /// cargo test --release -p kladde-heap --lib candidate_search_cost \
+    ///     -- --ignored --nocapture \
+    ///   | grep -E '^(workload|growing),' > growing.csv
     /// ```
+    ///
+    /// The `grep` is only there to drop the lines the test harness itself prints
+    /// around the output; every line the test emits is a CSV record.
     #[test]
     #[ignore = "measurement, not a behavioural test; takes minutes"]
     fn candidate_search_cost_over_a_churny_workload() {
+        println!("{CSV_HEADER}");
         for (lambda, alpha, mu) in POLICIES {
-            println!("\n\n########## lambda = {lambda}, alpha = {alpha}, mu = {mu:?} ##########");
             for &rounds in &[400usize, 4_000, 40_000] {
                 measure_one(rounds, lambda, alpha, mu);
             }
@@ -2680,80 +2601,41 @@ mod tests {
         h.set_lambda(lambda);
         h.set_alpha(alpha);
         h.set_mu(mu.0, mu.1);
-        let (_, bursts, snapshots) = run_churny_workload_tracked(&mut h, rounds);
-        let during_bursts = h.search_stats();
+        let (_, _, churn_bursts) = run_churny_workload_tracked(&mut h, rounds);
 
         // Then catch up: compaction with no churn competing, until the file is
         // within `COMPACT_ENOUGH_PERCENT` of the live bytes. Not to a gapless
         // heap -- see the constant. Still one burst at a time, so the schedule
-        // matches production's.
-        h.reset_search_stats();
+        // matches production's, and measured the same way so the two phases are
+        // directly comparable.
         let target = h.live_bytes() + h.live_bytes() * COMPACT_ENOUGH_PERCENT / 100;
-        let before = Snapshot::take(&h, rounds);
-        let mut steps = 0u64;
+        let mut catchup_bursts = Vec::new();
         while h.len() > target {
-            let (took, quiesced) = h.compact_incrementally(4096);
-            steps += took;
-            if quiesced || took == 0 {
+            let n = catchup_bursts.len();
+            let burst = timed_burst(&mut h, rounds, n, CATCH_UP_BUDGET);
+            let done = burst.quiesced || burst.slides + burst.evacuations == 0;
+            catchup_bursts.push(burst);
+            if done {
                 break;
             }
         }
-        let catching_up = h.search_stats();
-        let after = Snapshot::take(&h, rounds);
 
-        println!(
-            "\n=== {rounds} rounds -> {} live allocations ===",
-            after.allocations
+        let run = Run {
+            workload: "growing",
+            phase: "churn",
+            lambda,
+            alpha,
+            mu,
+            churn_rounds: rounds,
+        };
+        print_csv(run, &churn_bursts);
+        print_csv(
+            Run {
+                phase: "catchup",
+                ..run
+            },
+            &catchup_bursts,
         );
-        println!(
-            "  bursts: {} of budget {COMPACTION_BUDGET} every {COMPACTION_INTERVAL} ops; \
-             {:.1} steps each; {} of them ran out of work",
-            bursts.bursts,
-            bursts.steps as f64 / bursts.bursts.max(1) as f64,
-            bursts.quiesced,
-        );
-        println!(
-            "  catch-up to <={COMPACT_ENOUGH_PERCENT}% overhead: {steps} steps, \
-             {:.2}% -> {:.2}% overhead, {} -> {} gaps ({:.4} steps per allocation)",
-            before.overhead_percent(),
-            after.overhead_percent(),
-            before.gaps,
-            after.gaps,
-            steps as f64 / after.allocations.max(1) as f64,
-        );
-        report_search_stats("during bursts", during_bursts);
-        report_search_stats("catching up", catching_up);
-        report_step_shapes(during_bursts);
-
-        // `before`/`after` bracket the burst this row follows, so the pair says
-        // how much of the overhead the burst actually removed -- `after` alone
-        // cannot distinguish "little to do" from "did nothing".
-        println!(
-            "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>9}  {:>9}  {:>11}",
-            "round",
-            "allocations",
-            "live_bytes",
-            "end",
-            "gaps",
-            "widest",
-            "before",
-            "after",
-            "us/burst"
-        );
-        for s in &snapshots {
-            println!(
-                "  {:>8}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}  {:>8.2}%  {:>8.2}%  {:>11.1}",
-                s.round,
-                s.allocations,
-                s.live_bytes,
-                s.end,
-                s.gaps,
-                s.widest_gap,
-                s.overhead_before_percent(),
-                s.overhead_percent(),
-                s.micros_per_burst,
-            );
-        }
     }
 
     #[test]
