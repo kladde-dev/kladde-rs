@@ -313,7 +313,9 @@ impl EvacuationIndex {
         debug_assert!(gone.is_some(), "removing an entry the index never held");
     }
 
-    /// Every entry, in key order.
+    /// Every entry, in key order. Diagnostic: `assert_consistent` walks it to
+    /// check the index against the allocation map.
+    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = Key> + '_ {
         self.tree.iter().map(|(&k, _)| k)
     }
@@ -360,6 +362,10 @@ impl EvacuationIndex {
     /// (`O(B log_B n)`) rather than the two extra `Aggregate` fields it used to
     /// be, which were paid for on every merge at every level of every update.
     /// Cold-path cost in exchange for a smaller hot path.
+    ///
+    /// Being test-only, it is compiled out of real builds -- and of benchmarks,
+    /// which link the ordinary library rather than the test harness.
+    #[cfg(test)]
     pub fn widest_gap(&self) -> Option<(u64, u64)> {
         self.tree.descend_visit(WidestGap)
     }
@@ -433,9 +439,11 @@ impl Key {
 /// gap": entering the *rightmost* child that holds one and repeating is exactly
 /// a descent to the last gap. Allocations are not in the way even though a large
 /// allocation outranks a small gap, because a child holding only allocations is
+#[cfg(test)]
 /// skipped outright.
 struct WidestGap;
 
+#[cfg(test)]
 impl DescendVisit<Key, (), Aggregate> for WidestGap {
     type Result = (u64, u64);
 

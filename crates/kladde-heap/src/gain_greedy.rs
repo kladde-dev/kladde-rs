@@ -1081,7 +1081,6 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     ///
     /// Per-byte potential gain is `w`, as for any slide, plus the `ν` term every
     /// candidate now carries -- see [`Self::end_bonus`].
-    #[inline]
     fn end_slide_candidate(&self, budget: u64) -> Option<(u64, Step<u64>)> {
         if self.nu == 0 {
             return None;
@@ -1124,7 +1123,6 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// It is **not** in general a two-finger move: the destination is the lowest
     /// gap that *fits*, which is at or above the frontier, so the mover is left
     /// permanently placed only when that gap happens to be the frontier itself.
-    #[inline]
     fn end_evacuation_candidate(&self, budget: u64) -> Option<(u64, Step<u64>)> {
         if self.nu == 0 {
             return None;
@@ -1157,7 +1155,6 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// ranks by potential alone, so the best it can do is be paid afterwards for
     /// a top-of-heap move it happened to pick. Finding the best such move is
     /// [`Self::end_evacuation_candidate`]'s job.
-    #[inline]
     fn evacuation_retirement(&self, from: u64, len: u64) -> u64 {
         if from + len != self.end {
             return 0;
@@ -1176,7 +1173,6 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// the four-candidate rule. With it on the end slide alone, `ν` was not a
     /// price on file size but a thumb on one step shape, and it promoted a move
     /// with a rate of 0.19 over moves running at 0.5 and better.
-    #[inline]
     fn end_bonus(&self, retired: u64, copied: u64) -> u64 {
         if self.nu == 0 || retired == 0 {
             return 0;
