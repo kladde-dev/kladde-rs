@@ -140,15 +140,16 @@ pub(crate) struct SearchStats {
     pub calls: u64,
     /// Calls that returned a step (the rest found the heap already compact).
     pub proposals: u64,
-    /// Committed steps by candidate shape: the frontier slide, the end
-    /// evacuation, and the ordinary evacuation. Which shape wins is what decides
-    /// whether a burst shrinks the file or merely rearranges it -- see
-    /// `truncated_by_*`.
+    /// Committed steps by candidate shape: the frontier slide, the end slide,
+    /// and the evacuation. Which shape wins is what decides whether a burst
+    /// shrinks the file or merely rearranges it -- see `truncated_by_*`.
     pub slides: u64,
+    pub end_slides: u64,
     pub end_evacuations: u64,
     pub evacuations: u64,
     /// Bytes those steps moved.
     pub slide_bytes: u64,
+    pub end_slide_bytes: u64,
     pub end_evac_bytes: u64,
     pub evac_bytes: u64,
     /// Bytes `end` fell by as a result. **This is the only way free space
@@ -159,6 +160,7 @@ pub(crate) struct SearchStats {
     /// slide, since that shape exists to retire exactly that much -- which is
     /// what makes it the column to read when judging `ν`.
     pub truncated_by_slides: u64,
+    pub truncated_by_end_slides: u64,
     pub truncated_by_end_evacuations: u64,
     pub truncated_by_evacuations: u64,
     /// Placements (`alloc`, and the relocating half of `resize`) that found a
@@ -192,6 +194,11 @@ impl SearchStats {
                 self.slide_bytes += len;
                 self.truncated_by_slides += truncated;
             }
+            Shape::EndSlide => {
+                self.end_slides += 1;
+                self.end_slide_bytes += len;
+                self.truncated_by_end_slides += truncated;
+            }
             Shape::EndEvacuation => {
                 self.end_evacuations += 1;
                 self.end_evac_bytes += len;
@@ -213,6 +220,7 @@ impl SearchStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Shape {
     Slide,
+    EndSlide,
     EndEvacuation,
     Evacuation,
 }
@@ -393,55 +401,70 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// off the heap, and truncation is the only way compaction reduces it. `ν` is
     /// the first term that says so.
     ///
-    /// It prices every candidate that can retire `end`, which in practice means
-    /// `end_evacuation_candidate` -- and the frontier slide in the one
-    /// case where its run happens to reach the top of the heap.
+    /// It prices every candidate that can retire `end`: both end-shaped ones,
+    /// and the frontier slide in the case where its run reaches the top.
     ///
-    /// # The scale
+    /// # The scale, and why it is the budget rather than `end`
     ///
-    /// Every candidate is ranked **per byte copied**, so what it does to `end`
-    /// has to be expressed that way too: retiring `retired` bytes while copying
-    /// `copied` is a **rate**, around 1 for an end evacuation. Per-byte potential gain lives in
-    /// `[0, end)` -- a byte can travel at most the height of the heap. So
-    /// multiplying the rate by `end` puts the two on the same range, and
+    /// Every candidate is ranked **per byte copied**, so what a move does to
+    /// `end` has to be expressed that way too: retiring `retired` bytes while
+    /// copying `copied` is a **rate**, normally in `[0, 1]`. A rate has to be
+    /// multiplied by something to sit on the same axis as a per-byte potential
+    /// gain, and the choice of that something turns out to decide the whole
+    /// behaviour of the term:
     ///
     /// ```text
-    /// score = w  +  ν · end · w / r
+    /// score = per-byte potential gain  +  ν · budget · retired / copied
     /// ```
     ///
-    /// leaves `ν` **dimensionless**, which is what makes it a knob rather than a
-    /// constant needing re-tuning per heap size. Read it as: *`ν = 1` says a move
-    /// that retires a byte of `end` for every byte it copies is worth as much as
-    /// the best move the heap could possibly offer* -- one that carries a byte
-    /// the full height of the address space.
+    /// This was originally `end`, on the reasoning that per-byte gain is bounded
+    /// by the height of the heap, so scaling by `end` puts the two on one range
+    /// and leaves `ν` dimensionless. That is right about the *range* and wrong
+    /// about the *discrimination*, and the difference matters:
     ///
-    /// `ν = 0` disables the candidate outright, recovering best-of-two.
+    /// | | endgame value |
+    /// |---|---|
+    /// | `end` | ~554 721 |
+    /// | end-slide rate | 0.07 |
+    /// | bonus at `ν = ¼` | ~9 700 |
+    /// | the competing frontier slide's **entire** score | 8 – 64 |
+    ///
+    /// Scaled by `end`, a hopeless move outscores its rival by 150x and a good
+    /// one by 2000x -- both are so far above the competition that the rate
+    /// carries no information. The term only discriminates where the opponent
+    /// also scores `O(end)`, which is the comparison against evacuations, and
+    /// that is exactly the comparison `end_evacuation_candidate` now
+    /// covers. Against a *slide*, whose score is a gap width, scaling by `end`
+    /// saturates and a rate of 0.07 wins as easily as a rate of 1.
+    ///
+    /// The budget is the size of one step, so it sits between gap widths (tens)
+    /// and heap height (10^5) and -- unlike `end` -- does not grow with the
+    /// heap. At `ν = ⅛` and a 2048-byte budget a rate-1.0 move earns 256 and a
+    /// rate-0.07 move earns 18, against gap widths of 8 to 64: the rate decides,
+    /// continuously, with no threshold. That is what a weight should do, and it
+    /// is why the end slide needs no admission gate beyond its budget guard.
+    ///
+    /// `ν` stays dimensionless, now reading as *how much per-byte potential gain
+    /// a fully-efficient truncation is worth, in units of one step's budget*.
+    /// `ν = 0` switches file size out of the objective entirely, leaving every
+    /// candidate ranked on potential alone.
     ///
     /// # Why it is fixed-point, in units of [`Self::NU_ONE`]
     ///
-    /// Because `ν = 1` anchors on the *best conceivable* move, not a typical one,
-    /// and the two are far apart. An end evacuation retires about a byte of `end`
-    /// per byte copied, so at `ν = 1` its bonus is roughly `end` itself -- far
-    /// larger than the travel distance of a typical winning evacuation, which
-    /// means it wins nearly whenever it is offered. The interesting range, where
-    /// the two terms actually trade, is **entirely below one**.
-    ///
-    /// An integer `ν` therefore has exactly two useful settings, off and
-    /// saturated, and a sweep over `1, 8, 64, u64::MAX` measures the same policy
-    /// four times -- which is what the first sweep did, and why it wrongly
-    /// concluded the knob was inert. Fixed point costs one division and makes the
-    /// sub-unit range expressible.
-    ///
-    /// So `nu` is passed in units of [`Self::NU_ONE`]: `NU_ONE` is `ν = 1`,
-    /// `NU_ONE / 2` is `ν = 0.5`, and the useful settings are the small ones.
+    /// Because the useful settings are fractions. `NU_ONE` is `ν = 1`,
+    /// `NU_ONE / 8` is `ν = ⅛`. An integer `ν` would have exactly two settings
+    /// here, off and saturated -- which an earlier sweep over `1, 8, 64,
+    /// u64::MAX` demonstrated by measuring the same policy four times and
+    /// concluding the knob was inert.
     ///
     /// # Why this needs a knob at all, rather than a fixed rule
     ///
-    /// Because the trade is genuinely uncertain. An end evacuation shrinks the
-    /// file now, but its mover lands wherever a gap took it -- generally above
-    /// the frontier, so the frontier will reach it and move it again. It buys a
-    /// certain gain now against a certain cost later, and only measurement can
-    /// say at what rate that is worth doing.
+    /// Because the trade is genuinely uncertain. An end slide is the one move
+    /// that is *guaranteed* to shrink the file, and also the one whose bytes are
+    /// guaranteed to move again -- everything it touches sits above every gap, so
+    /// the frontier will reach it eventually. It buys a certain gain now against a
+    /// certain cost later, and only measurement can say at what rate that is worth
+    /// doing.
     pub fn set_nu(&mut self, nu: u64) {
         self.nu = nu;
     }
@@ -553,6 +576,8 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
                 // attributed the same way the ranking resolved it.
                 let shape = if self.slide_candidate(remaining).map(|(_, s)| s) == Some(step) {
                     Shape::Slide
+                } else if self.end_slide_candidate(remaining).map(|(_, s)| s) == Some(step) {
+                    Shape::EndSlide
                 } else if self.end_evacuation_candidate(remaining).map(|(_, s)| s) == Some(step) {
                     Shape::EndEvacuation
                 } else {
@@ -1083,6 +1108,57 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// alone would usually exceed any evacuation's entire score and the reward
     /// would stop being a tie-breaker and become a standing preference for
     /// sliding.
+    /// The **end slide**: the top run shifted down onto the highest gap, which is
+    /// the only step shape that is guaranteed to shrink the file.
+    ///
+    /// The highest gap is the only one with no gap above it, so the run sitting
+    /// on it reaches `end`. Sliding that run down by the gap's width `w` retires
+    /// exactly `w` bytes of `end` and destroys the gap. Nothing else has that
+    /// property: a frontier slide moves free space upward without retiring any of
+    /// it, and an evacuation retires `end` only in the special case that its
+    /// mover happens to be the topmost allocation.
+    ///
+    /// # The guard, which is not optional
+    ///
+    /// **Only offered when the whole run fits the remaining budget.** A
+    /// budget-truncated slide retires nothing at all -- it shifts a prefix down
+    /// and leaves the gap re-formed above it, `w` bytes wide as before, one
+    /// budget higher up. Repeat that and the gap walks the entire heap at a cost
+    /// of one full copy per budget, reclaiming `w` bytes at the end of it. That
+    /// is not a hypothetical: it is precisely the 157 MB the widest-gap slide
+    /// spent in the measured endgame, where the top gap was 16 bytes and the run
+    /// above it hundreds of kilobytes.
+    ///
+    /// With the guard, an end slide copies at most one budget and always destroys
+    /// a gap, so total end-slide copying over a compaction run is bounded by
+    /// `gaps · budget` -- linear, and it degrades to *silence* exactly in the
+    /// regime that broke the old policy, since a long top run simply fails the
+    /// test and the frontier slide finishes the job instead.
+    ///
+    /// # The score
+    ///
+    /// Per-byte potential gain is `w`, as for any slide, plus the `ν` term every
+    /// candidate now carries -- see [`Self::end_bonus`].
+    fn end_slide_candidate(&self, budget: u64) -> Option<(u64, Step<u64>)> {
+        if self.nu == 0 {
+            return None;
+        }
+        let to = self.index.highest_gap()?;
+        let from = self.next_start(to)?;
+        let w = from - to;
+        let r = self.end - from; // no gaps above `to`, so the run reaches `end`
+        if r == 0 || r > budget {
+            return None;
+        }
+        let reward = if self.weights.lambda { r.min(w) } else { 0 };
+        // A slide leaves the moved bytes contiguous with what was below the gap,
+        // so the top falls by exactly the gap's width.
+        let gain = w
+            .saturating_add(reward)
+            .saturating_add(self.end_bonus(w, r, budget));
+        Some((gain, Step { from, to, len: r }))
+    }
+
     /// The **end evacuation**: the topmost allocation, into the lowest gap that
     /// takes it.
     ///
@@ -1125,7 +1201,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             .weights
             .score(from, e.len, self.neighbours_of(from, e.len))
             .saturating_sub(to)
-            .saturating_add(self.end_bonus(retired, len));
+            .saturating_add(self.end_bonus(retired, len, budget));
         Some((gain, Step { from, to, len }))
     }
 
@@ -1155,14 +1231,21 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// the four-candidate rule. With it on the end slide alone, `ν` was not a
     /// price on file size but a thumb on one step shape, and it promoted a move
     /// with a rate of 0.19 over moves running at 0.5 and better.
-    fn end_bonus(&self, retired: u64, copied: u64) -> u64 {
+    fn end_bonus(&self, retired: u64, copied: u64, budget: u64) -> u64 {
         if self.nu == 0 || retired == 0 {
             return 0;
         }
-        // `end · retired / copied` first, so the product cannot overflow `u128`
-        // for a large `ν`; only then is the rate scaled and the fixed point
-        // divided out.
-        let rate = u128::from(self.end) * u128::from(retired) / u128::from(copied);
+        // `min(budget, end)` is the largest a step could actually be: the budget
+        // caps it, and so does the heap. Taking the smaller matters because a
+        // caller may pass `u64::MAX` to mean "unbounded", and an unbounded scale
+        // would saturate the bonus and make every end-shaped move win on a tie.
+        // It also means the term degrades gracefully to the old `end` scaling
+        // when the budget is not the binding constraint.
+        let scale = budget.min(self.end);
+        // `scale · retired / copied` first, so the product cannot overflow
+        // `u128` for a large `ν`; only then is the rate scaled and the fixed
+        // point divided out.
+        let rate = u128::from(scale) * u128::from(retired) / u128::from(copied);
         let bonus = rate.saturating_mul(u128::from(self.nu)) / u128::from(Self::NU_ONE);
         u64::try_from(bonus).unwrap_or(u64::MAX)
     }
@@ -1192,7 +1275,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         Some((
             gap_len
                 .saturating_add(reward)
-                .saturating_add(self.end_bonus(retired, len)),
+                .saturating_add(self.end_bonus(retired, len, budget)),
             Step { from, to, len },
         ))
     }
@@ -1293,29 +1376,13 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
     fn propose_compaction_step(&self, budget: u64) -> Option<Step<u64>> {
         let mut best: Option<(u64, Step<u64>)> = self.slide_candidate(budget);
 
-        // There was a fourth shape here, the **end slide**: the top run shifted
-        // down onto the highest gap, guarded so that only an untruncated one
-        // could be offered. It is gone, and the measurement that removed it is
-        // worth recording, because it was the shape `ν` was invented for.
-        //
-        // Over the quiesce phase of `compaction_cost_when_the_workload_stops`,
-        // summed across every `ν > 0` and every scale:
-        //
-        // | | steps | bytes copied | `end` retired | per byte copied |
-        // |---|---|---|---|---|
-        // | end slide      |   558 | 931 572 | 69 203  | **0.07** |
-        // | end evacuation | 1 620 | 407 691 | 407 949 | **1.00** |
-        //
-        // The end slide copied 2.3x more than the end evacuation to retire 6x
-        // less. Both move bytes that sit above the frontier and must move again,
-        // so both are paid for twice -- but the end evacuation buys a byte of
-        // file size per byte copied, and the end slide buys seven hundredths.
-        //
-        // The end evacuation subsumes what it was for. Both exist to retire
-        // `end`; the evacuation does it by vacating the top outright, which is
-        // available whenever any gap below fits the topmost allocation, and that
-        // turned out to be often enough that the slide was never the only way
-        // through.
+        // The end slide, at `ν > 0`. Offered second so that a tie keeps the
+        // frontier slide, which is the shape that guarantees termination.
+        if let Some((gain, step)) = self.end_slide_candidate(budget) {
+            if best.is_none_or(|(incumbent, _)| gain > incumbent) {
+                best = Some((gain, step));
+            }
+        }
 
         // The end evacuation: the topmost allocation into the lowest gap that
         // takes it. Offered before the index's evacuation so that when the two
@@ -1379,8 +1446,11 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
                 // genuinely different step from the end evacuation, kept in
                 // contention only by `μ`.
                 let len = u64::from(size);
-                let gain =
-                    gain.saturating_add(self.end_bonus(self.evacuation_retirement(from, len), len));
+                let gain = gain.saturating_add(self.end_bonus(
+                    self.evacuation_retirement(from, len),
+                    len,
+                    budget,
+                ));
                 if best.is_none_or(|(incumbent, _)| gain > incumbent) {
                     best = Some((gain, Step { from, to, len }));
                 }
@@ -1516,6 +1586,11 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             gaps.iter().map(|&(pos, _)| pos).min(),
             "lowest_gap disagreed with a scan"
         );
+        assert_eq!(
+            self.index.highest_gap(),
+            gaps.iter().map(|&(pos, _)| pos).max(),
+            "highest_gap disagreed with a scan"
+        );
         for min_len in gaps
             .iter()
             .flat_map(|&(_, len)| [len.saturating_sub(1), len, len + 1])
@@ -1572,17 +1647,16 @@ mod tests {
     /// spends all of it. See [`Weights::score`].
     ///
     /// The `ν` rungs vary **only** `ν`, against the otherwise-default policy, so
-    /// that the file-size term's effect is not confounded with anything else --
-    /// which the α/μ rungs of the original sweep are, and which cost that
-    /// comparison most of its force.
+    /// that the end slide's effect is not confounded with anything else -- which
+    /// the α/μ rungs of the original sweep are, and which cost that comparison
+    /// most of its force.
     ///
-    /// They are **geometric below `ν = 1`**, because that is where the end term
-    /// and the distance term actually trade: at `ν = 1` an end evacuation's bonus
-    /// is about `end` itself, already bigger than a typical winning evacuation's
-    /// travel distance. A first sweep over `1, 8, 64, u64::MAX` measured the
-    /// saturated policy four times over and concluded the knob was inert; these
-    /// rungs are placed to find the crossover instead of straddling it. `ν = 1`
-    /// and `u64::MAX` stay as the upper anchor and as a check that a `ν` big
+    /// They are **geometric around `ν = ⅛`**, which is where the bonus lands on
+    /// the same scale as a gap width and the rate therefore starts to decide
+    /// slide-versus-slide: at a 2048-byte budget, `ν = ⅛` pays a rate-1.0 move
+    /// 256 and a rate-0.07 move 18, against gap widths of 8 to 64. Below that
+    /// the term is inert; well above it, it saturates again and every end-shaped
+    /// move wins whenever offered. `u64::MAX` is kept as a check that a `ν` big
     /// enough to win every comparison still converges.
     const NU: u64 = GainGreedyHeap::<Pointer<u32>>::NU_ONE;
     const POLICIES: [(bool, u64, (u64, u64), u64); 14] = [
@@ -1593,12 +1667,12 @@ mod tests {
         (true, 0, (4096, 512), 0),
         (false, 64, (4096, 512), 0),
         (false, u64::MAX, (1 << 40, 1 << 36), 0),
-        (false, 0, (0, 0), NU / 64),
-        (false, 0, (0, 0), NU / 16),
+        (false, 0, (0, 0), NU / 32),
+        (false, 0, (0, 0), NU / 8),
         (false, 0, (0, 0), NU / 4),
+        (false, 0, (0, 0), NU / 2),
         (false, 0, (0, 0), NU),
-        (false, 0, (0, 0), NU * 4),
-        (false, 0, (0, 0), NU * 16),
+        (false, 0, (0, 0), NU * 8),
         (false, 0, (0, 0), u64::MAX),
     ];
 
@@ -2546,26 +2620,16 @@ mod tests {
         assert_eq!(h.index.widest_gap(), Some((40, 38)));
     }
 
-    /// What removing the end slide costs, pinned so the trade stays visible.
+    /// A three-gap-free layout with two gaps, neither wide enough for any
+    /// survivor, so no evacuation competes and the two slides are on show
+    /// against each other:
     ///
     /// ```text
     ///   0..40   alloc      40..48  gap (8)   <- frontier
     ///  48..88   alloc      88..104 gap (16)  <- highest, `end` sits above it
     /// 104..144  alloc                        <- the top run, 40 bytes
     /// ```
-    ///
-    /// Neither gap takes a 40-byte allocation, so there is no evacuation of any
-    /// kind -- ordinary or end. The end slide was the one candidate that could
-    /// retire `end` here, by shifting the top run down onto the 16-byte gap. Now
-    /// nothing can, at any `ν`: the frontier slide takes the step and `end` does
-    /// not move until later steps have merged the gaps into something an
-    /// allocation fits.
-    ///
-    /// It is a real loss, and the measurement is what justifies accepting it:
-    /// over the quiesce phase the end slide bought 0.07 bytes of `end` per byte
-    /// copied, against the end evacuation's 1.00.
-    #[test]
-    fn without_the_end_slide_a_heap_of_narrow_gaps_retires_nothing_immediately() {
+    fn two_gap_heap() -> Heap {
         let mut h = Heap::new();
         h.alloc(resizable(1), 40).unwrap(); //   0..40
         h.alloc(resizable(2), 8).unwrap(); //   40..48   freed
@@ -2575,20 +2639,40 @@ mod tests {
         h.free(resizable(2)).unwrap();
         h.free(resizable(4)).unwrap();
         assert_eq!(h.len(), 144);
+        h
+    }
 
-        for nu in [0, Heap::NU_ONE, u64::MAX] {
-            let mut h = h.clone();
-            h.set_nu(nu);
-            let step = h.propose_compaction_step(UNBOUNDED).unwrap();
-            assert_eq!(step.to, 40, "nu={nu}: only the frontier slide is available");
-            h.commit_compaction_step(step);
-            h.assert_invariants();
-            assert_eq!(h.len(), 144, "nu={nu}: nothing could retire `end` yet");
-            // But the gaps merged, and 24 bytes now takes the 16-byte allocation
-            // that a later round would allocate -- the free space is on its way
-            // to the top rather than being retired from it.
-            assert_eq!(h.index.lowest_gap(), Some(80));
-        }
+    /// At `ν > 0` the end slide beats the frontier slide even though its gap is
+    /// no more valuable per byte travelled -- because it is the only one of the
+    /// two that shrinks the file, and `ν` is what says so.
+    #[test]
+    fn the_end_slide_retires_end_where_the_frontier_slide_only_moves_free_space() {
+        let mut h = two_gap_heap();
+        h.set_nu(Heap::NU_ONE);
+
+        let step = h.propose_compaction_step(UNBOUNDED).unwrap();
+        assert_eq!(
+            step,
+            Step {
+                from: 104,
+                to: 88,
+                len: 40
+            },
+            "the top run should slide onto the highest gap"
+        );
+        h.commit_compaction_step(step);
+        h.assert_invariants();
+        assert_eq!(h.len(), 128, "`end` retired exactly the top gap's 16 bytes");
+        assert_eq!(h.index.highest_gap(), Some(40), "only the frontier is left");
+
+        // At `ν = 0` the candidate is not offered at all, and the frontier slide
+        // takes the step -- which moves the same amount of free space upward
+        // while leaving `end` exactly where it was.
+        let mut h = two_gap_heap();
+        let step = h.propose_compaction_step(UNBOUNDED).unwrap();
+        assert_eq!(step.to, 40, "the frontier");
+        h.commit_compaction_step(step);
+        assert_eq!(h.len(), 144, "nothing retired");
     }
 
     /// The placement counters must actually count, and must close the
@@ -2675,8 +2759,10 @@ mod tests {
         // `remove_raw`. Nothing here resizes, which would move `end` in-place
         // without going through `place`.
         let s = h.search_stats();
-        let truncated =
-            s.truncated_by_slides + s.truncated_by_end_evacuations + s.truncated_by_evacuations;
+        let truncated = s.truncated_by_slides
+            + s.truncated_by_end_slides
+            + s.truncated_by_end_evacuations
+            + s.truncated_by_evacuations;
         assert!(truncated > 0, "compaction truncated nothing in 600 rounds");
         assert_eq!(
             h.len(),
@@ -2700,12 +2786,12 @@ mod tests {
     /// 168..208  alloc                        <- the top run, 40 bytes
     /// ```
     ///
-    /// The end evacuation copies 40 bytes and drops `end` from 208 to 104 -- it
-    /// takes the adjacent gap with it -- for a rate of 2.6 end-bytes per byte
-    /// copied. That rate is why it, and not the end slide, survived: on this
-    /// layout the slide would have copied the same 40 bytes to retire 64.
+    /// The end slide copies 40 bytes to retire 64: rate 1.6. The end evacuation
+    /// copies the same 40 bytes but drops `end` from 208 to 104 -- it takes the
+    /// adjacent gap with it -- for a rate of 2.6. Before the fourth candidate
+    /// existed, `ν` credited only the slide and the weaker move won.
     #[test]
-    fn the_end_evacuation_takes_the_gap_below_the_mover_with_it() {
+    fn the_end_evacuation_outbids_the_end_slide_when_both_retire_end() {
         let mut h = Heap::new();
         h.alloc(resizable(1), 64).unwrap(); //    0..64   freed
         h.alloc(resizable(2), 40).unwrap(); //   64..104
@@ -2733,12 +2819,9 @@ mod tests {
             "`end` fell by 104 -- the mover's 40 bytes and the 64-byte gap below it"
         );
 
-        // `ν` is not what picks it here, and that is worth pinning too: at `ν = 0`
-        // the *classic* evacuation proposes the identical step, because 168 bytes
-        // of travel already beats the frontier slide's 64. The end evacuation is
-        // only decisive where potential alone points somewhere else -- which is
-        // exactly the case `an_index_evacuation_that_retires_end_is_the_end_evacuation`
-        // shows the two candidates agreeing on.
+        // And it wins on the `ν` term specifically: the end slide is a perfectly
+        // good candidate here -- it moves the same 40 bytes and retires 64 -- but
+        // it is outscored because it retires less per byte copied.
         let mut h = Heap::new();
         h.alloc(resizable(1), 64).unwrap();
         h.alloc(resizable(2), 40).unwrap();
@@ -2746,15 +2829,21 @@ mod tests {
         h.alloc(resizable(4), 40).unwrap();
         h.free(resizable(1)).unwrap();
         h.free(resizable(3)).unwrap();
-        let step = h.propose_compaction_step(UNBOUNDED).unwrap();
+        h.set_nu(Heap::NU_ONE);
+        let (slide_gain, slide) = h.end_slide_candidate(UNBOUNDED).unwrap();
+        let (evac_gain, _) = h.end_evacuation_candidate(UNBOUNDED).unwrap();
         assert_eq!(
-            step,
+            slide,
             Step {
                 from: 168,
-                to: 0,
+                to: 104,
                 len: 40
             },
-            "distance-greed alone already reaches for the topmost allocation"
+            "the end slide is offered, and is a real candidate"
+        );
+        assert!(
+            evac_gain > slide_gain,
+            "end evacuation {evac_gain} should outscore end slide {slide_gain}"
         );
     }
 
@@ -2817,6 +2906,29 @@ mod tests {
             checked >= 20,
             "only {checked} top-of-heap evacuations arose; the test proved little"
         );
+    }
+
+    /// The guard, which is the whole reason this candidate is safe: a top run
+    /// that does not fit the budget would be *truncated*, and a truncated end
+    /// slide retires nothing -- it shifts a prefix down and re-forms the gap one
+    /// budget higher. Repeat that and the gap walks the heap at a cost of one
+    /// full copy per budget, which is exactly the 157 MB the widest-gap slide
+    /// used to spend. So it is declined rather than truncated.
+    #[test]
+    fn an_end_slide_that_would_be_truncated_is_not_offered_at_all() {
+        let mut h = two_gap_heap();
+        h.set_nu(u64::MAX); // however much it is wanted, the guard still binds
+
+        let step = h.propose_compaction_step(32).unwrap();
+        assert_eq!(
+            step.to, 40,
+            "the 40-byte top run does not fit a 32-byte budget, so the \
+             frontier slide takes the step instead"
+        );
+
+        // One more byte of budget and it is affordable, so it is taken.
+        let step = h.propose_compaction_step(40).unwrap();
+        assert_eq!(step.to, 88, "now the whole top run fits");
     }
 
     /// The property the whole change exists for: compacting a heap riddled with
@@ -3019,9 +3131,11 @@ mod tests {
         /// Which candidate shape the burst's steps took, and how many bytes each
         /// moved. `slides + end_slides + end_evacuations + evacuations` is the step count.
         slides: u64,
+        end_slides: u64,
         end_evacuations: u64,
         evacuations: u64,
         slide_bytes: u64,
+        end_slide_bytes: u64,
         end_evac_bytes: u64,
         evac_bytes: u64,
         /// How many bytes of `end` each shape bought. Every compaction step
@@ -3032,6 +3146,7 @@ mod tests {
         /// nowhere else, which is why it is split by shape where
         /// `end_before − end_after` (necessarily their sum) is not.
         truncated_by_slides: u64,
+        truncated_by_end_slides: u64,
         truncated_by_end_evacuations: u64,
         truncated_by_evacuations: u64,
         /// Placements since the *previous* burst -- workload activity rather than
@@ -3104,12 +3219,16 @@ mod tests {
             micros,
             quiesced,
             slides: stats.slides - stats_before.slides,
+            end_slides: stats.end_slides - stats_before.end_slides,
             end_evacuations: stats.end_evacuations - stats_before.end_evacuations,
             evacuations: stats.evacuations - stats_before.evacuations,
             slide_bytes: stats.slide_bytes - stats_before.slide_bytes,
+            end_slide_bytes: stats.end_slide_bytes - stats_before.end_slide_bytes,
             end_evac_bytes: stats.end_evac_bytes - stats_before.end_evac_bytes,
             evac_bytes: stats.evac_bytes - stats_before.evac_bytes,
             truncated_by_slides: stats.truncated_by_slides - stats_before.truncated_by_slides,
+            truncated_by_end_slides: stats.truncated_by_end_slides
+                - stats_before.truncated_by_end_slides,
             truncated_by_end_evacuations: stats.truncated_by_end_evacuations
                 - stats_before.truncated_by_end_evacuations,
             truncated_by_evacuations: stats.truncated_by_evacuations
@@ -3140,15 +3259,15 @@ mod tests {
     const CSV_HEADER: &str = "workload,phase,lambda,alpha,mu_exact,mu_multiple,nu,churn_rounds,\
 burst,round,allocations,live_bytes_before,end_before,live_bytes_after,end_after,\
 gaps_after,widest_gap_after,micros,quiesced,\
-slides,end_evacuations,evacuations,\
-slide_bytes,end_evac_bytes,evac_bytes,\
-truncated_by_slides,truncated_by_end_evacuations,truncated_by_evacuations,\
+slides,end_slides,end_evacuations,evacuations,\
+slide_bytes,end_slide_bytes,end_evac_bytes,evac_bytes,\
+truncated_by_slides,truncated_by_end_slides,truncated_by_end_evacuations,truncated_by_evacuations,\
 placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
 
     fn print_csv(run: Run, bursts: &[Burst]) {
         for b in bursts {
             println!(
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 run.workload,
                 run.phase,
                 u8::from(run.lambda),
@@ -3169,12 +3288,15 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
                 b.micros,
                 u8::from(b.quiesced),
                 b.slides,
+                b.end_slides,
                 b.end_evacuations,
                 b.evacuations,
                 b.slide_bytes,
+                b.end_slide_bytes,
                 b.end_evac_bytes,
                 b.evac_bytes,
                 b.truncated_by_slides,
+                b.truncated_by_end_slides,
                 b.truncated_by_end_evacuations,
                 b.truncated_by_evacuations,
                 b.placed_in_gap,
@@ -3457,7 +3579,8 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
         loop {
             let n = rows.len();
             let row = timed_steps(&mut h, last_round, n, QUIESCE_STEPS_PER_ROW);
-            let done = row.quiesced || row.slides + row.end_evacuations + row.evacuations == 0;
+            let done = row.quiesced
+                || row.slides + row.end_slides + row.end_evacuations + row.evacuations == 0;
             rows.push(row);
             if done || rows.len() >= QUIESCE_ROW_CAP {
                 break;
@@ -3566,8 +3689,8 @@ placed_in_gap,placed_at_end,placed_in_gap_bytes,placed_at_end_bytes";
         while h.len() > target {
             let n = catchup_bursts.len();
             let burst = timed_burst(&mut h, rounds, n, CATCH_UP_BUDGET);
-            let done =
-                burst.quiesced || burst.slides + burst.end_evacuations + burst.evacuations == 0;
+            let done = burst.quiesced
+                || burst.slides + burst.end_slides + burst.end_evacuations + burst.evacuations == 0;
             catchup_bursts.push(burst);
             if done {
                 break;
