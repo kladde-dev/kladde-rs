@@ -40,18 +40,27 @@ augmented search tree keyed by size can exploit.
 The development is in five stages, each one adding something the previous stage
 could not express:
 
-1. The simplest objective — potential, and cost measured in bytes moved.
+1. The simplest objective — potential, and cost measured in bytes moved — plus
+   the `K · end` term that makes file size part of what is being minimized.
 2. An objective that prefers moving *large* allocations, for cost models with a
    fixed per-step overhead.
 3. Pricing what a move does to the gap count **at the source**.
 4. Pricing what it does **at the destination**, for fixed-size allocations, by
    preferring gaps whose width is an integer multiple of the allocation's size.
 5. Moving **runs** of adjacent allocations together — deferred, except for a
-   cheap opportunistic version adopted now.
+   cheap opportunistic version adopted now. This is also where the other step
+   shape lives: the **slide**, of which there are two, into the lowest gap and
+   into the highest.
 
-Three sections follow: alternatives considered and rejected, the algorithms and
-the data structures that implement them, and an assessment against what is
-currently implemented.
+Four sections follow: alternatives considered and rejected, the algorithms and
+the data structures that implement them, an assessment of what was built, and
+extensions the measurements argue for but that are not built.
+
+This document has been revised against a working implementation, so it reports
+measurements rather than estimates where it can. Two of its original conclusions
+did not survive contact: the slide's destination, which it treated as settled and
+which turned out to matter more than anything else here; and the belief that a
+potential-only objective was good enough, which stage 1 now corrects.
 
 ---
 
@@ -84,6 +93,52 @@ The size cancels. **The best move under this pairing of objective and cost is
 simply the one that travels furthest**, and the query we need is:
 
 > Among all pairs `(A, G)` with `G.width >= A.size`, maximize `A.pos − G.pos`.
+
+### The potential is not the whole objective: the `end` term
+
+`Φ` is indifferent to whether free space sits below `end` or vanishes above it.
+But `end` is the file size, which is what is actually read off the heap, and
+truncation is the only way compaction reduces it. A compactor greedy in `Φ`
+alone will happily spend a whole heap's worth of copying to rearrange free space
+it never retires — and does, measurably. So the objective is
+
+```
+Φ' = Φ  +  K · end
+```
+
+with `K` in **addresses per byte of file size**. Since every candidate is ranked
+per byte copied and both terms share that denominator,
+
+```
+score = [ (−ΔΦ) + K·(−Δend) ] / copied  =  −Δ[ Φ + K·end ] / copied
+```
+
+so the compactor is exactly **steepest descent on `Φ'` per byte copied**. That
+is an identity, not an analogy: the potential half of each candidate's score
+really is `−ΔΦ / copied` — the travel distance for an evacuation, the gap width
+for a slide — and the file-size half really is `−Δend / copied`, a *rate* of
+truncation. `Φ'` still falls monotonically, since every step lowers `Φ` and none
+raises `end`, so termination is unaffected.
+
+`K` reads directly: *at `K = 1024`, retiring one byte of `end` is worth moving
+one byte 1024 addresses further down*. That it is a plain constant matters more
+than it looks. Two earlier forms were tried and both had the coefficient depend
+on something:
+
+| form | objective | marginal price of a byte of `end` |
+|---|---|---|
+| `ν · end · rate` | `Φ + ½ν·end²` | grows with the heap |
+| `ν · budget · rate` | `Φ + ν·budget·end` | constant, but varies with the caller's budget |
+| `K · rate` | `Φ + K·end` | constant |
+
+The first is the instructive failure. Scaling by `end` looks right — per-byte
+gain is bounded by the height of the heap, so `end` puts both terms on one range
+— but it makes the *price* of file size grow with the file, and on a large heap
+every truncating move then dominates everything else regardless of how little it
+retires. That was the objective behaving exactly as written, not a scoring
+accident. Stages 2 and 3 below are additive terms in `A` alone and do **not**
+have this form; at `λ = α = μ = 0` the identification with `Φ'` is exact, and
+those three break it when set.
 
 The constraint `G.pos < A.pos` needs no separate handling: any pair violating it
 scores `<= 0`, so it can only win when no beneficial move exists at all, which is
@@ -184,12 +239,20 @@ Every subtree — every B+ tree node, and every leaf — carries:
 | field | meaning | identity |
 |---|---|---|
 | `min_gap_pos` | lowest `G.pos` over gaps in the subtree | `u64::MAX` |
+| `max_gap_pos` | highest `G.pos` over gaps in the subtree | `0` |
 | `max_alloc_score` | highest `score` over allocations in the subtree | `0` |
 | `best` | max of `score(A) − G.pos` over valid pairs *entirely inside* the subtree | `0` |
 | `best_pair` | the `(A, G)` achieving `best` | — |
 
-The first two are plain minima and maxima. `best` is what makes the root
+The first three are plain minima and maxima. `best` is what makes the root
 answer the query in `O(1)`.
+
+The two gap extremes each name a distinguished gap, and both turn out to be
+step destinations in their own right — `min_gap_pos` is the **compaction
+frontier** below which the heap is final, and `max_gap_pos` is the only gap
+whose closure can retire `end`. Note that `0` is *not* a usable "no gap here"
+sentinel for `max_gap_pos`, since a gap at address 0 is perfectly ordinary;
+`min_gap_pos != u64::MAX` carries the emptiness predicate for both.
 
 **On representation.** Everything is `u64` and the differences are computed with
 `saturating_sub`, which is not a detail — plain `u64` subtraction wraps an upward
@@ -315,9 +378,13 @@ The result is the true best budget-respecting pair, not a heuristic. This is a
 genuine advantage of keying by size rather than by address, and it is not
 available to either of the address-ordered searches currently implemented.
 
-(In `sweep-bptree` this needs a custom descent — the crate exposes
-`descend_visit` for that purpose — and I have not verified that its visitor
-interface can express a two-sided collection of canonical subtrees.)
+(In `sweep-bptree` this needs a custom descent, via `descend_visit`. Its visitor
+does express a two-sided collection: `visit_inner` receives a node's keys *and*
+all `size + 1` child arguments and returns which child to enter, so the prefix
+and suffix children can both be folded in on the way past. One detail is easy to
+get wrong — the crate sends an exact separator match to the *right* child, so the
+path is `keys.partition_point(|k| *k <= boundary)`, not `< boundary`, which would
+step left of the match and drop the whole suffix.)
 
 ---
 
@@ -813,19 +880,80 @@ So the rule is simply: extend while the run still fits in `min(w, budget)`. Note
 that the downward extension degenerates gracefully — if it reaches the allocation
 immediately above the gap, the step has become a slide.
 
-### The slide is still separate
+### The slides are still separate, and there are two of them
 
-This project's other candidate shape is the **slide**: the maximal run above the
-largest gap, shifted down into it. A slide is *not* an evacuation and cannot be
-represented in this tree, because it does not require the run to fit —
-`run.size > G.width` is the normal case, and the move is a partial overlapping
-shift by `G.width`.
+A **slide** shifts the run above a gap down into it. It is *not* an evacuation
+and cannot be represented in this tree, because it does not require the run to
+fit — `run.size > G.width` is the normal case, and the move is a partial
+overlapping shift by `G.width`.
 
-That matters beyond taxonomy. The slide is what guarantees a positive-gain move
+That matters beyond taxonomy. A slide is what guarantees a positive-gain move
 exists whenever any gap does; the tree can legitimately report `best = 0` on a
-heap full of gaps too narrow for anything (this project's `slivers` shape). **The
-tree replaces the evacuation search, not the slide.** Both candidates are offered
-and the better one wins, exactly as now.
+heap full of gaps too narrow for anything (this project's `slivers` shape).
+**The tree replaces the evacuation search, not the slide.**
+
+#### Which gap to slide into: the lowest, not the widest
+
+The obvious choice is the *widest* gap, since its per-byte gain is the largest.
+That is locally optimal and globally disastrous. Both choices close exactly one
+gap per untruncated slide, so gap-count progress does not separate them. What
+separates them is **order**, and the cost of closing a gap is the live bytes
+between it and the next gap still open above it:
+
+- Closing a gap *above* `G` lengthens the run `G` must later move, from `R` to
+  `R + R'`. Do that repeatedly and the total is quadratic in the gap count.
+- Closing them bottom-up telescopes: `Σ Rᵢ` is exactly the live bytes above the
+  lowest gap, each moved **once** — which is also the lower bound, since every
+  byte above the lowest gap must move at least once.
+
+Sharper: a slide into any gap that is not the lowest moves bytes that are
+*provably going to move again*, because the gapless layout drops everything
+above the lowest gap by at least its width. `min_gap_pos` at the root is the
+frontier below which the heap is final, and a slide into it is the only step
+shape that advances that frontier.
+
+Measured on the quiescing workload at 40 000 churn rounds — 6 980 allocations,
+554 721 live bytes, 1 455 gaps, widest 236 bytes:
+
+| | steps | bytes copied | ms |
+|---|---|---|---|
+| widest-first | 81 280 | 157 432 614 | 7 510 |
+| lowest-first | 2 135 | 572 888 | 63 |
+
+573 KB against 555 KB live is the bound above, met to within 3%. The frontier
+slide needs no width in the key at all: the gap's width is the distance to the
+next allocation, so the destination is a root read and the width one probe of
+the layout.
+
+It is not free. A burst costs 4–5× more while a workload is running, because the
+frontier sits at the bottom of an already-compacted region, so the run above it
+is long and made of small allocations — a step re-keys ~7× more allocations for
+the same bytes moved. And `end` is retired later, since a frontier slide only
+lets `end` retreat once the frontier reaches the last gap. That second cost is
+what the `end` term and the shapes below exist to answer.
+
+#### The end slide
+
+The **end slide** is the mirror: the run above the *highest* gap, which is the
+only gap with no gap above it, so the run sitting on it reaches `end`. Sliding
+it down by that gap's width `w` retires exactly `w` bytes of file size. Nothing
+else has that property unconditionally.
+
+It carries a guard that is not optional: **it is offered only when the whole top
+run fits the remaining budget.** A budget-truncated slide retires nothing at all
+— it shifts a prefix down and re-forms the gap one budget higher — and repeating
+that walks the gap through the entire heap at a cost of one full copy per
+budget, which is precisely the 157 MB in the table above. With the guard, an end
+slide copies at most one budget and always destroys a gap, so total end-slide
+copying is bounded by `gaps · budget`.
+
+The end slide is the weakest of the truncating shapes and remains the open
+question in this design. Measured over the quiesce phase it retires **0.07**
+bytes of `end` per byte copied, against the end evacuation's **1.00**, and
+removing it entirely restores the endgame to the `K = 0` optimum (1.02 bytes
+copied per live byte, against 1.16–1.22 with it) at the cost of about 0.1
+percentage points of overhead on the growing workload. Both variants are
+measured and neither dominates.
 
 ---
 
@@ -910,9 +1038,10 @@ gap_starting_at(addr)            -> Option<Gap>
 free_neighbours(addr, size)      -> 0 | 1 | 2
 run_len_from(addr, cap)          -> (len, truncated)  # contiguous, <= cap
 
-# free space -- all three answered by the evacuation index, which is keyed by size
+# free space -- all answered by the evacuation index, which is keyed by size
+lowest_gap()                     -> Option<Address>   # the compaction frontier; root read
+highest_gap()                    -> Option<Address>   # the only gap that can retire `end`; root read
 lowest_gap_fitting(width)        -> Option<Gap>       # lowest with G.width >= width
-widest_gap()                     -> Option<Gap>
 lowest_exact_gap(width)          -> Option<Gap>       # G.width == width exactly
 
 # the evacuation index
@@ -990,6 +1119,16 @@ than an in-place edit.
 
 ### Proposing a step
 
+Every candidate is scored `−ΔΦ/copied + K·retired/copied`, the two halves of
+`Φ'`. `retired` is what the move does to `end`, and is zero for most moves:
+
+| candidate | `−ΔΦ / copied` | `retired` |
+|---|---|---|
+| frontier slide | `gap_len` | `gap_len` if the run reaches `end`, else **0** |
+| end slide | `w` | `w`, always |
+| end evacuation | `score(A) − to` | `end − prev_end(A.pos)`, always `>= A.size` |
+| classic evacuation | `score(A) − G.pos` | — *see below* |
+
 ```
 fn propose_step(budget) -> Option<Step>:
     if no gaps exist:
@@ -997,10 +1136,19 @@ fn propose_step(budget) -> Option<Step>:
 
     best = None
 
-    # 1. The slide. Offered unconditionally: it is the only candidate that does
-    #    not require the moved bytes to fit in the gap, and so the only one that
-    #    guarantees progress while any gap exists.
+    # 1. The frontier slide. Offered unconditionally: it is the only candidate
+    #    that does not require the moved bytes to fit in the gap, and so the only
+    #    one that guarantees progress while any gap exists.
     best = offer(best, slide_candidate(budget))
+
+    # 1b. The end slide, at K > 0. Offered second so a tie keeps the frontier
+    #     slide, which is the shape that guarantees termination.
+    best = offer(best, end_slide_candidate(budget))
+
+    # 1c. The end evacuation: the topmost allocation into the lowest gap that
+    #     takes it. Offered before the index's evacuation so that when the two
+    #     agree, the shape is attributed to the candidate that sought it.
+    best = offer(best, end_evacuation_candidate(budget))
 
     # 2. The exact evacuation within the budget, from the augmented tree.
     best = offer(best, best_evacuation_within(budget))
@@ -1055,16 +1203,53 @@ above it — otherwise it would be trailing free space above `end`, not a gap �
 at steps 3 and 5. The guards cost a branch and buy the invariant that neither
 path can be reached in a state it does not handle.
 
+**The classic evacuation earns no `K` term, and cannot need one.** An evacuation
+retires `end` only if its mover is the topmost allocation — that is what
+`from + len == end` means — and there is exactly one such allocation. For a
+fixed mover the index maximizes `score(A) − G.pos` by minimizing `G.pos` over
+gaps that fit, which is `lowest_gap_fitting`: precisely the destination the end
+evacuation picks. Same mover, same destination, same step, same gain, and the
+end evacuation is offered first. (Verified byte-identical across 66 907
+measurement rows.) That is a property of *the index's objective*, not of
+evacuations in general — the tiling candidate below picks its destination by fit
+rather than by position, so it does carry the term.
+
+The end evacuation needs to be a candidate rather than a score term because "is
+the topmost allocation" is not a function of a key and would re-key on every
+mutation. But exactly one allocation has the property, so enumerating it
+directly costs one `next_back()` and beats indexing it outright. It dominates
+the end slide at the job `K` rewards: vacating the topmost allocation drops
+`end` all the way to the top of whatever is below, so it retires `>= A.size`
+while copying `A.size` — a rate of at least **1**, against the end slide's
+measured 0.07.
+
 ```
-fn slide_candidate(budget) -> Option<Candidate>:
-    g = widest_gap()?
-    from = g.pos + g.width
-    (len, truncated) = run_len_from(from, budget)
+fn slide_candidate(budget) -> Option<Candidate>:      # the frontier slide
+    to = lowest_gap()?
+    # A gap always has an allocation above it -- free space at the top is `end`
+    # retreating, not a gap -- so the width need not be in the key: it is the
+    # distance to the next allocation.
+    from = next_start(to)?
+    (len, _) = run_len_from(from, budget)
     if len == 0: return None
-    # A maximal run is flanked by free space above, so sliding it merges that
-    # with the range it vacates, or lets `end` retreat: r = +1 either way.
-    # A budget-truncated prefix merely relocates the gap: r = 0.
-    return Candidate { from, to: g.pos, len, r: if truncated { 0 } else { 1 } }
+    retired = if from + len == end { from - to } else { 0 }
+    return Candidate { from, to, len, retired }
+
+fn end_slide_candidate(budget) -> Option<Candidate>:
+    if K == 0: return None
+    to = highest_gap()?
+    from = next_start(to)?
+    r = end - from                 # no gaps above `to`, so the run reaches `end`
+    if r == 0 or r > budget: return None      # never truncate: see the guard
+    return Candidate { from, to, len: r, retired: from - to }
+
+fn end_evacuation_candidate(budget) -> Option<Candidate>:
+    if K == 0: return None
+    (from, A) = topmost_allocation()?
+    if A.size > budget: return None
+    to = lowest_gap_fitting(A.size)?
+    if to >= from: return None     # nothing below it fits: this would be upward
+    return Candidate { from, to, len: A.size, retired: end - prev_end(from) }
 
 fn extend_into_run(step, budget) -> Step:
     w   = gap_starting_at(step.to).width
@@ -1131,47 +1316,35 @@ structure below is updated from the deltas this one produces, so the update
 protocol is "mutate the layout, then push the resulting entry insertions and
 removals into the derived indexes".
 
-### B. The free-space directory — subsumed by C, kept only as a fallback
+### B. The free-space directory — subsumed by C, never built
 
 **Affords:** where the free space is, how wide, and which piece is the widest.
 
-**All three queries are answerable from C** (since C is keyed by size with gaps sorting last at
-equal size, which is exactly the order a free-space directory wants):
+**All of them are answerable from C** (since C is keyed by size with gaps sorting
+last at equal size, which is exactly the order a free-space directory wants):
+- `lowest_gap()` / `highest_gap()` — `min_gap_pos` and `max_gap_pos` at the
+  root. `O(1)`. These feed the two slides.
 - `lowest_gap_fitting(w)` — `min_gap_pos` aggregated over the key suffix from
-  `(w << 1) | 1`, one descent.
+  `(w << 1) | 1`, one descent. Feeds placement and the end evacuation.
 - `lowest_exact_gap(w)` — the gaps of width exactly `w` form a contiguous key
   block with prefix `(w << 1) | 1`, ordered within it by `score = G.pos`, so this
   is the first entry of that block: one `range(((w << 1) | 1, 0, 0)..).next()`,
   accepted only if its size field still reads `w`. Feeds `μ₁`.
-- `widest_gap()` — descend rightmost-first, entering the rightmost child whose
-  `min_gap_pos != u64::MAX`. The augmentation already distinguishes "contains a
-  gap" from "contains none", which is precisely the predicate this descent needs.
-  Feeds the slide.
 
-So B should not be built at all unless C cannot express these. The caveat is the
-one already flagged in stage 1: all three are custom descents against
-`sweep-bptree`'s `descend_visit`, whose visitor interface has not been verified to
-support them. Today's address-keyed `GapTree` with a max-width augmentation is the
-other fallback for `lowest_gap_fitting` specifically.
+`widest_gap()` is **no longer a production query at all**. Once the slide moved
+to the frontier nothing needed it, so the two aggregate fields it used to
+require (`max_gap_width` and the position achieving it) came out of the merge —
+which runs `B` times per level on every update path — and the query survives
+only as a diagnostic, as a descent entering the rightmost child whose
+`min_gap_pos != u64::MAX`. It is compiled out of real builds and of benchmarks.
 
-**If a fallback is needed,** it should not be the nested
-`BTreeMap<u64 /*width*/, BTreeSet<u64 /*pos*/>>` this section originally proposed
-— a map of small sets allocates a node per distinct width and leaves most of them
-nearly empty, which is a lot of pointer chasing and slack for a structure holding
-about 1 200 `u64`s. A single flat set does both remaining queries:
-
-```
-BTreeSet<(u64 /*width*/, Reverse<u64> /*pos*/)>
-```
-
-ordered by width ascending and position *descending*. Then `widest_gap()` is
-`last()` — the largest width, and within it the lowest position, which is the one
-the slide wants — and `lowest_exact_gap(w)` is `range(..=(w, Reverse(0))).next_back()`
-filtered on `width == w`. One allocation, one contiguous run of 16-byte elements.
-`lowest_gap_fitting` is not answerable from it and stays with C either way.
-
-**Maintained:** if built at all, on every gap creation, destruction, trim and
-merge.
+**B was never built.** The caveat flagged in stage 1 — that these are custom
+descents against `sweep-bptree`'s `descend_visit`, whose visitor interface had not
+been verified to support them — turned out not to bite: the interface is handed a
+node's keys *and* all `size + 1` child arguments and returns which child to enter,
+which is enough for a suffix aggregate, a two-sided canonical-subtree collection,
+and a steered descent alike. So C answers everything B was proposed for, and the
+two cheapest queries of all (`lowest_gap`, `highest_gap`) are root reads.
 
 **Note:** today's `MoverTree` disappears entirely — its query ("the
 highest-addressed allocation that fits in `w` bytes") is what the augmented
@@ -1184,8 +1357,8 @@ budget constraint, in `O(1)` and `O(B log_B n)` respectively.
 
 **Composed of:**
 - An augmented B+ tree over the key `((size << 1) | is_gap, score, address)`,
-  carrying `{ min_gap_pos, max_alloc_score, best, best_pair }` per subtree, merged
-  by the right-to-left sweep of stage 1.
+  carrying `{ min_gap_pos, max_gap_pos, max_alloc_score, best, best_pair }` per
+  subtree, merged by the right-to-left sweep of stage 1.
 - Its entries: one per gap, one per resizable allocation, and — once `α > 0` —
   one per non-empty `(fixed class, nc)` bucket (see D). At `α = 0`, which is where
   the first implementation should start, there is no bucketing: simply one entry
@@ -1196,9 +1369,10 @@ budget constraint, in `O(1)` and `O(B log_B n)` respectively.
 - `best_evacuation_within(budget)` — the prefix descent of stage 1's "the budget,
   for free": collect canonical prefix and suffix subtrees, take the suffix's
   `min_gap_pos` as a seed, sweep the prefix. `O(B log_B n)`.
-- `lowest_gap_fitting(w)`, `lowest_exact_gap(w)`, `widest_gap()` — as set out in
-  B, a suffix aggregate, a range lookup and a rightmost-gap descent respectively.
-  These are why B does not need to exist.
+- `lowest_gap()`, `highest_gap()` — root reads. These are why the two slides need
+  no free-space directory of their own.
+- `lowest_gap_fitting(w)`, `lowest_exact_gap(w)` — a suffix aggregate and a range
+  lookup, as set out in B. These are why B does not need to exist.
 
 **Maintained:** on every layout delta, and additionally whenever a neighbour
 count changes, which re-keys the affected allocation (stage 3). Budget three to
@@ -1273,8 +1447,8 @@ bonus in `place` or `propose_step`, and every move it makes stays valid.
 | today | becomes |
 |---|---|
 | `allocations` + `by_id` + `end` | A, unchanged |
-| `free_by_size` | **gone** — subsumed by C; B survives only as a fallback if C's descents cannot be expressed, and then as one flat set, not a nested map |
-| `GapTree` (address-keyed, max-width) | subsumed by C; the other fallback for `lowest_gap_fitting` alone |
+| `free_by_size` | **gone** — subsumed by C; B was never built |
+| `GapTree` (address-keyed, max-width) | **gone** — subsumed by C's descents and root reads |
 | `MoverTree` (address-keyed, min-size) | **gone** — C answers its question globally |
 | `live_by_size` (3-way by neighbours) | D, unchanged in shape — but only once `α > 0` |
 | — | C, the new augmented index |
@@ -1326,6 +1500,19 @@ Against replacing a 552-candidate walk with a root read, that looks like a clear
 win at the measured scale, and the margin widens with the heap because one side
 is logarithmic and the other linear.
 
+**In the event the query cost did move to the update path, and the interesting
+number is not the tree's.** A burst's cost tracks the number of allocations it
+*re-keys*, at a few microseconds each, and each re-key is `O(B log_B n)` with the
+augmentation refolded over all `B` children at every level on the path. That is
+the design's stated trade, and it is why the frontier slide is expensive in the
+active regime: it drags long runs of *small* allocations across the compacted
+region, re-keying ~7× more entries for the same bytes moved. Roughly 16 index
+operations are issued per allocation moved, of which only 2 — remove the old key,
+insert the new one — are irreducible; the rest is gap bookkeeping repeated once
+per member of the run, and neighbour re-keying that is skipped entirely once `α`
+is known to be unspendable. A bulk commit path for contiguous runs is the obvious
+unexploited saving, and is not built.
+
 Two further advantages are worth weighing:
 
 - **The budget query is exact**, in `O(B log_B n)`, replacing a two-track
@@ -1337,13 +1524,21 @@ Two further advantages are worth weighing:
 
 ### What I would not claim yet
 
-- **The estimate above is an estimate.** No implementation has been benchmarked.
-  It rests on the merge being 2–3× an existing augmentation's, which is a reading
-  of the code, not a measurement.
-- **Stage 3 has a cost stage 2 does not.** Making the score depend on neighbours
-  means each mutation re-keys up to four other entries. `α = 0` avoids this
-  entirely and removes the reason to bucket at all, so the two should be measured
-  against each other rather than adopted together on principle.
+- **Stage 3 costs more than the estimate suggested, and the fix was elsewhere.**
+  Making the score depend on neighbours means each mutation re-keys up to four
+  other entries — and the implementation was doing that *unconditionally*, even
+  at `α = 0` where the score ignores neighbours entirely. Skipping it when `α`
+  cannot be spent (which includes `λ = 1`, since the per-allocation cap gives `λ`
+  first claim on the headroom) took 26–45% off a burst on the realistic shapes.
+  That was pure overhead the design note had described as "the cost `α` is
+  measured against" without noticing it was being paid at `α = 0` too.
+- **Timing measurements on this hardware are not trustworthy build-to-build.**
+  Five consecutive runs of one binary span 6%, but two *builds* can differ by
+  30%+ — the first run after a rebuild is reliably fast. A criterion A/B against
+  a saved baseline lies along exactly that axis, and produced a 20–35%
+  "regression" that a repeat run showed to be nothing. Only alternating the two
+  versions several times in one session is reliable. Every structural figure in
+  this document (steps, bytes, gaps, overhead) is deterministic and unaffected.
 - **Stage 5 is deferred for a reason that may not survive tuning.** Runs need a
   steep reward, and the adopted sign bound forbids one. If `λ · reward(s) <= s`
   proves too tight in practice, the dual-aggregate alternative reopens both
@@ -1352,34 +1547,209 @@ Two further advantages are worth weighing:
   objective is no longer `ΔΦ / cost`, so the fragmentation behaviour would have to
   be re-measured from scratch. Every fragmentation number this project currently
   has was produced under distance-greed.
-- **Nothing here models the top of the heap.** The objective is potential-based,
-  and the potential is indifferent to whether free space sits below `end` or
-  vanishes above it. Since file size is what is actually read off the heap, and
-  since truncation is the only way compaction reduces it, a structure that
-  optimizes evacuations exactly may still be optimizing the wrong thing. That is
-  an open question about the objective, not about this data structure — but it
-  bounds how much a better search can be expected to buy.
+- **The top of the heap is modelled, but only just.** `K · end` is the term that
+  says file size matters, and adding it is what makes the compactor greedy on a
+  potential that includes the quantity actually read off the heap. But the
+  measured spread across a 256× range of `K` is about 0.13 percentage points of
+  overhead on one seed, and `shrinking` is non-monotone in `K`. What is robust is
+  the sign — every `K > 0` improves the growing workload and every `K > 0` costs
+  13–19% more copying to converge — not the placement of any particular value.
 
-### Recommendation
+### What was built
 
-Stages 1 and 2 are a contained, well-understood change: one additional augmented
-B+ tree, one merge rule used at every level, `MoverTree` deleted, and the existing
-`sweep-bptree` dependency already providing the trait. They replace a linear
-search with a constant-time read and make the budget constraint exact rather than
-heuristic. That is the piece worth building and measuring first, at `α = 0`.
+All of stage 1, stage 2 (`λ` as a bool), stage 4 (`μ₁`/`μₖ` with the size-class
+registry E), and stage 5's opportunistic run extension. Stage 3's `α` is
+implemented but is inert at `λ = 1` and measures as a tie-breaker; D was never
+needed, because at `α = 0` there is nothing to bucket by, and C carries one entry
+per allocation.
 
-Concretely, the first implementation should be: C with **one entry per
-allocation** (no bucketing, so no D — see stage 3 for why de-duplication does not
-pay at `α = 0`), `free_by_size` and `GapTree` folded into C's descents,
-`reward(s) = s` with `λ` a bool, and the benchmarks run across `λ ∈ {true, false}`.
+Beyond the five stages, two things the original document did not anticipate:
 
-Stage 4 is a small, self-contained addition whose motivation — keeping free space
-in a shape the allocator can consume without residue — is the one best supported
-by the measurements this project already has, and its index is shared between
-placement and compaction rather than serving only the latter.
+- **The slide became the frontier slide**, which is where the largest single
+  improvement came from — a 38× reduction in steps and 275× in bytes copied to
+  converge. The document had treated "which gap to slide into" as settled.
+- **The objective grew the `K · end` term**, and with it two new candidate
+  shapes whose product is file size rather than potential.
 
-Stage 3 should follow only once stages 1, 2 and 4 have been measured, because it
-is the one that makes an allocation's key depend on its neighbours.
+`widest_gap()` and the two aggregate fields serving it were removed as a
+consequence of the first; `highest_gap()` and `max_gap_pos` were added as a
+consequence of the second.
 
-Stage 5's opportunistic extension costs nothing and can ship with stage 1; its
-full form should wait.
+### What is still open
+
+The **end slide** earns its place only in the active regime, and pays for it
+during convergence; removing it is measured and defensible, keeping it is
+measured and defensible. The **`K` value** is chosen from one seed. And the
+pathology in the next section is unaddressed.
+
+---
+
+## Future extensions
+
+### The stress test: a shrinking allocation at a low address
+
+Everything above is measured on workloads that churn roughly uniformly. Here is
+a shape they do not cover, and on which the current policy is catastrophic.
+
+Put a resizable allocation at a low address and shrink it a little at a time,
+with a compact heap above it. Each shrink opens a **sliver at the frontier** that
+nothing fits: no evacuation can use it, no end evacuation is available (the gap
+fits nothing), and the end slide declines because the top run is far larger than
+one budget. The frontier slide is the only candidate left — and it walks that
+sliver to the top of the heap one budget at a time, reclaiming nothing until the
+last step of each chain.
+
+Measured, with 400 allocations above the shrinker and a 2048-byte budget:
+
+| shrink step | reclaimed | steps | bytes copied | copied per byte reclaimed |
+|---|---|---|---|---|
+| 8 B | 128 | 128 | 255 360 | **1 995** |
+| 64 B | 1 024 | 144 | 255 360 | 249 |
+| 512 B | 8 192 | 144 | 255 360 | 31 |
+
+The copying is *identical* in all three: `255 360 = 16 shrinks × 15 960 bytes
+live above the shrinker`, exactly. So
+
+> the cost of a shrink is the whole live heap above it, **regardless of how many
+> bytes the shrink freed**.
+
+It scales with the heap, so on the 555 KB heap of the main measurements one
+8-byte shrink would copy 555 KB.
+
+`K` cannot help, and correctly does nothing: a truncated frontier slide retires
+no `end`, so its `retired` is zero. Nor is the move dishonest in `Φ` — sliding
+15 960 bytes down by 8 really does drop `Φ` by 127 680. That is the whole
+problem. The move is exactly as good as the objective says it is, and the
+objective is not sensitive to the fact that this particular byte of gap is worth
+nothing to anybody.
+
+Note also that the compactor is destroying something valuable. A narrow gap at a
+*low* address is the best destination `place` has, since placement takes the
+lowest gap that fits; this project's own free-space accounting says most free
+space is destroyed by allocations landing in gaps rather than by truncation. So
+the eager slide spends 15 960 bytes to remove the allocator's preferred slot.
+
+Two remedies follow. They are complementary: the first changes where allocations
+*settle*, the second changes where a known-churning allocation *is moved to*.
+
+### Remedy 1: weigh resizable and fixed-size allocations differently
+
+Make the potential distinguish the two kinds of allocation:
+
+```
+Φ = Σ_{bytes of resizable allocations} address
+  + γ · Σ_{bytes of fixed-size allocations} address        (γ > 1)
+```
+
+Fixed-size bytes are then heavier, so the compactor prefers to move *them* down
+into gaps, and resizable allocations end up relatively higher — which is exactly
+where you want the allocation that will later release space in place, since
+space released near `end` is retired by truncation instead of by a heap-walk.
+
+**This looks like the objection of stage 2 and is not.** A per-allocation
+multiplicative weight normally destroys the merge: `gain = w(A)·A.pos −
+w(A)·G.pos` makes the coefficient on `G.pos` depend on which allocation is
+chosen, so the two sides can no longer be maximized independently — which is why
+`w(s) = s/(c₀+s)` was rejected in favour of an additive reward. But `γ` takes
+**finitely many values**, so you partition instead of linearize:
+
+```
+best = max over classes c of   γ_c · ( lower.max_alloc_score[c] − self.min_gap_pos )
+```
+
+Within a class the weight is constant, so `γ_c·(A.pos − G.pos)` factors cleanly
+and independent maximization is restored *per class*. The max across classes is
+taken at the end, in `O(#classes)` — still `O(1)` per merge with two classes.
+
+What it costs:
+
+- **The augmentation grows by one `(score, addr, size)` triple per class** —
+  three fields, ~20 bytes per node — and `extend_left` gains one
+  compare-and-subtract. Call it 30–40% more merge work, which is the hot path.
+- **The budgeted descent is mechanical**: the prefix sweep uses the same rule,
+  and the whole suffix still collapses to the single `min_gap_pos` scalar,
+  because that argument is about sizes and is indifferent to class.
+- **No new metadata.** `AllocationId::is_fixed_size()` already exists and
+  `alloc_key` already has the id in hand at every call site. The classification
+  is declared, immutable and free — which is a real advantage over inferring
+  churn from behaviour.
+- **Saturation order matters**: `a.saturating_sub(g)` *then* `saturating_mul(γ)`,
+  or an upward pair times `γ` wraps into a large positive.
+- **The sign bound loosens** to `λ·reward(s) + α <= γ·size`, so stage 2 and 3 are
+  unaffected.
+- **The slide's score becomes composition-dependent.** A run of mixed classes
+  gains `(weighted mean γ) · gap_len` per byte, so `run_len_from` has to
+  accumulate the class mix as it walks. It already walks the entries, so this is
+  cheap, but the score stops being a one-liner.
+
+**The limitation, stated plainly.** The compactor only ever moves things *down*
+into gaps. Preferring to move fixed allocations down does not lift resizables
+up; they become relatively higher only as things beneath them compact. So `γ`
+biases which allocation claims a low gap, but will not segregate a layout that
+is already wrong. Making it segregate would need swaps, which are deliberately
+out of scope here: a swap requires scratch space, so it is a three-move rotation
+of which one move goes *upward*, and that breaks the invariant that every step
+independently lowers `Φ'` and can be interrupted at any point.
+
+Because of that limitation, the cheapest version of this idea may not involve
+the tree at all: **have `place` steer resizable allocations away from the lowest
+fitting gap.** Allocations are placed once and mostly stay, so the layout
+segregates itself at allocation time, with no index change and no swaps. That is
+worth measuring before `γ`.
+
+### Remedy 2: a shrink counter, and evacuating *upward*
+
+Track a `shrink_count` (or `resize_count`) per resizable allocation, incremented
+on every shrink and **reset to zero whenever the allocation is moved**. When it
+passes a threshold, the allocation has demonstrated that it is a repeat offender,
+and the response is to move it to a *higher* address, where the space it keeps
+releasing is cheap to reclaim.
+
+This is attractive because it is *evidence-based* where `γ` is declarative: it
+catches the allocation that actually churns, rather than every allocation that
+might. The reset-on-move is what keeps it honest — the counter measures "damage
+done since we last dealt with this", not lifetime activity.
+
+It is also the less finished of the two ideas, and the open problems are real:
+
+- **Where does it go, and what pays for the move?** An upward move increases
+  `Φ`, and increases `end` if it goes to the top. So it is a step that makes the
+  objective *worse* and has to be justified by expected future savings — which
+  nothing in the current design knows how to express. The natural framing is that
+  it buys down an expected cost of `shrink_count × (live bytes above)` per future
+  shrink, but that is a forecast, and every other term here is a measurement of
+  the present state.
+- **What stops the next step from undoing it?** This is the sharp version of the
+  problem. Having lifted the allocation, the compactor sees a high-addressed
+  allocation and a gap below it, which is precisely the pattern it exists to
+  exploit — and the *end evacuation* will target it eagerly, since it is now
+  plausibly the topmost allocation. Relying on `γ` to prevent this (remedy 1
+  making a fixed-size allocation the more attractive mover) is only a preference,
+  not a guarantee: it holds when a fixed-size allocation of comparable value is
+  available and fails when one is not.
+
+  Options worth exploring, none yet convincing:
+  - **Reset the counter on the lift only, and make the score consult it.** Give
+    the allocation a temporary weight that resists being moved down again, decayed
+    over subsequent steps. This is expressible — it is an additive per-allocation
+    term of exactly the shape stage 2 and 3 already use — but it makes the key
+    depend on a mutable counter, so every increment is a re-key, and stage 3's
+    experience is that neighbour-dependent keys are the expensive kind.
+  - **Pin it.** Exclude the allocation from the index entirely for some number of
+    steps or until it stops shrinking. Simple and absolute, but the index's
+    entries are also what the *slides* move, so a pinned allocation in the middle
+    of a run would have to block the run, which is worse.
+  - **Place it above the frontier permanently**, i.e. treat "has churned" as a
+    one-way transition into a region of the address space the compactor does not
+    reclaim from. This is the cleanest of the three and is really a segregated
+    allocator, which is a larger change than anything else in this document.
+- **The threshold is a third tuning knob** on top of `λ`, `α`, `μ` and `K`, and
+  unlike those it gates a discrete action rather than weighting a continuous one,
+  so it cannot be swept in the same way.
+- **Storage.** The count has to live somewhere per allocation. The layout's
+  `Entry` is the obvious home; it does not belong in the index key unless the
+  score consults it, at which point every increment re-keys.
+
+A cheap first step for either remedy: instrument how often a *truncated* frontier
+slide fires on a sub-32-byte gap in the three existing measurements. That says
+whether this pathology is a latent hazard or something already being paid for.
