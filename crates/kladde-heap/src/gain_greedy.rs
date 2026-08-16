@@ -1686,6 +1686,46 @@ mod tests {
     }
 
     /// Run compaction to quiescence, returning the number of steps and bytes moved.
+    /// A resizable allocation at a low address, shrinking a little at a time,
+    /// with a compact heap above it. Each shrink opens a sliver at the frontier
+    /// that nothing fits, so the frontier slide is the only candidate -- and it
+    /// walks that sliver through the entire heap, one budget at a time, to
+    /// reclaim a handful of bytes.
+    #[test]
+    #[ignore]
+    fn a_shrinking_low_allocation_makes_the_frontier_slide_walk_the_heap() {
+        for &shrink_by in &[8u32, 64, 512] {
+            let mut h = Heap::new();
+            h.set_nu(Heap::NU_ONE / 2);
+            h.alloc(resizable(1), 16384).unwrap(); // the shrinking one, at 0
+            for i in 2..=400u32 {
+                h.alloc(resizable(i), 40).unwrap();
+            }
+            compact_fully(&mut h, COMPACTION_BUDGET);
+            assert_eq!(h.len(), h.live_bytes(), "starts gapless");
+
+            let live_before = h.live_bytes();
+            let (mut steps, mut copied) = (0u64, 0u64);
+            let mut size = 16384u32;
+            for _ in 0..16 {
+                size -= shrink_by;
+                h.resize(resizable(1), size).unwrap();
+                while let Some(step) = h.propose_compaction_step(COMPACTION_BUDGET) {
+                    copied += step.len;
+                    steps += 1;
+                    h.commit_compaction_step(step);
+                    assert!(steps < 200_000, "not converging");
+                }
+            }
+            let reclaimed = live_before - h.live_bytes();
+            println!(
+                "shrink_by={shrink_by:4}  live={live_before}  reclaimed={reclaimed:5}  \
+                 steps={steps:6}  copied={copied:9}  =>  {:.0} bytes copied per byte reclaimed",
+                copied as f64 / reclaimed as f64
+            );
+        }
+    }
+
     fn compact_fully(heap: &mut Heap, budget: u64) -> (usize, u64) {
         let (mut steps, mut bytes) = (0, 0);
         while let Some(step) = heap.propose_compaction_step(budget) {
