@@ -174,6 +174,10 @@ pub(crate) struct SearchStats {
     pub placed_at_end: u64,
     pub placed_in_gap_bytes: u64,
     pub placed_at_end_bytes: u64,
+    /// Bytes `end` fell by because the topmost allocation was freed. Not a CSV
+    /// column; it exists so a test can close the free-space budget, which needs
+    /// all three channels that move `end`.
+    pub retired_by_free: u64,
 }
 
 #[cfg(test)]
@@ -593,6 +597,19 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     #[inline(always)]
     fn record_search(&self, _proposed: bool) {}
 
+    /// Note that freeing the topmost allocation lowered `end`. A no-op outside
+    /// tests, and deliberately not a CSV column: it exists so the free-space
+    /// budget can be closed in a test, without changing the measurement schema.
+    #[cfg(test)]
+    fn record_free_retirement(&self, bytes: u64) {
+        let mut stats = self.stats.get();
+        stats.retired_by_free += bytes;
+        self.stats.set(stats);
+    }
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn record_free_retirement(&self, _bytes: u64) {}
+
     /// Note where a placement landed. A no-op outside tests.
     #[cfg(test)]
     fn record_placement(&self, in_gap: bool, bytes: u64) {
@@ -609,6 +626,32 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     #[cfg(not(test))]
     #[inline(always)]
     fn record_placement(&self, _in_gap: bool, _bytes: u64) {}
+
+    /// The placements made since this was last called, and reset.
+    ///
+    /// Separate from [`Self::search_stats`] because placements are counted on a
+    /// different clock. The compaction counters are bracketed around a burst, so
+    /// a before/after difference isolates them; placements happen in the
+    /// *workload*, between bursts, where such a bracket spans none of them and
+    /// reports zero for all four. Draining instead of differencing is what makes
+    /// "since the previous burst" the actual interval, without the caller having
+    /// to carry a mark across calls.
+    #[cfg(test)]
+    pub(crate) fn take_placements(&self) -> (u64, u64, u64, u64) {
+        let mut stats = self.stats.get();
+        let drained = (
+            stats.placed_in_gap,
+            stats.placed_at_end,
+            stats.placed_in_gap_bytes,
+            stats.placed_at_end_bytes,
+        );
+        stats.placed_in_gap = 0;
+        stats.placed_at_end = 0;
+        stats.placed_in_gap_bytes = 0;
+        stats.placed_at_end_bytes = 0;
+        self.stats.set(stats);
+        drained
+    }
 
     /// The search counters accumulated so far.
     #[cfg(test)]
@@ -1232,7 +1275,14 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
 
     fn free(&mut self, id: Id) -> Result<(), HeapError> {
         let addr = *self.by_id.get(&id).ok_or(HeapError::UnknownId)?;
+        // Freeing the topmost allocation retreats `end` with no help from
+        // compaction -- the third and last channel by which `end` moves. Recorded
+        // here rather than in `remove_raw`, which compaction also goes through:
+        // there the retreat is already accounted as truncation, and counting it
+        // again would double-count every step that vacates the top.
+        let before = self.end;
         self.remove_raw(addr);
+        self.record_free_retirement(before - self.end);
         Ok(())
     }
 
@@ -2601,6 +2651,106 @@ mod tests {
         assert_eq!(h.len(), 144, "nothing retired");
     }
 
+    /// The placement counters must actually count, and must close the
+    /// free-space budget: every free byte is created by freeing something
+    /// mid-heap and destroyed either by truncation or by a placement landing in
+    /// a gap. All four columns read zero in every measurement file until this
+    /// was fixed, and the phase check that read them passed regardless -- so the
+    /// property worth pinning is not "the numbers are plausible" but "they are
+    /// not zero, and they add up".
+    #[test]
+    fn placements_are_counted_between_bursts_and_balance_the_free_space() {
+        let mut h = Heap::new();
+        let mut live: Vec<Pointer<u32>> = Vec::new();
+        let mut next = 1u32;
+        let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let (mut in_gap, mut at_end, mut in_gap_bytes, mut at_end_bytes) = (0, 0, 0u64, 0u64);
+        for round in 0..600 {
+            if rand() % 100 < 60 || live.is_empty() {
+                let size = [8u32, 16, 64, 250][(rand() % 4) as usize];
+                let id = resizable(next);
+                next += 1;
+                h.alloc(id, size).unwrap();
+                live.push(id);
+            } else {
+                h.free(live.swap_remove((rand() % live.len() as u64) as usize))
+                    .unwrap();
+            }
+            if round % COMPACTION_INTERVAL == COMPACTION_INTERVAL - 1 {
+                let b = timed_burst(
+                    &mut h,
+                    round,
+                    round / COMPACTION_INTERVAL,
+                    COMPACTION_BUDGET,
+                );
+                in_gap += b.placed_in_gap;
+                at_end += b.placed_at_end;
+                in_gap_bytes += b.placed_in_gap_bytes;
+                at_end_bytes += b.placed_at_end_bytes;
+                h.assert_invariants();
+            }
+        }
+        // Drain the tail so the totals cover every placement, not only those
+        // that happened to fall before the last burst.
+        let (g, e, gb, eb) = h.take_placements();
+        in_gap += g;
+        at_end += e;
+        in_gap_bytes += gb;
+        at_end_bytes += eb;
+
+        assert!(
+            in_gap > 0,
+            "no placement was ever recorded as landing in a gap"
+        );
+        assert!(
+            at_end > 0,
+            "no placement was ever recorded as extending `end`"
+        );
+        assert_eq!(
+            in_gap + at_end,
+            u64::from(next - 1),
+            "every `alloc` must be counted exactly once"
+        );
+        assert!(
+            in_gap_bytes > 0 && at_end_bytes > 0,
+            "byte counters must move too, not just the call counts"
+        );
+
+        // The identity that makes these columns worth having. Exactly three
+        // things move `end`: a placement that found no gap raises it, compaction
+        // truncating the top lowers it, and freeing the topmost allocation lowers
+        // it. So
+        //
+        //     end  ==  placed at end  −  truncated  −  retired by free
+        //
+        // and the three terms come from independent counters -- one incremented
+        // in `place`, one derived from `end` either side of each burst, one from
+        // `remove_raw`. Nothing here resizes, which would move `end` in-place
+        // without going through `place`.
+        let s = h.search_stats();
+        let truncated = s.truncated_by_slides
+            + s.truncated_by_end_slides
+            + s.truncated_by_end_evacuations
+            + s.truncated_by_evacuations;
+        assert!(truncated > 0, "compaction truncated nothing in 600 rounds");
+        assert_eq!(
+            h.len(),
+            at_end_bytes - truncated - s.retired_by_free,
+            "the free-space budget does not close: end={}, placed at end={}, \
+             truncated={truncated}, retired by free={}",
+            h.len(),
+            at_end_bytes,
+            s.retired_by_free
+        );
+    }
+
     /// The point of the fourth candidate: when both can retire `end`, the
     /// evacuation of the topmost allocation must win, because it retires more
     /// per byte copied.
@@ -2979,6 +3129,14 @@ mod tests {
         /// compaction, but the other half of the free-space budget: free bytes
         /// are created by freeing something mid-heap and destroyed either by
         /// truncation here or by a placement landing in a gap.
+        ///
+        /// These come from [`GainGreedyHeap::take_placements`] and **not** from
+        /// bracketing the burst, which is what the other counters do. Placements
+        /// happen between bursts, so a bracket around the compaction call spans
+        /// none of them; before this was fixed all four columns were identically
+        /// zero in every measurement file, and a phase check that read them
+        /// ("no placements once the workload stops") passed without testing
+        /// anything.
         placed_in_gap: u64,
         placed_at_end: u64,
         placed_in_gap_bytes: u64,
@@ -3009,6 +3167,12 @@ mod tests {
         budget: u64,
         max_steps: u64,
     ) -> Burst {
+        // Drained *before* the timed region, so it covers the workload since the
+        // previous burst rather than the compaction about to run -- compaction
+        // never places anything, so bracketing this the way the counters below
+        // are bracketed would report zero forever.
+        let (placed_in_gap, placed_at_end, placed_in_gap_bytes, placed_at_end_bytes) =
+            h.take_placements();
         let stats_before = h.search_stats();
         let live_bytes_before = h.live_bytes();
         let end_before = h.len();
@@ -3045,10 +3209,10 @@ mod tests {
                 - stats_before.truncated_by_end_evacuations,
             truncated_by_evacuations: stats.truncated_by_evacuations
                 - stats_before.truncated_by_evacuations,
-            placed_in_gap: stats.placed_in_gap - stats_before.placed_in_gap,
-            placed_at_end: stats.placed_at_end - stats_before.placed_at_end,
-            placed_in_gap_bytes: stats.placed_in_gap_bytes - stats_before.placed_in_gap_bytes,
-            placed_at_end_bytes: stats.placed_at_end_bytes - stats_before.placed_at_end_bytes,
+            placed_in_gap,
+            placed_at_end,
+            placed_in_gap_bytes,
+            placed_at_end_bytes,
         }
     }
 
