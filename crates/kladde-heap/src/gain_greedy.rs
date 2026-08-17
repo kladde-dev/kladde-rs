@@ -44,7 +44,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::evacuation_index::{EvacuationIndex, Key};
+use crate::evacuation_index::{EvacuationIndex, Key, CLASSES};
 use crate::heap::{
     AllocationId, HeapError, IncrementallyCompactableHeap, RelocatableHeap, Relocation, Step,
 };
@@ -261,6 +261,9 @@ pub struct GainGreedyHeap<Id> {
     /// The exchange rate between potential and **file size**. See
     /// [`GainGreedyHeap::set_k`].
     k: u64,
+    /// How much heavier a fixed-size byte is than a resizable one in the
+    /// potential. See [`GainGreedyHeap::set_gamma`].
+    gamma: u64,
     /// Test-only instrumentation; absent from real builds.
     #[cfg(test)]
     stats: std::cell::Cell<SearchStats>,
@@ -279,6 +282,7 @@ impl<Id> Default for GainGreedyHeap<Id> {
             mu_exact: 0,
             mu_multiple: 0,
             k: 0,
+            gamma: 1,
             #[cfg(test)]
             stats: std::cell::Cell::new(SearchStats::default()),
         }
@@ -472,6 +476,44 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         self.k = k;
     }
 
+    /// **`γ`: how much heavier a fixed-size byte is than a resizable one.**
+    ///
+    /// The potential becomes
+    ///
+    /// ```text
+    /// Φ = Σ_{resizable bytes} address  +  γ · Σ_{fixed-size bytes} address
+    /// ```
+    ///
+    /// so its minimum puts every fixed-size allocation below every resizable
+    /// one. That is where a resizable allocation belongs: it is the kind that
+    /// later releases space *in place*, and space released near `end` is retired
+    /// by truncation while space released at address 0 costs a heap-walk.
+    ///
+    /// # Why this is not the objection of [`Self::lambda`]
+    ///
+    /// A per-allocation multiplicative weight normally destroys the merge:
+    /// `w(A)·A.pos − w(A)·G.pos` makes the coefficient on the gap depend on which
+    /// allocation is chosen, so the two sides stop being independently
+    /// maximizable. But `γ` takes **finitely many values**, so the augmentation
+    /// *partitions* instead of linearizing: one set of allocation aggregates per
+    /// class, and the crossing rule applied within each. Since `γ` is constant
+    /// inside a class, the merge can maximize the unweighted difference and the
+    /// scaling waits until the query -- which is also why `Argument::from_leaf`,
+    /// which has nowhere to receive `γ`, does not need it.
+    ///
+    /// # What it cannot do alone
+    ///
+    /// The compactor only ever moves things *down*. Preferring to move fixed-size
+    /// allocations down does not lift resizable ones up; they rise only
+    /// relatively, as things beneath them compact. So `γ` biases which allocation
+    /// claims a low gap but cannot repair a layout that is already wrong. See
+    /// `augmented-segment-tree.md`, "Future extensions".
+    ///
+    /// `γ = 1` is off, and is the default.
+    pub fn set_gamma(&mut self, gamma: u64) {
+        self.gamma = gamma.max(1);
+    }
+
     /// Turn the size reward on or off. See [`lambda`](Self::lambda).
     pub fn set_lambda(&mut self, lambda: bool) {
         self.set_weights(Weights {
@@ -527,8 +569,12 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
                 (false, false) => FreeNeighbours::Neither,
                 _ => FreeNeighbours::One,
             };
-            self.index
-                .insert(Key::alloc(addr, e.len, weights.score(addr, e.len, nc)));
+            self.index.insert(Key::alloc(
+                addr,
+                e.len,
+                weights.score(addr, e.len, nc),
+                e.id.is_fixed_size(),
+            ));
         }
     }
 
@@ -714,9 +760,14 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// looks once the score depends on the *neighbours*, since the map has to be
     /// in the same state both times. That is what the `unindex`/`reindex` dance
     /// below is for.
-    fn alloc_key(&self, addr: u64, len: u32) -> Key {
+    fn alloc_key(&self, addr: u64, len: u32, fixed: bool) -> Key {
         let nc = self.neighbours_of(addr, len);
-        Key::alloc(addr, len, self.weights.score(addr, len, nc))
+        Key::alloc(addr, len, self.weights.score(addr, len, nc), fixed)
+    }
+
+    /// The per-class potential weights, indexed as `Key::class` indexes them.
+    fn gammas(&self) -> [u64; CLASSES] {
+        [1, self.gamma]
     }
 
     /// The addresses whose neighbour category an insert or removal at `addr` can
@@ -747,7 +798,8 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         let Some(&e) = self.allocations.get(&addr) else {
             return;
         };
-        self.index.remove(self.alloc_key(addr, e.len));
+        self.index
+            .remove(self.alloc_key(addr, e.len, e.id.is_fixed_size()));
     }
 
     /// Put `addr` back under its re-derived category. Skipped exactly when
@@ -760,7 +812,8 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         let Some(&e) = self.allocations.get(&addr) else {
             return;
         };
-        self.index.insert(self.alloc_key(addr, e.len));
+        self.index
+            .insert(self.alloc_key(addr, e.len, e.id.is_fixed_size()));
     }
 
     /// Record an allocation in the index, and -- if it is fixed-size -- in its
@@ -768,7 +821,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// fit would only re-open on their next growth, so they earn no
     /// destination-side reward at all.
     fn alloc_record(&mut self, addr: u64, len: u32, id: Id) {
-        let key = self.alloc_key(addr, len);
+        let key = self.alloc_key(addr, len, id.is_fixed_size());
         self.index.insert(key);
         if id.is_fixed_size() {
             self.classes.add_alloc(len, addr);
@@ -776,7 +829,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     }
 
     fn alloc_forget(&mut self, addr: u64, len: u32, id: Id) {
-        let key = self.alloc_key(addr, len);
+        let key = self.alloc_key(addr, len, id.is_fixed_size());
         self.index.remove(key);
         if id.is_fixed_size() {
             self.classes.remove_alloc(len, addr);
@@ -940,21 +993,39 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// The maximal run of contiguous allocations starting at `start`, truncated
     /// to a prefix costing at most `budget` (but always at least one
     /// allocation). Returns the byte length and whether the budget cut it short.
-    fn run_len_from(&self, start: u64, budget: u64) -> (u64, bool) {
+    /// Also reports how many of those bytes are **fixed-size**, which is what
+    /// `γ` needs: a run of mixed classes drops the potential by the
+    /// class-weighted mean of `γ` per byte, not by `1`.
+    fn run_len_from(&self, start: u64, budget: u64) -> (u64, bool, u64) {
         let mut cursor = start;
         let mut taken = 0u64;
+        let mut fixed = 0u64;
         for (&addr, e) in self.allocations.range(start..) {
             if addr != cursor {
-                return (taken, false); // hit a gap: the run genuinely ends here
+                return (taken, false, fixed); // hit a gap: the run ends here
             }
             let next = taken + e.len as u64;
             if taken > 0 && next > budget {
-                return (taken, true); // stay within budget, having taken one
+                return (taken, true, fixed); // stay within budget, having taken one
             }
             taken = next;
+            if e.id.is_fixed_size() {
+                fixed += u64::from(e.len);
+            }
             cursor = addr + e.len as u64;
         }
-        (taken, false) // ran off the top of the heap
+        (taken, false, fixed) // ran off the top of the heap
+    }
+
+    /// The per-byte potential drop of shifting `len` bytes down by `distance`,
+    /// of which `fixed` are fixed-size. At `γ = 1` this is exactly `distance`.
+    fn slide_gain(&self, distance: u64, len: u64, fixed: u64) -> u64 {
+        if self.gamma == 1 {
+            return distance;
+        }
+        let weighted = u128::from(len - fixed) + u128::from(self.gamma) * u128::from(fixed);
+        let gain = u128::from(distance) * weighted / u128::from(len.max(1));
+        u64::try_from(gain).unwrap_or(u64::MAX)
     }
 
     /// Grow a chosen step into a **run**, in both directions, as far as the
@@ -1149,10 +1220,12 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         if r == 0 || r > budget {
             return None;
         }
+        let (_, _, fixed) = self.run_len_from(from, u64::MAX);
         let reward = if self.weights.lambda { r.min(w) } else { 0 };
         // A slide leaves the moved bytes contiguous with what was below the gap,
         // so the top falls by exactly the gap's width.
-        let gain = w
+        let gain = self
+            .slide_gain(w, r, fixed)
             .saturating_add(reward)
             .saturating_add(self.end_bonus(w, r));
         Some((gain, Step { from, to, len: r }))
@@ -1196,6 +1269,8 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         // Vacated entirely, so `end` falls to the top of whatever is below --
         // which is at least `len`, and more when a gap sits under the mover too.
         let retired = self.end - self.prev_end(from);
+        // The mover is resizable by construction (only resizables carry a shrink
+        // history worth lifting), so its class weight is 1 and `γ` does not enter.
         let gain = self
             .weights
             .score(from, e.len, self.neighbours_of(from, e.len))
@@ -1248,10 +1323,11 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         // key at all: it is the distance to the next allocation.
         let from = self.next_start(to)?;
         let gap_len = from - to;
-        let (len, _truncated) = self.run_len_from(from, budget);
+        let (len, _truncated, fixed) = self.run_len_from(from, budget);
         if len == 0 {
             return None;
         }
+        let gain = self.slide_gain(gap_len, len, fixed);
         let reward = if self.weights.lambda {
             len.min(gap_len)
         } else {
@@ -1264,8 +1340,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         // tests both conditions at once.
         let retired = if from + len == self.end { gap_len } else { 0 };
         Some((
-            gap_len
-                .saturating_add(reward)
+            gain.saturating_add(reward)
                 .saturating_add(self.end_bonus(retired, len)),
             Step { from, to, len },
         ))
@@ -1403,7 +1478,7 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
         // the *index's* objective, though, not of evacuations in general -- see
         // the tiling candidate below, which picks its destination by fit rather
         // than by position and therefore does need the term.
-        if let Some((gain, step)) = self.index.best_evacuation_within(budget) {
+        if let Some((gain, step)) = self.index.best_evacuation_within(budget, self.gammas()) {
             if best.is_none_or(|(incumbent, _)| gain > incumbent) {
                 best = Some((gain, step));
             }
@@ -1452,7 +1527,9 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
         // fallback costs nothing next to making the caller re-enter.
         let chosen = best.map(|(_, step)| step).or_else(|| {
             debug_assert!(self.index.lowest_gap().is_none(), "a gap with no slide");
-            self.index.best_evacuation().map(|(_, step)| step)
+            self.index
+                .best_evacuation(self.gammas())
+                .map(|(_, step)| step)
         });
         // Opportunistic, after the winner is known: never changes *which* move is
         // taken, only how much of the neighbourhood rides along with it.
@@ -1518,9 +1595,12 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             let score = self
                 .weights
                 .score(from, e.len, self.neighbours_of(from, e.len));
+            // `γ` scales the potential of the whole pair, and is applied after the
+            // saturation for the same reason the index applies it after the merge.
+            let gamma = self.gammas()[usize::from(e.id.is_fixed_size())];
             for &(pos, width) in &gaps {
                 if width >= u64::from(e.len) && pos < from {
-                    best = best.max(score.saturating_sub(pos));
+                    best = best.max(gamma.saturating_mul(score.saturating_sub(pos)));
                 }
             }
         }
@@ -1550,7 +1630,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
             .chain(
                 self.allocations
                     .iter()
-                    .map(|(&addr, e)| self.alloc_key(addr, e.len)),
+                    .map(|(&addr, e)| self.alloc_key(addr, e.len, e.id.is_fixed_size())),
             )
             .collect();
         expected.sort();
@@ -1606,7 +1686,7 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
         {
             assert_eq!(
                 self.index
-                    .best_evacuation_within(budget)
+                    .best_evacuation_within(budget, self.gammas())
                     .map(|(gain, _)| gain),
                 self.best_evacuation_by_brute_force(budget),
                 "the budgeted descent disagreed with brute force at budget={budget}"
@@ -2467,7 +2547,7 @@ mod tests {
                         continue;
                     };
                     assert!(step.to < step.from, "{step:?} is not downward");
-                    let (run, _) = h.run_len_from(step.from, u64::MAX);
+                    let (run, _, _) = h.run_len_from(step.from, u64::MAX);
                     assert!(
                         run >= step.len,
                         "{step:?} spans a gap: the run from {} is only {run}",
@@ -2876,6 +2956,111 @@ mod tests {
         );
     }
 
+    /// `γ` breaks a tie between two movers of equal size and equal travel
+    /// distance, towards the fixed-size one.
+    ///
+    /// ```text
+    ///   0..40   gap (40)
+    ///  40..80   alloc, resizable   -- travels 40 if it takes the gap
+    ///  80..120  gap (40)
+    /// 120..160  alloc, fixed-size  -- also travels 40, into the gap at 80
+    /// ```
+    ///
+    /// Both pairs score 40 unweighted, so at `γ = 1` the tie goes to whichever
+    /// the merge happens to witness. At `γ = 2` the fixed-size mover scores 80
+    /// and must win outright.
+    #[test]
+    fn gamma_prefers_moving_the_fixed_size_allocation() {
+        let build = || {
+            let mut h = Heap::new();
+            h.alloc(resizable(1), 8).unwrap(); //     0..8    freed -> gap A (8)
+            h.alloc(fixed(2), 92).unwrap(); //        8..100  fits no gap
+            h.alloc(resizable(3), 8).unwrap(); //   100..108  R
+            h.alloc(resizable(4), 64).unwrap(); //  108..172  freed -> gap B (64)
+            h.alloc(fixed(5), 64).unwrap(); //      172..236  F
+            h.free(resizable(1)).unwrap();
+            h.free(resizable(4)).unwrap();
+            h
+        };
+
+        // R travels 100 into gap A; F travels 64 into gap B -- the only gap wide
+        // enough for it. Unweighted, R wins.
+        let h = build();
+        assert_eq!(
+            h.index.best_evacuation(h.gammas()).unwrap(),
+            (
+                100,
+                Step {
+                    from: 100,
+                    to: 0,
+                    len: 8
+                }
+            )
+        );
+
+        // At gamma = 2, F's 64 becomes 128 and overtakes it.
+        let mut h = build();
+        h.set_gamma(2);
+        assert_eq!(
+            h.index.best_evacuation(h.gammas()).unwrap(),
+            (
+                128,
+                Step {
+                    from: 172,
+                    to: 108,
+                    len: 64
+                }
+            ),
+            "the fixed-size mover should win at gamma=2"
+        );
+    }
+
+    /// `γ` must not rescue an upward pair: the saturation has to happen before
+    /// the scaling, or a wrapped difference gets magnified instead of zeroed.
+    #[test]
+    fn gamma_cannot_rescue_an_upward_pair() {
+        let mut state = 0x0BAD_1DEA_5EED_F00Du64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for gamma in [1u64, 2, 64, u64::MAX] {
+            let mut h = Heap::new();
+            h.set_gamma(gamma);
+            let mut live: Vec<Pointer<u32>> = Vec::new();
+            let mut next = 1u32;
+            for round in 0..600 {
+                if rand() % 100 < 60 || live.is_empty() {
+                    let size = [8u32, 16, 64, 250][(rand() % 4) as usize];
+                    let id = if rand() % 3 == 0 {
+                        fixed(next)
+                    } else {
+                        resizable(next)
+                    };
+                    next += 1;
+                    h.alloc(id, size).unwrap();
+                    live.push(id);
+                } else {
+                    h.free(live.swap_remove((rand() % live.len() as u64) as usize))
+                        .unwrap();
+                }
+                if round % 4 == 0 {
+                    if let Some(step) = h.propose_compaction_step(COMPACTION_BUDGET) {
+                        assert!(step.to < step.from, "gamma={gamma}: {step:?} is upward");
+                        h.commit_compaction_step(step);
+                        h.assert_invariants();
+                    }
+                }
+            }
+            // And it still converges, however large the weight.
+            let (steps, _) = compact_fully(&mut h, COMPACTION_BUDGET);
+            assert!(steps < 100_000, "gamma={gamma}: did not converge");
+            assert_eq!(h.len(), h.live_bytes(), "gamma={gamma}: not gapless");
+        }
+    }
+
     /// The point of the fourth candidate: when both can retire `end`, the
     /// evacuation of the topmost allocation must win, because it retires more
     /// per byte copied.
@@ -2986,7 +3171,10 @@ mod tests {
             }
 
             if round % 3 == 0 {
-                if let Some((_, step)) = h.index.best_evacuation_within(COMPACTION_BUDGET) {
+                if let Some((_, step)) = h
+                    .index
+                    .best_evacuation_within(COMPACTION_BUDGET, h.gammas())
+                {
                     if step.from + step.len == h.len() {
                         checked += 1;
                         assert_eq!(

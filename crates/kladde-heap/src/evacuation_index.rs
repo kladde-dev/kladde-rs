@@ -66,6 +66,25 @@ use sweep_bptree::{BPlusTree, NodeStoreVec};
 
 use crate::heap::Step;
 
+/// How many weight classes an allocation can fall into: resizable and
+/// fixed-size. `γ` scales the potential of the second, so the augmentation
+/// carries one set of allocation aggregates per class -- see
+/// [`GainGreedyHeap::gamma`].
+///
+/// [`GainGreedyHeap::gamma`]: crate::GainGreedyHeap
+pub const CLASSES: usize = 2;
+
+/// The `is_gap` flag, now bit 1 of the size field: bit 0 carries the
+/// allocation class, so that both are visible to `from_leaf`, which is handed
+/// the keys and nothing else.
+///
+/// The order within one size is therefore *resizable alloc, fixed alloc, gap*,
+/// which preserves the property the whole merge rests on -- every allocation of
+/// size `s` still sorts before every gap of width `s`, so
+/// `key(G) > key(A) iff G.width >= A.size`. The formal ceiling on gap width
+/// drops from `2^63 − 1` to `2^62 − 1`, four exabytes.
+const GAP_BIT: u64 = 2;
+
 /// The concrete tree behind [`EvacuationIndex`].
 type Store = NodeStoreVec<Key, (), Aggregate>;
 
@@ -88,9 +107,9 @@ pub struct Key {
 
 impl Key {
     /// An allocation of `size` bytes at `addr`, scoring `score`.
-    pub fn alloc(addr: u64, size: u32, score: u64) -> Self {
+    pub fn alloc(addr: u64, size: u32, score: u64, fixed: bool) -> Self {
         Self {
-            sized: u64::from(size) << 1,
+            sized: (u64::from(size) << 2) | u64::from(fixed),
             score,
             addr,
         }
@@ -100,18 +119,24 @@ impl Key {
     /// ever a destination, and the merge subtracts it.
     pub fn gap(pos: u64, width: u64) -> Self {
         Self {
-            sized: (width << 1) | 1,
+            sized: (width << 2) | GAP_BIT,
             score: pos,
             addr: pos,
         }
     }
 
     fn is_gap(self) -> bool {
-        self.sized & 1 == 1
+        self.sized & GAP_BIT != 0
+    }
+
+    /// `0` for a resizable allocation, `1` for a fixed-size one -- the index
+    /// into every per-class field of the augmentation. Meaningless for a gap.
+    fn class(self) -> usize {
+        (self.sized & 1) as usize
     }
 
     fn size(self) -> u64 {
-        self.sized >> 1
+        self.sized >> 2
     }
 }
 
@@ -160,15 +185,19 @@ struct Aggregate {
     /// achieving it. The witness rides along because the merge has to be able to
     /// name the mover of a crossing pair, and `from_inner` never sees keys of
     /// the entries beneath it -- only its children's aggregates.
-    max_alloc_score: u64,
-    max_alloc_addr: u64,
-    max_alloc_size: u32,
+    max_alloc_score: [u64; CLASSES],
+    max_alloc_addr: [u64; CLASSES],
+    max_alloc_size: [u32; CLASSES],
     /// Best `score(A) − G.pos` over valid pairs lying *entirely inside* this
     /// subtree, and the pair achieving it.
-    best: u64,
-    best_from: u64,
-    best_to: u64,
-    best_len: u32,
+    /// Kept **per class and unweighted**. `γ` is constant within a class, so
+    /// maximizing `γ_c · x` over class `c` is maximizing `x` and scaling at the
+    /// end -- which is what lets the merge stay ignorant of `γ` entirely. The
+    /// query applies it; see [`Aggregate::scored_step`].
+    best: [u64; CLASSES],
+    best_from: [u64; CLASSES],
+    best_to: [u64; CLASSES],
+    best_len: [u32; CLASSES],
 }
 
 impl Default for Aggregate {
@@ -176,13 +205,13 @@ impl Default for Aggregate {
         Self {
             min_gap_pos: u64::MAX,
             max_gap_pos: 0,
-            max_alloc_score: 0,
-            max_alloc_addr: 0,
-            max_alloc_size: 0,
-            best: 0,
-            best_from: 0,
-            best_to: 0,
-            best_len: 0,
+            max_alloc_score: [0; CLASSES],
+            max_alloc_addr: [0; CLASSES],
+            max_alloc_size: [0; CLASSES],
+            best: [0; CLASSES],
+            best_from: [0; CLASSES],
+            best_to: [0; CLASSES],
+            best_len: [0; CLASSES],
         }
     }
 }
@@ -195,9 +224,10 @@ impl Aggregate {
             a.min_gap_pos = key.score;
             a.max_gap_pos = key.score;
         } else {
-            a.max_alloc_score = key.score;
-            a.max_alloc_addr = key.addr;
-            a.max_alloc_size = key.size() as u32;
+            let c = key.class();
+            a.max_alloc_score[c] = key.score;
+            a.max_alloc_addr[c] = key.addr;
+            a.max_alloc_size[c] = key.size() as u32;
         }
         a
     }
@@ -213,18 +243,25 @@ impl Aggregate {
     /// crossing case is `lower.max_alloc_score − self.min_gap_pos` and nothing
     /// else needs checking.
     fn extend_left(&mut self, lower: &Aggregate) {
-        let crossing = lower.max_alloc_score.saturating_sub(self.min_gap_pos);
-        if crossing > self.best {
-            self.best = crossing;
-            self.best_from = lower.max_alloc_addr;
-            self.best_len = lower.max_alloc_size;
-            self.best_to = self.min_gap_pos;
-        }
-        if lower.best > self.best {
-            self.best = lower.best;
-            self.best_from = lower.best_from;
-            self.best_len = lower.best_len;
-            self.best_to = lower.best_to;
+        for c in 0..CLASSES {
+            let crossing = lower.max_alloc_score[c].saturating_sub(self.min_gap_pos);
+            if crossing > self.best[c] {
+                self.best[c] = crossing;
+                self.best_from[c] = lower.max_alloc_addr[c];
+                self.best_len[c] = lower.max_alloc_size[c];
+                self.best_to[c] = self.min_gap_pos;
+            }
+            if lower.best[c] > self.best[c] {
+                self.best[c] = lower.best[c];
+                self.best_from[c] = lower.best_from[c];
+                self.best_len[c] = lower.best_len[c];
+                self.best_to[c] = lower.best_to[c];
+            }
+            if lower.max_alloc_score[c] > self.max_alloc_score[c] {
+                self.max_alloc_score[c] = lower.max_alloc_score[c];
+                self.max_alloc_addr[c] = lower.max_alloc_addr[c];
+                self.max_alloc_size[c] = lower.max_alloc_size[c];
+            }
         }
 
         if lower.min_gap_pos < self.min_gap_pos {
@@ -233,27 +270,38 @@ impl Aggregate {
         if lower.max_gap_pos > self.max_gap_pos {
             self.max_gap_pos = lower.max_gap_pos;
         }
-        if lower.max_alloc_score > self.max_alloc_score {
-            self.max_alloc_score = lower.max_alloc_score;
-            self.max_alloc_addr = lower.max_alloc_addr;
-            self.max_alloc_size = lower.max_alloc_size;
-        }
     }
 
     /// The step this aggregate's `best` describes, with the objective value it
     /// scored -- which is *not* the travel distance once the score carries more
     /// than the address, so the caller must not re-derive it from the step.
-    fn scored_step(&self) -> Option<(u64, Step<u64>)> {
-        (self.best > 0).then(|| {
-            (
-                self.best,
-                Step {
-                    from: self.best_from,
-                    to: self.best_to,
-                    len: u64::from(self.best_len),
-                },
-            )
-        })
+    /// The best step this aggregate describes, once `γ` is applied.
+    ///
+    /// This is where the weight enters, and the only place it does. Because `γ`
+    /// is constant within a class, the merge can maximize the unweighted
+    /// difference per class and the scaling can wait until here -- which is what
+    /// keeps `γ` out of `Argument::from_leaf`, whose signature has nowhere to put
+    /// it. Saturate the subtraction *before* scaling, or an upward pair wraps and
+    /// `γ` magnifies it.
+    fn scored_step(&self, gamma: [u64; CLASSES]) -> Option<(u64, Step<u64>)> {
+        let mut winner: Option<(u64, Step<u64>)> = None;
+        for (c, &g) in gamma.iter().enumerate() {
+            if self.best[c] == 0 {
+                continue;
+            }
+            let gain = g.saturating_mul(self.best[c]);
+            if winner.is_none_or(|(incumbent, _)| gain > incumbent) {
+                winner = Some((
+                    gain,
+                    Step {
+                        from: self.best_from[c],
+                        to: self.best_to[c],
+                        len: u64::from(self.best_len[c]),
+                    },
+                ));
+            }
+        }
+        winner
     }
 
     /// Fold a run of siblings in descending key order -- the right-to-left sweep.
@@ -322,8 +370,8 @@ impl EvacuationIndex {
 
     /// The best evacuation in the whole heap, as `(objective value, step)`. One
     /// field read at the root.
-    pub fn best_evacuation(&self) -> Option<(u64, Step<u64>)> {
-        self.tree.root_argument().scored_step()
+    pub fn best_evacuation(&self, gamma: [u64; CLASSES]) -> Option<(u64, Step<u64>)> {
+        self.tree.root_argument().scored_step(gamma)
     }
 
     /// The **compaction frontier**: the lowest-addressed gap in the heap, or
@@ -403,16 +451,20 @@ impl EvacuationIndex {
     /// Seeding the ordinary right-to-left sweep of the prefix with that scalar is
     /// what offers each prefix allocation both the gaps above it *within* the
     /// prefix and the best gap in the entire suffix.
-    pub fn best_evacuation_within(&self, budget: u64) -> Option<(u64, Step<u64>)> {
+    pub fn best_evacuation_within(
+        &self,
+        budget: u64,
+        gamma: [u64; CLASSES],
+    ) -> Option<(u64, Step<u64>)> {
         // Sizes are `u32`, so a budget at or above that ceiling constrains
         // nothing -- and taking the root read here also keeps `budget + 1` from
         // overflowing the shifted key below.
         if budget >= u64::from(u32::MAX) {
-            return self.best_evacuation();
+            return self.best_evacuation(gamma);
         }
         let mut visit = BudgetedBest {
             // The first key of any entry whose size exceeds the budget.
-            boundary: Key::alloc(0, 0, 0).with_sized((budget + 1) << 1),
+            boundary: Key::alloc(0, 0, 0, false).with_sized((budget + 1) << 2),
             prefix: Vec::new(),
             suffix_min_gap_pos: u64::MAX,
         };
@@ -421,7 +473,7 @@ impl EvacuationIndex {
             min_gap_pos: visit.suffix_min_gap_pos,
             ..Aggregate::default()
         };
-        Aggregate::sweep(seed, visit.prefix.iter().rev()).scored_step()
+        Aggregate::sweep(seed, visit.prefix.iter().rev()).scored_step(gamma)
     }
 }
 
@@ -544,6 +596,11 @@ impl DescendVisit<Key, (), Aggregate> for &mut BudgetedBest {
 mod tests {
     use super::*;
 
+    /// Every allocation in these layouts is minted resizable, so the index
+    /// tests exercise the merge with `γ` inert; `gain_greedy`'s tests cover the
+    /// weighted case end to end.
+    const NO_GAMMA: [u64; CLASSES] = [1; CLASSES];
+
     /// A heap layout as `(address, size)` allocations and `(pos, width)` gaps.
     #[derive(Default, Clone)]
     struct Layout {
@@ -568,7 +625,7 @@ mod tests {
         fn index(&self) -> EvacuationIndex {
             let mut ix = EvacuationIndex::default();
             for &(addr, size) in &self.allocs {
-                ix.insert(Key::alloc(addr, size, self.score(addr, size)));
+                ix.insert(Key::alloc(addr, size, self.score(addr, size), false));
             }
             for &(pos, width) in &self.gaps {
                 ix.insert(Key::gap(pos, width));
@@ -646,8 +703,8 @@ mod tests {
     #[test]
     fn an_empty_index_answers_nothing() {
         let ix = EvacuationIndex::default();
-        assert_eq!(ix.best_evacuation(), None);
-        assert_eq!(ix.best_evacuation_within(4096), None);
+        assert_eq!(ix.best_evacuation(NO_GAMMA), None);
+        assert_eq!(ix.best_evacuation_within(4096, NO_GAMMA), None);
         assert_eq!(ix.widest_gap(), None);
         assert_eq!(ix.lowest_gap_fitting(1), None);
     }
@@ -662,7 +719,7 @@ mod tests {
             lambda: false,
         };
         assert_eq!(
-            layout.index().best_evacuation().map(|(_, s)| s),
+            layout.index().best_evacuation(NO_GAMMA).map(|(_, s)| s),
             Some(Step {
                 from: 100,
                 to: 0,
@@ -678,7 +735,7 @@ mod tests {
             gaps: vec![(0, 9)],
             lambda: false,
         };
-        assert_eq!(layout.index().best_evacuation(), None);
+        assert_eq!(layout.index().best_evacuation(NO_GAMMA), None);
     }
 
     #[test]
@@ -690,7 +747,7 @@ mod tests {
             gaps: vec![(50, 100)],
             lambda: false,
         };
-        assert_eq!(layout.index().best_evacuation(), None);
+        assert_eq!(layout.index().best_evacuation(NO_GAMMA), None);
     }
 
     #[test]
@@ -703,7 +760,7 @@ mod tests {
         // 900 -> 200 travels 700; 500 -> 0 travels 500; 900 -> 0 is invalid
         // (a 100-byte allocation does not fit a 4-byte gap).
         assert_eq!(
-            layout.index().best_evacuation().map(|(_, s)| s),
+            layout.index().best_evacuation(NO_GAMMA).map(|(_, s)| s),
             Some(Step {
                 from: 900,
                 to: 200,
@@ -749,20 +806,21 @@ mod tests {
         let ix = layout.index();
         // Unconstrained, the 100-byte allocation travelling 700 wins.
         assert_eq!(
-            ix.best_evacuation_within(4096).map(|(_, s)| s.from),
+            ix.best_evacuation_within(4096, NO_GAMMA)
+                .map(|(_, s)| s.from),
             Some(900)
         );
         // At a budget of 99 it is out of reach, and the 4-byte one is all that
         // is left -- into the *lowest* gap that fits it, not the nearest.
         assert_eq!(
-            ix.best_evacuation_within(99).map(|(_, s)| s),
+            ix.best_evacuation_within(99, NO_GAMMA).map(|(_, s)| s),
             Some(Step {
                 from: 500,
                 to: 0,
                 len: 4
             })
         );
-        assert_eq!(ix.best_evacuation_within(3), None);
+        assert_eq!(ix.best_evacuation_within(3, NO_GAMMA), None);
     }
 
     /// The budgeted descent is the part that could silently lose a candidate:
@@ -779,7 +837,7 @@ mod tests {
                 let ix = layout.index();
 
                 assert_eq!(
-                    ix.best_evacuation().map(|(gain, _)| gain),
+                    ix.best_evacuation(NO_GAMMA).map(|(gain, _)| gain),
                     layout.best_by_brute_force(u64::MAX),
                     "lambda={lambda} n={n}: the root disagreed with brute force"
                 );
@@ -801,7 +859,8 @@ mod tests {
 
                 for budget in [0u64, 1, 8, 15, 16, 63, 64, 249, 250, 251, 10_000] {
                     assert_eq!(
-                        ix.best_evacuation_within(budget).map(|(gain, _)| gain),
+                        ix.best_evacuation_within(budget, NO_GAMMA)
+                            .map(|(gain, _)| gain),
                         layout.best_by_brute_force(budget),
                         "lambda={lambda} n={n} budget={budget}: the budgeted descent disagreed"
                     );
@@ -836,7 +895,7 @@ mod tests {
                 continue;
             }
             assert_eq!(
-                layout.index().best_evacuation(),
+                layout.index().best_evacuation(NO_GAMMA),
                 None,
                 "an upward pair was proposed"
             );
@@ -852,7 +911,7 @@ mod tests {
             let layout = random_layout(&mut rand, 300);
             let ix = layout.index();
             for budget in [4u64, 16, 64, 250, 4_096] {
-                let Some((_, step)) = ix.best_evacuation_within(budget) else {
+                let Some((_, step)) = ix.best_evacuation_within(budget, NO_GAMMA) else {
                     continue;
                 };
                 assert!(step.to < step.from, "{step:?} is not downward");
@@ -880,7 +939,7 @@ mod tests {
         let mut layout = random_layout(&mut rand, 500);
         let mut ix = layout.index();
 
-        while let Some((gain, step)) = ix.best_evacuation() {
+        while let Some((gain, step)) = ix.best_evacuation(NO_GAMMA) {
             assert_eq!(
                 Some(gain),
                 layout.best_by_brute_force(u64::MAX),
@@ -888,7 +947,12 @@ mod tests {
             );
             // Retire the winning mover from both the index and the reference.
             let size = step.len as u32;
-            ix.remove(Key::alloc(step.from, size, layout.score(step.from, size)));
+            ix.remove(Key::alloc(
+                step.from,
+                size,
+                layout.score(step.from, size),
+                false,
+            ));
             layout.allocs.retain(|&(a, _)| a != step.from);
         }
         assert_eq!(layout.best_by_brute_force(u64::MAX), None);
@@ -907,12 +971,15 @@ mod tests {
         );
         // `bulk_load` recomputes the augmentation, so query it rather than
         // trusting that equal entries imply equal aggregates.
-        assert_eq!(cloned.best_evacuation(), ix.best_evacuation());
+        assert_eq!(
+            cloned.best_evacuation(NO_GAMMA),
+            ix.best_evacuation(NO_GAMMA)
+        );
         assert_eq!(cloned.widest_gap(), ix.widest_gap());
         for budget in [4u64, 64, 250, 4_096] {
             assert_eq!(
-                cloned.best_evacuation_within(budget),
-                ix.best_evacuation_within(budget)
+                cloned.best_evacuation_within(budget, NO_GAMMA),
+                ix.best_evacuation_within(budget, NO_GAMMA)
             );
         }
     }
