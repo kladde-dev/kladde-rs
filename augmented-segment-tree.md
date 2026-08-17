@@ -196,7 +196,9 @@ key = ( (size << 1) | is_gap ,  score ,  address )
 
 where `size` is `A.size` for an allocation and `G.width` for a gap, `is_gap` is
 `false` for allocations and `true` for gaps, and `score` is `A.pos` / `G.pos` at
-this stage (stages 2 and 3 enrich it). The size field is `u64` even though
+this stage (stages 2 and 3 enrich it). `γ`, in "Future extensions", widens the
+field by one more bit to carry the allocation.s class, for the same reason
+`is_gap` is here: `from_leaf` sees the keys and nothing else. The size field is `u64` even though
 allocation sizes are `u32`, because gap widths are already `u64` — so the shifted
 flag costs nothing real. The formal ceiling moves from `2^64 − 1` to `2^63 − 1`
 on *gap width*, which is an eight-exabyte gap; allocation sizes are untouched.
@@ -1356,9 +1358,10 @@ index now answers globally and in `O(1)`, rather than once per gap.
 budget constraint, in `O(1)` and `O(B log_B n)` respectively.
 
 **Composed of:**
-- An augmented B+ tree over the key `((size << 1) | is_gap, score, address)`,
-  carrying `{ min_gap_pos, max_gap_pos, max_alloc_score, best, best_pair }` per
-  subtree, merged by the right-to-left sweep of stage 1.
+- An augmented B+ tree over the key `((size << 1) | is_gap, score, address)`
+  -- widened to `((size << 2) | (is_gap << 1) | is_fixed, ...)` once `γ` is in
+  play -- carrying `{ min_gap_pos, max_gap_pos, max_alloc_score, best, best_pair }`
+  per subtree, merged by the right-to-left sweep of stage 1.
 - Its entries: one per gap, one per resizable allocation, and — once `α > 0` —
   one per non-empty `(fixed class, nc)` bucket (see D). At `α = 0`, which is where
   the first implementation should start, there is no bucketing: simply one entry
@@ -1586,6 +1589,12 @@ pathology in the next section has a design but no implementation.
 
 ## Future extensions
 
+Both halves below are now **implemented**, behind knobs that default to off
+(`γ = 1`, `T = 0`), and that default path is bit-identical to the policy above.
+The pseudocode and the costings have been corrected against the code where the
+two diverged — the places where they did are called out in the text, because
+each was a surprise worth keeping.
+
 ### The stress test: a shrinking allocation at a low address
 
 Everything above is measured on workloads that churn roughly uniformly. Here is
@@ -1668,37 +1677,74 @@ Within a class the weight is constant, so `γ_c·(A.pos − G.pos)` factors clea
 and independent maximization is restored *per class*. The max across classes is
 taken at the end, in `O(#classes)` — still `O(1)` per merge at two classes.
 
+**γ never enters the merge**, which is not a stylistic choice: `from_leaf` and
+`from_inner` have nowhere to receive it. It does not need to. γ is constant
+within a class, so maximizing `γ_c·x` over class `c` is maximizing `x` and
+scaling afterwards — the merge keeps each class's best **unweighted**, and the
+query applies γ to the root. That is what makes `best` per class rather than one
+combined winner.
+
 ```
 Aggregate {
-    min_gap_pos, max_gap_pos,                       # unchanged
+    min_gap_pos, max_gap_pos,                                   # no class: gaps are destinations
     max_alloc_score[c], max_alloc_addr[c], max_alloc_size[c],   # one triple per class
-    best, best_from, best_to, best_len,             # still one combined winner
+    best[c], best_from[c], best_to[c], best_len[c],             # unweighted, per class
 }
 
 fn extend_left(self, lower):
     for c in classes:
-        # saturate *before* scaling: an upward pair must collapse to 0 first, or
-        # γ turns a wrapped difference into a large positive.
-        crossing = γ[c].saturating_mul(
-            lower.max_alloc_score[c].saturating_sub(self.min_gap_pos))
-        if crossing > self.best:
-            self.best = crossing
-            self.best_from, self.best_len = lower.max_alloc_addr[c], lower.max_alloc_size[c]
-            self.best_to = self.min_gap_pos
-    if lower.best > self.best:
-        self.best, self.best_from, self.best_to, self.best_len = lower.best, ...
-    self.min_gap_pos = min(self.min_gap_pos, lower.min_gap_pos)
-    self.max_gap_pos = max(self.max_gap_pos, lower.max_gap_pos)
-    for c in classes:
+        crossing = lower.max_alloc_score[c].saturating_sub(self.min_gap_pos)
+        if crossing > self.best[c]:
+            self.best[c] = crossing
+            self.best_from[c], self.best_len[c] = lower.max_alloc_addr[c], lower.max_alloc_size[c]
+            self.best_to[c] = self.min_gap_pos
+        if lower.best[c] > self.best[c]:
+            self.best[c], self.best_from[c], self.best_to[c], self.best_len[c] = lower...
         if lower.max_alloc_score[c] > self.max_alloc_score[c]:
             self.max_alloc_score[c], self.max_alloc_addr[c], self.max_alloc_size[c] = lower...
+    self.min_gap_pos = min(self.min_gap_pos, lower.min_gap_pos)
+    self.max_gap_pos = max(self.max_gap_pos, lower.max_gap_pos)
+
+# γ is applied here, and only here.
+fn scored_step(self, γ) -> Option<(gain, Step)>:
+    # Saturate *before* scaling: an upward pair must collapse to 0 first, or γ
+    # turns a wrapped difference into a large positive.
+    return argmax over classes c with best[c] > 0 of
+        ( γ[c].saturating_mul(self.best[c]),
+          Step { from: best_from[c], to: best_to[c], len: best_len[c] } )
 ```
 
 What it costs:
 
-- **Three fields per extra class** in the augmentation, ~20 bytes per node, and
-  one more compare-and-subtract in `extend_left`. Call it 30–40% more merge work,
-  which is the hot path.
+- **Seven scalar slots per extra class** in the augmentation, and one more
+  compare-and-subtract in `extend_left`. Measured, the `Aggregate` goes from 72
+  to 112 bytes per node — and the merge runs `B` times per level on every insert
+  and removal, so this is the hot path.
+
+  This is more than a first estimate suggests, and the surprise is instructive.
+  The obvious three are `max_alloc_score`/`_addr`/`_size`, which the crossing
+  rule needs per class because γ multiplies them differently. The other four are
+  `best`/`best_from`/`_to`/`_len`, and they follow from where γ is applied:
+  since it cannot enter the merge, each class's winner has to survive
+  *separately* all the way to the root, because a single combined `best` would
+  have to commit to a comparison the merge cannot make. Roughly half the growth
+  therefore exists purely to defer γ. The alternative — threading γ into the
+  `Argument` implementation via a type parameter, letting `best` collapse back
+  to one field — is uglier and should not be attempted without a measurement
+  showing it matters.
+- **The class has to be readable from the key.** `Argument::from_leaf` is handed
+  the keys and nothing else, so an entry's class has to be in its key like
+  `is_gap` is. It goes in bit 0 of the size field, with `is_gap` moving to bit 1:
+
+  ```text
+  key = ( (size << 2) | (is_gap << 1) | is_fixed ,  score ,  address )
+  ```
+
+  which orders one size as *resizable alloc, fixed alloc, gap* — so every
+  allocation of size `s` still sorts before every gap of width `s`, and
+  `key(G) > key(A) iff G.width >= A.size` survives intact. This supersedes the
+  key given in stage 1; the formal ceiling on gap width drops from `2^63 − 1` to
+  `2^62 − 1`, four exabytes.
 - **The budgeted descent is mechanical.** The prefix sweep uses the same rule,
   and the whole suffix still collapses to the single `min_gap_pos` scalar,
   because that argument is about sizes and is indifferent to class.
@@ -1929,19 +1975,30 @@ fn on_shrink(id, c, old_size, s) -> Relocation:
     move_allocation(id, from = c, to = target)
     shrink_counts.remove(id)                     # reset == remove
     move_allocation(r.id, from = r.pos, to = c)
-    return Relocation::Double { first: (c, target), then: (r.pos, c) }
+    return Relocation::Double { first: (c, target), then: (r.pos, c), then_len: r.len }
 ```
 
-`Relocation` becomes an ordered enum:
+`Relocation` becomes an ordered enum, and gains a size parameter:
 
 ```
-enum Relocation<A> { None, Single { old: A, new: A }, Double { first: (A, A), then: (A, A) } }
+enum Relocation<A, S> {
+    None,
+    Single { old: A, new: A },
+    Double { first: (A, A), then: (A, A), then_len: S },
+}
 ```
 
-The blast radius is smaller than it looks: `Relocation` is only `resize`'s return
-type, and exactly one place acts on it — `ComposedBackend::resize`, which covers
-the destination and copies the bytes. `MockBackend` and `UnjournaledBackend`
-forward it untouched. The `Double` arm does the same thing twice, in order.
+`then_len` is the third thing this design needed that a first reading does not
+suggest. The second move is of a *different* allocation — one the caller never
+asked about — so unlike `first`, whose length the caller knows because it just
+requested the resize, there is no way for it to look the length up. Carrying it
+is the only option that does not add a lookup to the trait.
+
+The blast radius is otherwise smaller than it looks: `Relocation` is only
+`resize`.s return type, and exactly one place acts on it —
+`ComposedBackend::resize`, which covers the destination and copies the bytes.
+`MockBackend` and `UnjournaledBackend` forward it untouched. The `Double` arm
+does the same thing twice, in order.
 
 Note that the second move is a *downward* move of a single allocation, so it is
 the ordinary evacuation shape; when it comes from the fallback it is a slide, and
