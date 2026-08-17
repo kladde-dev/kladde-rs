@@ -1687,35 +1687,103 @@ mod tests {
     #[test]
     #[ignore]
     fn a_shrinking_low_allocation_makes_the_frontier_slide_walk_the_heap() {
+        println!("{PATHOLOGY_HEADER}");
         for &shrink_by in &[8u32, 64, 512] {
-            let mut h = Heap::new();
-            h.set_k(1024);
-            h.alloc(resizable(1), 16384).unwrap(); // the shrinking one, at 0
-            for i in 2..=400u32 {
-                h.alloc(resizable(i), 40).unwrap();
-            }
-            compact_fully(&mut h, COMPACTION_BUDGET);
-            assert_eq!(h.len(), h.live_bytes(), "starts gapless");
+            print_pathology(shrink_by, run_pathology(shrink_by));
+        }
+    }
 
-            let live_before = h.live_bytes();
-            let (mut steps, mut copied) = (0u64, 0u64);
-            let mut size = 16384u32;
-            for _ in 0..16 {
-                size -= shrink_by;
-                h.resize(resizable(1), size).unwrap();
-                while let Some(step) = h.propose_compaction_step(COMPACTION_BUDGET) {
-                    copied += step.len;
-                    steps += 1;
-                    h.commit_compaction_step(step);
-                    assert!(steps < 200_000, "not converging");
-                }
+    /// What one run of the stress test produced.
+    struct Pathology {
+        live: u64,
+        reclaimed: u64,
+        steps: u64,
+        copied: u64,
+        /// Where the shrinking allocation ended up, and how high that is as a
+        /// fraction of the file. The machinery's whole purpose is to raise it:
+        /// a shrinker near `end` opens its slivers at the *top*, where they are
+        /// retired by truncation instead of walked to the top by the frontier
+        /// slide.
+        final_pos: u64,
+        final_end: u64,
+        /// Copies attributable to the shrink path rather than to compaction --
+        /// zero until the lift exists, then the price being paid for the rest.
+        lift_copies: u64,
+    }
+
+    const PATHOLOGY_HEADER: &str =
+        "shrink_by  live   reclaimed  steps   copied     per_byte  C_pos    C_pos/end  lift_copies";
+
+    fn print_pathology(shrink_by: u32, p: Pathology) {
+        println!(
+            "{shrink_by:9} {:6} {:10} {:7} {:10} {:9.0} {:8} {:10.2} {:12}",
+            p.live,
+            p.reclaimed,
+            p.steps,
+            p.copied,
+            p.copied as f64 / p.reclaimed as f64,
+            p.final_pos,
+            p.final_pos as f64 / p.final_end as f64,
+            p.lift_copies,
+        );
+    }
+
+    /// A resizable allocation at address 0, shrinking a little at a time, with a
+    /// compact heap of small fixed-size allocations above it.
+    ///
+    /// The allocations above are **fixed-size**, which matters once `γ` exists:
+    /// the target layout is every fixed-size allocation below every resizable
+    /// one, so this heap's minimum-potential arrangement is precisely the one
+    /// where the shrinker has been lifted to the top.
+    fn run_pathology(shrink_by: u32) -> Pathology {
+        let mut h = Heap::new();
+        h.set_k(1024);
+        h.alloc(resizable(1), 16384).unwrap(); // the shrinking one, at 0
+        for i in 2..=400u32 {
+            h.alloc(fixed(i), 40).unwrap();
+        }
+        compact_fully(&mut h, COMPACTION_BUDGET);
+        assert_eq!(h.len(), h.live_bytes(), "starts gapless");
+        assert_eq!(
+            h.lookup(resizable(1)).unwrap().0,
+            0,
+            "the shrinker starts low"
+        );
+
+        let live = h.live_bytes();
+        let (mut steps, mut copied, mut lift_copies) = (0u64, 0u64, 0u64);
+        let mut size = 16384u32;
+        for _ in 0..16 {
+            size -= shrink_by;
+            let end_before = h.len();
+            let moved = h.resize(resizable(1), size).unwrap();
+            // Bytes the *resize* moved: zero today, and the cost of the lift
+            // once the shrink path starts relocating.
+            lift_copies += relocated_bytes(&h, moved, end_before);
+            while let Some(step) = h.propose_compaction_step(COMPACTION_BUDGET) {
+                copied += step.len;
+                steps += 1;
+                h.commit_compaction_step(step);
+                assert!(steps < 200_000, "not converging");
             }
-            let reclaimed = live_before - h.live_bytes();
-            println!(
-                "shrink_by={shrink_by:4}  live={live_before}  reclaimed={reclaimed:5}  \
-                 steps={steps:6}  copied={copied:9}  =>  {:.0} bytes copied per byte reclaimed",
-                copied as f64 / reclaimed as f64
-            );
+        }
+        h.assert_invariants();
+        Pathology {
+            live,
+            reclaimed: live - h.live_bytes(),
+            steps,
+            copied,
+            final_pos: h.lookup(resizable(1)).unwrap().0,
+            final_end: h.len(),
+            lift_copies,
+        }
+    }
+
+    /// How many bytes a `resize`'s relocation asked the caller to copy.
+    fn relocated_bytes(h: &Heap, moved: Relocation<u64>, _end_before: u64) -> u64 {
+        match moved {
+            None => 0,
+            Some((_, new)) => h.allocations.get(&new).map_or(0, |e| u64::from(e.len)),
         }
     }
 
