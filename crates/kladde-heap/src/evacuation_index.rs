@@ -418,6 +418,19 @@ impl EvacuationIndex {
         self.tree.descend_visit(WidestGap)
     }
 
+    /// The **highest**-addressed gap at least `min_len` bytes wide -- the exact
+    /// mirror of [`Self::lowest_gap_fitting`], collecting `max_gap_pos` over the
+    /// same suffix instead of `min_gap_pos`. It is what a lift aims at: as high
+    /// as the heap can put the mover without extending `end`.
+    pub fn highest_gap_fitting(&self, min_len: u64) -> Option<u64> {
+        self.tree
+            .descend_visit(SuffixMaxGapPos {
+                boundary: Key::gap(0, min_len),
+                acc: None,
+            })
+            .flatten()
+    }
+
     /// The lowest-addressed gap at least `min_len` bytes wide.
     ///
     /// A suffix aggregate: every gap with `width >= min_len` sits at or above the
@@ -433,6 +446,68 @@ impl EvacuationIndex {
             })
             .unwrap_or(u64::MAX);
         (found != u64::MAX).then_some(found)
+    }
+
+    /// The **largest** allocation of `class` with `size <= w` and `addr > floor`.
+    ///
+    /// Two phases, because the size-prefix `[0, w]` is not one subtree: it is the
+    /// union of the canonical subtrees collected along a descent to the boundary
+    /// key, exactly as [`Self::best_evacuation_within`] collects them. Scanning
+    /// those right to left, the first that can hold a qualifying allocation holds
+    /// the largest one, since the key order is by size.
+    ///
+    /// # The predicate is sound but not complete
+    ///
+    /// `max_alloc_addr[class]` is the address of the subtree's highest-*scoring*
+    /// allocation of that class. At `λ = α = 0` the score *is* the address, so it
+    /// is the maximum address and the predicate is exact. Once `λ` or `α` is set
+    /// they diverge, and a subtree holding a qualifying allocation whose score is
+    /// not the maximum can be skipped. The consequence is a smaller replacement
+    /// than the true largest, or none -- never an invalid one, since the predicate
+    /// holding guarantees a qualifying allocation is present. The leftward retry
+    /// below recovers some of what the incompleteness loses.
+    pub fn largest_fitting_above(&self, class: usize, w: u64, floor: u64) -> Option<(u64, u32)> {
+        if w >= u64::from(u32::MAX) {
+            // The boundary below would overflow the shifted key; nothing is that
+            // large, so the whole prefix is in play.
+            return self.largest_fitting_above(class, u64::from(u32::MAX) - 1, floor);
+        }
+        let mut visit = PrefixSubtrees {
+            boundary: Key::alloc(0, 0, 0, false).with_sized((w + 1) << 2),
+            prefix: Vec::new(),
+            leaf: Vec::new(),
+        };
+        self.tree.descend_visit(&mut visit);
+
+        // The leaf's own qualifying keys sit to the right of every collected
+        // subtree, so they are checked first.
+        if let Some(k) = visit
+            .leaf
+            .iter()
+            .rev()
+            .find(|k| !k.is_gap() && k.class() == class && k.addr > floor)
+        {
+            return Some((k.addr, k.size() as u32));
+        }
+        for sub in visit.prefix.iter().rev() {
+            if sub.max_alloc_addr[class] > floor {
+                if let Some(found) = self.descend_rightmost(sub, class, floor) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    /// Walk to the rightmost allocation of `class` above `floor` inside one
+    /// subtree, steering by the same sound-but-incomplete predicate.
+    fn descend_rightmost(&self, _sub: &Aggregate, class: usize, floor: u64) -> Option<(u64, u32)> {
+        // `sweep-bptree` hands out aggregates, not subtree handles, so the walk
+        // is expressed as a second `descend_visit` steered by the same predicate
+        // rather than as a pointer chase from `sub`.
+        self.tree
+            .descend_visit(RightmostAbove { class, floor })
+            .flatten()
     }
 
     /// The best evacuation whose mover is at most `budget` bytes -- **exactly**,
@@ -514,6 +589,103 @@ impl DescendVisit<Key, (), Aggregate> for WidestGap {
         keys.iter()
             .rfind(|k| k.is_gap())
             .map(|k| (k.score, k.size()))
+    }
+}
+
+/// Collects the canonical subtrees of the key prefix below `boundary`, plus the
+/// prefix's own keys in the leaf the descent lands in.
+struct PrefixSubtrees {
+    boundary: Key,
+    prefix: Vec<Aggregate>,
+    leaf: Vec<Key>,
+}
+
+impl DescendVisit<Key, (), Aggregate> for &mut PrefixSubtrees {
+    type Result = ();
+
+    fn visit_inner(&mut self, keys: &[Key], arguments: &[Aggregate]) -> DescendVisitResult<()> {
+        let path = path_to(keys, self.boundary);
+        self.prefix.extend_from_slice(&arguments[..path]);
+        DescendVisitResult::GoDown(path)
+    }
+
+    fn visit_leaf(&mut self, keys: &[Key], _values: &[()]) -> Option<()> {
+        let cut = keys.partition_point(|k| *k < self.boundary);
+        self.leaf.extend_from_slice(&keys[..cut]);
+        Some(())
+    }
+}
+
+/// Descends to the rightmost allocation of one class above `floor`, entering the
+/// rightmost child that can contain one. See
+/// [`EvacuationIndex::largest_fitting_above`] for why the predicate is sound but
+/// not complete.
+struct RightmostAbove {
+    class: usize,
+    floor: u64,
+}
+
+impl DescendVisit<Key, (), Aggregate> for RightmostAbove {
+    type Result = Option<(u64, u32)>;
+
+    fn visit_inner(
+        &mut self,
+        _keys: &[Key],
+        arguments: &[Aggregate],
+    ) -> DescendVisitResult<Self::Result> {
+        match arguments
+            .iter()
+            .rposition(|a| a.max_alloc_addr[self.class] > self.floor)
+        {
+            Some(child) => DescendVisitResult::GoDown(child),
+            None => DescendVisitResult::Cancel,
+        }
+    }
+
+    fn visit_leaf(&mut self, keys: &[Key], _values: &[()]) -> Option<Self::Result> {
+        Some(
+            keys.iter()
+                .rev()
+                .find(|k| !k.is_gap() && k.class() == self.class && k.addr > self.floor)
+                .map(|k| (k.addr, k.size() as u32)),
+        )
+    }
+}
+
+/// Collects `max_gap_pos` over the key suffix at or above `boundary`.
+struct SuffixMaxGapPos {
+    boundary: Key,
+    acc: Option<u64>,
+}
+
+impl DescendVisit<Key, (), Aggregate> for SuffixMaxGapPos {
+    type Result = Option<u64>;
+
+    fn visit_inner(
+        &mut self,
+        keys: &[Key],
+        arguments: &[Aggregate],
+    ) -> DescendVisitResult<Self::Result> {
+        let path = path_to(keys, self.boundary);
+        for a in &arguments[path + 1..] {
+            if a.min_gap_pos != u64::MAX {
+                self.acc = Some(
+                    self.acc
+                        .map_or(a.max_gap_pos, |m: u64| m.max(a.max_gap_pos)),
+                );
+            }
+        }
+        DescendVisitResult::GoDown(path)
+    }
+
+    fn visit_leaf(&mut self, keys: &[Key], _values: &[()]) -> Option<Self::Result> {
+        let cut = keys.partition_point(|k| *k < self.boundary);
+        for k in &keys[cut..] {
+            if k.is_gap() {
+                self.acc = Some(self.acc.map_or(k.score, |m: u64| m.max(k.score)));
+            }
+        }
+        Some(self.acc)
     }
 }
 

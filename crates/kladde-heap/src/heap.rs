@@ -80,7 +80,29 @@ pub struct Step<A> {
 
 /// What a [`RelocatableHeap::resize`] did to an allocation's address: `None` if
 /// it kept it, `Some((old, new))` if the bytes must be moved by the caller.
-pub type Relocation<A> = Option<(A, A)>;
+/// What a `resize` asks the caller to copy, **in order**.
+///
+/// `Double` exists for the lift (see `augmented-segment-tree.md`, "Future
+/// extensions"): a shrinking allocation is moved *up* and a replacement is moved
+/// down into the space it vacated. The replacement.s destination is the mover.s
+/// own old address, so the two copies **must** be performed in the order given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relocation<A, S> {
+    /// Nothing moved.
+    None,
+    /// One allocation moved from `old` to `new`.
+    Single { old: A, new: A },
+    /// Two allocations moved. `first` must be copied before `then`.
+    ///
+    /// `then_len` is carried because the second move is of a *different*
+    /// allocation, one the caller never asked about and whose size it therefore
+    /// has no way to look up.
+    Double {
+        first: (A, A),
+        then: (A, A),
+        then_len: S,
+    },
+}
 
 /// Geometry: which allocation lives where, where the free space is, and how to
 /// squeeze it out.
@@ -115,7 +137,7 @@ pub trait RelocatableHeap {
         &mut self,
         id: Self::Id,
         new_size: Self::Size,
-    ) -> Result<Relocation<Self::Address>, HeapError>;
+    ) -> Result<Relocation<Self::Address, Self::Size>, HeapError>;
 
     /// Where `id` currently lives, and how big it is.
     fn lookup(&self, id: Self::Id) -> Option<(Self::Address, Self::Size)>;

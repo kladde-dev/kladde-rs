@@ -19,7 +19,7 @@
 use std::io::{self, SeekFrom};
 
 use crate::backend::BackendError;
-use crate::heap::{CompactionProgress, RelocatableHeap};
+use crate::heap::{CompactionProgress, RelocatableHeap, Relocation};
 use crate::pointer::{
     Pointer, ResolvedPointer, Sizedness, UniquePointerFixedSize, UniquePointerResizable,
 };
@@ -161,12 +161,26 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Composed<S, H, W>
             .resize(id, new_size)
             .expect("resize of a dangling handle");
         match moved {
-            Some((old, new)) => {
+            Relocation::Single { old, new } => {
                 let copy_len = old_size.to_usize().min(new_size.to_usize());
                 self.cover(new, new_size)?;
                 self.copy_bytes(old, new, copy_len)?;
             }
-            None => self.cover(self.address_of(id), new_size)?,
+            // A lift: the mover goes up and a replacement comes down into the
+            // address it vacated. The order is not ours to choose -- the second
+            // destination *is* the first source.
+            Relocation::Double {
+                first,
+                then,
+                then_len,
+            } => {
+                let copy_len = old_size.to_usize().min(new_size.to_usize());
+                self.cover(first.1, new_size)?;
+                self.copy_bytes(first.0, first.1, copy_len)?;
+                self.cover(then.1, then_len)?;
+                self.copy_bytes(then.0, then.1, then_len.to_usize())?;
+            }
+            Relocation::None => self.cover(self.address_of(id), new_size)?,
         }
         Ok(())
     }

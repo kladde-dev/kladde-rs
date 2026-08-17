@@ -264,6 +264,18 @@ pub struct GainGreedyHeap<Id> {
     /// How much heavier a fixed-size byte is than a resizable one in the
     /// potential. See [`GainGreedyHeap::set_gamma`].
     gamma: u64,
+    /// How many times over a lift must have paid for itself before it is taken.
+    /// Zero disables the mechanism. See [`GainGreedyHeap::set_lift_threshold`].
+    lift_threshold: u64,
+    /// Shrinks charged to each resizable allocation since it was last moved up.
+    ///
+    /// **Sparse: an absent key means zero**, and a reset is a removal. Keyed by
+    /// id rather than address, which is the whole point -- a compaction move
+    /// changes an allocation.s address, not its id, and `insert_raw`/`remove_raw`
+    /// maintain only location state. Neither mentions this map, so the count
+    /// survives every compaction step because nothing is acting on it, rather
+    /// than because something is carefully preserving it.
+    shrink_counts: HashMap<Id, u8>,
     /// Test-only instrumentation; absent from real builds.
     #[cfg(test)]
     stats: std::cell::Cell<SearchStats>,
@@ -283,6 +295,8 @@ impl<Id> Default for GainGreedyHeap<Id> {
             mu_multiple: 0,
             k: 0,
             gamma: 1,
+            lift_threshold: 0,
+            shrink_counts: HashMap::new(),
             #[cfg(test)]
             stats: std::cell::Cell::new(SearchStats::default()),
         }
@@ -474,6 +488,162 @@ impl<Id: AllocationId> GainGreedyHeap<Id> {
     /// doing.
     pub fn set_k(&mut self, k: u64) {
         self.k = k;
+    }
+
+    /// **`T`: how many times over a lift must have paid for itself.**
+    ///
+    /// A resizable allocation low in the heap that shrinks repeatedly is the
+    /// worst case this compactor has: each shrink opens a sliver at the frontier
+    /// that nothing fits, so the frontier slide walks it to the top of the heap
+    /// one budget at a time, copying every live byte above the shrinker to
+    /// reclaim a handful. The cost of a shrink is the whole live heap above it,
+    /// *regardless of how many bytes the shrink freed*.
+    ///
+    /// The answer is to move the offender up, out of the way -- but only once it
+    /// has demonstrated that it is an offender, and only when the move pays. `T`
+    /// is that exchange rate, and it is dimensionless: the lift fires when
+    ///
+    /// ```text
+    /// count × L  >=  T · (s + r_len)        and       count > 1
+    /// ```
+    ///
+    /// where `count` is the number of shrinks charged to the allocation, `s` its
+    /// new size, `r_len` the replacement's, and `L` the height it actually gains.
+    /// That makes the threshold self-tuning: an allocation low in a large heap
+    /// has a large `L` and lifts almost at once, one already near `end` has a
+    /// small `L` and never does, and an expensive lift demands more evidence.
+    ///
+    /// `T = 0` disables the mechanism, and is the default.
+    pub fn set_lift_threshold(&mut self, t: u64) {
+        self.lift_threshold = t;
+    }
+
+    /// Charge a shrink to `id`, and return the new count.
+    ///
+    /// Only shrinks that **actually create a frontier sliver** are charged: if a
+    /// gap already sits below the allocation, the frontier slide targets that
+    /// instead and this shrink costs nothing extra, so counting it would measure
+    /// activity rather than damage. The test is one root read -- the sliver just
+    /// made starts at `addr + new_size`, so "no gap below" is exactly "that
+    /// sliver is the frontier".
+    #[must_use]
+    fn charge_shrink(&mut self, id: Id, addr: u64, new_size: u32) -> Option<u64> {
+        if self.lift_threshold == 0 || id.is_fixed_size() {
+            return None;
+        }
+        if self.index.lowest_gap() != Some(addr + u64::from(new_size)) {
+            return None;
+        }
+        let slot = self.shrink_counts.entry(id).or_insert(0);
+        *slot = slot.saturating_add(1);
+        Some(u64::from(*slot))
+    }
+
+    /// Where a lifted allocation of `size` bytes at `addr` should go.
+    ///
+    /// The highest gap that takes it, or `end`. The single comparison
+    /// `g > addr + size` rejects two cases at once: a gap *below* the mover,
+    /// which would move it the wrong way, and the sliver the shrink just made,
+    /// which is contiguous with the mover's own span -- a "lift" into that raises
+    /// it by exactly its own size, and the arithmetic of a vacated span merging
+    /// with its own destination is an easy way to corrupt the layout.
+    fn lift_target(&self, addr: u64, size: u32) -> u64 {
+        match self.index.highest_gap_fitting(u64::from(size)) {
+            Some(g) if g > addr + u64::from(size) => g,
+            _ => self.end,
+        }
+    }
+
+    /// The allocation that should fill the gap a lifted mover leaves behind.
+    ///
+    /// Chosen as the **largest that fits** in each class, with the two compared
+    /// by `γ`-weighted gain -- largest rather than highest-scoring because the
+    /// point is to leave a residue too small to take the mover back. Falls back
+    /// to the allocation directly above the gap, slid down; that one always
+    /// exists, because the lift is skipped when the mover is already the highest
+    /// allocation, but note it moves the gap up rather than consuming it and so
+    /// blocks nothing.
+    fn lift_replacement(&self, floor: u64, w: u64) -> Option<(u64, u32)> {
+        let mut best: Option<(u64, (u64, u32))> = None;
+        for class in 0..CLASSES {
+            let Some((addr, len)) = self.index.largest_fitting_above(class, w, floor) else {
+                continue;
+            };
+            // The descent's predicate is sound, so this holds -- but it is exact
+            // only at `λ = α = 0`, where score and address coincide.
+            if addr <= floor {
+                continue;
+            }
+            let nc = self.neighbours_of(addr, len);
+            let gain = self.gammas()[class]
+                .saturating_mul(self.weights.score(addr, len, nc).saturating_sub(floor));
+            if best.is_none_or(|(incumbent, _)| gain > incumbent) {
+                best = Some((gain, (addr, len)));
+            }
+        }
+        best.map(|(_, a)| a).or_else(|| {
+            let above = floor + w;
+            self.allocations.get(&above).map(|e| (above, e.len))
+        })
+    }
+
+    /// The lift itself: move `id` up and pull a replacement down into its place.
+    ///
+    /// Returns `None` when the trigger does not fire, in which case the count is
+    /// left standing and the next shrink reconsiders.
+    fn try_lift(
+        &mut self,
+        id: Id,
+        addr: u64,
+        size: u32,
+        count: u64,
+    ) -> Option<Relocation<u64, u32>> {
+        if count <= 1 {
+            return None;
+        }
+        // Skipped when the mover is already the highest allocation: there is
+        // nowhere above to go, and nothing above to pull down.
+        let (&highest, _) = self.allocations.iter().next_back()?;
+        if highest == addr {
+            return None;
+        }
+        // A cheap *necessary* condition. `L <= end − addr` and `s + r_len >= s`,
+        // so failing this guarantees the exact test below would fail too -- and
+        // it costs one subtraction against two descents.
+        if count.saturating_mul(self.end - addr)
+            < self.lift_threshold.saturating_mul(u64::from(size))
+        {
+            return None;
+        }
+
+        // The gap the mover would leave starts exactly at its own address:
+        // `charge_shrink` only counts when no gap sits below it, so nothing
+        // merges downward.
+        let gap_end = self.next_start(addr + u64::from(size)).unwrap_or(self.end);
+        let w = gap_end - addr;
+        let target = self.lift_target(addr, size);
+        let (r_addr, r_len) = self.lift_replacement(addr, w)?;
+
+        // How much height the mover really gains, assuming the next compaction
+        // may pull it back down to where the replacement came from.
+        let l = r_addr.min(target) - addr;
+        let cost = u64::from(size) + u64::from(r_len);
+        if count.saturating_mul(l) < self.lift_threshold.saturating_mul(cost) {
+            return None;
+        }
+
+        // ORDER IS MANDATORY: the replacement lands on the mover's own old
+        // address, so the mover's bytes must be copied out first.
+        let e = self.remove_raw(addr);
+        self.insert_raw(target, size, e.id);
+        self.shrink_counts.remove(&id); // reset == remove
+        let r = self.remove_raw(r_addr);
+        self.insert_raw(addr, r.len, r.id);
+        Some(Relocation::Double {
+            first: (addr, target),
+            then: (r_addr, addr),
+            then_len: r.len,
+        })
     }
 
     /// **`γ`: how much heavier a fixed-size byte is than a resizable one.**
@@ -1363,6 +1533,10 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
 
     fn free(&mut self, id: Id) -> Result<(), HeapError> {
         let addr = *self.by_id.get(&id).ok_or(HeapError::UnknownId)?;
+        // The only place an allocation truly dies: `remove_raw` is also reached
+        // from both branches of `resize` and from `commit_compaction_step`, and
+        // there the allocation lives on at a new address or a new size.
+        self.shrink_counts.remove(&id);
         // Freeing the topmost allocation retreats `end` with no help from
         // compaction -- the third and last channel by which `end` moves. Recorded
         // here rather than in `remove_raw`, which compaction also goes through:
@@ -1374,11 +1548,11 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
         Ok(())
     }
 
-    fn resize(&mut self, id: Id, new_size: u32) -> Result<Relocation<u64>, HeapError> {
+    fn resize(&mut self, id: Id, new_size: u32) -> Result<Relocation<u64, u32>, HeapError> {
         let addr = *self.by_id.get(&id).ok_or(HeapError::UnknownId)?;
         let old_len = self.allocations[&addr].len;
         if new_size == old_len {
-            return Ok(None);
+            return Ok(Relocation::None);
         }
 
         // Shrinking, or growing into the gap immediately above, keeps the
@@ -1393,7 +1567,14 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
         if fits_in_place {
             let e = self.remove_raw(addr);
             self.insert_raw(addr, new_size, e.id);
-            return Ok(None);
+            if new_size < old_len {
+                if let Some(count) = self.charge_shrink(id, addr, new_size) {
+                    if let Some(moved) = self.try_lift(id, addr, new_size, count) {
+                        return Ok(moved);
+                    }
+                }
+            }
+            return Ok(Relocation::None);
         }
 
         // Otherwise find the new home *before* releasing the old one, so the two
@@ -1403,7 +1584,14 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
         let dest = self.place(new_size, false)?;
         let e = self.remove_raw(addr);
         self.insert_raw(dest, new_size, e.id);
-        Ok(Some((addr, dest)))
+        // A relocating grow that lands higher has done the lift.s job already.
+        if dest > addr {
+            self.shrink_counts.remove(&id);
+        }
+        Ok(Relocation::Single {
+            old: addr,
+            new: dest,
+        })
     }
 
     fn lookup(&self, id: Id) -> Option<(u64, u32)> {
@@ -1767,9 +1955,12 @@ mod tests {
     #[test]
     #[ignore]
     fn a_shrinking_low_allocation_makes_the_frontier_slide_walk_the_heap() {
-        println!("{PATHOLOGY_HEADER}");
-        for &shrink_by in &[8u32, 64, 512] {
-            print_pathology(shrink_by, run_pathology(shrink_by));
+        // (gamma, T): the first row is the machinery switched off.
+        for (gamma, t) in [(1u64, 0u64), (1, 4), (4, 4), (4, 1), (4, 16), (16, 4)] {
+            println!("\ngamma={gamma} T={t}\n{PATHOLOGY_HEADER}");
+            for &shrink_by in &[8u32, 64, 512] {
+                print_pathology(shrink_by, run_pathology(shrink_by, gamma, t));
+            }
         }
     }
 
@@ -1779,32 +1970,33 @@ mod tests {
         reclaimed: u64,
         steps: u64,
         copied: u64,
-        /// Where the shrinking allocation ended up, and how high that is as a
-        /// fraction of the file. The machinery's whole purpose is to raise it:
+        /// Where the shrinking allocation ended up. The machinery's whole purpose is to raise it:
         /// a shrinker near `end` opens its slivers at the *top*, where they are
         /// retired by truncation instead of walked to the top by the frontier
         /// slide.
         final_pos: u64,
-        final_end: u64,
         /// Copies attributable to the shrink path rather than to compaction --
         /// zero until the lift exists, then the price being paid for the rest.
         lift_copies: u64,
+        /// Whether the shrinker finished as the topmost allocation, which is
+        /// where its slivers stop being expensive.
+        is_topmost: bool,
     }
 
     const PATHOLOGY_HEADER: &str =
-        "shrink_by  live   reclaimed  steps   copied     per_byte  C_pos    C_pos/end  lift_copies";
+        "shrink_by  live   reclaimed  steps   compacted  lift    total_per_byte  C_pos    C_top";
 
     fn print_pathology(shrink_by: u32, p: Pathology) {
         println!(
-            "{shrink_by:9} {:6} {:10} {:7} {:10} {:9.0} {:8} {:10.2} {:12}",
+            "{shrink_by:9} {:6} {:10} {:7} {:10} {:7} {:15.0} {:8} {:6}",
             p.live,
             p.reclaimed,
             p.steps,
             p.copied,
-            p.copied as f64 / p.reclaimed as f64,
-            p.final_pos,
-            p.final_pos as f64 / p.final_end as f64,
             p.lift_copies,
+            (p.copied + p.lift_copies) as f64 / p.reclaimed as f64,
+            p.final_pos,
+            p.is_topmost,
         );
     }
 
@@ -1815,9 +2007,11 @@ mod tests {
     /// the target layout is every fixed-size allocation below every resizable
     /// one, so this heap's minimum-potential arrangement is precisely the one
     /// where the shrinker has been lifted to the top.
-    fn run_pathology(shrink_by: u32) -> Pathology {
+    fn run_pathology(shrink_by: u32, gamma: u64, t: u64) -> Pathology {
         let mut h = Heap::new();
         h.set_k(1024);
+        h.set_gamma(gamma);
+        h.set_lift_threshold(t);
         h.alloc(resizable(1), 16384).unwrap(); // the shrinking one, at 0
         for i in 2..=400u32 {
             h.alloc(fixed(i), 40).unwrap();
@@ -1835,11 +2029,10 @@ mod tests {
         let mut size = 16384u32;
         for _ in 0..16 {
             size -= shrink_by;
-            let end_before = h.len();
             let moved = h.resize(resizable(1), size).unwrap();
             // Bytes the *resize* moved: zero today, and the cost of the lift
             // once the shrink path starts relocating.
-            lift_copies += relocated_bytes(&h, moved, end_before);
+            lift_copies += relocated_bytes(moved, size);
             while let Some(step) = h.propose_compaction_step(COMPACTION_BUDGET) {
                 copied += step.len;
                 steps += 1;
@@ -1854,16 +2047,18 @@ mod tests {
             steps,
             copied,
             final_pos: h.lookup(resizable(1)).unwrap().0,
-            final_end: h.len(),
             lift_copies,
+            is_topmost: h.allocations.keys().next_back()
+                == Some(&h.lookup(resizable(1)).unwrap().0),
         }
     }
 
     /// How many bytes a `resize`'s relocation asked the caller to copy.
-    fn relocated_bytes(h: &Heap, moved: Relocation<u64>, _end_before: u64) -> u64 {
+    fn relocated_bytes(moved: Relocation<u64, u32>, mover_len: u32) -> u64 {
         match moved {
-            None => 0,
-            Some((_, new)) => h.allocations.get(&new).map_or(0, |e| u64::from(e.len)),
+            Relocation::None => 0,
+            Relocation::Single { .. } => u64::from(mover_len),
+            Relocation::Double { then_len, .. } => u64::from(mover_len) + u64::from(then_len),
         }
     }
 
@@ -1943,7 +2138,11 @@ mod tests {
         h.alloc(fixed(2), 10).unwrap();
         h.free(fixed(2)).unwrap();
 
-        assert_eq!(h.resize(p, 30).unwrap(), None, "should grow in place");
+        assert_eq!(
+            h.resize(p, 30).unwrap(),
+            Relocation::None,
+            "should grow in place"
+        );
         assert_eq!(h.lookup(p), Some((0, 30)));
         h.assert_invariants();
     }
@@ -1956,7 +2155,11 @@ mod tests {
         h.alloc(fixed(2), 10).unwrap(); // blocks growth at 10
 
         let moved = h.resize(p, 30).unwrap();
-        assert_eq!(moved, Some((0, 20)), "must move above the blocker");
+        assert_eq!(
+            moved,
+            Relocation::Single { old: 0, new: 20 },
+            "must move above the blocker"
+        );
         assert_eq!(h.lookup(p), Some((20, 30)));
         assert_eq!(h.implied_gaps(), vec![(0, 10)]);
         h.assert_invariants();
@@ -1969,7 +2172,7 @@ mod tests {
         h.alloc(p, 30).unwrap();
         h.alloc(fixed(2), 10).unwrap();
 
-        assert_eq!(h.resize(p, 10).unwrap(), None);
+        assert_eq!(h.resize(p, 10).unwrap(), Relocation::None);
         assert_eq!(h.lookup(p), Some((0, 10)));
         assert_eq!(h.implied_gaps(), vec![(10, 20)]);
         h.assert_invariants();
@@ -2011,7 +2214,7 @@ mod tests {
         let moved = h.resize(p, 15).unwrap();
         assert_eq!(
             moved,
-            Some((195, 0)),
+            Relocation::Single { old: 195, new: 0 },
             "must fall to the lowest fitting gap, not rise into the exact one"
         );
         h.assert_invariants();
@@ -3018,7 +3221,7 @@ mod tests {
     /// `γ` must not rescue an upward pair: the saturation has to happen before
     /// the scaling, or a wrapped difference gets magnified instead of zeroed.
     #[test]
-    fn gamma_cannot_rescue_an_upward_pair() {
+    fn gamma_and_the_lift_never_break_an_invariant() {
         let mut state = 0x0BAD_1DEA_5EED_F00Du64;
         let mut rand = move || {
             state ^= state << 13;
@@ -3026,9 +3229,18 @@ mod tests {
             state ^= state << 17;
             state
         };
-        for gamma in [1u64, 2, 64, u64::MAX] {
+        for (gamma, t) in [
+            (1u64, 0u64),
+            (2, 1),
+            (64, 4),
+            (u64::MAX, 1),
+            (4, u64::MAX),
+            (1, 1),
+        ] {
             let mut h = Heap::new();
             h.set_gamma(gamma);
+            h.set_lift_threshold(t);
+            h.set_k(1024);
             let mut live: Vec<Pointer<u32>> = Vec::new();
             let mut next = 1u32;
             for round in 0..600 {
@@ -3046,9 +3258,23 @@ mod tests {
                     h.free(live.swap_remove((rand() % live.len() as u64) as usize))
                         .unwrap();
                 }
+                // Shrinks are what drive the lift, so the workload has to do them.
+                if rand() % 4 == 0 && !live.is_empty() {
+                    let victim = live[(rand() % live.len() as u64) as usize];
+                    if !victim.is_fixed_size() {
+                        let (_, len) = h.lookup(victim).unwrap();
+                        if len > 8 {
+                            h.resize(victim, len - 8).unwrap();
+                            h.assert_invariants();
+                        }
+                    }
+                }
                 if round % 4 == 0 {
                     if let Some(step) = h.propose_compaction_step(COMPACTION_BUDGET) {
-                        assert!(step.to < step.from, "gamma={gamma}: {step:?} is upward");
+                        assert!(
+                            step.to < step.from,
+                            "gamma={gamma} T={t}: {step:?} is upward"
+                        );
                         h.commit_compaction_step(step);
                         h.assert_invariants();
                     }
@@ -3056,8 +3282,15 @@ mod tests {
             }
             // And it still converges, however large the weight.
             let (steps, _) = compact_fully(&mut h, COMPACTION_BUDGET);
-            assert!(steps < 100_000, "gamma={gamma}: did not converge");
-            assert_eq!(h.len(), h.live_bytes(), "gamma={gamma}: not gapless");
+            assert!(steps < 100_000, "gamma={gamma} T={t}: did not converge");
+            assert_eq!(h.len(), h.live_bytes(), "gamma={gamma} T={t}: not gapless");
+            // Nothing may be left behind for an allocation that no longer exists.
+            for id in h.shrink_counts.keys() {
+                assert!(
+                    h.by_id.contains_key(id),
+                    "gamma={gamma} T={t}: stale counter"
+                );
+            }
         }
     }
 
