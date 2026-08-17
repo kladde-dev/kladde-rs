@@ -1580,7 +1580,7 @@ consequence of the second.
 The **end slide** earns its place only in the active regime, and pays for it
 during convergence; removing it is measured and defensible, keeping it is
 measured and defensible. The **`K` value** is chosen from one seed. And the
-pathology in the next section is unaddressed.
+pathology in the next section has a design but no implementation.
 
 ---
 
@@ -1629,28 +1629,35 @@ lowest gap that fits; this project's own free-space accounting says most free
 space is destroyed by allocations landing in gaps rather than by truncation. So
 the eager slide spends 15 960 bytes to remove the allocator's preferred slot.
 
-Two remedies follow. They are complementary: the first changes where allocations
-*settle*, the second changes where a known-churning allocation *is moved to*.
+### The design, in two halves
 
-### Remedy 1: weigh resizable and fixed-size allocations differently
+Two mechanisms answer it, and both are adopted. The first changes where
+allocations *settle* and is expressed in the objective; the second changes where
+a demonstrably churning allocation *is put*, and is expressed as a discrete
+action on the resize path. Neither works alone: γ has no way to lift an
+allocation that is already low, and the lift has no way to pay for itself
+without γ.
 
-Make the potential distinguish the two kinds of allocation:
+### Half 1: γ — weighing resizable against fixed-size allocations
+
+Make the potential distinguish the two kinds:
 
 ```
 Φ = Σ_{bytes of resizable allocations} address
   + γ · Σ_{bytes of fixed-size allocations} address        (γ > 1)
 ```
 
-Fixed-size bytes are then heavier, so the compactor prefers to move *them* down
-into gaps, and resizable allocations end up relatively higher — which is exactly
-where you want the allocation that will later release space in place, since
-space released near `end` is retired by truncation instead of by a heap-walk.
+Fixed-size bytes are heavier, so the compactor prefers to move *them* down into
+gaps, and the minimum-`Φ` layout puts every fixed-size allocation below every
+resizable one. That is where you want the allocation that will later release
+space in place: space released near `end` is retired by truncation, space
+released at address 0 costs a heap-walk.
 
 **This looks like the objection of stage 2 and is not.** A per-allocation
-multiplicative weight normally destroys the merge: `gain = w(A)·A.pos −
+multiplicative weight normally destroys the merge — `gain = w(A)·A.pos −
 w(A)·G.pos` makes the coefficient on `G.pos` depend on which allocation is
-chosen, so the two sides can no longer be maximized independently — which is why
-`w(s) = s/(c₀+s)` was rejected in favour of an additive reward. But `γ` takes
+chosen, so the two sides can no longer be maximized independently, which is why
+`w(s) = s/(c₀+s)` was rejected in favour of an additive reward. But γ takes
 **finitely many values**, so you partition instead of linearize:
 
 ```
@@ -1659,97 +1666,313 @@ best = max over classes c of   γ_c · ( lower.max_alloc_score[c] − self.min_g
 
 Within a class the weight is constant, so `γ_c·(A.pos − G.pos)` factors cleanly
 and independent maximization is restored *per class*. The max across classes is
-taken at the end, in `O(#classes)` — still `O(1)` per merge with two classes.
+taken at the end, in `O(#classes)` — still `O(1)` per merge at two classes.
+
+```
+Aggregate {
+    min_gap_pos, max_gap_pos,                       # unchanged
+    max_alloc_score[c], max_alloc_addr[c], max_alloc_size[c],   # one triple per class
+    best, best_from, best_to, best_len,             # still one combined winner
+}
+
+fn extend_left(self, lower):
+    for c in classes:
+        # saturate *before* scaling: an upward pair must collapse to 0 first, or
+        # γ turns a wrapped difference into a large positive.
+        crossing = γ[c].saturating_mul(
+            lower.max_alloc_score[c].saturating_sub(self.min_gap_pos))
+        if crossing > self.best:
+            self.best = crossing
+            self.best_from, self.best_len = lower.max_alloc_addr[c], lower.max_alloc_size[c]
+            self.best_to = self.min_gap_pos
+    if lower.best > self.best:
+        self.best, self.best_from, self.best_to, self.best_len = lower.best, ...
+    self.min_gap_pos = min(self.min_gap_pos, lower.min_gap_pos)
+    self.max_gap_pos = max(self.max_gap_pos, lower.max_gap_pos)
+    for c in classes:
+        if lower.max_alloc_score[c] > self.max_alloc_score[c]:
+            self.max_alloc_score[c], self.max_alloc_addr[c], self.max_alloc_size[c] = lower...
+```
 
 What it costs:
 
-- **The augmentation grows by one `(score, addr, size)` triple per class** —
-  three fields, ~20 bytes per node — and `extend_left` gains one
-  compare-and-subtract. Call it 30–40% more merge work, which is the hot path.
-- **The budgeted descent is mechanical**: the prefix sweep uses the same rule,
+- **Three fields per extra class** in the augmentation, ~20 bytes per node, and
+  one more compare-and-subtract in `extend_left`. Call it 30–40% more merge work,
+  which is the hot path.
+- **The budgeted descent is mechanical.** The prefix sweep uses the same rule,
   and the whole suffix still collapses to the single `min_gap_pos` scalar,
   because that argument is about sizes and is indifferent to class.
 - **No new metadata.** `AllocationId::is_fixed_size()` already exists and
-  `alloc_key` already has the id in hand at every call site. The classification
-  is declared, immutable and free — which is a real advantage over inferring
-  churn from behaviour.
-- **Saturation order matters**: `a.saturating_sub(g)` *then* `saturating_mul(γ)`,
-  or an upward pair times `γ` wraps into a large positive.
-- **The sign bound loosens** to `λ·reward(s) + α <= γ·size`, so stage 2 and 3 are
-  unaffected.
+  `alloc_key` has the id in hand at every call site. The classification is
+  declared, immutable, and free.
+- **The sign bound loosens** to `λ·reward(s) + α <= γ·size`, so stages 2 and 3
+  are unaffected.
 - **The slide's score becomes composition-dependent.** A run of mixed classes
   gains `(weighted mean γ) · gap_len` per byte, so `run_len_from` has to
   accumulate the class mix as it walks. It already walks the entries, so this is
   cheap, but the score stops being a one-liner.
 
-**The limitation, stated plainly.** The compactor only ever moves things *down*
-into gaps. Preferring to move fixed allocations down does not lift resizables
-up; they become relatively higher only as things beneath them compact. So `γ`
-biases which allocation claims a low gap, but will not segregate a layout that
-is already wrong. Making it segregate would need swaps, which are deliberately
-out of scope here: a swap requires scratch space, so it is a three-move rotation
-of which one move goes *upward*, and that breaks the invariant that every step
-independently lowers `Φ'` and can be interrupted at any point.
+**What γ alone cannot do.** The compactor only ever moves things *down* into
+gaps. Preferring to move fixed allocations down does not lift resizables up;
+they become relatively higher only as things beneath them compact. So γ biases
+which allocation claims a low gap, but will not repair a layout that is already
+wrong — which is what the second half is for. (A cheaper partial substitute,
+not adopted, would be to have `place` steer resizable allocations away from the
+lowest fitting gap, so the layout segregates itself at allocation time.)
 
-Because of that limitation, the cheapest version of this idea may not involve
-the tree at all: **have `place` steer resizable allocations away from the lowest
-fitting gap.** Allocations are placed once and mostly stay, so the layout
-segregates itself at allocation time, with no index change and no swaps. That is
-worth measuring before `γ`.
+### Half 2: the shrink counter and the lift
 
-### Remedy 2: a shrink counter, and evacuating *upward*
+#### The counter
 
-Track a `shrink_count` (or `resize_count`) per resizable allocation, incremented
-on every shrink and **reset to zero whenever the allocation is moved**. When it
-passes a threshold, the allocation has demonstrated that it is a repeat offender,
-and the response is to move it to a *higher* address, where the space it keeps
-releasing is cheap to reclaim.
+A **sparse side map**, `shrink_counts: HashMap<Id, u8>`, in which an absent key
+means zero.
 
-This is attractive because it is *evidence-based* where `γ` is declarative: it
-catches the allocation that actually churns, rather than every allocation that
-might. The reset-on-move is what keeps it honest — the counter measures "damage
-done since we last dealt with this", not lifetime activity.
+Keyed by `Id`, which is what makes it cheap in the way that matters: a
+compaction move changes an allocation's *address*, not its id, and
+`insert_raw`/`remove_raw` maintain location state only — `allocations`, keyed by
+address, and `by_id`, whose value is the address. A shrink counter is not
+location state, so **neither primitive mentions it**. The count survives every
+compaction move because nothing is acting on it, rather than because something
+is carefully preserving it. That asymmetry is the whole reason for a side map
+rather than a field in `Entry` (+4 bytes on every allocation, measured) or a byte
+packed into `by_id`'s address word (free, but destroyed and recreated on every
+move, so it would have to be threaded through both primitives — an obligation
+invisible to anyone reading `commit_compaction_step`, and silent when forgotten).
 
-It is also the less finished of the two ideas, and the open problems are real:
+It is touched in exactly three places, none of them on the compaction path:
 
-- **Where does it go, and what pays for the move?** An upward move increases
-  `Φ`, and increases `end` if it goes to the top. So it is a step that makes the
-  objective *worse* and has to be justified by expected future savings — which
-  nothing in the current design knows how to express. The natural framing is that
-  it buys down an expected cost of `shrink_count × (live bytes above)` per future
-  shrink, but that is a forecast, and every other term here is a measurement of
-  the present state.
-- **What stops the next step from undoing it?** This is the sharp version of the
-  problem. Having lifted the allocation, the compactor sees a high-addressed
-  allocation and a gap below it, which is precisely the pattern it exists to
-  exploit — and the *end evacuation* will target it eagerly, since it is now
-  plausibly the topmost allocation. Relying on `γ` to prevent this (remedy 1
-  making a fixed-size allocation the more attractive mover) is only a preference,
-  not a guarantee: it holds when a fixed-size allocation of comparable value is
-  available and fails when one is not.
+| site | action |
+|---|---|
+| `resize`, shrink branch | increment, then test the trigger |
+| the lift | **remove** the entry (reset means remove, so the map stays sparse) |
+| `free` | remove the entry |
 
-  Options worth exploring, none yet convincing:
-  - **Reset the counter on the lift only, and make the score consult it.** Give
-    the allocation a temporary weight that resists being moved down again, decayed
-    over subsequent steps. This is expressible — it is an additive per-allocation
-    term of exactly the shape stage 2 and 3 already use — but it makes the key
-    depend on a mutable counter, so every increment is a re-key, and stage 3's
-    experience is that neighbour-dependent keys are the expensive kind.
-  - **Pin it.** Exclude the allocation from the index entirely for some number of
-    steps or until it stops shrinking. Simple and absolute, but the index's
-    entries are also what the *slides* move, so a pinned allocation in the middle
-    of a run would have to block the run, which is worse.
-  - **Place it above the frontier permanently**, i.e. treat "has churned" as a
-    one-way transition into a region of the address space the compactor does not
-    reclaim from. This is the cleanest of the three and is really a segregated
-    allocator, which is a larger change than anything else in this document.
-- **The threshold is a third tuning knob** on top of `λ`, `α`, `μ` and `K`, and
-  unlike those it gates a discrete action rather than weighting a continuous one,
-  so it cannot be swept in the same way.
-- **Storage.** The count has to live somewhere per allocation. The layout's
-  `Entry` is the obvious home; it does not belong in the index key unless the
-  score consults it, at which point every increment re-keys.
+`free` is the right and only home for cleanup: `remove_raw` is also called from
+both branches of `resize` and from `commit_compaction_step`, and in every case
+but `free` the allocation lives on at a new address or a new size. `alloc`,
+`free` and `resize` are the whole public surface, so there is no other death
+path. `assert_consistent` checks that every key corresponds to a live resizable
+allocation, which is what would catch a fourth caller appearing later.
 
-A cheap first step for either remedy: instrument how often a *truncated* frontier
-slide fires on a sub-32-byte gap in the three existing measurements. That says
-whether this pathology is a latent hazard or something already being paid for.
+#### When the counter advances
+
+Only on a shrink that **actually creates a frontier sliver** — that is, only when
+no gap already sits below C. If one does, the frontier slide targets that gap
+instead and this shrink costs nothing extra, so counting it would measure
+activity rather than damage.
+
+The test is one root read. After the in-place shrink the sliver starts at
+`c + s`, so "no gap below C" is exactly "the sliver we just made is the
+frontier":
+
+```
+index.lowest_gap() == Some(c + s)
+```
+
+That condition has a consequence used throughout below: **the gap C would leave
+starts exactly at `c`.** Nothing merges downward, because there is nothing free
+below C to merge with. So the vacated gap is `[c, gap_end)` with
+`w = gap_end − c ≥ old_size`, and the replacement's destination is C's own old
+address.
+
+#### The trigger
+
+```
+count × L  ≥  T · (s + r_len)      and      count > 1
+```
+
+with `T` dimensionless — "how many times over must the lift have paid for itself
+before I do it" — and
+
+```
+L = min(r_pos, target) − c
+```
+
+`L` is the height C actually gains, discounted by the assumption that the next
+compaction may pull it back down to where the replacement came from. It stands in
+for the quantity that drives the pathology, live bytes above C, and is a
+conservative proxy for it: `bytes_above(c) − bytes_above(c + L) ≤ L`. It also
+correctly refuses to credit a lift that barely raises C.
+
+The trigger self-tunes in the way a fixed count would not:
+
+- C low in a large heap, with a distant replacement: `L` is large, the threshold
+  is ~1, lift almost at once. Correct — each shrink is costing a heap-walk.
+- C already high, or the replacement immediately above it: `L` is small, the
+  threshold is large, effectively never. Correct — the lift buys nothing.
+- C large, or an expensive replacement: `s + r_len` is large, so demand more
+  evidence.
+
+A `u8` still suffices, and saturating at 255 means "never lift", which is the
+right answer whenever the computed threshold exceeds it.
+
+Because the exact test needs both a target and a replacement, a cheap
+**necessary** condition prunes it first. `L ≤ end − c` and `s + r_len ≥ s`, so
+
+```
+count × (end − c)  <  T · s        ⟹        the exact test fails too
+```
+
+and the searches below can be skipped without changing any decision.
+
+#### The target
+
+```
+target = match index.highest_gap_fitting(s):
+    Some(g) if g > c + s  =>  g          # strictly above the vacated span
+    _                     =>  end
+```
+
+`highest_gap_fitting(s)` is the exact mirror of `lowest_gap_fitting(s)` — the
+same suffix descent from key `(s << 1) | 1`, collecting `max_gap_pos` instead of
+`min_gap_pos` — and `max_gap_pos` is already in the aggregate, so it is nearly
+free. It puts C as high as possible, which is the goal, and needs none of the
+2-D machinery that "the nearest gap above C" would.
+
+The single comparison `g > c + s` rejects two cases at once: a gap *below* C,
+which would move C the wrong way, and the sliver C just made, which is contiguous
+with C's own span — a "lift" into it would raise C by exactly its own size, and
+the arithmetic of vacated-span-merges-destination-gap is an easy way to corrupt
+the layout.
+
+The whole operation is skipped when C is already the highest allocation.
+
+#### The replacement
+
+The largest allocation that fits, **in each class**, with the two candidates then
+compared by γ-weighted gain — so blocking and the class preference are both
+expressed. Largest-fit rather than best-score because the point is to leave a
+residue too small to take C back.
+
+```
+fn best_replacement(c, w) -> Option<Alloc>:
+    best = None
+    for class in classes:
+        if let Some(a) = largest_fitting_above(class, w, floor = c):
+            if a.addr > c:                       # exact check; see the descent
+                best = max_by(best, a, key = γ[class] · (score(a) − c))
+    if best.is_some(): return best
+
+    # (3) The fallback: the allocation directly above the gap, slid down. It
+    # always exists, because C is not the highest allocation -- but note that a
+    # slide moves the gap up rather than consuming it, so this case blocks
+    # nothing. It is taken anyway; see "what is still open".
+    return allocation_starting_at(c + w)
+```
+
+#### The steered descent
+
+`largest_fitting_above(class, w, floor)` finds the largest allocation of that
+class with `size ≤ w` and `addr > floor`. Two phases, because the size-prefix
+`[0, w]` is not a single subtree — it is the union of the canonical subtrees
+collected along a descent to the boundary key, exactly as
+`best_evacuation_within` collects them.
+
+```
+fn largest_fitting_above(class, w, floor) -> Option<Alloc>:
+    boundary = (w + 1) << 1                      # first key of any larger size
+    prefix   = canonical_subtrees_below(boundary)        # ascending key order
+
+    # Right to left: the first subtree that can hold a qualifying allocation
+    # holds the largest one, since the key order is by size.
+    for sub in prefix.reversed():
+        if sub.max_alloc_addr[class] > floor:
+            if let Some(a) = descend_rightmost(sub, class, floor):
+                return Some(a)
+            # sound but incomplete -- keep looking leftward
+    return None
+
+fn descend_rightmost(node, class, floor) -> Option<Alloc>:
+    while node is inner:
+        i = rightmost index with node.argument[i].max_alloc_addr[class] > floor
+        if i is none: return None
+        node = node.child(i)
+    return rightmost key k in node with
+        k.is_alloc and class(k) == class and k.addr > floor
+```
+
+**The predicate is sound but not complete.** `max_alloc_addr[class]` is the
+address of the subtree's highest-*scoring* allocation of that class. At
+`λ = α = 0` the score *is* the address, so the field is the maximum address and
+the predicate is exact. Once `λ` or `α` is set they diverge, and a subtree
+holding a qualifying allocation whose score is not the maximum can be skipped.
+The consequences are a smaller replacement than the true largest, or a fall
+through to the slide — never an invalid one, since the predicate holding
+guarantees a qualifying allocation is present. The leftward retry above recovers
+some of what the incompleteness loses; the `a.addr > c` check in
+`best_replacement` is then an assertion that never fires.
+
+#### The two moves
+
+```
+fn on_shrink(id, c, old_size, s) -> Relocation:
+    shrink_in_place(id, s)                       # always fits; leaves the sliver
+    if not id.is_resizable():                    return Relocation::None
+    if index.lowest_gap() != Some(c + s):        return Relocation::None   # not the frontier
+
+    count = shrink_counts.get(id) + 1
+    shrink_counts.insert(id, count)
+    if count <= 1:                               return Relocation::None
+    if c == highest_allocation_start():          return Relocation::None
+    if count · (end − c) < T · s:                return Relocation::None   # cheap prune
+
+    gap_end = next_start(c + s) or end
+    w       = gap_end − c                        # >= old_size
+    target  = target_for(c, s)
+    r       = best_replacement(c, w)?
+    L       = min(r.pos, target) − c
+    if count · L < T · (s + r.len):              return Relocation::None
+
+    # ORDER IS MANDATORY. The replacement's destination is `c` -- C's own old
+    # address -- so C's bytes must be copied out before the replacement's are
+    # copied in.
+    move_allocation(id, from = c, to = target)
+    shrink_counts.remove(id)                     # reset == remove
+    move_allocation(r.id, from = r.pos, to = c)
+    return Relocation::Double { first: (c, target), then: (r.pos, c) }
+```
+
+`Relocation` becomes an ordered enum:
+
+```
+enum Relocation<A> { None, Single { old: A, new: A }, Double { first: (A, A), then: (A, A) } }
+```
+
+The blast radius is smaller than it looks: `Relocation` is only `resize`'s return
+type, and exactly one place acts on it — `ComposedBackend::resize`, which covers
+the destination and copies the bytes. `MockBackend` and `UnjournaledBackend`
+forward it untouched. The `Double` arm does the same thing twice, in order.
+
+Note that the second move is a *downward* move of a single allocation, so it is
+the ordinary evacuation shape; when it comes from the fallback it is a slide, and
+its source and destination overlap, which `copy_bytes` already handles because
+`commit_compaction_step` produces overlapping slides today. The first move is
+*upward*, which is why none of this can go through `commit_compaction_step` —
+whose `assert!(to < from)` is what underwrites "every step independently lowers
+`Φ'`".
+
+### What this design does not fix
+
+- **The lift is unbudgeted.** The compaction budget bounds per-flush copying;
+  this happens on the resize path and bypasses it. Bounded by `s + r_len`, but
+  those are `u32` sizes, so the bound is nominally large and an adversary picks
+  the moment. Capping the lift at some multiple of the compaction budget — and
+  letting the count keep rising when it does not fit — would close that.
+- **Moving to `end` grows the file**, and the operation is not scored against
+  `K` because it does not happen during compaction. Later compaction reclaims
+  it, so it is transient, but it is a regression in the quantity `K` exists to
+  protect, taken to avoid an unbounded copying cost. `highest_gap_fitting`
+  avoids it whenever any gap above will take C.
+- **The undo is bounded, not prevented.** The vacated gap is at least C's *old*
+  size, so C — now smaller — always fits it. If the best replacement leaves a
+  residue of at least `s`, or if the slide fallback is taken (which moves the gap
+  up rather than consuming it), the next compaction can pull C straight back.
+  What limits the damage is the counter: the reset means at most one wasted lift
+  per `T` qualifying shrinks. And it is never wholly wasted — because the vacated
+  gap starts exactly at `c`, a dragged-back C lands at `c + r_len`, strictly
+  above where it started.
+- **`T` is unmeasured**, and unlike `λ`, `α`, `μ` and `K` it gates a discrete
+  action rather than weighting a continuous one, so it cannot be swept the same
+  way.
+- **The descent's predicate is approximate away from the default policy**, as
+  set out above.
