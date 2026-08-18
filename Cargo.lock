@@ -358,23 +358,15 @@ dependencies = [
 name = "kladde"
 version = "0.1.0"
 dependencies = [
- "kladde-alloc",
- "kladde-traits",
-]
-
-[[package]]
-name = "kladde-alloc"
-version = "0.1.0"
-dependencies = [
- "kladde-traits",
- "serde",
+ "kladde-heap",
+ "kladde-persist",
 ]
 
 [[package]]
 name = "kladde-derive"
 version = "0.1.0"
 dependencies = [
- "kladde-traits",
+ "kladde-persist",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -394,6 +386,7 @@ name = "kladde-persist"
 version = "0.1.0"
 dependencies = [
  "kladde-heap",
+ "kladde-schema",
 ]
 
 [[package]]
@@ -404,20 +397,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "kladde-traits"
-version = "0.1.0"
-dependencies = [
- "kladde-schema",
-]
-
-[[package]]
 name = "kladde-types"
 version = "0.1.0"
 dependencies = [
  "kladde",
- "kladde-alloc",
  "kladde-derive",
- "kladde-traits",
+ "kladde-persist",
  "postcard",
  "serde",
 ]

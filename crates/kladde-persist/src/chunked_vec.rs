@@ -1,6 +1,6 @@
-//! [`PersistableVec`]: a deliberately "prematurely optimized" chunked vector, to
+//! [`ChunkedVec`]: a deliberately "prematurely optimized" chunked vector, to
 //! validate that the redesigned trait surface supports the layouts kladde may
-//! eventually want. See `generic-allocator.md`, "Test case: chunked PersistableVec".
+//! eventually want. See `generic-allocator.md`, "Test case: chunked ChunkedVec".
 //!
 //! ## On-disk layouts and how they're told apart
 //!
@@ -43,9 +43,10 @@ use kladde_heap::{
 };
 use std::io::Read;
 
+use crate::guard::Guard;
 use crate::location::Location;
 use crate::persistable::Persistable;
-use crate::repr::{decode_option_slice, encode_option, PointerRepr};
+use kladde_heap::{decode_option_slice, encode_option, PointerRepr};
 
 /// Elements per fixed-size chunk in Linked mode (and the Small/Linked threshold).
 const CHUNK_LEN: usize = 4;
@@ -62,7 +63,7 @@ enum Repr<P> {
 
 /// A chunked, backend-persisted vector. Elements live in memory as a `Vec<T>`;
 /// `store`/`load` project that to/from the chunked on-disk layout.
-pub struct PersistableVec<T, P = Pointer> {
+pub struct ChunkedVec<T, P = Pointer> {
     data: Vec<T>,
     repr: Repr<P>,
 }
@@ -100,7 +101,7 @@ impl ChunkLayout {
     }
 }
 
-impl<T, P> PersistableVec<T, P> {
+impl<T, P> ChunkedVec<T, P> {
     pub fn new() -> Self {
         Self {
             data: Vec::new(),
@@ -128,13 +129,13 @@ impl<T, P> PersistableVec<T, P> {
     }
 }
 
-impl<T, P> Default for PersistableVec<T, P> {
+impl<T, P> Default for ChunkedVec<T, P> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T, P: PointerRepr> PersistableVec<T, P> {
+impl<T, P: PointerRepr> ChunkedVec<T, P> {
     /// Free every backend allocation this vector owns (its handles don't free on
     /// drop -- freeing needs the backend). Leaves the vector empty in memory.
     pub fn free<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) {
@@ -151,7 +152,7 @@ impl<T, P: PointerRepr> PersistableVec<T, P> {
     }
 }
 
-impl<T: Persistable<P>, P: PointerRepr> PersistableVec<T, P> {
+impl<T: Persistable<P>, P: PointerRepr> ChunkedVec<T, P> {
     /// Transition `self.repr` to fit `self.data.len()`, returning the head id (or
     /// `None` when empty). Reuses existing allocations where it can.
     fn sync<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) -> Option<P> {
@@ -299,10 +300,29 @@ fn read_bytes<P: PointerRepr, B: ReadBackend<Pointer = P>>(
     buf
 }
 
-impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for PersistableVec<T, P> {
+impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for ChunkedVec<T, P> {
     // Just the head pointer id inline; the length/size lives with the allocator
     // (Small) or one indirection away (Linked).
     const INLINE_SIZE: usize = P::BYTE_LEN;
+
+    type Guard<'s, B: WriteBackend<Pointer = P>>
+        = ChunkedVecGuard<'s, T, B>
+    where
+        Self: 's,
+        B: 's;
+
+    #[inline]
+    fn guard<'s, B: WriteBackend<Pointer = P>>(
+        &'s mut self,
+        backend: &'s B,
+        location: Location<P, B::Size>,
+    ) -> Self::Guard<'s, B> {
+        ChunkedVecGuard {
+            inner: self,
+            backend,
+            location,
+        }
+    }
 
     fn store<B: WriteBackend<Pointer = P>>(&mut self, backend: &B, location: Location<P, B::Size>) {
         let head = self.sync(backend);
@@ -395,26 +415,72 @@ impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for PersistableVec<T, P> 
     }
 }
 
+/// The [`Guard`] for a [`ChunkedVec`].
+///
+/// Whole-value only ([`set`](ChunkedVecGuard::set)): a `ChunkedVec` re-lays its
+/// entire chunk chain on `store`, so there is no incremental mutation to expose.
+/// The general-purpose incremental container is `kladde_types::PersistableVec`.
+pub struct ChunkedVecGuard<'s, T, B: WriteBackend> {
+    inner: &'s mut ChunkedVec<T, B::Pointer>,
+    backend: &'s B,
+    location: Location<B::Pointer, B::Size>,
+}
+
+impl<'s, T: Persistable<B::Pointer>, B: WriteBackend> ChunkedVecGuard<'s, T, B> {
+    /// Replaces the whole vector with `value` and re-lays it on the backend.
+    pub fn set(&mut self, mut value: ChunkedVec<T, B::Pointer>) {
+        value.store(self.backend, self.location);
+        *self.inner = value;
+    }
+}
+
+impl<'s, T, B: WriteBackend> Guard for ChunkedVecGuard<'s, T, B> {
+    type Persistable = ChunkedVec<T, B::Pointer>;
+    type Backend = B;
+
+    fn as_persistable(&self) -> &Self::Persistable {
+        self.inner
+    }
+    fn as_persistable_mut(&mut self) -> &mut Self::Persistable {
+        self.inner
+    }
+    fn backend(&self) -> &B {
+        self.backend
+    }
+}
+
+impl<'s, T, B: WriteBackend> std::ops::Deref for ChunkedVecGuard<'s, T, B> {
+    type Target = ChunkedVec<T, B::Pointer>;
+    fn deref(&self) -> &Self::Target {
+        self.inner
+    }
+}
+
+impl<'s, T, B: WriteBackend> std::ops::DerefMut for ChunkedVecGuard<'s, T, B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use kladde_heap::{Backend, MockBackend};
 
-    fn as_vec(v: &PersistableVec<u32>) -> Vec<u32> {
+    fn as_vec(v: &ChunkedVec<u32>) -> Vec<u32> {
         v.iter().copied().collect()
     }
 
     /// Store `v` at a fresh root, then load it back through the same backend.
-    fn round_trip(b: &mut MockBackend, v: &mut PersistableVec<u32>) -> PersistableVec<u32> {
-        let root = b.alloc_fixed_size(<PersistableVec<u32> as Persistable>::INLINE_SIZE as u32);
+    fn round_trip(b: &mut MockBackend, v: &mut ChunkedVec<u32>) -> ChunkedVec<u32> {
+        let root = b.alloc_fixed_size(<ChunkedVec<u32> as Persistable>::INLINE_SIZE as u32);
         v.store(b, Location::new(root.raw(), 0));
-        PersistableVec::<u32>::load(b, Location::new(root.raw(), 0))
+        ChunkedVec::<u32>::load(b, Location::new(root.raw(), 0))
     }
 
     #[test]
     fn empty_vec_round_trips_as_a_null_pointer() {
         let mut b = MockBackend::new();
-        let mut v = PersistableVec::<u32>::new();
+        let mut v = ChunkedVec::<u32>::new();
         let loaded = round_trip(&mut b, &mut v);
         assert!(loaded.is_empty());
     }
@@ -422,7 +488,7 @@ mod tests {
     #[test]
     fn small_vec_round_trips() {
         let mut b = MockBackend::new();
-        let mut v = PersistableVec::<u32>::new();
+        let mut v = ChunkedVec::<u32>::new();
         for x in [10, 20, 30] {
             v.push(x);
         }
@@ -433,7 +499,7 @@ mod tests {
     #[test]
     fn large_vec_round_trips_through_the_linked_layout() {
         let mut b = MockBackend::new();
-        let mut v = PersistableVec::<u32>::new();
+        let mut v = ChunkedVec::<u32>::new();
         let expected: Vec<u32> = (0..10).collect(); // > CHUNK_LEN (4) -> linked, 3 chunks
         for &x in &expected {
             v.push(x);
@@ -446,7 +512,7 @@ mod tests {
     fn small_is_resizable_and_large_is_fixed_on_disk() {
         let mut b = MockBackend::new();
 
-        let mut small = PersistableVec::<u32>::new();
+        let mut small = ChunkedVec::<u32>::new();
         small.push(1);
         let root = b.alloc_fixed_size(4);
         small.store(&b, Location::new(root.raw(), 0));
@@ -467,7 +533,7 @@ mod tests {
     #[test]
     fn growing_across_the_threshold_then_reloading_preserves_data() {
         let mut b = MockBackend::new();
-        let mut v = PersistableVec::<u32>::new();
+        let mut v = ChunkedVec::<u32>::new();
         let root = b.alloc_fixed_size(4);
 
         // Start small (3 elems), store.
@@ -483,14 +549,14 @@ mod tests {
         }
         v.store(&b, Location::new(root.raw(), 0));
 
-        let loaded = PersistableVec::<u32>::load(&mut b, Location::new(root.raw(), 0));
+        let loaded = ChunkedVec::<u32>::load(&mut b, Location::new(root.raw(), 0));
         assert_eq!(as_vec(&loaded), (1..=9).collect::<Vec<_>>());
     }
 
     #[test]
     fn shrinking_back_below_the_threshold_preserves_data() {
         let mut b = MockBackend::new();
-        let mut v = PersistableVec::<u32>::new();
+        let mut v = ChunkedVec::<u32>::new();
         let root = b.alloc_fixed_size(4);
 
         for x in 0..8 {
@@ -500,7 +566,7 @@ mod tests {
         v.data.truncate(2); // now small-sized
         v.store(&b, Location::new(root.raw(), 0)); // Linked -> Small
 
-        let loaded = PersistableVec::<u32>::load(&mut b, Location::new(root.raw(), 0));
+        let loaded = ChunkedVec::<u32>::load(&mut b, Location::new(root.raw(), 0));
         assert_eq!(as_vec(&loaded), vec![0, 1]);
         // head is resizable again
         let head = decode_option_slice::<Pointer>(&{
@@ -519,7 +585,7 @@ mod tests {
     #[test]
     fn store_reuses_allocations_rather_than_leaking() {
         let b = MockBackend::new();
-        let mut v = PersistableVec::<u32>::new();
+        let mut v = ChunkedVec::<u32>::new();
         let root = b.alloc_fixed_size(4);
 
         for x in [1, 2, 3] {

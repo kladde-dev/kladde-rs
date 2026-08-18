@@ -1,7 +1,7 @@
 //! [`Location`]: where a value's inline bytes live -- an `anchor` allocation and
 //! an `offset` within it.
 
-use kladde_heap::Pointer;
+use kladde_heap::{Pointer, Word};
 
 /// A displacement within an allocation: the `anchor` pointer plus a byte
 /// `offset`. Parametric over both the pointer type `P` (default `Pointer`) and
@@ -20,5 +20,19 @@ pub struct Location<P = Pointer, S = u32> {
 impl<P, S> Location<P, S> {
     pub fn new(anchor: P, offset: S) -> Self {
         Self { anchor, offset }
+    }
+}
+
+impl<P, S: Word> std::ops::Add<S> for Location<P, S> {
+    type Output = Location<P, S>;
+
+    /// Advances the location by `offset` bytes within the same anchor -- how an
+    /// inline value reaches a field/element at a static offset
+    /// (`location + field_offset`).
+    fn add(self, offset: S) -> Location<P, S> {
+        Location {
+            anchor: self.anchor,
+            offset: self.offset + offset,
+        }
     }
 }

@@ -11,9 +11,9 @@
 mod support;
 
 use kladde_derive::Persistable;
-use kladde_traits::Persistable as _;
-use kladde_traits::{Allocator, Location};
-use support::{MockBackend, Number};
+use kladde_persist::Persistable;
+use kladde_persist::ReadBackend;
+use support::{root_location, MockBackend, Number};
 
 #[derive(Persistable)]
 #[kladde(transparent)]
@@ -35,10 +35,13 @@ struct PlainLabel {
 #[test]
 fn transparent_tuple_newtype_round_trips_as_its_field() {
     // The wrapper reserves exactly what the inner type does.
-    assert_eq!(Meters::INLINE_SIZE, Number::INLINE_SIZE);
+    assert_eq!(
+        <Meters as Persistable>::INLINE_SIZE,
+        <Number as Persistable>::INLINE_SIZE
+    );
 
-    let backend = MockBackend::default();
-    let location = backend.root_location(Meters::INLINE_SIZE);
+    let mut backend = MockBackend::default();
+    let location = root_location(&backend, <Meters as Persistable>::INLINE_SIZE);
 
     let mut m = Meters(Number(0));
     {
@@ -52,14 +55,14 @@ fn transparent_tuple_newtype_round_trips_as_its_field() {
     assert_eq!(m.0, Number(42));
 
     // Reloading reconstructs the wrapper from the same bytes.
-    let reloaded = Meters::load(&backend, location);
+    let reloaded = <Meters as Persistable>::load(&mut backend, location);
     assert_eq!(reloaded.0, Number(42));
 }
 
 #[test]
 fn transparent_braced_newtype_round_trips_as_its_field() {
-    let backend = MockBackend::default();
-    let location = backend.root_location(Label::INLINE_SIZE);
+    let mut backend = MockBackend::default();
+    let location = root_location(&backend, <Label as Persistable>::INLINE_SIZE);
 
     let mut label = Label { value: Number(0) };
     {
@@ -68,7 +71,7 @@ fn transparent_braced_newtype_round_trips_as_its_field() {
     }
     assert_eq!(label.value, Number(7));
 
-    let reloaded = Label::load(&backend, location);
+    let reloaded = <Label as Persistable>::load(&mut backend, location);
     assert_eq!(reloaded.value, Number(7));
 }
 
@@ -77,8 +80,8 @@ fn non_transparent_newtype_round_trips_the_same_way() {
     // The very same round-trip as the transparent cases -- a plain
     // single-field struct is representationally a newtype too; only its
     // guard accessor (`value_mut`) and schema differ.
-    let backend = MockBackend::default();
-    let location = backend.root_location(PlainLabel::INLINE_SIZE);
+    let mut backend = MockBackend::default();
+    let location = root_location(&backend, <PlainLabel as Persistable>::INLINE_SIZE);
 
     let mut label = PlainLabel { value: Number(0) };
     {
@@ -87,37 +90,54 @@ fn non_transparent_newtype_round_trips_the_same_way() {
     }
     assert_eq!(label.value, Number(7));
 
-    let reloaded = PlainLabel::load(&backend, location);
+    let reloaded = <PlainLabel as Persistable>::load(&mut backend, location);
     assert_eq!(reloaded.value, Number(7));
 }
 
 /// Stores something into a fresh root region and returns that region's raw
 /// bytes -- so two ways of storing the same value can be compared byte for
 /// byte.
-fn stored_region(size: usize, store: impl FnOnce(&MockBackend, Location)) -> Vec<u8> {
-    let backend = MockBackend::default();
-    let location = backend.root_location(size);
+fn stored_region(size: usize, store: impl FnOnce(&MockBackend, support::MockLocation)) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut backend = MockBackend::default();
+    let location = root_location(&backend, size);
     store(&backend, location);
-    backend.read(location.anchor, 0, size as u32)
+    let mut bytes = vec![0u8; size];
+    backend
+        .read_at(location.anchor, 0)
+        .read_exact(&mut bytes)
+        .expect("read stored region");
+    bytes
 }
 
 #[test]
 fn newtypes_share_layout_regardless_of_transparency() {
     // Same inline size across the inner type and both wrappers...
-    assert_eq!(Number::INLINE_SIZE, 4);
-    assert_eq!(Meters::INLINE_SIZE, Number::INLINE_SIZE);
-    assert_eq!(Label::INLINE_SIZE, Number::INLINE_SIZE);
-    assert_eq!(PlainLabel::INLINE_SIZE, Number::INLINE_SIZE);
+    assert_eq!(<Number as Persistable>::INLINE_SIZE, 4);
+    assert_eq!(
+        <Meters as Persistable>::INLINE_SIZE,
+        <Number as Persistable>::INLINE_SIZE
+    );
+    assert_eq!(
+        <Label as Persistable>::INLINE_SIZE,
+        <Number as Persistable>::INLINE_SIZE
+    );
+    assert_eq!(
+        <PlainLabel as Persistable>::INLINE_SIZE,
+        <Number as Persistable>::INLINE_SIZE
+    );
 
     // ...and identical *bytes*: storing the same inner value through the
     // transparent wrapper, the non-transparent wrapper, or the bare inner
     // type writes the same region. Memory layout is a property of the
     // fields, not of `#[kladde(transparent)]`.
-    let via_inner = stored_region(Number::INLINE_SIZE, |b, loc| Number(42).store(b, loc));
-    let via_transparent = stored_region(Meters::INLINE_SIZE, |b, loc| {
+    let via_inner = stored_region(<Number as Persistable>::INLINE_SIZE, |b, loc| {
+        Number(42).store(b, loc)
+    });
+    let via_transparent = stored_region(<Meters as Persistable>::INLINE_SIZE, |b, loc| {
         Meters(Number(42)).store(b, loc)
     });
-    let via_plain = stored_region(PlainLabel::INLINE_SIZE, |b, loc| {
+    let via_plain = stored_region(<PlainLabel as Persistable>::INLINE_SIZE, |b, loc| {
         PlainLabel { value: Number(42) }.store(b, loc)
     });
     assert_eq!(via_inner, via_transparent);
@@ -128,10 +148,16 @@ fn newtypes_share_layout_regardless_of_transparency() {
 fn only_transparency_shares_the_inner_types_fingerprint() {
     // Transparent: schema-identical to the field, so same fingerprint and
     // no descriptor of its own.
-    assert_eq!(Meters::fingerprint(), Number::fingerprint());
-    assert_eq!(Label::fingerprint(), Number::fingerprint());
     assert_eq!(
-        Meters::schema().descriptors().len(),
+        <Meters as Persistable>::fingerprint(),
+        <Number as Persistable>::fingerprint()
+    );
+    assert_eq!(
+        <Label as Persistable>::fingerprint(),
+        <Number as Persistable>::fingerprint()
+    );
+    assert_eq!(
+        <Meters as Persistable>::schema().descriptors().len(),
         1,
         "a transparent wrapper adds no node -- just the inner type's",
     );
@@ -139,8 +165,11 @@ fn only_transparency_shares_the_inner_types_fingerprint() {
     // Non-transparent: owns its own `Struct` descriptor, so a *different*
     // fingerprint and an extra node. This is the one thing transparency
     // changes about the schema.
-    assert_ne!(PlainLabel::fingerprint(), Number::fingerprint());
-    assert_eq!(PlainLabel::schema().descriptors().len(), 2);
+    assert_ne!(
+        <PlainLabel as Persistable>::fingerprint(),
+        <Number as Persistable>::fingerprint()
+    );
+    assert_eq!(<PlainLabel as Persistable>::schema().descriptors().len(), 2);
 }
 
 #[derive(Persistable)]
@@ -154,6 +183,6 @@ fn a_transparent_field_dedups_against_the_inner_type() {
     // `a: Meters` is transparent to `Number` and `b: Number` is `Number`,
     // so both resolve to the *same* descriptor: the schema is the root
     // struct plus a single shared `Number` node, not two.
-    let table = HasTransparent::schema();
+    let table = <HasTransparent as Persistable>::schema();
     assert_eq!(table.descriptors().len(), 2);
 }

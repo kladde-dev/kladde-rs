@@ -1,266 +1,98 @@
 //! The crate application code actually depends on: opening/creating a
-//! [`Kladde`] root value, and the concrete [`DefaultBackend`] that backs
-//! it.
+//! [`Kladde`] root value, and the [`DefaultBackend`] that backs it.
 //!
-//! v1 has no real file behind any of this -- see `spec.md`'s "Crash
-//! Consistency" note. `DefaultBackend` journals a small, fixed set of
-//! type-agnostic memory-management microoperations (see `spec.md`'s "The
-//! Trait Layer"/"Flushing") into memory and, on [`Kladde::flush`], replays
-//! them against [`kladde_alloc::MockAllocator`]; there is deliberately no
-//! `open`/`create` taking a `Path`, since v1 has nothing to open -- state
-//! lives only as long as the process does.
+//! ## What changed when kladde moved onto `kladde-heap`
+//!
+//! v1's `DefaultBackend` was a hand-rolled `Vec<Microop>` journal replayed
+//! against an in-memory `MockAllocator` (the former `kladde-alloc` crate), with
+//! no address space at all -- every allocation was its own `Box<[u8]>`. It is
+//! now a [`kladde_heap`] backend: a real address space with placement, gaps,
+//! and incremental compaction, over a `Storage` byte interface.
+//!
+//! Two consequences for application code:
+//!
+//! - **Mutations are visible immediately.** [`DefaultBackend`] is *unjournaled*
+//!   -- it applies every operation as it happens -- so a [`Kladde::load`] no
+//!   longer has to be preceded by a flush. (The journaled backend
+//!   `kladde_heap::JournaledWriteBackend` exists, but plugging it in is blocked
+//!   on deciding what a flush *means*: a durability commit or a memory-bounding
+//!   checkpoint. `Kladde` is generic over its backend so that swap needs no
+//!   change here.)
+//! - **[`Kladde::flush`] now means "compact"**, not "materialize". See its doc
+//!   comment.
+//!
+//! There is still no real file behind any of this: `DefaultBackend`'s storage is
+//! in memory, so state lives only as long as the process does. That is why there
+//! is no `open`/`create` taking a `Path` yet.
 
-use kladde_alloc::MockAllocator;
-use kladde_traits::{
-    Allocator, AllocatorExt, Location, Persistable, RawPointer, ResolvedPointer, UniquePointer,
-    UniquePointerResizable,
+use kladde_persist::{
+    Backend, CompactingBackend, Location, Persistable, ReadBackend, UniquePointer, Word,
+    WriteBackend, WriteBackendExt,
 };
-use std::cell::{Cell, RefCell};
-use std::num::NonZeroU32;
 
 // The schema/fingerprint surface, so an application that depends on `kladde`
 // for its root value can inspect that root type's schema
 // (`T::schema()`/`T::fingerprint()`) without naming `kladde-schema` or
-// `kladde-traits` directly.
-pub use kladde_traits::{
+// `kladde-persist` directly.
+pub use kladde_persist::{
     Field, Fingerprint, SchemaBuilder, TypeDescriptor, TypeRef, TypeTable, Variant, Version,
 };
 
-/// The microoperations `spec.md`'s journal ever records -- nothing
-/// type-specific, purely a byte-level effect on the allocator. `Alloc`'s
-/// `index` is decided (by `DefaultBackend`'s own index counter) at the
-/// moment the entry is created, not during replay -- see the "which
-/// instance" discussion this design is built on. `Splice` is the atomic
-/// content-shift op (see [`Allocator::splice`]): it exists precisely so a
-/// resize-plus-tail-move-plus-write is a *single* entry rather than three.
-#[derive(Debug, Clone, PartialEq)]
-enum Microop {
-    Alloc {
-        index: NonZeroU32,
-        size: usize,
-    },
-    Free {
-        index: NonZeroU32,
-    },
-    Write {
-        index: NonZeroU32,
-        offset: u32,
-        bytes: Vec<u8>,
-    },
-    Copy {
-        src: NonZeroU32,
-        src_offset: u32,
-        len: u32,
-        dst: NonZeroU32,
-        dst_offset: u32,
-    },
-    Resize {
-        index: NonZeroU32,
-        new_size: usize,
-    },
-    Splice {
-        index: NonZeroU32,
-        offset: u32,
-        old_len: u32,
-        new: Vec<u8>,
-    },
-}
+pub use kladde_heap::CompactionProgress;
 
-/// The concrete [`Allocator`] implementation `Kladde` uses. Owns the
-/// index-generation counter and the in-memory journal of `Microop`s;
-/// delegates actual byte storage to a [`MockAllocator`], but only when
-/// [`DefaultBackend::flush`] replays the journal into it -- calling
-/// `Allocator`'s methods on a `DefaultBackend` never touches the
-/// `MockAllocator` directly, it only ever appends to the journal (plus,
-/// for an allocation, minting a fresh index immediately).
-pub struct DefaultBackend {
-    journal: RefCell<Vec<Microop>>,
-    next_index: Cell<u32>,
-    allocator: MockAllocator,
-}
-
-impl DefaultBackend {
-    pub fn new() -> Self {
-        DefaultBackend {
-            journal: RefCell::new(Vec::new()),
-            next_index: Cell::new(0),
-            allocator: MockAllocator::new(),
-        }
-    }
-
-    /// Number of not-yet-flushed microoperations. Mainly for tests /
-    /// introspection.
-    pub fn journal_len(&self) -> usize {
-        self.journal.borrow().len()
-    }
-
-    /// Number of currently-materialized (flushed, not yet freed)
-    /// allocations. Mainly for tests asserting that a mutation didn't
-    /// leak an allocation it should have reused or freed.
-    pub fn live_count(&self) -> usize {
-        self.allocator.live_count()
-    }
-
-    /// Replays every recorded microoperation against the underlying
-    /// `MockAllocator`, in order, then drains the journal. See
-    /// `spec.md`'s "Flushing": since the journal already holds nothing
-    /// but microoperations, this never needs to call back into any
-    /// data-type implementation.
-    ///
-    /// Public so tests/other crates can flush a bare `DefaultBackend`
-    /// directly without going through `Kladde`; application code should
-    /// generally prefer `Kladde::flush`, which additionally gets the
-    /// borrow-checker guarantee that no `Guard` is still live (see its
-    /// doc comment).
-    pub fn flush(&self) {
-        for op in self.journal.borrow_mut().drain(..) {
-            match op {
-                Microop::Alloc { index, size } => self.allocator.materialize_alloc(index, size),
-                Microop::Free { index } => self.allocator.materialize_free(index),
-                Microop::Write {
-                    index,
-                    offset,
-                    bytes,
-                } => self.allocator.materialize_write(index, offset, &bytes),
-                Microop::Copy {
-                    src,
-                    src_offset,
-                    len,
-                    dst,
-                    dst_offset,
-                } => self
-                    .allocator
-                    .materialize_copy(src, src_offset, len, dst, dst_offset),
-                Microop::Resize { index, new_size } => {
-                    self.allocator.materialize_resize(index, new_size)
-                }
-                Microop::Splice {
-                    index,
-                    offset,
-                    old_len,
-                    new,
-                } => self
-                    .allocator
-                    .materialize_splice(index, offset, old_len, &new),
-            }
-        }
-    }
-}
-
-impl Default for DefaultBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DefaultBackend {
-    /// Mints a fresh, never-before-used allocation index and journals an
-    /// `Alloc` for it. Shared by every allocation entry point (fixed regions
-    /// come through the trait's default `alloc_fixed`, which calls
-    /// `alloc_resizable`).
-    fn mint_alloc(&self, byte_size: usize) -> NonZeroU32 {
-        let raw = self
-            .next_index
-            .get()
-            .checked_add(1)
-            .expect("DefaultBackend index space exhausted");
-        self.next_index.set(raw);
-        let index = NonZeroU32::new(raw).unwrap();
-        self.journal.borrow_mut().push(Microop::Alloc {
-            index,
-            size: byte_size,
-        });
-        index
-    }
-}
-
-impl Allocator for DefaultBackend {
-    fn read(&self, target: RawPointer, offset: u32, len: u32) -> Vec<u8> {
-        self.allocator.read(target.index(), offset, len)
-    }
-
-    fn write(&self, target: RawPointer, offset: u32, bytes: &[u8]) {
-        self.journal.borrow_mut().push(Microop::Write {
-            index: target.index(),
-            offset,
-            bytes: bytes.to_vec(),
-        });
-    }
-
-    fn copy(&self, src: RawPointer, src_offset: u32, len: u32, dst: RawPointer, dst_offset: u32) {
-        self.journal.borrow_mut().push(Microop::Copy {
-            src: src.index(),
-            src_offset,
-            len,
-            dst: dst.index(),
-            dst_offset,
-        });
-    }
-
-    fn alloc_resizable(&self, byte_size: usize) -> UniquePointerResizable {
-        UniquePointerResizable::from_index(self.mint_alloc(byte_size))
-    }
-
-    fn free_resizable(&self, pointer: UniquePointerResizable) {
-        self.journal.borrow_mut().push(Microop::Free {
-            index: pointer.index(),
-        });
-    }
-
-    fn resize(&self, pointer: &UniquePointerResizable, new_byte_size: usize) {
-        self.journal.borrow_mut().push(Microop::Resize {
-            index: pointer.index(),
-            new_size: new_byte_size,
-        });
-    }
-
-    fn splice(
-        &self,
-        pointer: &UniquePointerResizable,
-        byte_offset: u32,
-        old_byte_len: u32,
-        new: &[u8],
-    ) {
-        self.journal.borrow_mut().push(Microop::Splice {
-            index: pointer.index(),
-            offset: byte_offset,
-            old_len: old_byte_len,
-            new: new.to_vec(),
-        });
-    }
-
-    fn capacity(&self, pointer: &UniquePointerResizable) -> Option<usize> {
-        self.allocator.capacity(pointer.index())
-    }
-
-    fn resolve(&self, pointer: RawPointer) -> Option<ResolvedPointer<'_>> {
-        self.allocator
-            .resolve(pointer.index())
-            .map(ResolvedPointer::from_target)
-    }
-}
-
-/// A root [`Persistable`] value paired with its own [`DefaultBackend`] --
-/// the entry point application code actually uses.
+/// The concrete backend a [`Kladde`] uses unless told otherwise: an in-memory
+/// [`kladde_heap`] backend with `Pointer = Pointer<u32>` and `Size = u32`,
+/// applying every operation immediately and compacting on demand.
 ///
-/// Unlike every other `Persistable` value, the root gets its own
-/// allocation *eagerly*, in [`Kladde::new`] -- it doesn't have the
-/// "constructed without a backend in hand" problem that makes every other
-/// container's pointer lazy, since `root` and `backend` are brought
-/// together in the same call. See `spec.md`'s "Pointers and Memory
-/// Management".
-pub struct Kladde<T> {
+/// A type alias rather than a newtype, so an application that outgrows it can
+/// name any other `kladde-heap` backend in [`Kladde`]'s second parameter without
+/// this crate mediating.
+pub type DefaultBackend = kladde_heap::MockBackend;
+
+/// How many bytes of copying [`Kladde::flush`] will spend per call.
+pub const DEFAULT_COMPACTION_BUDGET: usize = kladde_heap::DEFAULT_COMPACTION_BUDGET;
+
+/// A root [`Persistable`] value paired with its backend -- the entry point
+/// application code actually uses.
+///
+/// Unlike every other `Persistable` value, the root gets its own allocation
+/// *eagerly*, in [`Kladde::new`] -- it doesn't have the "constructed without a
+/// backend in hand" problem that makes every other container's pointer lazy,
+/// since `root` and `backend` are brought together in the same call. See
+/// `spec.md`'s "Pointers and Memory Management".
+///
+/// `B` is the backend. It defaults to [`DefaultBackend`]; the parameter exists
+/// so a journaled or file-backed backend can be substituted without changing any
+/// of this type's code.
+pub struct Kladde<T, B: Backend = DefaultBackend> {
     root: T,
-    backend: DefaultBackend,
-    root_pointer: UniquePointer<T>,
+    backend: B,
+    root_pointer: UniquePointer<T, B::Pointer>,
 }
 
-impl<T: Persistable> Kladde<T> {
-    /// Wraps `root` with a fresh, empty `DefaultBackend`, allocating the
+impl<T: Persistable> Kladde<T, DefaultBackend> {
+    /// Wraps `root` with a fresh, empty [`DefaultBackend`], allocating the
     /// root's own storage immediately.
+    ///
+    /// Deliberately fixed to `DefaultBackend` rather than generic over `B:
+    /// Default`: a bare `Kladde::new(value)` has nothing to infer the backend
+    /// from (a type parameter's default does not participate in inference), so a
+    /// generic `new` would force every call site to annotate. Use
+    /// [`with_backend`](Kladde::with_backend) for any other backend.
     pub fn new(root: T) -> Self {
-        let backend = DefaultBackend::new();
-        let root_pointer = backend.alloc_boxed::<T>();
+        Self::with_backend(root, DefaultBackend::default())
+    }
+}
+
+impl<T, B> Kladde<T, B>
+where
+    T: Persistable<B::Pointer>,
+    B: WriteBackend,
+{
+    /// Wraps `root` with `backend`, allocating the root's own storage
+    /// immediately.
+    pub fn with_backend(root: T, backend: B) -> Self {
+        let root_pointer = backend.alloc_typed::<T>();
         Kladde {
             root,
             backend,
@@ -273,62 +105,80 @@ impl<T: Persistable> Kladde<T> {
         &self.root
     }
 
-    /// A `Guard` through which mutations to the root value are recorded
-    /// and applied.
-    pub fn guard(&mut self) -> T::Guard<'_, DefaultBackend> {
-        let location = Location {
-            anchor: self.root_pointer.raw(),
-            offset: 0,
-        };
+    /// A [`Guard`](kladde_persist::Guard) through which mutations to the root
+    /// value are recorded and applied.
+    pub fn guard(&mut self) -> <T as Persistable<B::Pointer>>::Guard<'_, B> {
+        let location = Location::new(self.root_pointer.raw(), Word::zero());
         self.root.guard(&self.backend, location)
     }
 
-    pub fn backend(&self) -> &DefaultBackend {
+    pub fn backend(&self) -> &B {
         &self.backend
     }
+}
 
-    /// Replays every not-yet-flushed microoperation against the backend's
-    /// allocator. Takes `&mut self` deliberately: `Guard`s are only ever
-    /// obtainable via `&mut self` too, so the borrow checker guarantees a
-    /// flush can never run while a (possibly multi-microop, not yet fully
-    /// recorded) mutation is still in progress -- see `spec.md`'s Crash
-    /// Consistency section.
-    pub fn flush(&mut self) {
-        self.backend.flush();
+impl<T, B> Kladde<T, B>
+where
+    T: Persistable<B::Pointer>,
+    B: ReadBackend,
+{
+    /// Reconstructs a fresh `T` purely from the backend's storage -- no
+    /// reference to `self.root`. The primary correctness test for the write
+    /// path: this should always equal `self.root`.
+    ///
+    /// Takes `&mut self` because reads are sequential and hand out a real
+    /// seekable cursor. A useful side effect: the borrow checker forbids loading
+    /// while any guard (which holds `&self`) is still alive.
+    pub fn load(&mut self) -> T {
+        let location = Location::new(self.root_pointer.raw(), Word::zero());
+        T::load(&mut self.backend, location)
+    }
+}
+
+impl<T, B> Kladde<T, B>
+where
+    T: Persistable<B::Pointer>,
+    B: CompactingBackend,
+{
+    /// Spends a bounded amount of work squeezing fragmentation out of the
+    /// backing store, then truncates it.
+    ///
+    /// **This is not v1's `flush`.** Under [`DefaultBackend`] every mutation is
+    /// already applied by the time the guard method returns, so there is nothing
+    /// buffered to materialize; what a periodic call still buys is compaction.
+    /// The name is kept because this is the seam a journaled backend's real
+    /// flush will attach to -- see the crate docs.
+    pub fn flush(&mut self) -> CompactionProgress {
+        self.compact(DEFAULT_COMPACTION_BUDGET)
     }
 
-    /// Reconstructs a fresh `T` purely from the backend's (post-flush)
-    /// storage -- no reference to `self.root`. The primary correctness
-    /// test for flushing: this should equal `self.root` after a flush.
-    pub fn load(&self) -> T {
-        let location = Location {
-            anchor: self.root_pointer.raw(),
-            offset: 0,
-        };
-        T::load(&self.backend, location)
+    /// [`flush`](Self::flush) with an explicit byte budget.
+    pub fn compact(&mut self, budget: usize) -> CompactionProgress {
+        self.backend.compact_incrementally(budget)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kladde_traits::Guard;
+    use kladde_persist::{Guard, PointerRepr, Word};
+    use std::io::Read;
 
     struct Counter(u32);
 
-    impl Persistable for Counter {
+    impl<P: PointerRepr> Persistable<P> for Counter {
         const INLINE_SIZE: usize = 4;
 
-        type Guard<'s, B: kladde_traits::Backend>
+        type Guard<'s, B: WriteBackend<Pointer = P>>
             = CounterGuard<'s, B>
         where
             Self: 's,
             B: 's;
 
-        fn guard<'s, B: kladde_traits::Backend>(
+        fn guard<'s, B: WriteBackend<Pointer = P>>(
             &'s mut self,
             backend: &'s B,
-            location: Location,
+            location: Location<P, B::Size>,
         ) -> Self::Guard<'s, B> {
             CounterGuard {
                 inner: self,
@@ -337,29 +187,40 @@ mod tests {
             }
         }
 
-        fn store<B: kladde_traits::Backend>(&mut self, backend: &B, location: Location) {
+        fn store<B: WriteBackend<Pointer = P>>(
+            &mut self,
+            backend: &B,
+            location: Location<P, B::Size>,
+        ) {
             backend.write(location.anchor, location.offset, &self.0.to_le_bytes());
         }
 
-        fn load<B: kladde_traits::Backend>(backend: &B, location: Location) -> Self {
-            let bytes = backend.read(location.anchor, location.offset, 4);
-            Counter(u32::from_le_bytes(bytes.try_into().unwrap()))
+        fn load<B: ReadBackend<Pointer = P>>(
+            backend: &mut B,
+            location: Location<P, B::Size>,
+        ) -> Self {
+            let mut bytes = [0u8; 4];
+            backend
+                .read_at(location.anchor, location.offset)
+                .read_exact(&mut bytes)
+                .expect("read Counter");
+            Counter(u32::from_le_bytes(bytes))
         }
 
         fn describe_local(
-            _builder: &mut kladde_traits::SchemaBuilder,
-        ) -> kladde_traits::TypeDescriptor {
-            kladde_traits::TypeDescriptor::Primitive(kladde_traits::Primitive::U32)
+            _builder: &mut kladde_persist::SchemaBuilder,
+        ) -> kladde_persist::TypeDescriptor {
+            kladde_persist::TypeDescriptor::Primitive(kladde_persist::Primitive::U32)
         }
     }
 
-    struct CounterGuard<'s, B> {
+    struct CounterGuard<'s, B: WriteBackend> {
         inner: &'s mut Counter,
         backend: &'s B,
-        location: Location,
+        location: Location<B::Pointer, B::Size>,
     }
 
-    impl<'s, B: kladde_traits::Backend> CounterGuard<'s, B> {
+    impl<'s, B: WriteBackend> CounterGuard<'s, B> {
         fn set(&mut self, value: u32) {
             self.backend.write(
                 self.location.anchor,
@@ -370,7 +231,7 @@ mod tests {
         }
     }
 
-    impl<'s, B: kladde_traits::Backend> Guard for CounterGuard<'s, B> {
+    impl<'s, B: WriteBackend> Guard for CounterGuard<'s, B> {
         type Persistable = Counter;
         type Backend = B;
 
@@ -386,86 +247,71 @@ mod tests {
     }
 
     #[test]
-    fn mutation_updates_state_and_journals_microops() {
+    fn mutation_updates_state_and_is_immediately_readable() {
         let mut kladde = Kladde::new(Counter(0));
 
         kladde.guard().set(42);
 
         assert_eq!(kladde.get().0, 42);
-        // One `Alloc` (the root, from `Kladde::new`) plus one `Write`
-        // (the `set` call) are still sitting in the journal, unflushed.
-        assert_eq!(kladde.backend().journal_len(), 2);
+        // No flush needed: the default backend is unjournaled, so `load` sees
+        // the mutation right away. This is the behavior change from v1's
+        // journal-and-replay `DefaultBackend`.
+        assert_eq!(kladde.load().0, 42);
     }
 
     #[test]
-    fn flush_drains_the_journal_and_makes_load_reflect_the_mutation() {
+    fn flushing_compacts_and_leaves_the_value_intact() {
         let mut kladde = Kladde::new(Counter(0));
         kladde.guard().set(7);
 
-        kladde.flush();
+        let progress = kladde.flush();
 
-        assert_eq!(kladde.backend().journal_len(), 0);
+        assert!(
+            progress.quiesced,
+            "a single-allocation heap is already compact"
+        );
         assert_eq!(kladde.load().0, 7);
     }
 
     #[test]
-    fn resizable_allocation_capacity_round_trips_through_flush() {
+    fn the_root_allocation_is_created_eagerly() {
+        let kladde = Kladde::new(Counter(0));
+        assert_eq!(kladde.backend().live_count(), 1);
+    }
+
+    #[test]
+    fn allocations_round_trip_through_the_backend_without_a_flush() {
         let backend = DefaultBackend::new();
 
-        let pointer = backend.alloc_array::<u8>(16);
+        let pointer = backend.alloc_resizable_array::<u8>(16);
         assert_eq!(
-            backend.capacity(&pointer),
-            None,
-            "capacity is unreadable until the alloc is materialized (flushed)"
+            Backend::size(&backend, pointer.raw()).unwrap(),
+            16,
+            "size is readable immediately -- nothing is deferred"
         );
 
-        backend.flush();
-        assert_eq!(backend.capacity(&pointer), Some(16));
-
-        backend.resize(&pointer, 40);
-        backend.flush();
-        assert_eq!(
-            backend.capacity(&pointer),
-            Some(40),
-            "capacity tracks resize"
-        );
+        backend.resize(&pointer, 40).unwrap();
+        assert_eq!(Backend::size(&backend, pointer.raw()).unwrap(), 40);
 
         let live = backend.live_count();
         backend.free_resizable(pointer);
-        backend.flush();
-        assert_eq!(
-            backend.live_count(),
-            live - 1,
-            "free_resizable reclaims the region"
-        );
+        assert_eq!(backend.live_count(), live - 1);
     }
 
     #[test]
-    fn splice_is_journaled_and_replayed_as_one_entry() {
-        let backend = DefaultBackend::new();
-        let pointer = backend.alloc_array::<u8>(4);
+    fn splice_replaces_a_range_and_resizes_in_one_call() {
+        let mut backend = DefaultBackend::new();
+        let pointer = backend.alloc_resizable_array::<u8>(4);
         backend.write(pointer.raw(), 0, &[1, 2, 3, 4]);
-        backend.flush();
 
-        // A single splice call is one journal entry (unlike the
-        // resize+copy+write trio it replaces).
         backend.splice(&pointer, 1, 2, &[9, 9, 9]);
-        assert_eq!(backend.journal_len(), 1);
-        backend.flush();
 
-        assert_eq!(backend.capacity(&pointer), Some(5));
-        assert_eq!(backend.read(pointer.raw(), 0, 5), vec![1, 9, 9, 9, 4]);
-    }
-
-    #[test]
-    fn load_before_any_flush_would_read_unmaterialized_storage() {
-        // Documenting current behavior rather than asserting a
-        // requirement: nothing has been flushed yet, so the root's
-        // allocation was only *minted*, never *materialized* -- reading
-        // it is a logic error in application code (flush first), not
-        // something `load` is expected to handle gracefully.
-        let kladde = Kladde::new(Counter(0));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| kladde.load()));
-        assert!(result.is_err());
+        assert_eq!(Backend::size(&backend, pointer.raw()).unwrap(), 5);
+        let mut bytes = [0u8; 5];
+        backend
+            .read_at(pointer.raw(), Word::zero())
+            .read_exact(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, [1, 9, 9, 9, 4]);
     }
 }

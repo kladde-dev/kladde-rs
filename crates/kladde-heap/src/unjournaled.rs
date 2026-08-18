@@ -138,6 +138,13 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> ReadBackend
     }
 }
 
+impl<S: Storage, H: IncrementallyCompactableHeap<Id = Pointer<W>>, W: Word> crate::CompactingBackend
+    for UnjournaledBackend<S, H, W>
+{
+    fn compact_incrementally(&self, budget: usize) -> CompactionProgress {
+        UnjournaledBackend::compact_incrementally(self, Word::from_usize(budget))
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

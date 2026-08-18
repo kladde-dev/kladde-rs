@@ -28,6 +28,7 @@
 
 use std::io::{self, Read, Seek};
 
+use crate::heap::CompactionProgress;
 use crate::pointer::{ResolvedPointer, UniquePointerFixedSize, UniquePointerResizable};
 use crate::word::Word;
 
@@ -78,8 +79,12 @@ impl std::error::Error for BackendError {}
 /// but *not* read or write access to stored bytes -- that is what the two halves
 /// are for.
 pub trait Backend {
-    /// The concrete, `Copy` serialized id (e.g. `Pointer<u32>`).
-    type Pointer: Copy;
+    /// The concrete, serialized id (e.g. `Pointer<u32>`).
+    ///
+    /// Bounded by [`PointerRepr`] rather than merely `Copy` so that every
+    /// downstream guard and container can serialize an `Option<Self::Pointer>`
+    /// without restating the bound.
+    type Pointer: crate::PointerRepr;
     /// Offsets and allocation sizes.
     type Size: Word;
 
@@ -177,4 +182,24 @@ pub trait WriteBackend: Backend {
         old_len: Self::Size,
         new: &[u8],
     );
+}
+
+/// A backend whose heap can be asked to spend a bounded amount of work squeezing
+/// fragmentation out of the address space.
+///
+/// Sits alongside the read/write split rather than inside it: compaction is
+/// neither reading nor writing *stored values*, it relocates them behind the
+/// stable ids, so it is available in both phases and to `&self` holders. Only
+/// backends over an
+/// [`IncrementallyCompactableHeap`](crate::IncrementallyCompactableHeap)
+/// implement it -- a backend over a non-compacting heap simply doesn't have the
+/// method, rather than having one that silently does nothing.
+pub trait CompactingBackend: Backend {
+    /// Run compaction steps until the heap quiesces or `budget` bytes have been
+    /// copied, then truncate the store.
+    ///
+    /// `budget` is in bytes and is a *ranking* input rather than a hard cap: a
+    /// single step larger than the whole budget is still executed when nothing
+    /// else has moved, so one oversized slide can never be starved forever.
+    fn compact_incrementally(&self, budget: usize) -> CompactionProgress;
 }

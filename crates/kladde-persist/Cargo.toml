@@ -12,3 +12,4 @@ publish.workspace = true
 
 [dependencies]
 kladde-heap = { workspace = true }
+kladde-schema = { workspace = true }

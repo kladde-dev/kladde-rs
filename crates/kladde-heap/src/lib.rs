@@ -30,12 +30,13 @@ mod heap;
 mod journaled;
 mod mock;
 mod pointer;
+mod repr;
 mod size_classes;
 mod storage;
 mod unjournaled;
 mod word;
 
-pub use backend::{Backend, BackendError, ReadBackend, WriteBackend};
+pub use backend::{Backend, BackendError, CompactingBackend, ReadBackend, WriteBackend};
 pub use gain_greedy::GainGreedyHeap;
 pub use heap::{
     AllocationId, CompactionProgress, HeapError, IncrementallyCompactableHeap, RelocatableHeap,
@@ -47,6 +48,7 @@ pub use pointer::{
     Pointer, ResolvedPointer, Sizedness, UniquePointer, UniquePointerFixedSize,
     UniquePointerResizable,
 };
+pub use repr::{decode_option, decode_option_slice, encode_option, PointerRepr};
 pub use storage::Storage;
 pub use unjournaled::UnjournaledBackend;
 pub use word::Word;

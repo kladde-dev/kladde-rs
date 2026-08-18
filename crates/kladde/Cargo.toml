@@ -6,5 +6,5 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-kladde-traits = { workspace = true }
-kladde-alloc = { workspace = true }
+kladde-heap = { workspace = true }
+kladde-persist = { workspace = true }

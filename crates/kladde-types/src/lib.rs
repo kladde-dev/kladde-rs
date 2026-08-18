@@ -1,14 +1,13 @@
-//! The built-in backed container types (`PersistableVec`, `PersistableHashMap`
-//! -- a rope is deferred, see `spec.md`) and blanket [`Persistable`] impls
-//! for primitives.
+//! The built-in backed container types (`PersistableVec`, `PersistableHashMap`,
+//! `PersistableString` -- a rope is deferred, see `spec.md`).
 //!
 //! Per `spec.md`'s "Workspace Layout": most of what lives here is
 //! hand-implemented directly against `Persistable`/`Guard`/`UniquePointer`
 //! rather than derive-macro output, the same way `std`'s own collections
 //! hand-write unsafe raw-pointer manipulation internally.
 //!
-//! Also re-exports the [`Persistable`](kladde_derive::Persistable) derive
-//! macro for convenience, so application crates only need one dependency.
+//! Also re-exports the [`Persistable`](kladde_derive::Persistable) derive macro
+//! for convenience, so application crates only need one dependency.
 
 #[cfg(feature = "serde")]
 mod blob;
@@ -25,42 +24,42 @@ pub use map::{PersistableHashMap, PersistableHashMapGuard};
 pub use string::{PersistableString, PersistableStringGuard};
 pub use vec::{PersistableVec, PersistableVecGuard};
 
-// `Persistable` here names two different things in two different
-// namespaces -- the trait (from `kladde-traits`) and the derive macro
-// (from `kladde-derive`) -- the same way `serde::Serialize` does for the
-// trait/derive pair it re-exports.
+// `Persistable` here names two different things in two different namespaces --
+// the trait (from `kladde-persist`) and the derive macro (from `kladde-derive`)
+// -- the same way `serde::Serialize` does for the trait/derive pair it
+// re-exports.
 //
-// The scalar `*Guard` blanket-impl types (`I32Guard`, `StringGuard`, ...)
-// live in `kladde-traits`, not here -- `impl Persistable for i32` inside
-// this crate would be `impl ForeignTrait for ForeignType`, which the
-// orphan rules forbid; `kladde-traits` (where `Persistable` is defined)
-// is the only place that impl is legal. Re-exported here so application
-// code only needs one dependency.
+// The scalar `*Guard` blanket-impl types (`I32Guard`, `BoolGuard`, ...) live in
+// `kladde-persist`, not here -- `impl Persistable for i32` inside this crate
+// would be `impl ForeignTrait for ForeignType`, which the orphan rules forbid;
+// `kladde-persist` (where `Persistable` is defined) is the only place that impl
+// is legal. Re-exported here so application code only needs one dependency.
 pub use kladde_derive::Persistable;
 
-/// This crate's own version, used as the `Opaque` descriptor version for
-/// every built-in container (`type-descriptors.md` §2.4). Kept in sync with
+/// This crate's own version, used as the `Opaque` descriptor version for every
+/// built-in container (`type-descriptors.md` §2.4). Kept in sync with
 /// `Cargo.toml` automatically via the `CARGO_PKG_VERSION_*` environment.
-pub(crate) fn library_version() -> kladde_traits::Version {
-    kladde_traits::Version {
+pub(crate) fn library_version() -> kladde_persist::Version {
+    kladde_persist::Version {
         major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
         minor: env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
         patch: env!("CARGO_PKG_VERSION_PATCH").parse().unwrap(),
     }
 }
-pub use kladde_traits::{
-    Allocator, AllocatorExt, Backend, Guard, Location, Persistable, RawPointer, ResolvedPointer,
-    UniquePointer, UniquePointerFixedSize, UniquePointerResizable,
+
+pub use kladde_persist::{
+    Backend, Guard, Location, Persistable, Pointer, ReadBackend, UniquePointer,
+    UniquePointerFixedSize, UniquePointerResizable, WriteBackend, WriteBackendExt,
 };
-pub use kladde_traits::{
+pub use kladde_persist::{
     BoolGuard, CharGuard, F32Guard, F64Guard, I16Guard, I32Guard, I64Guard, I8Guard, TupleGuard,
     U16Guard, U32Guard, U64Guard, U8Guard,
 };
 
 // Schema/fingerprint surface (originally from `kladde-schema`, re-exported
-// through `kladde-traits`), so application code that builds or inspects a
+// through `kladde-persist`), so application code that builds or inspects a
 // type's schema needs only this crate.
-pub use kladde_traits::{
+pub use kladde_persist::{
     Field, Fingerprint, Primitive, SchemaBuilder, TypeDescriptor, TypeRef, TypeTable, Variant,
     Version,
 };

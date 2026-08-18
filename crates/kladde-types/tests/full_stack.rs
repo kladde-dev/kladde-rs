@@ -81,7 +81,9 @@ fn derived_struct_nested_in_a_persisted_hash_map_via_kladde() {
         Some(&PersistableString::from("engineer"))
     );
 
-    assert_eq!(app.backend().journal_len(), 0);
+    // Nothing is buffered: the default backend applies every mutation as it
+    // happens, so a compaction round finds an already-consistent heap.
+    assert!(app.flush().quiesced);
 }
 
 #[test]

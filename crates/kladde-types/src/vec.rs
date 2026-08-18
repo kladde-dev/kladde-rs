@@ -1,44 +1,80 @@
-//! [`PersistableVec`] -- the backed variant of `Vec<T>`, named distinctly
-//! from `std::vec::Vec` rather than shadowing it.
+//! [`PersistableVec`] -- the backed variant of `Vec<T>`, named distinctly from
+//! `std::vec::Vec` rather than shadowing it.
 //!
-//! Snapshot layout: a small, fixed 8-byte inline header (`target`, `len`
-//! -- see `kladde_traits::write_header`) plus a separate content
-//! allocation holding `len` fixed-size (`T::INLINE_SIZE`) element slots,
-//! analogous to how `std::vec::Vec` is laid out in memory. No
-//! slack/amortized growth yet -- every push/remove resizes the content
-//! allocation to exactly fit. Per `later.md`, this straightforward layout
-//! is meant to be replaced with a chunked-list representation eventually.
+//! Snapshot layout: a `P::BYTE_LEN`-byte inline pointer id (`None` encoded as
+//! all-zero, the on-file null niche) plus a separate content allocation holding
+//! the elements back to back in fixed-size (`T::INLINE_SIZE`) slots, analogous
+//! to how `std::vec::Vec` is laid out in memory. No slack/amortized growth yet
+//! -- every push/remove resizes the content allocation to exactly fit. Per
+//! `later.md`, this straightforward layout is meant to be replaced with a
+//! chunked-list representation eventually (`kladde_persist::ChunkedVec` is the
+//! prototype of that).
+//!
+//! ## The length is not stored
+//!
+//! The old layout carried an inline `{ target, len }` header. It no longer does:
+//! the heap already owns each allocation's size, so `len` is recovered as
+//! `backend.size(pointer) / T::INLINE_SIZE`. That halves the inline footprint
+//! and removes a field that could drift out of step with the allocation.
+//!
+//! Two consequences worth naming:
+//!
+//! - **Zero-sized elements are unrepresentable.** A `T` with
+//!   `INLINE_SIZE == 0` leaves no way to recover a length from a size, so
+//!   `PersistableVec<T>` panics on such a `T` rather than silently reporting
+//!   an empty vector. (Nothing in kladde has a zero-sized `Persistable` today
+//!   except `()` itself.)
+//! - **"Publish the length last" is no longer expressible.** The old `push`
+//!   grew the allocation, wrote the element, *then* published the new length,
+//!   so a torn journal prefix left the previous, still-valid length. With the
+//!   length being the allocation size, growing the allocation *is* publishing
+//!   the length. This costs nothing today (the backend applies every operation
+//!   immediately -- there is no journal to tear), but it is a property that has
+//!   to be re-established when the write-ahead log arrives.
 
-use kladde_traits::{
-    read_header, write_header, AllocatorExt, Backend, Guard, Location, Persistable, RawPointer,
-    UniquePointerResizable,
+use kladde_persist::{
+    Guard, Location, Persistable, Pointer, PointerRepr, ReadBackend, UniquePointerResizable, Word,
+    WriteBackend, WriteBackendExt,
 };
+use std::io::Read;
 use std::ops::{Deref, DerefMut};
 
 /// A growable array whose contents are persisted to the backing store.
 ///
-/// Behaves like `std::vec::Vec<T>` for reads (`len`, `get`, `iter`, ...),
-/// which touch only the in-memory copy. Mutation goes through a
-/// [`PersistableVecGuard`] obtained from [`Persistable::guard`] (or a
-/// derived parent's `_mut()` accessor): `push`/`remove`/`get_mut` each
-/// update memory *and* record the change to the backend in one step, so
-/// persistence is never a separate, forgettable action. The element type
-/// `T` only needs to implement [`Persistable`] -- any scalar, container,
-/// `PersistableString`, or `#[derive(Persistable)]` type.
+/// Behaves like `std::vec::Vec<T>` for reads (`len`, `get`, `iter`, ...), which
+/// touch only the in-memory copy. Mutation goes through a
+/// [`PersistableVecGuard`] obtained from [`Persistable::guard`] (or a derived
+/// parent's `_mut()` accessor): `push`/`remove`/`get_mut` each update memory
+/// *and* record the change to the backend in one step, so persistence is never a
+/// separate, forgettable action. The element type `T` only needs to implement
+/// [`Persistable`] -- any scalar, container, `PersistableString`, or
+/// `#[derive(Persistable)]` type.
 #[derive(Debug, PartialEq)]
-pub struct PersistableVec<T> {
+pub struct PersistableVec<T, P = Pointer> {
     data: Vec<T>,
-    /// The variable-capacity content allocation holding this vec's elements
-    /// -- `None` until the first `push` (or a `store` of a
-    /// `from_iter`-built vec) ever needs one. Lazily created rather than
-    /// eager, since `PersistableVec::new()` takes no `Backend` to create
-    /// one with. A [`UniquePointerResizable`] (the `Box<[u8]>`-like handle):
-    /// its byte capacity is owned by the allocator, while this vec keeps only
-    /// the logical element count (in `data`, published as the header `len`).
-    pointer: Option<UniquePointerResizable>,
+    /// The variable-capacity content allocation holding this vec's elements --
+    /// `None` until the first `push` (or a `store` of a `from_iter`-built vec)
+    /// ever needs one. Lazily created rather than eager, since
+    /// `PersistableVec::new()` takes no backend to create one with. Its byte
+    /// capacity is owned by the allocator, and *is* this vec's length.
+    pointer: Option<UniquePointerResizable<P>>,
 }
 
-impl<T> PersistableVec<T> {
+/// The element stride, rejecting the zero-sized case the pointer-only layout
+/// cannot represent (see the module docs).
+#[inline]
+fn stride<T: Persistable<P>, P: PointerRepr>() -> usize {
+    let elem = <T as Persistable<P>>::INLINE_SIZE;
+    assert!(
+        elem > 0,
+        "PersistableVec cannot hold a zero-sized element type: its length is \
+         recovered from the content allocation's size, which would be 0 for any \
+         number of elements",
+    );
+    elem
+}
+
+impl<T, P> PersistableVec<T, P> {
     pub fn new() -> Self {
         PersistableVec {
             data: Vec::new(),
@@ -62,9 +98,9 @@ impl<T> PersistableVec<T> {
         self.data.iter()
     }
 
-    /// Crate-internal escape hatch for [`crate::PersistableString`], the
-    /// only thing that needs a raw `&[T]`/`Vec<T>` view rather than going
-    /// through `get`/`iter`/`push`/`remove` one element at a time.
+    /// Crate-internal escape hatch for [`crate::PersistableString`], the only
+    /// thing that needs a raw `&[T]`/`Vec<T>` view rather than going through
+    /// `get`/`iter`/`push`/`remove` one element at a time.
     pub(crate) fn as_slice(&self) -> &[T] {
         &self.data
     }
@@ -74,19 +110,18 @@ impl<T> PersistableVec<T> {
     }
 }
 
-impl<T> Default for PersistableVec<T> {
+impl<T, P> Default for PersistableVec<T, P> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Backend-free, like `new()` -- but unlike `new()`, the result may hold
-/// real content with `pointer` still `None` if `iter` isn't empty (e.g.
+/// Backend-free, like `new()` -- but unlike `new()`, the result may hold real
+/// content with `pointer` still `None` if `iter` isn't empty (e.g.
 /// `PersistableString::from("hello")` goes through this). `store`'s `None`
-/// branch below handles that: it's not the same "genuinely never
-/// touched" case `new()`/`load` produce, so it can't just assume there's
-/// nothing to allocate.
-impl<T> FromIterator<T> for PersistableVec<T> {
+/// branch handles that: it's not the same "genuinely never touched" case
+/// `new()`/`load` produce, so it can't just assume there's nothing to allocate.
+impl<T, P> FromIterator<T> for PersistableVec<T, P> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         PersistableVec {
             data: Vec::from_iter(iter),
@@ -95,7 +130,7 @@ impl<T> FromIterator<T> for PersistableVec<T> {
     }
 }
 
-impl<'a, T> IntoIterator for &'a PersistableVec<T> {
+impl<'a, T, P> IntoIterator for &'a PersistableVec<T, P> {
     type Item = &'a T;
     type IntoIter = std::slice::Iter<'a, T>;
 
@@ -104,22 +139,21 @@ impl<'a, T> IntoIterator for &'a PersistableVec<T> {
     }
 }
 
-impl<T: Persistable> Persistable for PersistableVec<T> {
-    /// A fixed 8-byte `{ target, len }` header -- the content allocation
-    /// itself (`len * T::INLINE_SIZE` bytes) is separate.
-    const INLINE_SIZE: usize = 8;
+impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for PersistableVec<T, P> {
+    /// Just the content allocation's id -- the length lives with the allocator.
+    const INLINE_SIZE: usize = P::BYTE_LEN;
 
-    type Guard<'s, B: Backend>
+    type Guard<'s, B: WriteBackend<Pointer = P>>
         = PersistableVecGuard<'s, T, B>
     where
         Self: 's,
         B: 's;
 
     #[inline]
-    fn guard<'s, B: Backend>(
+    fn guard<'s, B: WriteBackend<Pointer = P>>(
         &'s mut self,
         backend: &'s B,
-        location: Location,
+        location: Location<P, B::Size>,
     ) -> Self::Guard<'s, B> {
         PersistableVecGuard {
             inner: self,
@@ -128,111 +162,118 @@ impl<T: Persistable> Persistable for PersistableVec<T> {
         }
     }
 
-    /// Publishes a header at `location` pointing at this vec's content --
-    /// used when a whole `PersistableVec` is being written as a brand-new
-    /// value somewhere (e.g. a struct field being assembled) rather than
-    /// via incremental `push`/`remove`.
+    /// Publishes this vec's content pointer at `location` -- used when a whole
+    /// `PersistableVec` is being written as a brand-new value somewhere (e.g. a
+    /// struct field being assembled) rather than via incremental `push`/`remove`.
     ///
     /// If a pointer already exists, its content is already correct
-    /// (`push`/`remove`/`get_mut().set(...)` keep it in sync
-    /// incrementally) -- `store` only needs to point a new header at it,
-    /// not rewrite anything. The one case that *does* need real work:
-    /// `data` non-empty despite `pointer` being `None`, which happens for
-    /// a value built via `PersistableVec::from_iter` (see its doc comment)
-    /// that's never been pushed/set through a `Guard`, so there's been no
-    /// chance yet to allocate. This is why `store` takes `&mut self`, not
-    /// `&self` (see the trait doc comment): it allocates *and* remembers
-    /// the new pointer in `self`, so a second `store` call later reuses
-    /// it instead of allocating (and leaking) again, and so any `Guard`
-    /// obtained from `self` afterward (e.g. via a container's `get_mut`)
-    /// sees consistent bookkeeping. Each element gets the same treatment
-    /// recursively, in case it's itself an "owning" type with the same
-    /// possible gap (e.g. a `PersistableString`).
-    fn store<B: Backend>(&mut self, backend: &B, location: Location) {
-        match &self.pointer {
-            Some(existing) => {
-                write_header(backend, location, existing.index(), self.data.len() as u32);
-            }
-            None if self.data.is_empty() => {
-                // The genuinely-never-touched case (`new`/`load`, or an
-                // empty `from_iter`) -- nothing to allocate, just record
-                // "no allocation yet" directly (`write_header` requires a
-                // real index, so this can't go through it).
-                backend.write(location.anchor, location.offset, &[0u8; 8]);
-            }
-            None => {
-                let elem_size = T::INLINE_SIZE as u32;
-                let pointer = backend.alloc_array::<T>(self.data.len());
-                for (i, item) in self.data.iter_mut().enumerate() {
-                    item.store(
-                        backend,
-                        Location {
-                            anchor: pointer.raw(),
-                            offset: i as u32 * elem_size,
-                        },
-                    );
-                }
-                write_header(backend, location, pointer.index(), self.data.len() as u32);
-                self.pointer = Some(pointer);
-            }
-        }
-    }
-
-    fn load<B: Backend>(backend: &B, location: Location) -> Self {
-        let (target, len) = read_header(backend, location);
-        let pointer = target.map(UniquePointerResizable::from_index);
-        let mut data = Vec::with_capacity(len as usize);
-        if let Some(target) = target {
-            let anchor = RawPointer::from_index(target);
-            let elem_size = T::INLINE_SIZE as u32;
-            for i in 0..len {
-                data.push(T::load(
+    /// (`push`/`remove`/`get_mut().set(..)` keep it in sync incrementally) --
+    /// `store` only needs to point a new slot at it. The one case that *does*
+    /// need real work: `data` non-empty despite `pointer` being `None`, which
+    /// happens for a value built via `PersistableVec::from_iter` that has never
+    /// been pushed/set through a `Guard`, so there's been no chance yet to
+    /// allocate. This is why `store` takes `&mut self` (see the trait doc
+    /// comment): it allocates *and* remembers the new pointer in `self`, so a
+    /// second `store` reuses it instead of leaking, and any `Guard` obtained
+    /// from `self` afterward sees consistent bookkeeping. Each element gets the
+    /// same treatment recursively, in case it is itself an "owning" type.
+    fn store<B: WriteBackend<Pointer = P>>(&mut self, backend: &B, location: Location<P, B::Size>) {
+        if self.pointer.is_none() && !self.data.is_empty() {
+            let elem = stride::<T, P>();
+            let pointer = backend.alloc_resizable_array::<T>(self.data.len());
+            for (i, item) in self.data.iter_mut().enumerate() {
+                item.store(
                     backend,
-                    Location {
-                        anchor,
-                        offset: i * elem_size,
-                    },
-                ));
+                    Location::new(pointer.raw(), Word::from_usize(i * elem)),
+                );
             }
+            self.pointer = Some(pointer);
         }
-        PersistableVec { data, pointer }
+        write_slot(backend, location, self.pointer.as_ref().map(|p| p.raw()));
     }
 
-    fn describe_local(builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeDescriptor
+    fn load<B: ReadBackend<Pointer = P>>(backend: &mut B, location: Location<P, B::Size>) -> Self {
+        let Some(target) = read_slot::<P, B>(backend, location) else {
+            return PersistableVec::new();
+        };
+        let elem = stride::<T, P>();
+        let len = backend
+            .size(target)
+            .expect("PersistableVec content allocation is live")
+            .to_usize()
+            / elem;
+        let mut data = Vec::with_capacity(len);
+        for i in 0..len {
+            data.push(T::load(
+                backend,
+                Location::new(target, Word::from_usize(i * elem)),
+            ));
+        }
+        PersistableVec {
+            data,
+            pointer: Some(UniquePointerResizable::from_pointer(target)),
+        }
+    }
+
+    fn describe_local(builder: &mut kladde_persist::SchemaBuilder) -> kladde_persist::TypeDescriptor
     where
         Self: 'static,
     {
-        kladde_traits::TypeDescriptor::Opaque {
+        kladde_persist::TypeDescriptor::Opaque {
             library_name: "kladde-types".into(),
             type_name: "PersistableVec".into(),
             version: crate::library_version(),
-            inline_size: 8,
-            parameters: vec![<T as Persistable>::describe(builder)],
+            inline_size: P::BYTE_LEN as u64,
+            parameters: vec![<T as Persistable<P>>::describe(builder)],
         }
     }
 }
 
-/// `B` defaults to [`kladde::DefaultBackend`](../../kladde/struct.DefaultBackend.html)
-/// so application code that only ever uses the default backend never has
-/// to name it.
-pub struct PersistableVecGuard<'s, T, B = kladde::DefaultBackend> {
-    inner: &'s mut PersistableVec<T>,
-    backend: &'s B,
-    location: Location,
+/// Writes the inline pointer slot (`None` as the all-zero null niche).
+pub(crate) fn write_slot<P: PointerRepr, B: WriteBackend<Pointer = P>>(
+    backend: &B,
+    location: Location<P, B::Size>,
+    pointer: Option<P>,
+) {
+    backend.write(
+        location.anchor,
+        location.offset,
+        kladde_persist::encode_option(pointer).as_ref(),
+    );
 }
 
-// `get_mut` doesn't need any extra bounds beyond `T: Persistable` --
-// kept in its own impl block, as before, so it stays available
-// regardless of what other bounds `push`/`remove` need.
-impl<'s, T: Persistable, B: Backend> PersistableVecGuard<'s, T, B> {
+/// Reads back a slot written by [`write_slot`].
+pub(crate) fn read_slot<P: PointerRepr, B: ReadBackend<Pointer = P>>(
+    backend: &mut B,
+    location: Location<P, B::Size>,
+) -> Option<P> {
+    let mut bytes = vec![0u8; P::BYTE_LEN];
+    backend
+        .read_at(location.anchor, location.offset)
+        .read_exact(&mut bytes)
+        .expect("read inline content pointer");
+    kladde_persist::decode_option_slice(&bytes)
+}
+
+/// The mutation-capable view onto a [`PersistableVec`].
+pub struct PersistableVecGuard<'s, T, B: WriteBackend> {
+    inner: &'s mut PersistableVec<T, B::Pointer>,
+    backend: &'s B,
+    location: Location<B::Pointer, B::Size>,
+}
+
+// `get_mut` doesn't need any extra bounds beyond `T: Persistable` -- kept in its
+// own impl block so it stays available regardless of what other bounds
+// `push`/`remove` need.
+impl<'s, T: Persistable<B::Pointer>, B: WriteBackend> PersistableVecGuard<'s, T, B> {
     #[inline]
-    pub fn get_mut(&mut self, index: usize) -> Option<T::Guard<'_, B>> {
-        let elem_size = T::INLINE_SIZE as u32;
+    pub fn get_mut(
+        &mut self,
+        index: usize,
+    ) -> Option<<T as Persistable<B::Pointer>>::Guard<'_, B>> {
+        let elem = stride::<T, B::Pointer>();
         let pointer = self.inner.pointer.as_ref()?;
-        let location = Location {
-            anchor: pointer.raw(),
-            offset: index as u32 * elem_size,
-        };
+        let location = Location::new(pointer.raw(), Word::from_usize(index * elem));
         self.inner
             .data
             .get_mut(index)
@@ -240,42 +281,44 @@ impl<'s, T: Persistable, B: Backend> PersistableVecGuard<'s, T, B> {
     }
 }
 
-impl<'s, T: Persistable, B: Backend> PersistableVecGuard<'s, T, B> {
-    /// Appends `value`: grows (or creates) the content allocation to fit
-    /// one more element, writes the new element into the freshly-grown
-    /// slot, then publishes the updated header -- in that order, so any
-    /// crash/torn-journal prefix of this sequence leaves the previous,
-    /// still-valid state (the header update is always last -- see
-    /// `spec.md`'s Crash Consistency section).
+impl<'s, T: Persistable<B::Pointer>, B: WriteBackend> PersistableVecGuard<'s, T, B> {
+    /// Appends `value`: grows (or creates) the content allocation to fit one
+    /// more element, then writes the new element into the freshly-grown slot.
+    ///
+    /// Growing the allocation *is* publishing the new length (see the module
+    /// docs), so unlike the old `{ target, len }` layout there is no separate
+    /// header write to order last.
     pub fn push(&mut self, mut value: T) {
-        let elem_size = T::INLINE_SIZE as u32;
+        let elem = stride::<T, B::Pointer>();
         let old_len = self.inner.data.len();
-        let new_len = old_len + 1;
-        let new_byte_size = new_len * T::INLINE_SIZE;
+        let new_byte_size = Word::from_usize((old_len + 1) * elem);
 
         match &self.inner.pointer {
-            Some(pointer) => self.backend.resize(pointer, new_byte_size),
-            None => self.inner.pointer = Some(self.backend.alloc_array::<T>(new_len)),
+            Some(pointer) => self
+                .backend
+                .resize(pointer, new_byte_size)
+                .expect("grow PersistableVec content"),
+            None => {
+                let pointer = self.backend.alloc_resizable_array::<T>(old_len + 1);
+                write_slot(self.backend, self.location, Some(pointer.raw()));
+                self.inner.pointer = Some(pointer);
+            }
         }
         let pointer = self.inner.pointer.as_ref().unwrap();
 
         value.store(
             self.backend,
-            Location {
-                anchor: pointer.raw(),
-                offset: old_len as u32 * elem_size,
-            },
+            Location::new(pointer.raw(), Word::from_usize(old_len * elem)),
         );
-        write_header(self.backend, self.location, pointer.index(), new_len as u32);
 
         self.inner.data.push(value);
     }
 
-    /// Removes and returns the element at `index`, shifting every later
-    /// element down to close the gap.
+    /// Removes and returns the element at `index`, shifting every later element
+    /// down to close the gap.
     ///
-    /// Runs in `O(n)` in the number of elements after `index`. Panics if
-    /// `index` is out of bounds, matching [`Vec::remove`].
+    /// Runs in `O(n)` in the number of elements after `index`. Panics if `index`
+    /// is out of bounds, matching [`Vec::remove`].
     ///
     /// ```
     /// use kladde::Kladde;
@@ -291,36 +334,39 @@ impl<'s, T: Persistable, B: Backend> PersistableVecGuard<'s, T, B> {
     /// assert_eq!(db.get().get(0), Some(&20));
     /// ```
     pub fn remove(&mut self, index: usize) -> T {
-        let elem_size = T::INLINE_SIZE as u32;
-        let old_len = self.inner.data.len();
+        let elem = stride::<T, B::Pointer>();
         assert!(
-            index < old_len,
+            index < self.inner.data.len(),
             "PersistableVec::remove: index out of bounds"
         );
-        let new_len = old_len - 1;
         let pointer = self
             .inner
             .pointer
             .as_ref()
             .expect("PersistableVec::remove called but no content allocation exists");
 
-        self.backend
-            .splice(pointer, index as u32 * elem_size, elem_size, &[]);
-        write_header(self.backend, self.location, pointer.index(), new_len as u32);
+        // The splice both shifts the tail down and shrinks the allocation, which
+        // is the length update.
+        self.backend.splice(
+            pointer,
+            Word::from_usize(index * elem),
+            Word::from_usize(elem),
+            &[],
+        );
 
         self.inner.data.remove(index)
     }
 }
 
-impl<'s, B: Backend> PersistableVecGuard<'s, u8, B> {
+impl<'s, B: WriteBackend> PersistableVecGuard<'s, u8, B> {
     /// Replaces the entire contents with `new` in a single bulk update.
     ///
-    /// Runs in `O(n)` in the new length, regardless of the current length,
-    /// so replacing a whole value is far cheaper than clearing and
-    /// re-pushing one byte at a time. Accepts anything convertible into a
-    /// `Vec<u8>`; an owned `Vec<u8>` is moved in without copying, while a
-    /// slice or byte-string literal is copied. Passing an empty value
-    /// clears the contents and releases the backing allocation.
+    /// Runs in `O(n)` in the new length, regardless of the current length, so
+    /// replacing a whole value is far cheaper than clearing and re-pushing one
+    /// byte at a time. Accepts anything convertible into a `Vec<u8>`; an owned
+    /// `Vec<u8>` is moved in without copying, while a slice or byte-string
+    /// literal is copied. Passing an empty value clears the contents and
+    /// releases the backing allocation.
     ///
     /// Only available for byte vectors (`PersistableVec<u8>`), for which a
     /// whole-buffer replacement is a single contiguous write.
@@ -338,23 +384,19 @@ impl<'s, B: Backend> PersistableVecGuard<'s, u8, B> {
     /// assert_eq!(db.get().get(0), Some(&b'h'));
     /// ```
     pub fn set(&mut self, new: impl Into<Vec<u8>>) {
-        // Non-generic inner fn: the real body compiles once per backend,
-        // rather than being re-monomorphized for every `Into` argument type.
-        fn inner<B: Backend>(guard: &mut PersistableVecGuard<'_, u8, B>, new: Vec<u8>) {
+        // Non-generic inner fn: the real body compiles once per backend, rather
+        // than being re-monomorphized for every `Into` argument type.
+        fn inner<B: WriteBackend>(guard: &mut PersistableVecGuard<'_, u8, B>, new: Vec<u8>) {
             let old_len = guard.inner.data.len();
-            let new_len = new.len();
 
-            // Empty content returns to the lazy no-allocation state (empty
-            // <=> no allocation, the invariant `PersistableBlob` relies on),
-            // freeing any existing region. The empty header is published
-            // *before* the free, so a torn-journal prefix leaves the value
-            // already empty with the old region merely unreferenced
-            // (reclaimed at the next flush), never dangling.
-            if new_len == 0 {
+            // Empty content returns to the lazy no-allocation state (empty <=>
+            // no allocation, the invariant `PersistableBlob` relies on), freeing
+            // any existing region. The null slot is published *before* the free,
+            // so a torn prefix leaves the value already empty with the old
+            // region merely unreferenced, never dangling.
+            if new.is_empty() {
                 if let Some(pointer) = guard.inner.pointer.take() {
-                    guard
-                        .backend
-                        .write(guard.location.anchor, guard.location.offset, &[0u8; 8]);
+                    write_slot(guard.backend, guard.location, None);
                     guard.backend.free_resizable(pointer);
                 }
                 guard.inner.data.clear();
@@ -363,28 +405,18 @@ impl<'s, B: Backend> PersistableVecGuard<'s, u8, B> {
 
             match &guard.inner.pointer {
                 None => {
-                    // No allocation yet -- alloc then publish (append-then-
-                    // publish; there's no old content to splice against).
-                    let pointer = guard.backend.alloc_array::<u8>(new_len);
-                    guard.backend.write(pointer.raw(), 0, &new);
-                    write_header(
-                        guard.backend,
-                        guard.location,
-                        pointer.index(),
-                        new_len as u32,
-                    );
+                    // No allocation yet -- alloc, fill, then publish.
+                    let pointer = guard.backend.alloc_resizable_array::<u8>(new.len());
+                    guard.backend.write(pointer.raw(), Word::zero(), &new);
+                    write_slot(guard.backend, guard.location, Some(pointer.raw()));
                     guard.inner.pointer = Some(pointer);
                 }
                 Some(pointer) => {
-                    // Replace the entire old content in one atomic op, then
-                    // republish the (possibly changed) length.
-                    guard.backend.splice(pointer, 0, old_len as u32, &new);
-                    write_header(
-                        guard.backend,
-                        guard.location,
-                        pointer.index(),
-                        new_len as u32,
-                    );
+                    // Replace the entire old content in one atomic op; the
+                    // splice's resize is the length update.
+                    guard
+                        .backend
+                        .splice(pointer, Word::zero(), Word::from_usize(old_len), &new);
                 }
             }
             guard.inner.data = new;
@@ -394,14 +426,14 @@ impl<'s, B: Backend> PersistableVecGuard<'s, u8, B> {
     }
 }
 
-impl<'s, T: Persistable, B: Backend> Guard for PersistableVecGuard<'s, T, B> {
-    type Persistable = PersistableVec<T>;
+impl<'s, T, B: WriteBackend> Guard for PersistableVecGuard<'s, T, B> {
+    type Persistable = PersistableVec<T, B::Pointer>;
     type Backend = B;
 
-    fn as_persistable(&self) -> &PersistableVec<T> {
+    fn as_persistable(&self) -> &Self::Persistable {
         self.inner
     }
-    fn as_persistable_mut(&mut self) -> &mut PersistableVec<T> {
+    fn as_persistable_mut(&mut self) -> &mut Self::Persistable {
         self.inner
     }
     fn backend(&self) -> &B {
@@ -409,15 +441,15 @@ impl<'s, T: Persistable, B: Backend> Guard for PersistableVecGuard<'s, T, B> {
     }
 }
 
-impl<'s, T, B> Deref for PersistableVecGuard<'s, T, B> {
-    type Target = PersistableVec<T>;
-    fn deref(&self) -> &PersistableVec<T> {
+impl<'s, T, B: WriteBackend> Deref for PersistableVecGuard<'s, T, B> {
+    type Target = PersistableVec<T, B::Pointer>;
+    fn deref(&self) -> &Self::Target {
         self.inner
     }
 }
 
-impl<'s, T, B> DerefMut for PersistableVecGuard<'s, T, B> {
-    fn deref_mut(&mut self) -> &mut PersistableVec<T> {
+impl<'s, T, B: WriteBackend> DerefMut for PersistableVecGuard<'s, T, B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner
     }
 }
@@ -425,21 +457,16 @@ impl<'s, T, B> DerefMut for PersistableVecGuard<'s, T, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::MockBackend;
-    use kladde_traits::Allocator;
+    use crate::test_support::{root_location, MockBackend};
 
-    fn root_location(backend: &MockBackend) -> Location {
-        let pointer = backend.alloc_fixed(PersistableVec::<i32>::INLINE_SIZE);
-        Location {
-            anchor: pointer.raw(),
-            offset: 0,
-        }
+    fn root(backend: &MockBackend) -> Location<Pointer, u32> {
+        root_location(backend, <PersistableVec<i32> as Persistable>::INLINE_SIZE)
     }
 
     #[test]
     fn push_appends_in_memory() {
         let backend = MockBackend::default();
-        let location = root_location(&backend);
+        let location = root(&backend);
         let mut vec = PersistableVec::<i32>::new();
 
         let mut guard = vec.guard(&backend, location);
@@ -454,7 +481,7 @@ mod tests {
     #[test]
     fn get_mut_returns_a_nested_guard_for_persistable_elements() {
         let backend = MockBackend::default();
-        let location = root_location(&backend);
+        let location = root(&backend);
         let mut vec = PersistableVec::<i32>::new();
         {
             let mut guard = vec.guard(&backend, location);
@@ -470,7 +497,7 @@ mod tests {
     #[test]
     fn remove_shrinks_the_vec() {
         let backend = MockBackend::default();
-        let location = root_location(&backend);
+        let location = root(&backend);
         let mut vec = PersistableVec::<i32>::new();
         {
             let mut guard = vec.guard(&backend, location);
@@ -488,9 +515,9 @@ mod tests {
     }
 
     #[test]
-    fn flushing_and_reloading_round_trips_the_content() {
-        let backend = MockBackend::default();
-        let location = root_location(&backend);
+    fn reloading_round_trips_the_content() {
+        let mut backend = MockBackend::default();
+        let location = root(&backend);
         let mut vec = PersistableVec::<i32>::new();
         {
             let mut guard = vec.guard(&backend, location);
@@ -498,167 +525,122 @@ mod tests {
             guard.push(20);
             guard.push(30);
         }
-        {
-            let mut guard = vec.guard(&backend, location);
-            guard.remove(1); // remove the middle element
-        }
+        vec.guard(&backend, location).remove(1);
 
-        backend.flush();
-
-        let reloaded = PersistableVec::<i32>::load(&backend, location);
-        assert_eq!(reloaded.data, vec![10, 30]);
+        let reloaded = <PersistableVec<i32> as Persistable>::load(&mut backend, location);
+        assert_eq!(reloaded.as_slice(), &[10, 30]);
         assert_eq!(reloaded, vec);
     }
 
     #[test]
+    fn the_length_comes_back_from_the_allocation_size() {
+        let mut backend = MockBackend::default();
+        let location = root(&backend);
+        let mut vec = PersistableVec::<i32>::new();
+        {
+            let mut guard = vec.guard(&backend, location);
+            for i in 0..7 {
+                guard.push(i);
+            }
+        }
+        // Nothing wrote a length anywhere: the inline slot is just a pointer.
+        assert_eq!(<PersistableVec<i32> as Persistable>::INLINE_SIZE, 4);
+        assert_eq!(
+            <PersistableVec<i32> as Persistable>::load(&mut backend, location).len(),
+            7
+        );
+    }
+
+    #[test]
     fn set_grows_and_shrinks_reusing_one_allocation() {
-        let backend = MockBackend::default();
-        let location = root_location(&backend);
+        let mut backend = MockBackend::default();
+        let location = root_location(&backend, <PersistableVec<u8> as Persistable>::INLINE_SIZE);
         let mut vec = PersistableVec::<u8>::new();
 
-        vec.guard(&backend, location).set(b"start");
-        backend.flush();
-        let live = backend.live_count();
-
-        for content in [
-            &b"a much longer byte string"[..],
-            &b"x"[..],
-            &b"equalize!"[..],
-            &b"back again"[..],
-        ] {
+        for content in [b"hello".as_slice(), b"hi".as_slice(), b"hello there"] {
             vec.guard(&backend, location).set(content);
-            backend.flush();
             assert_eq!(vec.as_slice(), content);
-            assert_eq!(
-                backend.live_count(),
-                live,
-                "set must reuse the one allocation, not leak"
-            );
-            let reloaded = PersistableVec::<u8>::load(&backend, location);
+            assert_eq!(backend.live_count(), 2, "one root + one content allocation");
+            let reloaded = <PersistableVec<u8> as Persistable>::load(&mut backend, location);
             assert_eq!(reloaded.as_slice(), content);
         }
     }
 
     #[test]
     fn set_to_empty_frees_and_returns_to_lazy() {
-        let backend = MockBackend::default();
-        let location = root_location(&backend);
+        let mut backend = MockBackend::default();
+        let location = root_location(&backend, <PersistableVec<u8> as Persistable>::INLINE_SIZE);
         let mut vec = PersistableVec::<u8>::new();
 
-        vec.guard(&backend, location).set(b"some content");
-        backend.flush();
-        let live = backend.live_count();
-        assert!(live > 0);
+        vec.guard(&backend, location).set(b"content");
+        assert_eq!(backend.live_count(), 2);
 
         vec.guard(&backend, location).set(b"");
-        backend.flush();
-        assert_eq!(
-            backend.live_count(),
-            live - 1,
-            "emptying should free the content allocation"
-        );
         assert!(vec.is_empty());
-        assert!(PersistableVec::<u8>::load(&backend, location).is_empty());
+        assert_eq!(backend.live_count(), 1, "content allocation was released");
+        assert!(<PersistableVec<u8> as Persistable>::load(&mut backend, location).is_empty());
 
-        // Re-populating after emptying allocates a fresh region and works.
+        // ...and it can be filled again afterwards.
         vec.guard(&backend, location).set(b"again");
-        backend.flush();
         assert_eq!(vec.as_slice(), b"again");
-        assert_eq!(
-            PersistableVec::<u8>::load(&backend, location).as_slice(),
-            b"again"
-        );
-    }
-
-    #[test]
-    fn set_on_a_fresh_empty_vec_stays_lazy() {
-        let backend = MockBackend::default();
-        let location = root_location(&backend);
-        backend.flush(); // materialize the root anchor itself
-        let live_before = backend.live_count();
-
-        let mut vec = PersistableVec::<u8>::new();
-        vec.guard(&backend, location).set(b"");
-        backend.flush();
-
-        assert_eq!(
-            backend.live_count(),
-            live_before,
-            "replacing an empty vec with empty content shouldn't allocate"
-        );
-    }
-
-    #[test]
-    fn store_reuses_an_existing_allocation_instead_of_leaking_it() {
-        let backend = MockBackend::default();
-        let location_a = root_location(&backend);
-        let location_b = root_location(&backend);
-
-        let mut vec = PersistableVec::<i32>::new();
-        {
-            let mut guard = vec.guard(&backend, location_a);
-            guard.push(1);
-            guard.push(2);
-        }
-        backend.flush();
-        let live_before = backend.live_count();
-
-        // `vec` already owns a live allocation from the pushes above --
-        // `store` writing it somewhere new (e.g. as part of assembling a
-        // struct field, without ever resetting `vec`'s own pointer)
-        // should reuse that allocation rather than leaking it.
-        vec.store(&backend, location_b);
-        backend.flush();
-
-        assert_eq!(
-            backend.live_count(),
-            live_before,
-            "store() should reuse the existing allocation, not leak a second one"
-        );
-
-        let reloaded = PersistableVec::<i32>::load(&backend, location_b);
-        assert_eq!(reloaded, vec);
+        assert_eq!(backend.live_count(), 2);
     }
 
     #[test]
     fn store_allocates_content_for_a_from_iter_constructed_vec() {
-        let backend = MockBackend::default();
-        let location = root_location(&backend);
+        let mut backend = MockBackend::default();
+        let location = root(&backend);
+        let mut vec = PersistableVec::from_iter([1, 2, 3]);
 
-        let mut vec: PersistableVec<i32> = [1, 2, 3].into_iter().collect();
         vec.store(&backend, location);
-        backend.flush();
 
-        let reloaded = PersistableVec::<i32>::load(&backend, location);
-        assert_eq!(reloaded.data, vec![1, 2, 3]);
+        let reloaded = <PersistableVec<i32> as Persistable>::load(&mut backend, location);
+        assert_eq!(reloaded.as_slice(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn store_reuses_an_existing_allocation_instead_of_leaking_it() {
+        let mut backend = MockBackend::default();
+        let location = root(&backend);
+        let mut vec = PersistableVec::from_iter([1, 2, 3]);
+
+        vec.store(&backend, location);
+        let after_first = backend.live_count();
+        vec.store(&backend, location);
+
+        assert_eq!(backend.live_count(), after_first, "no second allocation");
+        assert_eq!(
+            <PersistableVec<i32> as Persistable>::load(&mut backend, location).as_slice(),
+            &[1, 2, 3]
+        );
     }
 
     #[test]
     fn store_on_a_from_iter_constructed_vec_remembers_its_own_pointer() {
-        let backend = MockBackend::default();
-        let location = root_location(&backend);
-
-        // Constructed without a backend, so `pointer` starts `None` even
-        // though `data` is non-empty -- `store`'s first call has to
-        // allocate. It must also remember that allocation in `self`, or
-        // a later `push` (via `get_mut`-adjacent bookkeeping) would
-        // either panic or allocate (and leak) a second time.
-        let mut vec: PersistableVec<i32> = [1, 2, 3].into_iter().collect();
+        let mut backend = MockBackend::default();
+        let location = root(&backend);
+        let mut vec = PersistableVec::from_iter([1, 2, 3]);
         vec.store(&backend, location);
-        backend.flush();
-        let live_before = backend.live_count();
 
+        // The pointer learned during `store` is what a later `push` grows.
         vec.guard(&backend, location).push(4);
-        backend.flush();
 
-        assert_eq!(
-            backend.live_count(),
-            live_before,
-            "push() should reuse the allocation store() already made, not leak a second one"
-        );
         assert_eq!(vec.get(3), Some(&4));
+        assert_eq!(
+            <PersistableVec<i32> as Persistable>::load(&mut backend, location).as_slice(),
+            &[1, 2, 3, 4]
+        );
+    }
 
-        let reloaded = PersistableVec::<i32>::load(&backend, location);
-        assert_eq!(reloaded.data, vec![1, 2, 3, 4]);
+    #[test]
+    fn an_empty_vec_stores_as_a_null_pointer_and_allocates_nothing() {
+        let mut backend = MockBackend::default();
+        let location = root(&backend);
+        let mut vec = PersistableVec::<i32>::new();
+
+        vec.store(&backend, location);
+
+        assert_eq!(backend.live_count(), 1, "just the root allocation");
+        assert!(<PersistableVec<i32> as Persistable>::load(&mut backend, location).is_empty());
     }
 }

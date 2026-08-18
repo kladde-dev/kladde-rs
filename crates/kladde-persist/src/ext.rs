@@ -11,7 +11,7 @@ use kladde_heap::{
 };
 
 use crate::persistable::Persistable;
-use crate::repr::PointerRepr;
+use kladde_heap::PointerRepr;
 
 /// Typed convenience allocations. Available on any [`WriteBackend`] whose pointer
 /// type is a [`PointerRepr`] (so the element type can be `Persistable` against it).

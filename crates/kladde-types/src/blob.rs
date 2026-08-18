@@ -28,7 +28,9 @@
 //! ```
 
 use crate::vec::PersistableVec;
-use kladde_traits::{Backend, Guard, Location, Persistable};
+use kladde_persist::{
+    Guard, Location, Persistable, Pointer, PointerRepr, ReadBackend, WriteBackend,
+};
 use std::ops::{Deref, DerefMut};
 
 /// Persists an arbitrary `serde`-serializable `T` as an opaque blob.
@@ -47,11 +49,11 @@ use std::ops::{Deref, DerefMut};
 /// ```
 /// use kladde_types::PersistableBlob;
 ///
-/// let blob = PersistableBlob::new(vec![1u8, 2, 3]);
+/// let blob: PersistableBlob<Vec<u8>> = PersistableBlob::new(vec![1u8, 2, 3]);
 /// assert_eq!(*blob, vec![1, 2, 3]); // Deref to the wrapped value
 /// ```
 #[derive(Debug, PartialEq)]
-pub struct PersistableBlob<T> {
+pub struct PersistableBlob<T, P = Pointer> {
     /// In-memory cache of the wrapped value, for cheap `Deref`/`edit`
     /// reads. The persisted source of truth is `serialized`'s bytes.
     value: T,
@@ -59,10 +61,10 @@ pub struct PersistableBlob<T> {
     /// vec. Empty exactly when `value == T::default()` (see the module
     /// doc comment); non-empty vecs own a content allocation, which
     /// `PersistableVec` creates/reuses/frees crash-safely.
-    serialized: PersistableVec<u8>,
+    serialized: PersistableVec<u8, P>,
 }
 
-impl<T: serde::Serialize> PersistableBlob<T> {
+impl<T: serde::Serialize, P> PersistableBlob<T, P> {
     /// Wraps `value`, ready to be stored.
     ///
     /// Needs no backend and allocates nothing in the backing store: that
@@ -72,7 +74,7 @@ impl<T: serde::Serialize> PersistableBlob<T> {
     /// ```
     /// use kladde_types::PersistableBlob;
     ///
-    /// let blob = PersistableBlob::new(42u32);
+    /// let blob: PersistableBlob<u32> = PersistableBlob::new(42u32);
     /// assert_eq!(*blob, 42);
     /// ```
     pub fn new(value: T) -> Self {
@@ -85,7 +87,7 @@ impl<T: serde::Serialize> PersistableBlob<T> {
     }
 }
 
-impl<T: Default> Default for PersistableBlob<T> {
+impl<T: Default, P> Default for PersistableBlob<T, P> {
     fn default() -> Self {
         PersistableBlob {
             value: T::default(),
@@ -94,32 +96,32 @@ impl<T: Default> Default for PersistableBlob<T> {
     }
 }
 
-impl<T> Deref for PersistableBlob<T> {
+impl<T, P> Deref for PersistableBlob<T, P> {
     type Target = T;
     fn deref(&self) -> &T {
         &self.value
     }
 }
 
-impl<T> Persistable for PersistableBlob<T>
+impl<T, P: PointerRepr> Persistable<P> for PersistableBlob<T, P>
 where
     T: serde::Serialize + serde::de::DeserializeOwned + Default,
 {
-    /// Delegated straight to the wrapped `PersistableVec<u8>`'s 8-byte
-    /// `{ target, len }` header -- a blob *is* that vec, representationally.
-    const INLINE_SIZE: usize = <PersistableVec<u8> as Persistable>::INLINE_SIZE;
+    /// Delegated straight to the wrapped `PersistableVec<u8>`'s inline pointer
+    /// -- a blob *is* that vec, representationally.
+    const INLINE_SIZE: usize = <PersistableVec<u8, P> as Persistable<P>>::INLINE_SIZE;
 
-    type Guard<'s, B: Backend>
+    type Guard<'s, B: WriteBackend<Pointer = P>>
         = PersistableBlobGuard<'s, T, B>
     where
         Self: 's,
         B: 's;
 
     #[inline]
-    fn guard<'s, B: Backend>(
+    fn guard<'s, B: WriteBackend<Pointer = P>>(
         &'s mut self,
         backend: &'s B,
-        location: Location,
+        location: Location<P, B::Size>,
     ) -> Self::Guard<'s, B> {
         PersistableBlobGuard {
             inner: self,
@@ -128,12 +130,12 @@ where
         }
     }
 
-    fn store<B: Backend>(&mut self, backend: &B, location: Location) {
+    fn store<B: WriteBackend<Pointer = P>>(&mut self, backend: &B, location: Location<P, B::Size>) {
         self.serialized.store(backend, location);
     }
 
-    fn load<B: Backend>(backend: &B, location: Location) -> Self {
-        let serialized = PersistableVec::<u8>::load(backend, location);
+    fn load<B: ReadBackend<Pointer = P>>(backend: &mut B, location: Location<P, B::Size>) -> Self {
+        let serialized = <PersistableVec<u8, P> as Persistable<P>>::load(backend, location);
         let value = if serialized.is_empty() {
             // Empty content is the canonical on-disk encoding of the
             // default value -- see the module doc comment's `empty <=>
@@ -147,21 +149,23 @@ where
 
     // `T` here is a foreign, `serde`-serialized type that is *not* itself
     // `Persistable`, so its inner structure cannot be described -- a
-    // `PersistableBlob<T>` is genuinely an opaque `postcard` blob behind an 8-byte
-    // header. That means every `PersistableBlob<_>` shares one fingerprint,
+    // `PersistableBlob<T>` is genuinely an opaque `postcard` blob behind an
+    // inline pointer. That means every `PersistableBlob<_>` shares one fingerprint,
     // regardless of `T`; the schema cannot tell `PersistableBlob<Foo>` from
     // `PersistableBlob<Bar>`. This is a known limitation of the `serde` escape
     // hatch (and a reason to prefer a real `Persistable` type where the
     // distinction matters).
-    fn describe_local(_builder: &mut kladde_traits::SchemaBuilder) -> kladde_traits::TypeDescriptor
+    fn describe_local(
+        _builder: &mut kladde_persist::SchemaBuilder,
+    ) -> kladde_persist::TypeDescriptor
     where
         Self: 'static,
     {
-        kladde_traits::TypeDescriptor::Opaque {
+        kladde_persist::TypeDescriptor::Opaque {
             library_name: "kladde-types".into(),
             type_name: "PersistableBlob".into(),
             version: crate::library_version(),
-            inline_size: 8,
+            inline_size: P::BYTE_LEN as u64,
             parameters: vec![],
         }
     }
@@ -172,16 +176,14 @@ where
 /// Read the current value through [`Deref`] to the blob; replace it
 /// wholesale with [`set`](Self::set), change it in place with
 /// [`edit`](Self::edit), or reset it to `T::default()` with
-/// [`set_to_default`](Self::set_to_default). `B` defaults to
-/// [`kladde::DefaultBackend`](../../kladde/struct.DefaultBackend.html), so
-/// code using the default backend never has to name it.
-pub struct PersistableBlobGuard<'s, T, B = kladde::DefaultBackend> {
-    inner: &'s mut PersistableBlob<T>,
+/// [`set_to_default`](Self::set_to_default).
+pub struct PersistableBlobGuard<'s, T, B: WriteBackend> {
+    inner: &'s mut PersistableBlob<T, B::Pointer>,
     backend: &'s B,
-    location: Location,
+    location: Location<B::Pointer, B::Size>,
 }
 
-impl<'s, T: serde::Serialize, B: Backend> PersistableBlobGuard<'s, T, B> {
+impl<'s, T: serde::Serialize, B: WriteBackend> PersistableBlobGuard<'s, T, B> {
     /// Replaces the wrapped value with `value` and persists it.
     ///
     /// To change only part of a large value, prefer [`edit`](Self::edit) so
@@ -245,7 +247,7 @@ impl<'s, T: serde::Serialize, B: Backend> PersistableBlobGuard<'s, T, B> {
     }
 }
 
-impl<'s, T: serde::Serialize + Default, B: Backend> PersistableBlobGuard<'s, T, B> {
+impl<'s, T: serde::Serialize + Default, B: WriteBackend> PersistableBlobGuard<'s, T, B> {
     /// Resets the wrapped value to `T::default()`, releasing its backing
     /// allocation.
     ///
@@ -266,17 +268,17 @@ impl<'s, T: serde::Serialize + Default, B: Backend> PersistableBlobGuard<'s, T, 
     }
 }
 
-impl<'s, T, B: Backend> Guard for PersistableBlobGuard<'s, T, B>
+impl<'s, T, B: WriteBackend> Guard for PersistableBlobGuard<'s, T, B>
 where
     T: serde::Serialize + serde::de::DeserializeOwned + Default,
 {
-    type Persistable = PersistableBlob<T>;
+    type Persistable = PersistableBlob<T, B::Pointer>;
     type Backend = B;
 
-    fn as_persistable(&self) -> &PersistableBlob<T> {
+    fn as_persistable(&self) -> &Self::Persistable {
         self.inner
     }
-    fn as_persistable_mut(&mut self) -> &mut PersistableBlob<T> {
+    fn as_persistable_mut(&mut self) -> &mut Self::Persistable {
         self.inner
     }
     fn backend(&self) -> &B {
@@ -284,15 +286,15 @@ where
     }
 }
 
-impl<'s, T, B> Deref for PersistableBlobGuard<'s, T, B> {
-    type Target = PersistableBlob<T>;
-    fn deref(&self) -> &PersistableBlob<T> {
+impl<'s, T, B: WriteBackend> Deref for PersistableBlobGuard<'s, T, B> {
+    type Target = PersistableBlob<T, B::Pointer>;
+    fn deref(&self) -> &Self::Target {
         self.inner
     }
 }
 
-impl<'s, T, B> DerefMut for PersistableBlobGuard<'s, T, B> {
-    fn deref_mut(&mut self) -> &mut PersistableBlob<T> {
+impl<'s, T, B: WriteBackend> DerefMut for PersistableBlobGuard<'s, T, B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner
     }
 }
@@ -306,11 +308,11 @@ impl<'s, T, B> DerefMut for PersistableBlobGuard<'s, T, B> {
 /// on drop, whether or not it changed, so reach for it only when you intend
 /// to write.
 #[must_use = "an edit persists on drop; bind it or call .commit()"]
-pub struct PersistableBlobEdit<'g, 's, T: serde::Serialize, B: Backend = kladde::DefaultBackend> {
+pub struct PersistableBlobEdit<'g, 's, T: serde::Serialize, B: WriteBackend> {
     guard: &'g mut PersistableBlobGuard<'s, T, B>,
 }
 
-impl<'g, 's, T: serde::Serialize, B: Backend> PersistableBlobEdit<'g, 's, T, B> {
+impl<'g, 's, T: serde::Serialize, B: WriteBackend> PersistableBlobEdit<'g, 's, T, B> {
     /// Persists the edited value and consumes the handle.
     ///
     /// Equivalent to letting the handle drop; call it to make the commit
@@ -320,20 +322,20 @@ impl<'g, 's, T: serde::Serialize, B: Backend> PersistableBlobEdit<'g, 's, T, B> 
     }
 }
 
-impl<'g, 's, T: serde::Serialize, B: Backend> Deref for PersistableBlobEdit<'g, 's, T, B> {
+impl<'g, 's, T: serde::Serialize, B: WriteBackend> Deref for PersistableBlobEdit<'g, 's, T, B> {
     type Target = T;
     fn deref(&self) -> &T {
         &self.guard.inner.value
     }
 }
 
-impl<'g, 's, T: serde::Serialize, B: Backend> DerefMut for PersistableBlobEdit<'g, 's, T, B> {
+impl<'g, 's, T: serde::Serialize, B: WriteBackend> DerefMut for PersistableBlobEdit<'g, 's, T, B> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.guard.inner.value
     }
 }
 
-impl<'g, 's, T: serde::Serialize, B: Backend> Drop for PersistableBlobEdit<'g, 's, T, B> {
+impl<'g, 's, T: serde::Serialize, B: WriteBackend> Drop for PersistableBlobEdit<'g, 's, T, B> {
     fn drop(&mut self) {
         self.guard.persist();
     }
@@ -342,40 +344,32 @@ impl<'g, 's, T: serde::Serialize, B: Backend> Drop for PersistableBlobEdit<'g, '
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::MockBackend;
-    use kladde_traits::Allocator;
+    use crate::test_support::{root_location as root_alloc, MockBackend};
 
-    fn root_location(backend: &MockBackend) -> Location {
-        let pointer = backend.alloc_fixed(PersistableBlob::<i32>::INLINE_SIZE);
-        Location {
-            anchor: pointer.raw(),
-            offset: 0,
-        }
+    fn root_location(backend: &MockBackend) -> Location<Pointer, u32> {
+        root_alloc(backend, <PersistableBlob<i32> as Persistable>::INLINE_SIZE)
     }
 
     #[test]
     fn new_round_trips_through_store_and_load() {
-        let backend = MockBackend::default();
+        let mut backend = MockBackend::default();
         let location = root_location(&backend);
 
         let mut value = PersistableBlob::new(42i32);
         value.store(&backend, location);
-        backend.flush();
 
-        let reloaded = PersistableBlob::<i32>::load(&backend, location);
+        let reloaded = <PersistableBlob<i32> as Persistable>::load(&mut backend, location);
         assert_eq!(*reloaded, 42);
     }
 
     #[test]
     fn default_is_lazy_and_round_trips_as_the_default_value() {
-        let backend = MockBackend::default();
+        let mut backend = MockBackend::default();
         let location = root_location(&backend);
-        backend.flush(); // materialize the root anchor itself, unrelated to `PersistableBlob<T>`
         let live_before = backend.live_count();
 
         let mut value = PersistableBlob::<i32>::default();
         value.store(&backend, location);
-        backend.flush();
 
         assert_eq!(
             backend.live_count(),
@@ -383,22 +377,20 @@ mod tests {
             "default() shouldn't allocate anything"
         );
 
-        let reloaded = PersistableBlob::<i32>::load(&backend, location);
+        let reloaded = <PersistableBlob<i32> as Persistable>::load(&mut backend, location);
         assert_eq!(*reloaded, 0);
     }
 
     #[test]
     fn set_reuses_an_existing_allocation_instead_of_leaking_it() {
-        let backend = MockBackend::default();
+        let mut backend = MockBackend::default();
         let location = root_location(&backend);
 
         let mut value = PersistableBlob::new(1i32);
         value.store(&backend, location);
-        backend.flush();
         let live_before = backend.live_count();
 
         value.guard(&backend, location).set(2);
-        backend.flush();
 
         assert_eq!(
             backend.live_count(),
@@ -407,28 +399,26 @@ mod tests {
         );
         assert_eq!(*value, 2);
 
-        let reloaded = PersistableBlob::<i32>::load(&backend, location);
+        let reloaded = <PersistableBlob<i32> as Persistable>::load(&mut backend, location);
         assert_eq!(*reloaded, 2);
     }
 
     #[test]
     fn set_to_default_frees_the_allocation_and_goes_back_to_lazy() {
-        let backend = MockBackend::default();
+        let mut backend = MockBackend::default();
         let location = root_location(&backend);
 
         let mut value = PersistableBlob::new(5i32);
         value.store(&backend, location);
-        backend.flush();
         let live_before = backend.live_count();
         assert!(live_before > 0);
 
         value.guard(&backend, location).set_to_default();
-        backend.flush();
 
         assert_eq!(backend.live_count(), live_before - 1);
         assert_eq!(*value, 0);
 
-        let reloaded = PersistableBlob::<i32>::load(&backend, location);
+        let reloaded = <PersistableBlob<i32> as Persistable>::load(&mut backend, location);
         assert_eq!(*reloaded, 0);
     }
 
@@ -437,24 +427,22 @@ mod tests {
         // A `String` payload whose serialization length actually changes,
         // exercising the grow / shrink / same-length branches of the
         // wrapped vec's `set`.
-        let backend = MockBackend::default();
+        let mut backend = MockBackend::default();
         let location = root_location(&backend);
 
         let mut value = PersistableBlob::new(String::from("hi"));
         value.store(&backend, location);
-        backend.flush();
         let live = backend.live_count();
 
         for text in ["a much longer string than before", "x", "medium length"] {
             value.guard(&backend, location).set(String::from(text));
-            backend.flush();
             assert_eq!(&*value, text);
             assert_eq!(
                 backend.live_count(),
                 live,
                 "grow/shrink must reuse the one allocation, not leak"
             );
-            let reloaded = PersistableBlob::<String>::load(&backend, location);
+            let reloaded = <PersistableBlob<String> as Persistable>::load(&mut backend, location);
             assert_eq!(&*reloaded, text);
         }
     }
@@ -467,7 +455,7 @@ mod tests {
 
     #[test]
     fn edit_persists_in_place_field_changes() {
-        let backend = MockBackend::default();
+        let mut backend = MockBackend::default();
         let location = root_location(&backend);
 
         let mut value = PersistableBlob::new(Rec {
@@ -475,7 +463,6 @@ mod tests {
             b: "one".into(),
         });
         value.store(&backend, location);
-        backend.flush();
 
         {
             let mut guard = value.guard(&backend, location);
@@ -483,16 +470,15 @@ mod tests {
             edit.a = 2; // mutate a single field in place, no whole-value rebuild
             edit.commit();
         }
-        backend.flush();
 
-        let reloaded = PersistableBlob::<Rec>::load(&backend, location);
+        let reloaded = <PersistableBlob<Rec> as Persistable>::load(&mut backend, location);
         assert_eq!(reloaded.a, 2);
         assert_eq!(reloaded.b, "one");
     }
 
     #[test]
     fn edit_persists_on_drop_without_explicit_commit() {
-        let backend = MockBackend::default();
+        let mut backend = MockBackend::default();
         let location = root_location(&backend);
 
         let mut value = PersistableBlob::new(Rec {
@@ -500,34 +486,30 @@ mod tests {
             b: "one".into(),
         });
         value.store(&backend, location);
-        backend.flush();
 
         {
             let mut guard = value.guard(&backend, location);
             guard.edit().b = "two".into(); // dropped at the end of the statement
         }
-        backend.flush();
 
-        let reloaded = PersistableBlob::<Rec>::load(&backend, location);
+        let reloaded = <PersistableBlob<Rec> as Persistable>::load(&mut backend, location);
         assert_eq!(reloaded.b, "two");
         assert_eq!(reloaded.a, 1);
     }
 
     #[test]
     fn setting_to_an_equal_value_is_a_no_op_but_still_correct() {
-        let backend = MockBackend::default();
+        let mut backend = MockBackend::default();
         let location = root_location(&backend);
 
         let mut value = PersistableBlob::new(String::from("stable"));
         value.store(&backend, location);
-        backend.flush();
         let live = backend.live_count();
 
         value.guard(&backend, location).set(String::from("stable"));
-        backend.flush();
 
         assert_eq!(backend.live_count(), live);
-        let reloaded = PersistableBlob::<String>::load(&backend, location);
+        let reloaded = <PersistableBlob<String> as Persistable>::load(&mut backend, location);
         assert_eq!(&*reloaded, "stable");
     }
 

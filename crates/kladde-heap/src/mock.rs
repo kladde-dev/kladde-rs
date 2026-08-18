@@ -107,6 +107,11 @@ impl ReadBackend for MockBackend {
     }
 }
 
+impl crate::CompactingBackend for MockBackend {
+    fn compact_incrementally(&self, budget: usize) -> crate::CompactionProgress {
+        self.0.compact_incrementally(budget as u64)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

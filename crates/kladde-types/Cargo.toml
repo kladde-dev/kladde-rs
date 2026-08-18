@@ -6,12 +6,13 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-kladde-traits = { workspace = true }
-kladde-alloc = { workspace = true }
+kladde-persist = { workspace = true }
 kladde-derive = { workspace = true }
-kladde = { workspace = true }
 serde = { workspace = true, optional = true }
 postcard = { workspace = true, optional = true }
+
+[dev-dependencies]
+kladde = { workspace = true }
 
 [features]
 # Gates `PersistableBlob<T>` -- the generic wrapper for foreign types that

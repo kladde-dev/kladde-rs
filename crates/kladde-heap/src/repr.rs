@@ -1,6 +1,11 @@
 //! [`PointerRepr`]: the on-file byte (de)serialization of pointer ids, plus the
 //! `Option<Pointer>` null-niche encoding.
 //!
+//! Lives in `kladde-heap` rather than the serialization layer because it is a
+//! property of the *pointer*, not of any type being persisted -- and because
+//! `Backend::Pointer: PointerRepr` is what spares every downstream guard and
+//! container a `where B::Pointer: PointerRepr` clause.
+//!
 //! Modeled on `num-traits`' `ToBytes`/`FromBytes`. Little-endian is kladde's
 //! blessed byte ordering, so the method names carry **no** `le`. Because every
 //! [`Pointer`] is nonzero (its field is a `W::NonZero`), a valid pointer never
@@ -8,7 +13,8 @@
 //! for `None`, giving the null niche **on file** as well as in memory. The
 //! [`encode_option`]/[`decode_option`] helpers implement exactly that.
 
-use kladde_heap::{Pointer, Word};
+use crate::pointer::Pointer;
+use crate::word::Word;
 
 /// Byte (de)serialization of a pointer id. The `Bytes` associated type stands in
 /// for `[u8; SIZE]` (an associated-const array length in a trait signature needs

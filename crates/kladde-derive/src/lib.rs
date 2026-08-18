@@ -4,10 +4,10 @@
 //! - Both named structs (`struct S { x: T }`) and tuple structs
 //!   (`struct S(T, U)`) are supported, laid out identically. Every field is
 //!   treated uniformly (including primitives, via blanket `Persistable`
-//!   impls in `kladde-traits`) -- no special-cased scalar setters, just a
+//!   impls in `kladde-persist`) -- no special-cased scalar setters, just a
 //!   `{field}_mut()` accessor per field (`field_{i}_mut()` for a tuple
 //!   struct's positional fields). Tuples of `Persistable` types, `(T, U)`,
-//!   are `Persistable` too (see `kladde-traits`), laid out the same way.
+//!   are `Persistable` too (see `kladde-persist`), laid out the same way.
 //! - A derived struct's own `INLINE_SIZE` is the sum of its fields'
 //!   (each field's offset within it is therefore static, computable at
 //!   compile time), and it never owns an allocation of its own -- it just
@@ -83,10 +83,10 @@
 //! struct Meters(i32);
 //! ```
 //!
-//! **Dependency note:** generated code references `::kladde_traits::...`
-//! paths directly, so any crate using this macro needs `kladde-traits` as
+//! **Dependency note:** generated code references `::kladde_persist::...`
+//! paths directly, so any crate using this macro needs `kladde-persist` as
 //! a *direct* dependency too -- re-exports (e.g. via `kladde-types`)
-//! aren't enough to make `::kladde_traits` resolve. The same reason
+//! aren't enough to make `::kladde_persist` resolve. The same reason
 //! `#[derive(serde::Serialize)]` requires a direct `serde` dependency,
 //! not just `serde_derive`.
 
@@ -134,7 +134,8 @@ pub fn derive_persistable(input: TokenStream) -> TokenStream {
 ///   `type_generics`, `where_clause`), with a `T: Persistable` bound
 ///   added to each type parameter (the `#[derive(Debug)]` heuristic); and
 /// - the generated *guard*'s generic lists, which extend the type's own
-///   parameters with a fresh lifetime `'__s` and backend `__B`. Those two
+///   parameters with a fresh lifetime `'__s`, pointer type `::kladde_persist::Pointer`, and backend
+///   `__B`. The last three
 ///   are given deliberately underscore-prefixed, collision-proof names so
 ///   a user type like `struct Foo<B> { .. }` (its own `B`) doesn't clash
 ///   with the guard's backend parameter -- the same hygiene trick serde's
@@ -143,18 +144,20 @@ pub fn derive_persistable(input: TokenStream) -> TokenStream {
 /// Only type parameters are supported; lifetime and const parameters are
 /// rejected in [`build`](Ctx::build).
 struct Ctx {
-    /// The type's `impl` generics with `T: Persistable` bounds added,
-    /// e.g. `<T: Persistable>` (empty for a non-generic type).
+    /// The `impl` generics of the `Persistable` impl: the pointer type `::kladde_persist::Pointer`
+    /// followed by the type's own parameters, each given a
+    /// `Persistable<::kladde_persist::Pointer>` bound, e.g. `<::kladde_persist::Pointer: PointerRepr, T: Persistable<::kladde_persist::Pointer>>`.
     impl_generics: proc_macro2::TokenStream,
     /// The type's type generics, e.g. `<T>` (empty for a non-generic type).
     type_generics: proc_macro2::TokenStream,
     /// The type's own `where`-clause, verbatim (empty if none).
     where_clause: proc_macro2::TokenStream,
-    /// Generic list for *declaring* the guard struct and for the generic
-    /// list of every `impl` block on it: `<'__s, T: Persistable, __B: Backend>`.
+    /// Generic list for *declaring* the guard struct and for every `impl` block
+    /// on it: `<'__s, T: Persistable<::kladde_persist::Pointer>, ::kladde_persist::Pointer: PointerRepr,
+    /// __B: WriteBackend<Pointer = ::kladde_persist::Pointer>>`.
     guard_impl_generics: proc_macro2::TokenStream,
     /// Generic list for *naming* the guard type (bare parameter names, no
-    /// bounds): `<'__s, T, __B>`.
+    /// bounds): `<'__s, T, ::kladde_persist::Pointer, __B>`.
     guard_use_generics: proc_macro2::TokenStream,
     /// The type's type parameters rendered with their bounds (`T: ... +
     /// Persistable`), for building further generic lists (e.g. the `Parts`
@@ -190,9 +193,11 @@ impl Ctx {
         // `later.md`.
         let mut bounded = input.generics.clone();
         for tp in bounded.type_params_mut() {
-            tp.bounds.push(parse_quote!(::kladde_traits::Persistable));
+            tp.bounds.push(parse_quote!(
+                ::kladde_persist::Persistable<::kladde_persist::Pointer>
+            ));
         }
-        let (impl_generics, type_generics, where_clause) = bounded.split_for_impl();
+        let (_, type_generics, where_clause) = bounded.split_for_impl();
 
         // The guard's own generic lists: the type's (bounded) parameters,
         // bracketed by a fresh lifetime and backend with collision-proof
@@ -206,12 +211,18 @@ impl Ctx {
             .map(|tp| tp.ident.clone())
             .collect();
 
+        // `::kladde_persist::Pointer` (the pointer type) leads every generic list: `Persistable` is
+        // generic over it, so the type parameters' own bounds mention it. It is
+        // *redundant* on the guard lists -- `__B::Pointer` already determines it
+        // -- but carrying it explicitly means every generated body can spell the
+        // bound as plain `Persistable<::kladde_persist::Pointer>`, whether it sits inside the
+        // `Persistable` impl or inside a guard impl.
         Ok(Ctx {
-            impl_generics: quote!(#impl_generics),
+            impl_generics: quote! { <#(#bounded_params,)*> },
             type_generics: quote!(#type_generics),
             where_clause: quote!(#where_clause),
             guard_impl_generics: quote! {
-                <'__s, #(#bounded_params,)* __B: ::kladde_traits::Backend>
+                <'__s, #(#bounded_params,)* __B: ::kladde_persist::WriteBackend<Pointer = ::kladde_persist::Pointer>>
             },
             guard_use_generics: quote! { <'__s, #(#param_idents,)* __B> },
             bounded_params,
@@ -251,12 +262,20 @@ fn transparent_attr(attrs: &[syn::Attribute]) -> syn::Result<bool> {
 /// caller's generated code actually accesses each field (`self.foo`,
 /// `self.0`, a `match`-bound local, ...) -- shared by struct-derive and
 /// (per-variant) enum-derive.
-fn field_offsets(field_ty: &[syn::Type]) -> Vec<proc_macro2::TokenStream> {
+/// `base` is where the whole run starts within the value's own inline bytes: `0`
+/// for a struct, `4` for an enum variant (past the discriminant).
+///
+/// The result is typed as the *backend's* `Size`, not `u32`, because that is
+/// what `Location<P, S>`'s `Add` takes -- so every use site must have `__B` in
+/// scope, which every generated use site does.
+fn field_offsets(field_ty: &[syn::Type], base: usize) -> Vec<proc_macro2::TokenStream> {
     (0..field_ty.len())
         .map(|i| {
             let earlier = &field_ty[..i];
             quote! {
-                (0usize #( + <#earlier as ::kladde_traits::Persistable>::INLINE_SIZE )*) as u32
+                <<__B as ::kladde_persist::Backend>::Size as ::kladde_persist::Word>::from_usize(
+                    #base #( + <#earlier as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::INLINE_SIZE )*
+                )
             }
         })
         .collect()
@@ -266,7 +285,7 @@ fn field_offsets(field_ty: &[syn::Type]) -> Vec<proc_macro2::TokenStream> {
 /// back to back -- the sum of each field's own `INLINE_SIZE`.
 fn total_size(field_ty: &[syn::Type]) -> proc_macro2::TokenStream {
     quote! {
-        0usize #( + <#field_ty as ::kladde_traits::Persistable>::INLINE_SIZE )*
+        0usize #( + <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::INLINE_SIZE )*
     }
 }
 
@@ -294,13 +313,13 @@ fn guard_scaffold(
 
     quote! {
         #[doc(hidden)]
-        #vis struct #guard_ident #guard_use_generics #where_clause {
+        #vis struct #guard_ident #guard_impl_generics #where_clause {
             inner: &'__s mut #ident #type_generics,
             backend: &'__s __B,
-            location: ::kladde_traits::Location,
+            location: ::kladde_persist::Location<::kladde_persist::Pointer, <__B as ::kladde_persist::Backend>::Size>,
         }
 
-        impl #guard_impl_generics ::kladde_traits::Guard
+        impl #guard_impl_generics ::kladde_persist::Guard
             for #guard_ident #guard_use_generics #where_clause
         {
             type Persistable = #ident #type_generics;
@@ -345,17 +364,17 @@ fn guard_assoc(ctx: &Ctx, guard_ident: &syn::Ident) -> proc_macro2::TokenStream 
         guard_use_generics, ..
     } = ctx;
     quote! {
-        type Guard<'__s, __B: ::kladde_traits::Backend>
+        type Guard<'__s, __B: ::kladde_persist::WriteBackend<Pointer = ::kladde_persist::Pointer>>
             = #guard_ident #guard_use_generics
         where
             Self: '__s,
             __B: '__s;
 
         #[inline]
-        fn guard<'__s, __B: ::kladde_traits::Backend>(
+        fn guard<'__s, __B: ::kladde_persist::WriteBackend<Pointer = ::kladde_persist::Pointer>>(
             &'__s mut self,
             backend: &'__s __B,
-            location: ::kladde_traits::Location,
+            location: ::kladde_persist::Location<::kladde_persist::Pointer, <__B as ::kladde_persist::Backend>::Size>,
         ) -> Self::Guard<'__s, __B> {
             #guard_ident {
                 inner: self,
@@ -369,7 +388,7 @@ fn guard_assoc(ctx: &Ctx, guard_ident: &syn::Ident) -> proc_macro2::TokenStream 
 /// `#[kladde(transparent)]`, analogous to `#[serde(transparent)]`: a
 /// single-field newtype (tuple `struct S(T)` or braced `struct S { x: T }`)
 /// that is persisted *exactly* as its one field. The generated
-/// [`Persistable`](::kladde_traits::Persistable) impl delegates its whole
+/// [`Persistable`](::kladde_persist::Persistable) impl delegates its whole
 /// representation to `T` -- same `INLINE_SIZE`, same bytes at the same
 /// location -- and, crucially, is **schema-transparent**: it overrides
 /// `describe` to reuse `T`'s descriptor rather than registering a node of
@@ -451,8 +470,8 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> proc_macro2::TokenStrea
             #[inline]
             #vis fn get_mut(
                 &mut self,
-            ) -> <#field_ty as ::kladde_traits::Persistable>::Guard<'_, __B> {
-                <#field_ty as ::kladde_traits::Persistable>::guard(
+            ) -> <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::Guard<'_, __B> {
+                <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::guard(
                     &mut self.inner.#member,
                     self.backend,
                     self.location,
@@ -460,24 +479,24 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> proc_macro2::TokenStrea
             }
         }
 
-        impl #impl_generics ::kladde_traits::Persistable for #ident #type_generics #where_clause {
+        impl #impl_generics ::kladde_persist::Persistable<::kladde_persist::Pointer> for #ident #type_generics #where_clause {
             // Transparent: the wrapper *is* its one field, so it owns no
             // storage of its own and forwards everything at offset 0.
             const INLINE_SIZE: usize =
-                <#field_ty as ::kladde_traits::Persistable>::INLINE_SIZE;
+                <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::INLINE_SIZE;
 
             #guard_assoc
 
-            fn store<__B: ::kladde_traits::Backend>(&mut self, backend: &__B, location: ::kladde_traits::Location) {
-                <#field_ty as ::kladde_traits::Persistable>::store(
+            fn store<__B: ::kladde_persist::WriteBackend<Pointer = ::kladde_persist::Pointer>>(&mut self, backend: &__B, location: ::kladde_persist::Location<::kladde_persist::Pointer, <__B as ::kladde_persist::Backend>::Size>) {
+                <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::store(
                     &mut self.#member,
                     backend,
                     location,
                 );
             }
 
-            fn load<__B: ::kladde_traits::Backend>(backend: &__B, location: ::kladde_traits::Location) -> Self {
-                let __value = <#field_ty as ::kladde_traits::Persistable>::load(backend, location);
+            fn load<__B: ::kladde_persist::ReadBackend<Pointer = ::kladde_persist::Pointer>>(backend: &mut __B, location: ::kladde_persist::Location<::kladde_persist::Pointer, <__B as ::kladde_persist::Backend>::Size>) -> Self {
+                let __value = <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::load(backend, location);
                 #construct
             }
 
@@ -486,11 +505,11 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> proc_macro2::TokenStrea
             // share one fingerprint. Overriding `describe` (and leaving
             // `describe_local` at its default) is exactly the transparency
             // escape hatch documented on `Persistable::describe`.
-            fn describe(builder: &mut ::kladde_traits::SchemaBuilder) -> ::kladde_traits::TypeRef
+            fn describe(builder: &mut ::kladde_persist::SchemaBuilder) -> ::kladde_persist::TypeRef
             where
                 Self: 'static,
             {
-                <#field_ty as ::kladde_traits::Persistable>::describe(builder)
+                <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::describe(builder)
             }
         }
     }
@@ -553,7 +572,7 @@ fn derive_struct(
         })
         .collect();
 
-    let field_offset = field_offsets(&field_ty);
+    let field_offset = field_offsets(&field_ty, 0);
     let total_size = total_size(&field_ty);
 
     // `load` reconstructs the value; the syntax differs between a braced
@@ -563,7 +582,7 @@ fn derive_struct(
         quote! {
             #ident(
                 #(
-                    <#field_ty as ::kladde_traits::Persistable>::load(
+                    <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::load(
                         backend,
                         location + #field_offset,
                     ),
@@ -576,7 +595,7 @@ fn derive_struct(
         quote! {
             #ident {
                 #(
-                    #field_ident: <#field_ty as ::kladde_traits::Persistable>::load(
+                    #field_ident: <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::load(
                         backend,
                         location + #field_offset,
                     ),
@@ -596,7 +615,7 @@ fn derive_struct(
     let bounded_params = &ctx.bounded_params;
     let param_idents = &ctx.param_idents;
     let parts_decl_generics = quote! {
-        <'__f, #(#bounded_params,)* __B: ::kladde_traits::Backend>
+        <'__f, #(#bounded_params,)* __B: ::kladde_persist::WriteBackend<Pointer = ::kladde_persist::Pointer>>
     };
     let parts_ret_generics = quote! { <'_, #(#param_idents,)* __B> };
     // The `Parts` struct holds `Guard<'__f, __B>` associated types, whose
@@ -615,14 +634,14 @@ fn derive_struct(
             #[doc(hidden)]
             #vis struct #parts_ident #parts_decl_generics (
                 #(
-                    #vis <#field_ty as ::kladde_traits::Persistable>::Guard<'__f, __B>,
+                    #vis <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::Guard<'__f, __B>,
                 )*
             ) #parts_where;
         };
         let ctor = quote! {
             #parts_ident(
                 #(
-                    <#field_ty as ::kladde_traits::Persistable>::guard(
+                    <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::guard(
                         &mut self.inner.#member,
                         self.backend,
                         self.location + #field_offset,
@@ -639,14 +658,14 @@ fn derive_struct(
             #vis struct #parts_ident #parts_decl_generics #parts_where {
                 #(
                     #vis #field_ident:
-                        <#field_ty as ::kladde_traits::Persistable>::Guard<'__f, __B>,
+                        <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::Guard<'__f, __B>,
                 )*
             }
         };
         let ctor = quote! {
             #parts_ident {
                 #(
-                    #field_ident: <#field_ty as ::kladde_traits::Persistable>::guard(
+                    #field_ident: <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::guard(
                         &mut self.inner.#member,
                         self.backend,
                         self.location + #field_offset,
@@ -670,8 +689,8 @@ fn derive_struct(
                 #[inline]
                 #vis fn #accessor_ident(
                     &mut self,
-                ) -> <#field_ty as ::kladde_traits::Persistable>::Guard<'_, __B> {
-                    <#field_ty as ::kladde_traits::Persistable>::guard(
+                ) -> <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::Guard<'_, __B> {
+                    <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::guard(
                         &mut self.inner.#member,
                         self.backend,
                         self.location + #field_offset,
@@ -688,7 +707,7 @@ fn derive_struct(
             }
         }
 
-        impl #impl_generics ::kladde_traits::Persistable for #ident #type_generics #where_clause {
+        impl #impl_generics ::kladde_persist::Persistable<::kladde_persist::Pointer> for #ident #type_generics #where_clause {
             // A struct never owns an allocation of its own -- it's just
             // the sum of its fields' inline representations, threaded
             // through at static offsets.
@@ -696,9 +715,9 @@ fn derive_struct(
 
             #guard_assoc
 
-            fn store<__B: ::kladde_traits::Backend>(&mut self, backend: &__B, location: ::kladde_traits::Location) {
+            fn store<__B: ::kladde_persist::WriteBackend<Pointer = ::kladde_persist::Pointer>>(&mut self, backend: &__B, location: ::kladde_persist::Location<::kladde_persist::Pointer, <__B as ::kladde_persist::Backend>::Size>) {
                 #(
-                    ::kladde_traits::Persistable::store(
+                    <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::store(
                         &mut self.#member,
                         backend,
                         location + #field_offset,
@@ -706,23 +725,23 @@ fn derive_struct(
                 )*
             }
 
-            fn load<__B: ::kladde_traits::Backend>(backend: &__B, location: ::kladde_traits::Location) -> Self {
+            fn load<__B: ::kladde_persist::ReadBackend<Pointer = ::kladde_persist::Pointer>>(backend: &mut __B, location: ::kladde_persist::Location<::kladde_persist::Pointer, <__B as ::kladde_persist::Backend>::Size>) -> Self {
                 #load_body
             }
 
             fn describe_local(
-                __builder: &mut ::kladde_traits::SchemaBuilder,
-            ) -> ::kladde_traits::TypeDescriptor
+                __builder: &mut ::kladde_persist::SchemaBuilder,
+            ) -> ::kladde_persist::TypeDescriptor
             where
                 Self: 'static,
             {
-                ::kladde_traits::TypeDescriptor::Struct {
+                ::kladde_persist::TypeDescriptor::Struct {
                     name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
                     fields: ::std::vec![
                         #(
-                            ::kladde_traits::Field {
+                            ::kladde_persist::Field {
                                 name: ::std::string::ToString::to_string(#schema_name),
-                                ty: <#field_ty as ::kladde_traits::Persistable>::describe(
+                                ty: <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::describe(
                                     __builder,
                                 ),
                             },
@@ -755,24 +774,24 @@ fn derive_unit_like_struct(
     quote! {
         #scaffold
 
-        impl #impl_generics ::kladde_traits::Persistable for #ident #type_generics #where_clause {
+        impl #impl_generics ::kladde_persist::Persistable<::kladde_persist::Pointer> for #ident #type_generics #where_clause {
             const INLINE_SIZE: usize = 0;
 
             #guard_assoc
 
-            fn store<__B: ::kladde_traits::Backend>(&mut self, _backend: &__B, _location: ::kladde_traits::Location) {}
+            fn store<__B: ::kladde_persist::WriteBackend<Pointer = ::kladde_persist::Pointer>>(&mut self, _backend: &__B, _location: ::kladde_persist::Location<::kladde_persist::Pointer, <__B as ::kladde_persist::Backend>::Size>) {}
 
-            fn load<__B: ::kladde_traits::Backend>(_backend: &__B, _location: ::kladde_traits::Location) -> Self {
+            fn load<__B: ::kladde_persist::ReadBackend<Pointer = ::kladde_persist::Pointer>>(_backend: &mut __B, _location: ::kladde_persist::Location<::kladde_persist::Pointer, <__B as ::kladde_persist::Backend>::Size>) -> Self {
                 #ident
             }
 
             fn describe_local(
-                _builder: &mut ::kladde_traits::SchemaBuilder,
-            ) -> ::kladde_traits::TypeDescriptor
+                _builder: &mut ::kladde_persist::SchemaBuilder,
+            ) -> ::kladde_persist::TypeDescriptor
             where
                 Self: 'static,
             {
-                ::kladde_traits::TypeDescriptor::Struct {
+                ::kladde_persist::TypeDescriptor::Struct {
                     name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
                     fields: ::std::vec![],
                 }
@@ -881,7 +900,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
         .collect();
     let variant_field_offset: Vec<Vec<proc_macro2::TokenStream>> = variant_field_ty
         .iter()
-        .map(|tys| field_offsets(tys))
+        .map(|tys| field_offsets(tys, 4))
         .collect();
     let variant_size: Vec<proc_macro2::TokenStream> =
         variant_field_ty.iter().map(|tys| total_size(tys)).collect();
@@ -929,19 +948,20 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
             let pattern = &variant_pattern[i];
             let bindings = &variant_binding[i];
             let field_offset = &variant_field_offset[i];
+            let field_ty = &variant_field_ty[i];
             quote! {
                 #pattern => {
-                    ::kladde_traits::Allocator::write(
+                    ::kladde_persist::WriteBackend::write(
                         backend,
                         location.anchor,
                         location.offset,
                         &DISC[#i].to_le_bytes(),
                     );
                     #(
-                        ::kladde_traits::Persistable::store(
+                        <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::store(
                             #bindings,
                             backend,
-                            location + 4 + #field_offset,
+                            location + #field_offset,
                         );
                     )*
                 }
@@ -963,9 +983,9 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
                     quote! {
                         #ident::#v_ident {
                             #(
-                                #field_ident: <#field_ty as ::kladde_traits::Persistable>::load(
+                                #field_ident: <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::load(
                                     backend,
-                                    location + 4 + #field_offset,
+                                    location + #field_offset,
                                 ),
                             )*
                         }
@@ -974,9 +994,9 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
                 Fields::Unnamed(_) => quote! {
                     #ident::#v_ident(
                         #(
-                            <#field_ty as ::kladde_traits::Persistable>::load(
+                            <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::load(
                                 backend,
-                                location + 4 + #field_offset,
+                                location + #field_offset,
                             ),
                         )*
                     )
@@ -994,14 +1014,14 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
             let field_name = &variant_field_name[i];
             let field_ty = &variant_field_ty[i];
             quote! {
-                ::kladde_traits::Variant {
+                ::kladde_persist::Variant {
                     discriminant: DISC[#i] as u64,
                     name: ::std::string::ToString::to_string(::std::stringify!(#v_ident)),
                     fields: ::std::vec![
                         #(
-                            ::kladde_traits::Field {
+                            ::kladde_persist::Field {
                                 name: ::std::string::ToString::to_string(#field_name),
-                                ty: <#field_ty as ::kladde_traits::Persistable>::describe(
+                                ty: <#field_ty as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::describe(
                                     __builder,
                                 ),
                             },
@@ -1024,12 +1044,12 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
             /// (mutating a field within the current variant in place,
             /// and/or matching directly on this guard).
             #vis fn set(&mut self, mut value: #ident #type_generics) {
-                ::kladde_traits::Persistable::store(&mut value, self.backend, self.location);
+                <#ident #type_generics as ::kladde_persist::Persistable<::kladde_persist::Pointer>>::store(&mut value, self.backend, self.location);
                 *self.inner = value;
             }
         }
 
-        impl #impl_generics ::kladde_traits::Persistable for #ident #type_generics #where_clause {
+        impl #impl_generics ::kladde_persist::Persistable<::kladde_persist::Pointer> for #ident #type_generics #where_clause {
             const INLINE_SIZE: usize = 4 + {
                 let variant_sizes = [#(#variant_size),*];
                 let mut max = 0usize;
@@ -1045,17 +1065,26 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
 
             #guard_assoc
 
-            fn store<__B: ::kladde_traits::Backend>(&mut self, backend: &__B, location: ::kladde_traits::Location) {
+            fn store<__B: ::kladde_persist::WriteBackend<Pointer = ::kladde_persist::Pointer>>(&mut self, backend: &__B, location: ::kladde_persist::Location<::kladde_persist::Pointer, <__B as ::kladde_persist::Backend>::Size>) {
                 #discriminants
                 match self {
                     #(#variant_store_arm)*
                 }
             }
 
-            fn load<__B: ::kladde_traits::Backend>(backend: &__B, location: ::kladde_traits::Location) -> Self {
+            fn load<__B: ::kladde_persist::ReadBackend<Pointer = ::kladde_persist::Pointer>>(backend: &mut __B, location: ::kladde_persist::Location<::kladde_persist::Pointer, <__B as ::kladde_persist::Backend>::Size>) -> Self {
                 #discriminants
-                let discriminant_bytes = ::kladde_traits::Allocator::read(backend, location.anchor, location.offset, 4);
-                let discriminant = u32::from_le_bytes(discriminant_bytes.try_into().unwrap());
+                let discriminant = {
+                    let mut __buf = [0u8; 4];
+                    let mut __cursor = ::kladde_persist::ReadBackend::read_at(
+                        backend,
+                        location.anchor,
+                        location.offset,
+                    );
+                    ::std::io::Read::read_exact(&mut __cursor, &mut __buf)
+                        .expect("read enum discriminant");
+                    u32::from_le_bytes(__buf)
+                };
                 #(
                     if discriminant == DISC[#variant_index] {
                         return #variant_load_expr;
@@ -1069,13 +1098,13 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
             }
 
             fn describe_local(
-                __builder: &mut ::kladde_traits::SchemaBuilder,
-            ) -> ::kladde_traits::TypeDescriptor
+                __builder: &mut ::kladde_persist::SchemaBuilder,
+            ) -> ::kladde_persist::TypeDescriptor
             where
                 Self: 'static,
             {
                 #discriminants
-                ::kladde_traits::TypeDescriptor::Enum {
+                ::kladde_persist::TypeDescriptor::Enum {
                     name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
                     discriminant_width: 4,
                     variants: ::std::vec![

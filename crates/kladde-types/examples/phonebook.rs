@@ -7,10 +7,9 @@
 //!
 //! v1 has no real file behind any of this (see `spec.md`'s "Crash
 //! Consistency" note) -- state lives only for the duration of this
-//! process. Every mutating command still gets recorded to an in-memory
-//! journal of microoperations; the count printed after each command is
-//! that journal growing, and `flush` (or quitting) drains it by replaying
-//! everything into the (also in-memory, mock) allocator.
+//! process. The default backend applies every mutation immediately, so the
+//! count printed after each command is the number of live allocations in the
+//! heap; `flush` (or quitting) runs a bounded compaction round over them.
 
 use kladde::Kladde;
 use kladde_types::{Persistable, PersistableHashMap, PersistableString, PersistableVec};
@@ -72,7 +71,7 @@ fn main() {
             "help" => print_help(),
             "flush" => {
                 book.flush();
-                println!("flushed (journal entries: {})", journal_len(&book));
+                println!("flushed (live allocations: {})", live_allocations(&book));
             }
             "add" => match words.as_slice() {
                 [_, name, email] => {
@@ -83,7 +82,10 @@ fn main() {
                             phones: PersistableVec::new(),
                         },
                     );
-                    println!("added {name} (journal entries: {})", journal_len(&book));
+                    println!(
+                        "added {name} (live allocations: {})",
+                        live_allocations(&book)
+                    );
                 }
                 _ => println!("usage: add <name> <email>"),
             },
@@ -103,7 +105,10 @@ fn main() {
                         }
                     };
                     if found {
-                        println!("updated email (journal entries: {})", journal_len(&book));
+                        println!(
+                            "updated email (live allocations: {})",
+                            live_allocations(&book)
+                        );
                     } else {
                         println!("no such contact: {name}");
                     }
@@ -135,8 +140,8 @@ fn main() {
                     };
                     if found {
                         println!(
-                            "added phone number (journal entries: {})",
-                            journal_len(&book)
+                            "added phone number (live allocations: {})",
+                            live_allocations(&book)
                         );
                     } else {
                         println!("no such contact: {name}");
@@ -177,8 +182,8 @@ fn main() {
                     };
                     if found {
                         println!(
-                            "updated email and added phone (journal entries: {})",
-                            journal_len(&book)
+                            "updated email and added phone (live allocations: {})",
+                            live_allocations(&book)
                         );
                     } else {
                         println!("no such contact: {name}");
@@ -194,7 +199,10 @@ fn main() {
                     .contacts_mut()
                     .remove(&PersistableString::from(*name))
                 {
-                    Some(_) => println!("removed {name} (journal entries: {})", journal_len(&book)),
+                    Some(_) => println!(
+                        "removed {name} (live allocations: {})",
+                        live_allocations(&book)
+                    ),
                     None => println!("no such contact: {name}"),
                 },
                 _ => println!("usage: remove <name>"),
@@ -226,13 +234,14 @@ fn main() {
 
     book.flush();
     println!(
-        "goodbye -- {} contact(s), flushed and 0 op(s) left in the journal",
+        "goodbye -- {} contact(s), {} live allocation(s) after compaction",
         book.get().contacts.len(),
+        live_allocations(&book),
     );
 }
 
-fn journal_len(book: &Kladde<AddressBook>) -> usize {
-    book.backend().journal_len()
+fn live_allocations(book: &Kladde<AddressBook>) -> usize {
+    book.backend().live_count()
 }
 
 fn print_help() {

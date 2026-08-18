@@ -1,8 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/kladde-traits",
-    "crates/kladde-alloc",
     "crates/kladde",
     "crates/kladde-derive",
     "crates/kladde-types",
@@ -18,8 +16,6 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
-kladde-traits = { path = "crates/kladde-traits" }
-kladde-alloc = { path = "crates/kladde-alloc" }
 kladde = { path = "crates/kladde" }
 kladde-derive = { path = "crates/kladde-derive" }
 kladde-types = { path = "crates/kladde-types" }

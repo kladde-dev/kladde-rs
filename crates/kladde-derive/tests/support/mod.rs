@@ -1,36 +1,47 @@
-//! Shared test fixtures for exercising `#[derive(Persistable)]`-generated
-//! code: a minimal hand-written "leaf" `Persistable` type (standing in
-//! for what `kladde-traits`' primitive blanket impls provide) and a real,
-//! flush-capable mock `Backend`.
+//! Shared test fixtures for exercising `#[derive(Persistable)]`-generated code:
+//! a minimal hand-written "leaf" `Persistable` type (standing in for what
+//! `kladde-persist`'s primitive blanket impls provide) over the real
+//! `kladde_persist::MockBackend`.
 //!
-//! Not every item here is used by every test binary that includes this
-//! module (each `tests/*.rs` file compiles as its own crate) -- allowed
-//! rather than split further, since it's `#[cfg(test)]`-only fixture code.
+//! Not every item here is used by every test binary that includes this module
+//! (each `tests/*.rs` file compiles as its own crate) -- allowed rather than
+//! split further, since it's `#[cfg(test)]`-only fixture code.
 #![allow(dead_code)]
 
-use kladde_traits::{
-    Allocator, Guard, Location, Persistable, RawPointer, ResolvedPointer, UniquePointerResizable,
+use kladde_persist::{
+    Backend, Guard, Location, Persistable, PointerRepr, ReadBackend, Word, WriteBackend,
 };
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::num::NonZeroU32;
+use std::io::Read;
+
+pub use kladde_persist::MockBackend;
+
+/// The pointer/size types the mock backend works in, so tests can name a
+/// `Location` without spelling out associated types.
+pub type MockLocation = Location<<MockBackend as Backend>::Pointer, <MockBackend as Backend>::Size>;
+
+/// Hands out a location backed by a real allocation, sized for whatever root
+/// type a test uses.
+pub fn root_location(backend: &MockBackend, size: usize) -> MockLocation {
+    let pointer = backend.alloc_fixed_size(Word::from_usize(size));
+    Location::new(pointer.raw(), 0)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Number(pub i32);
 
-impl Persistable for Number {
+impl<P: PointerRepr> Persistable<P> for Number {
     const INLINE_SIZE: usize = 4;
 
-    type Guard<'s, B: kladde_traits::Backend>
+    type Guard<'s, B: WriteBackend<Pointer = P>>
         = NumberGuard<'s, B>
     where
         Self: 's,
         B: 's;
 
-    fn guard<'s, B: kladde_traits::Backend>(
+    fn guard<'s, B: WriteBackend<Pointer = P>>(
         &'s mut self,
         backend: &'s B,
-        location: Location,
+        location: Location<P, B::Size>,
     ) -> Self::Guard<'s, B> {
         NumberGuard {
             inner: self,
@@ -39,29 +50,33 @@ impl Persistable for Number {
         }
     }
 
-    fn store<B: kladde_traits::Backend>(&mut self, backend: &B, location: Location) {
+    fn store<B: WriteBackend<Pointer = P>>(&mut self, backend: &B, location: Location<P, B::Size>) {
         backend.write(location.anchor, location.offset, &self.0.to_le_bytes());
     }
 
-    fn load<B: kladde_traits::Backend>(backend: &B, location: Location) -> Self {
-        let bytes = backend.read(location.anchor, location.offset, 4);
-        Number(i32::from_le_bytes(bytes.try_into().unwrap()))
+    fn load<B: ReadBackend<Pointer = P>>(backend: &mut B, location: Location<P, B::Size>) -> Self {
+        let mut bytes = [0u8; 4];
+        backend
+            .read_at(location.anchor, location.offset)
+            .read_exact(&mut bytes)
+            .expect("read Number");
+        Number(i32::from_le_bytes(bytes))
     }
 
     fn describe_local(
-        _builder: &mut kladde_traits::SchemaBuilder,
-    ) -> kladde_traits::TypeDescriptor {
-        kladde_traits::TypeDescriptor::Primitive(kladde_traits::Primitive::I32)
+        _builder: &mut kladde_persist::SchemaBuilder,
+    ) -> kladde_persist::TypeDescriptor {
+        kladde_persist::TypeDescriptor::Primitive(kladde_persist::Primitive::I32)
     }
 }
 
-pub struct NumberGuard<'s, B> {
+pub struct NumberGuard<'s, B: WriteBackend> {
     inner: &'s mut Number,
     backend: &'s B,
-    location: Location,
+    location: Location<B::Pointer, B::Size>,
 }
 
-impl<'s, B: kladde_traits::Backend> NumberGuard<'s, B> {
+impl<'s, B: WriteBackend> NumberGuard<'s, B> {
     pub fn set(&mut self, value: i32) {
         self.backend.write(
             self.location.anchor,
@@ -72,7 +87,7 @@ impl<'s, B: kladde_traits::Backend> NumberGuard<'s, B> {
     }
 }
 
-impl<'s, B: kladde_traits::Backend> Guard for NumberGuard<'s, B> {
+impl<'s, B: WriteBackend> Guard for NumberGuard<'s, B> {
     type Persistable = Number;
     type Backend = B;
 
@@ -84,85 +99,5 @@ impl<'s, B: kladde_traits::Backend> Guard for NumberGuard<'s, B> {
     }
     fn backend(&self) -> &B {
         self.backend
-    }
-}
-
-/// A real, in-memory-materialized (not deferred-to-flush) backend for
-/// tests: `alloc` both mints an index *and* immediately materializes it,
-/// so tests can `write`/`read` and check results without a separate
-/// flush step. `root_location` hands out a location backed by a real
-/// allocation, sized for whatever root type a test uses.
-#[derive(Default)]
-pub struct MockBackend {
-    regions: RefCell<HashMap<NonZeroU32, Vec<u8>>>,
-    next_index: std::cell::Cell<u32>,
-}
-
-impl MockBackend {
-    pub fn root_location(&self, size: usize) -> Location {
-        let pointer = self.alloc_fixed(size);
-        Location {
-            anchor: pointer.raw(),
-            offset: 0,
-        }
-    }
-}
-
-impl Allocator for MockBackend {
-    fn read(&self, target: RawPointer, offset: u32, len: u32) -> Vec<u8> {
-        let regions = self.regions.borrow();
-        let region = &regions[&target.index()];
-        region[offset as usize..(offset + len) as usize].to_vec()
-    }
-    fn write(&self, target: RawPointer, offset: u32, bytes: &[u8]) {
-        let mut regions = self.regions.borrow_mut();
-        let region = regions.get_mut(&target.index()).unwrap();
-        let start = offset as usize;
-        if region.len() < start + bytes.len() {
-            region.resize(start + bytes.len(), 0);
-        }
-        region[start..start + bytes.len()].copy_from_slice(bytes);
-    }
-    fn copy(&self, src: RawPointer, src_offset: u32, len: u32, dst: RawPointer, dst_offset: u32) {
-        let bytes = self.read(src, src_offset, len);
-        self.write(dst, dst_offset, &bytes);
-    }
-    fn alloc_resizable(&self, byte_size: usize) -> UniquePointerResizable {
-        let raw = self.next_index.get() + 1;
-        self.next_index.set(raw);
-        let index = NonZeroU32::new(raw).unwrap();
-        self.regions
-            .borrow_mut()
-            .insert(index, vec![0u8; byte_size]);
-        UniquePointerResizable::from_index(index)
-    }
-    fn free_resizable(&self, pointer: UniquePointerResizable) {
-        self.regions.borrow_mut().remove(&pointer.index());
-    }
-    fn resize(&self, pointer: &UniquePointerResizable, new_byte_size: usize) {
-        let mut regions = self.regions.borrow_mut();
-        let region = regions.get_mut(&pointer.index()).unwrap();
-        region.resize(new_byte_size, 0);
-    }
-    fn splice(
-        &self,
-        pointer: &UniquePointerResizable,
-        byte_offset: u32,
-        old_byte_len: u32,
-        new: &[u8],
-    ) {
-        let mut regions = self.regions.borrow_mut();
-        let region = regions.get_mut(&pointer.index()).unwrap();
-        let start = byte_offset as usize;
-        region.splice(start..start + old_byte_len as usize, new.iter().copied());
-    }
-    fn capacity(&self, pointer: &UniquePointerResizable) -> Option<usize> {
-        self.regions.borrow().get(&pointer.index()).map(Vec::len)
-    }
-    fn resolve(&self, pointer: RawPointer) -> Option<ResolvedPointer<'_>> {
-        self.regions
-            .borrow()
-            .contains_key(&pointer.index())
-            .then(|| ResolvedPointer::from_target(pointer.index()))
     }
 }
