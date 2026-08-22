@@ -3,7 +3,8 @@
 //! `Kladde` (store + flush + reload).
 
 use kladde::Kladde;
-use kladde_types::{Persistable, PersistableString, PersistableVec};
+use kladde::Persistable;
+use kladde_types::{PersistableString, PersistableVec};
 
 #[test]
 fn tuple_as_a_vec_element_round_trips() {

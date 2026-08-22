@@ -4,16 +4,17 @@
 //! eyeballing what `#[derive(Persistable)]` produces and for reading off
 //! golden-vector fingerprints.
 
-use kladde_types::{Persistable, PersistableString, PersistableVec, TypeDescriptor};
+use kladde::Persistable;
+use kladde_types::{PersistableString, PersistableVec, TypeDescriptor};
 
-#[derive(kladde_types::Persistable)]
+#[derive(kladde::Persistable)]
 enum PhoneKind {
     Mobile,
     Work,
     Home,
 }
 
-#[derive(kladde_types::Persistable)]
+#[derive(kladde::Persistable)]
 struct Contact {
     name: PersistableString,
     kind: PhoneKind,

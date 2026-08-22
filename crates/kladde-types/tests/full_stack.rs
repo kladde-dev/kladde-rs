@@ -5,7 +5,8 @@
 //! reconstructing everything fresh purely from the backend's storage.
 
 use kladde::Kladde;
-use kladde_types::{Persistable, PersistableHashMap, PersistableString, PersistableVec};
+use kladde::Persistable;
+use kladde_types::{PersistableHashMap, PersistableString, PersistableVec};
 
 #[derive(Persistable, Debug, PartialEq)]
 enum Role {

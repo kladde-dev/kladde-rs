@@ -12,7 +12,8 @@
 //! heap; `flush` (or quitting) runs a bounded compaction round over them.
 
 use kladde::Kladde;
-use kladde_types::{Persistable, PersistableHashMap, PersistableString, PersistableVec};
+use kladde::Persistable;
+use kladde_types::{PersistableHashMap, PersistableString, PersistableVec};
 use std::io::{self, Write};
 
 #[derive(Persistable, Debug)]

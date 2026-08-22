@@ -1,28 +1,29 @@
 //! End-to-end `describe`/`schema`/`fingerprint` over real `Persistable`
 //! types: derived structs and enums, built-in containers, and recursion.
 
-use kladde_types::{Persistable, PersistableString, PersistableVec};
+use kladde::Persistable;
+use kladde_types::{PersistableString, PersistableVec};
 
-#[derive(kladde_types::Persistable)]
+#[derive(kladde::Persistable)]
 struct Point {
     x: i32,
     y: i32,
 }
 
 // Same field names and types as `Point`; only the type's own name differs.
-#[derive(kladde_types::Persistable)]
+#[derive(kladde::Persistable)]
 struct Coordinate {
     x: i32,
     y: i32,
 }
 
-#[derive(kladde_types::Persistable)]
+#[derive(kladde::Persistable)]
 struct PointSwapped {
     y: i32,
     x: i32,
 }
 
-#[derive(kladde_types::Persistable)]
+#[derive(kladde::Persistable)]
 struct PointRenamedField {
     x: i32,
     z: i32,
@@ -41,7 +42,7 @@ fn type_name_does_not_affect_fingerprint_but_field_name_and_order_do() {
     assert_ne!(base, PointRenamedField::fingerprint(), "field name matters");
 }
 
-#[derive(kladde_types::Persistable)]
+#[derive(kladde::Persistable)]
 struct WithContainers {
     name: PersistableString,
     scores: PersistableVec<i32>,
@@ -55,7 +56,7 @@ fn containers_fingerprint_stably() {
     assert_eq!(WithContainers::schema().descriptors().len(), 4);
 }
 
-#[derive(kladde_types::Persistable)]
+#[derive(kladde::Persistable)]
 enum Shape {
     Empty,
     Circle(i32),
@@ -69,7 +70,7 @@ fn enum_fingerprint_is_stable() {
 
 // A recursive type: a tree whose children are more trees. `Tree` reaches
 // itself through `PersistableVec<Tree>`, exercising the de Bruijn back-edge.
-#[derive(kladde_types::Persistable)]
+#[derive(kladde::Persistable)]
 struct Tree {
     value: i32,
     children: PersistableVec<Tree>,
@@ -85,12 +86,12 @@ fn recursive_type_fingerprints_reproducibly() {
 
 #[test]
 fn explicit_enum_discriminants_are_honored() {
-    #[derive(kladde_types::Persistable)]
+    #[derive(kladde::Persistable)]
     enum Explicit {
         A = 10,
         B = 20,
     }
-    #[derive(kladde_types::Persistable)]
+    #[derive(kladde::Persistable)]
     enum Implicit {
         A,
         B,

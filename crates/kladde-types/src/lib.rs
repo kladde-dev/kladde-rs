@@ -6,8 +6,11 @@
 //! rather than derive-macro output, the same way `std`'s own collections
 //! hand-write unsafe raw-pointer manipulation internally.
 //!
-//! Also re-exports the [`Persistable`](kladde_derive::Persistable) derive macro
-//! for convenience, so application crates only need one dependency.
+//! This crate is a *default* library, not a layer of the system: nothing
+//! depends on it, and everything in it is written against the same public
+//! `Persistable`/`Guard` surface any third-party crate can use. The derive
+//! macro is not re-exported here -- it comes from `kladde`, which is where
+//! generated code is rooted.
 
 #[cfg(feature = "serde")]
 mod blob;
@@ -23,18 +26,6 @@ pub use blob::{PersistableBlob, PersistableBlobEdit, PersistableBlobGuard};
 pub use map::{PersistableHashMap, PersistableHashMapGuard};
 pub use string::{PersistableString, PersistableStringGuard};
 pub use vec::{PersistableVec, PersistableVecGuard};
-
-// `Persistable` here names two different things in two different namespaces --
-// the trait (from `kladde-persist`) and the derive macro (from `kladde-derive`)
-// -- the same way `serde::Serialize` does for the trait/derive pair it
-// re-exports.
-//
-// The scalar `*Guard` blanket-impl types (`I32Guard`, `BoolGuard`, ...) live in
-// `kladde-persist`, not here -- `impl Persistable for i32` inside this crate
-// would be `impl ForeignTrait for ForeignType`, which the orphan rules forbid;
-// `kladde-persist` (where `Persistable` is defined) is the only place that impl
-// is legal. Re-exported here so application code only needs one dependency.
-pub use kladde_derive::Persistable;
 
 /// This crate's own version, used as the `Opaque` descriptor version for every
 /// built-in container (`type-descriptors.md` §2.4). Kept in sync with

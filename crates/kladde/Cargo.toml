@@ -8,3 +8,11 @@ publish.workspace = true
 [dependencies]
 kladde-heap = { workspace = true }
 kladde-persist = { workspace = true }
+kladde-derive = { workspace = true, optional = true }
+
+[features]
+# On by default, as serde does: `#[derive(Persistable)]` is what most
+# application code reaches for first, and generated code names `::kladde`,
+# so the macro and the items it needs arrive together or not at all.
+default = ["derive"]
+derive = ["dep:kladde-derive"]

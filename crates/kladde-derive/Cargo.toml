@@ -14,4 +14,7 @@ quote = { workspace = true }
 proc-macro2 = { workspace = true }
 
 [dev-dependencies]
+# The tests exercise the default path, where generated code names `::kladde`.
+# `kladde-persist` stays for the `#[kladde(crate = "...")]` escape hatch.
+kladde = { workspace = true }
 kladde-persist = { workspace = true }

@@ -33,7 +33,7 @@ use std::ops::Deref;
 /// simply fails to compile under `#[derive(Persistable)]`.
 ///
 /// ```compile_fail
-/// use kladde_types::Persistable;
+/// use kladde::Persistable;
 ///
 /// #[derive(Persistable)]
 /// struct Contact {
@@ -44,7 +44,8 @@ use std::ops::Deref;
 /// Swapping in `PersistableString` fixes the exact same struct:
 ///
 /// ```
-/// use kladde_types::{Persistable, PersistableString};
+/// use kladde::Persistable;
+/// use kladde_types::PersistableString;
 ///
 /// #[derive(Persistable)]
 /// struct Contact {

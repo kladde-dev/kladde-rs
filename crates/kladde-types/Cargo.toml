@@ -7,7 +7,6 @@ publish.workspace = true
 
 [dependencies]
 kladde-persist = { workspace = true }
-kladde-derive = { workspace = true }
 serde = { workspace = true, optional = true }
 postcard = { workspace = true, optional = true }
 

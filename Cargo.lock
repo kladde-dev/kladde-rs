@@ -358,6 +358,7 @@ dependencies = [
 name = "kladde"
 version = "0.1.0"
 dependencies = [
+ "kladde-derive",
  "kladde-heap",
  "kladde-persist",
 ]
@@ -366,6 +367,7 @@ dependencies = [
 name = "kladde-derive"
 version = "0.1.0"
 dependencies = [
+ "kladde",
  "kladde-persist",
  "proc-macro2",
  "quote",
@@ -401,7 +403,6 @@ name = "kladde-types"
 version = "0.1.0"
 dependencies = [
  "kladde",
- "kladde-derive",
  "kladde-persist",
  "postcard",
  "serde",
