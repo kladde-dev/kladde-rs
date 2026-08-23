@@ -1,13 +1,13 @@
 //! The backend trait split: [`Backend`] (shared type carrier + read-only
-//! allocator queries), [`ReadBackend`] (stored-byte reads, `&mut self`), and
+//! heap queries), [`ReadBackend`] (stored-byte reads, `&mut self`), and
 //! [`WriteBackend`] (stored-byte writes + address-hidden allocation, `&self`).
 //!
-//! A backend is **composed of** an [`Allocator`](crate::Allocator) and a
-//! [`Storage`](crate::Storage) -- it does *not* extend `Allocator`. That lets the
-//! two layers choose their `&self`/`&mut self` and their address visibility
-//! independently: the reusable `Allocator` keeps a plain `&mut self` API, while
-//! the backend presents the `&self` write facade the guard model needs (its
-//! interior mutability lives in the concrete backend, never in the allocator).
+//! A backend is **composed of** a [`RelocatableHeap`](crate::RelocatableHeap) and
+//! a [`Storage`](crate::Storage) -- it does *not* extend `RelocatableHeap`. That
+//! lets the two layers choose their `&self`/`&mut self` and their address
+//! visibility independently: the reusable heap keeps a plain `&mut self` API,
+//! while the backend presents the `&self` write facade the guard model needs (its
+//! interior mutability lives in the concrete backend, never in the heap).
 //!
 //! ## Why the read/write split, and the `&self`/`&mut self` asymmetry
 //!
@@ -32,11 +32,13 @@ use crate::heap::CompactionProgress;
 use crate::pointer::{ResolvedPointer, UniquePointerFixedSize, UniquePointerResizable};
 use crate::word::Word;
 
-/// Backend-layer error. The backend owns the id table, so a bad/corrupt *id* is
-/// its error (`DanglingPointer`/`WrongSizedness`, folded in from the old
-/// allocator error); it also touches `Storage`, hence `Io`. The allocator's own
-/// `OutOfMemory`/`Overlap` don't appear here -- the write path treats them as
-/// impossible (in-memory) and unwraps.
+/// Backend-layer error. A bad/corrupt *id* is the backend's error
+/// (`DanglingPointer`/`WrongSizedness`) even though the heap owns the
+/// `id -> address` table, because the backend is what mints ids and decodes them
+/// off the file; it also touches `Storage`, hence `Io`. The heap's own
+/// [`HeapError`](crate::HeapError) variants don't appear here -- the write path
+/// treats `OutOfMemory` as impossible (in-memory) and unwraps, and
+/// `UnknownId`/`DuplicateId` surface as `DanglingPointer`.
 #[derive(Debug)]
 pub enum BackendError {
     /// The id isn't a live allocation (freed / never existed / corrupt bytes).
@@ -62,7 +64,7 @@ impl std::fmt::Display for BackendError {
 }
 impl std::error::Error for BackendError {}
 
-/// Shared type carrier **and** the always-safe read-only allocator queries.
+/// Shared type carrier **and** the always-safe read-only heap queries.
 ///
 /// Every backend has exactly one `Pointer` and one `Size`, declared here once so
 /// the two halves structurally can't disagree and `B::Pointer`/`B::Size` stay
@@ -81,9 +83,9 @@ impl std::error::Error for BackendError {}
 pub trait Backend {
     /// The concrete, serialized id (e.g. `Pointer<u32>`).
     ///
-    /// Bounded by [`PointerRepr`] rather than merely `Copy` so that every
-    /// downstream guard and container can serialize an `Option<Self::Pointer>`
-    /// without restating the bound.
+    /// Bounded by [`PointerRepr`](crate::PointerRepr) rather than merely `Copy`
+    /// so that every downstream guard and container can serialize an
+    /// `Option<Self::Pointer>` without restating the bound.
     type Pointer: crate::PointerRepr;
     /// Offsets and allocation sizes.
     type Size: Word;
@@ -133,10 +135,10 @@ pub trait ReadBackend: Backend {
 
 /// Write access to *stored bytes*, plus **address-hidden** allocation. All
 /// methods take `&self` (the guard-reborrow model); the interior mutability this
-/// needs lives inside the concrete backend, never in the reusable `Allocator`.
-/// Addresses never surface here: the backend owns the id table and consumes the
-/// allocator's relocation report (`Allocator::resize`'s `Option<Address>`)
-/// internally to move bytes.
+/// needs lives inside the concrete backend, never in the reusable heap.
+/// Addresses never surface here: the backend consumes the heap's relocation
+/// report ([`RelocatableHeap::resize`](crate::RelocatableHeap::resize)'s
+/// [`Relocation`](crate::Relocation)) internally to move bytes.
 pub trait WriteBackend: Backend {
     fn alloc_resizable(&self, size: Self::Size) -> UniquePointerResizable<Self::Pointer>;
     fn alloc_fixed_size(&self, size: Self::Size) -> UniquePointerFixedSize<Self::Pointer>;
@@ -151,9 +153,12 @@ pub trait WriteBackend: Backend {
         new_size: Self::Size,
     ) -> Result<(), BackendError>;
 
-    /// Convert a fixed-size allocation to resizable, keeping the same id (the
-    /// backend re-tags sizedness in its table and relocates the bytes via
-    /// `free` + `alloc`). There is no allocator-level `make_*`.
+    /// Convert a fixed-size allocation to resizable, **minting a new id**:
+    /// sizedness rides on the id itself, so there is nothing to re-tag in place.
+    /// The backend allocates a fresh range of the new sizedness, copies
+    /// `min(old_size, new_size)` bytes across, and frees the old one; the single
+    /// owner is handed the new id back, which is what keeps this sound. There is
+    /// no heap-level `make_*`.
     fn make_resizable(
         &self,
         p: UniquePointerFixedSize<Self::Pointer>,
