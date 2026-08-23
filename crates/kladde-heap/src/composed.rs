@@ -154,7 +154,16 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Composed<S, H, W>
         p: &UniquePointerResizable<Pointer<W>>,
         new_size: H::Size,
     ) -> Result<(), BackendError> {
-        let id = p.raw();
+        self.resize_by_id(p.raw(), new_size)
+    }
+
+    /// [`resize`](Self::resize) addressed by id rather than by owned handle, for
+    /// the journal replayer -- which holds ids, never handles.
+    pub(crate) fn resize_by_id(
+        &mut self,
+        id: Pointer<W>,
+        new_size: H::Size,
+    ) -> Result<(), BackendError> {
         let (_, old_size) = self.heap.lookup(id).ok_or(BackendError::DanglingPointer)?;
         let moved = self
             .heap
@@ -195,11 +204,25 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Composed<S, H, W>
         new_size: H::Size,
         new_sizedness: Sizedness,
     ) -> Result<Pointer<W>, BackendError> {
+        let new_id = self.mint(new_sizedness);
+        self.convert_to(old_id, new_id, new_size)?;
+        Ok(new_id)
+    }
+
+    /// [`convert`](Self::convert) with the new id supplied rather than minted.
+    ///
+    /// The journal replayer needs this: the log already recorded which id the
+    /// conversion produced, so replay must reuse it rather than mint a second one.
+    pub(crate) fn convert_to(
+        &mut self,
+        old_id: Pointer<W>,
+        new_id: Pointer<W>,
+        new_size: H::Size,
+    ) -> Result<(), BackendError> {
         let (old_addr, old_size) = self
             .heap
             .lookup(old_id)
             .ok_or(BackendError::DanglingPointer)?;
-        let new_id = self.mint(new_sizedness);
         let new_addr = self
             .heap
             .alloc(new_id, new_size)
@@ -208,7 +231,7 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Composed<S, H, W>
         self.cover(new_addr, new_size)?;
         self.copy_bytes(old_addr, new_addr, copy_len)?;
         self.free(old_id);
-        Ok(new_id)
+        Ok(())
     }
 
     pub(crate) fn make_resizable(
@@ -240,7 +263,17 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Composed<S, H, W>
         old_len: H::Size,
         new: &[u8],
     ) {
-        let id = p.raw();
+        self.splice_by_id(p.raw(), offset, old_len, new)
+    }
+
+    /// [`splice`](Self::splice) addressed by id, for the journal replayer.
+    pub(crate) fn splice_by_id(
+        &mut self,
+        id: Pointer<W>,
+        offset: H::Size,
+        old_len: H::Size,
+        new: &[u8],
+    ) {
         let (_, size) = self.heap.lookup(id).expect("splice of a dangling handle");
         let old_size = size.to_usize();
         let off = offset.to_usize();
@@ -256,7 +289,7 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Composed<S, H, W>
 
         // Resize to fit `new` in place of the spliced-out range.
         let new_size: H::Size = Word::from_usize(off + new.len() + tail_len);
-        self.resize(p, new_size).expect("splice resize");
+        self.resize_by_id(id, new_size).expect("splice resize");
 
         // Lay down `new`, then the saved tail immediately after it.
         self.seek_to(id, offset).expect("seek for splice write");

@@ -27,6 +27,7 @@ mod composed;
 mod evacuation_index;
 mod gain_greedy;
 mod heap;
+mod journal;
 mod journaled;
 mod mock;
 mod pointer;
