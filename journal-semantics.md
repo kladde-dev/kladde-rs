@@ -739,37 +739,127 @@ the fold, so the number and order of hoisted reads is known to recovery, which c
 consume the hoist blob **positionally**. No per-item delimiters — one length and one
 checksum over the whole blob.
 
-### 9.5 Framing: checksums and epochs
+### 9.5 Framing, and the unit of durability
 
-Two distinct jobs, and a checksum only does one of them.
+Ops are grouped into **frames**. A frame is self-delimiting — a header carrying
+`byte_len` and a checksum, then that many bytes of ops — so the next frame begins
+immediately after, at no particular alignment. Frames are **variable-length and
+never padded**: with the length in the header, a reader walks the chain from the
+start and always knows where the next one begins.
+
+(SQLite pads because its frames each carry exactly one fixed-size database page.
+That constraint comes from its payload domain, not from checksumming, and does not
+apply here.)
+
+**The write granularity decides the checksum granularity, not the other way
+round.** A frame's checksum cannot be computed until the frame is complete, so a
+frame is exactly what one `write()` emits. That makes the real question "how often
+do we call `write()`", which is a durability question, not a framing one:
+
+| write granularity | loss window on a process crash |
+| --- | --- |
+| one frame per op | the op in flight |
+| one frame per group of ops | everything buffered since the last frame |
+
+Tying frames to a fixed byte budget — fill 4 KiB, then write — is the tempting
+answer and the wrong one. It makes durability depend on how fast the user happens
+to be typing, so a pause leaves recent edits in memory indefinitely; fixing that
+with a timer puts "how much work may be lost" inside a library that cannot know the
+answer. That belongs to the application.
+
+So: **one frame per op by default.** An op that reaches the journal with a valid
+checksum is persisted. At roughly 1–2 µs per `write()` on a page-cached file, that
+costs 0.01–0.2 % of a core at interactive rates (10–1000 ops/s) and becomes
+significant only in bulk work — which is what §9.5.1 gives an explicit escape hatch
+for.
 
 **Checksums detect a torn tail.** Use **CRC-32C** (Castagnoli): 4 bytes, hardware
 accelerated on x86-64 (SSE4.2 `crc32`) and AArch64 (the CRC32 extension), and with
 *provable* burst-error detection up to 32 bits, which XXH3 and friends do not offer.
-Speed is not the deciding factor here — correctness guarantees on short records are.
+Speed is not the deciding factor — correctness guarantees on short frames are.
 
-Where to put it matters more than which function:
+**Chain the checksums**, SQLite-style: each frame's CRC is computed over its own
+content *and* the previous frame's CRC. This subsumes the epoch counter. After a
+checkpoint releases a journal prefix, that file region gets reused, and a stale
+frame left there has a *perfectly valid* standalone CRC — a checksum alone cannot
+tell it is from a previous life. A chained CRC can, because the stale frame's
+running value will not match the current chain. It also catches reordering, and it
+costs nothing extra in bytes: one salt in the journal header replaces a per-frame
+epoch.
 
-| scheme | overhead on a ~20-byte op | notes |
-| --- | --- | --- |
-| per-op CRC-32C | +4 bytes ≈ **20–25%** | per-op recovery granularity, but ruinous for small ops |
-| per-4 KiB-block CRC-32C | 4 bytes / 4096 ≈ **0.1%** | what SQLite's WAL and PostgreSQL's page CRCs do |
+Per-op framing therefore costs a `u32` CRC plus a small length field — call it 5–6
+bytes on a ~20-byte op, so 25–30 %. That is **journal** space, which is truncated
+at every checkpoint, not permanent growth of the data region.
 
-kladde's ops are deliberately fine-grained and therefore small, so **per-block wins
-decisively**. Let ops span block boundaries (rather than padding, as SQLite does) and
-validate the block chain on recovery. A full block header of
-`{ epoch: u64, seq: u32, byte_len: u32, crc32c: u32 }` is 20 bytes per 4 KiB — about
-**0.5%**. The hoist blob is one contiguous region written once per flush, so a single
-CRC over the whole thing is negligible.
+The hoist blob is one contiguous region written once per flush, so a single length
+and CRC over the whole thing is negligible.
 
-**Epochs defeat stale records, which checksums cannot.** After a checkpoint releases
-a log prefix, that file region gets reused. A stale record left there has a
-*perfectly valid* CRC — a checksum has no way to know it is from a previous life. So
-each block header carries a monotonically increasing **epoch**, bumped whenever the
-log is reset or wrapped, and recovery accepts a block only if its epoch is the one it
-expects. This is what SQLite's rotating WAL salt and PostgreSQL's timeline IDs are
-for. A `u64` epoch never wraps in practice; a `u32` would need a rollover story and
-is not worth the 4 bytes saved.
+#### 9.5.1 Batches and transactions
+
+Two grouping concepts, deliberately distinct, because durability grouping and
+atomicity grouping are different things — the same split that lets a database offer
+deferred durability without weakening atomicity.
+
+- A **batch** is a group whose persistence *may* be deferred until the group ends.
+  It is a hint, not a guarantee: the backend may interrupt a long batch, frame what
+  it has, optionally flush, and open a new one. This is the tool for the bulk-import
+  case, and its interruptibility is what keeps the journal bounded without the
+  application having to think about it.
+- A **transaction** is a batch with **atomic** persistence: all of its ops are
+  applied or none are. It is the standard atomic commit unit.
+
+**Nesting flattens by subsumption**: an inner scope is absorbed into an outer one
+exactly when the outer guarantee is at least as strong as the inner. That single
+rule gives all four cases —
+
+| inner | outer | | |
+| --- | --- | --- | --- |
+| batch | batch | equal | flatten |
+| batch | transaction | outer stronger | flatten |
+| transaction | transaction | equal | flatten (**flat nesting**, as opposed to savepoints) |
+| **transaction** | **batch** | outer *weaker* | **stays explicit** |
+
+The last row is the whole point: a batch has no atomicity to lend, so absorbing a
+transaction into one would silently discard a guarantee the application asked for.
+
+One rule follows that is worth stating separately: **a batch may be interrupted only
+at a transaction boundary.** The backend's freedom to split is real, but it cannot
+cut through an atomic unit.
+
+**Assessment.** The split is right, and the subsumption rule is better than
+enumerating four cases — it is one comparison on an ordered enum, and it stays
+correct if a third level is ever added.
+
+Four things worth being explicit about:
+
+- **The journal bound becomes "largest transaction", not "batch size".** An
+  application that wraps its bulk import in one enormous *transaction* rather than a
+  batch reintroduces exactly the unbounded-journal problem the batch was meant to
+  solve. That is inherent to redo-only recovery (§9.2), not a flaw in the design,
+  but it should be documented where application authors will see it, because the two
+  spellings look interchangeable and are not.
+- **A transaction should buffer in memory and reach the journal at commit.** This
+  makes abort free — drop the buffer, nothing to undo, nothing to mark aborted — and
+  it delivers the one-checksum-per-transaction saving. It also composes with the
+  interruption rule: the backend cannot frame a partial transaction anyway.
+- **A batch is observationally invisible.** Because it promises no atomicity,
+  nothing can detect that one was split. That is what makes interruption safe, and
+  it means a batch must be documented as purely a performance hint so nobody builds
+  correctness on it.
+- **Nested batches need a depth count, not a flag**, so dropping an inner scope does
+  not end the outer one. Trivial, and trivially easy to get wrong.
+
+This also unifies a loose end in §9.1: a guard method is an **implicit
+transaction** — the smallest thing an application author perceives as one change,
+and already the natural atomicity boundary. An explicit transaction simply widens
+that boundary, and a batch widens the *durability* boundary without touching
+atomicity.
+
+Finally, transactions are not only an optimization. Until they exist, every
+multi-op guard method must be hand-audited so that any prefix of its ops leaves a
+valid state — the discipline in `later.md`'s write-ahead-logging section, whose cost
+scales with the number of container types. Transactions **retire** that discipline.
+That is an argument for their priority, not just their performance.
 
 ### 9.6 Which actions survive being replayed
 
@@ -838,7 +928,7 @@ Steps 1–7 are **done**; step 8 is not.
    implementable and `Copy` becomes addable.
 7. **The scheduler** (§5) — only if buffering measured in step 6 proves too
    expensive.
-8. **Durability** (§9): framed records with epochs and CRC-32C (§9.5), the durable
+8. **Durability** (§9): self-delimiting frames with chained CRC-32C (§9.5), the durable
    heap snapshot that `open` needs anyway, ordering the log append before the data
    writes, and the commit-prefix policy. Restartable flush arrives here.
 
@@ -849,7 +939,7 @@ Step 8 is deliberately last, and it is genuinely separable: the log is already t
 authority from step 1, so nothing above it changes shape when the log becomes
 durable. Two things make that separation hold rather than merely look plausible, and
 both are cheap enough to do early — the determinism assertion in step 3, and
-reserving the epoch/CRC header fields in the record format from the start even while
+reserving the length/CRC frame-header fields in the record format from the start even while
 writing zeros into them. Without those two, step 8 becomes a retrofit rather than an
 addition.
 
