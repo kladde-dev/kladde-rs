@@ -36,7 +36,9 @@ consequences of the ones that do not:
 3. **`make_*` on an allocation claimed by an earlier checkpoint loses its
    content.** The immediate path (`Composed::convert`) is
    `mint → alloc(new) → copy min(old,new) → free(old)`; the deferred path performs
-   only the `mint`. The copy is not deferred or approximated — it is absent.
+   only the `mint`. The copy is not deferred or approximated — it is absent. §4.3
+   fixes this by removing the copy rather than deferring it: the immediate path
+   relocates on *every* conversion, which is its own problem.
 
 The more fundamental statement of the same defect is not any of these. It is that
 **the journal does not record every mutation**, so a crash mid-transaction is
@@ -60,12 +62,16 @@ whose absence would make some other entry unreplayable or misinterpretable":
 | `Alloc(id, size)` | otherwise a `Write` has no target and a serialized id dangles. Sizedness rides on the id, so it needs no separate field. |
 | `Free(id)` | annihilation, and the id's release |
 | `Resize(id, size)` | bounds for replayed writes; content destruction |
-| `MakeFixed`/`MakeResizable(old → new, size)` | id identity across a sizedness conversion |
+| `ChangeSizedness(old → new)` | id identity when sizedness changes (§4.3) |
 | `Write(id, offset, bytes)` | content |
 | `Splice(id, offset, old_len, bytes)` | content, with a tail shift |
 
+`make_resizable`/`make_fixed_size` are **not** log ops. They decompose into a
+`ChangeSizedness` and a `Resize` (§4.3), which is what lets the common case move no
+bytes at all.
+
 A future `Copy(src, src_off, len, dst, dst_off)` joins the content group; §6 is
-written with it in mind because it is the operation that makes the scheduling
+written with it in mind because it is the only operation that makes the scheduling
 question interesting.
 
 Two derived structures, and it matters that they are derived:
@@ -122,10 +128,19 @@ Five states, of which two are "absent" and must be distinguished:
 | `Absent/dead` | no | no — never minted, or freed and already checkpointed | nothing |
 | `New(S)` | yes | no | `heap.alloc(id, S)` |
 | `Resized(S)` | yes | yes | `heap.resize(id, S)` |
+| `Relabelled { from, S }` | yes | under `from` | `heap.relabel(from, id)`, then `heap.resize(id, S)` if `S` changed, then recycle `from`'s counter |
 | `Freed` | yes | maybe | `heap.free(id)` **if live**, then recycle the counter |
 
-`New` and `Resized` are distinct because they call different heap methods, not
-because they carry different data.
+These are distinct because they call different heap methods, not because they carry
+different data. `relabel` is a new `RelocatableHeap` method: it rekeys one
+allocation in place — same address, same size — which for `GainGreedyHeap` means
+re-inserting its evacuation-index key with the other `is_fixed` bit. It copies no
+bytes.
+
+`Relabelled` owns *both* halves of a sizedness change, which is why the old id ends
+up with no entry at all rather than a `Freed` one: making the relabel responsible
+for recycling `from`'s counter removes an ordering coupling between two entries that
+would otherwise have to be processed in the right sequence.
 
 ### 3.1 Transitions
 
@@ -136,16 +151,21 @@ because they carry different data.
 | `resize` | `New(S)` | `New(S′)` | |
 | | `Absent/live` | `Resized(S′)` | |
 | | `Resized(S)` | `Resized(S′)` | |
+| | `Relabelled { from, S }` | `Relabelled { from, S′ }` | composes, so `ChangeSizedness; Resize` needs no extra state |
 | | `Freed`, `Absent/dead` | — | `Err(DanglingPointer)` |
-| `make_*` | old: `New(S)` | old: `Freed` | **two entries at once** |
-| | old: `Absent/live` / `Resized(S)` | old: `Freed` | + content must move (§6) |
-| | new: `Absent/dead` | new: `New(S′)` | fresh id, fresh counter |
+| `ChangeSizedness` | old: `New(S)`, and&nbsp;new: `Absent/dead` | old: `Absent/dead`, and&nbsp;new: `New(S)` | never claimed, so no relabel — just move the entry |
+| | old: `Absent/live` / `Resized(S)` / `Relabelled{..,S}`, and&nbsp;new: `Absent/dead` | old: `Absent/dead`, and&nbsp;new: `Relabelled { from: old, S }` | |
 | `splice` | as `resize` | as `resize` | size change plus content ops |
 | `free` | `Absent/live` | `Freed` | |
 | | `Resized(S)` | `Freed` | |
 | | `New(S)` | `Freed` | **not `Absent`** — see below |
-| checkpoint | `New` / `Resized` | `Absent/live` | map cleared |
+| | `Relabelled { from, S }` | `Freed` | degenerates to releasing `from`; both counters recycle |
+| checkpoint | `New` / `Resized` / `Relabelled` | `Absent/live` | map cleared |
 | | `Freed` | `Absent/dead` | counters recycled here, and only here |
+
+`ChangeSizedness` is the **only** op that mutates two entries in one call, which is
+why its rows name the old and the new id explicitly: the two columns of one row fire
+*together*, they are not alternatives.
 
 `write` earns a row precisely because it is a no-op on the map. If `write` ever
 needs to touch `pending`, something has gone wrong.
@@ -172,7 +192,7 @@ bytes.
 
 ```rust
 enum Source {
-    Literal(ArenaPos),      // bytes buffered in the journal's byte arena
+    Literal(LogOffset),     // bytes carried by a record in the log
     Storage(Id, Offset),    // must be read from the file
     Undefined,              // uninitialized; may be anything (§2.1)
 }
@@ -182,7 +202,14 @@ A piece table is a sorted map from **segment start offset** to `Source` — one 
 per segment boundary, never per byte. A byte's origin is found with
 `range(..=offset).next_back()`, giving `(seg_start, source)`; the origin is that
 source advanced by `offset - seg_start`. `Source` is offset-relative precisely so
-that advance is meaningful.
+that advance is meaningful — which is also what lets a `Literal` survive being
+partially overwritten, the survivor simply pointing into the middle of the original
+payload.
+
+`Literal` names a position in **the log**, whatever the log currently is: an
+in-memory byte buffer today, a framed on-disk record later. Nothing below depends on
+which, and §4.1 is written so the representation does not have to change when that
+does.
 
 The distinction that drives everything:
 
@@ -203,20 +230,52 @@ representation natural rather than bolted on.
 | `Resize(s′)` | clip to `s′`, or extend with `Undefined` |
 | `Splice(off, old_len, new)` | overwrite, then **shift the suffix segments** |
 | `Copy(src, …)` | overwrite the destination range with pieces taken from *src's current table* |
+| `ChangeSizedness(old → new)` | move the table to `new`, rewriting `Storage(old, k)` → `Storage(new, k)` (§4.3) |
 | `Free` | mark released |
 
 Overwrite is the only non-trivial primitive: split at both boundaries (materializing
 them from the covering segment), drop the entries strictly inside, insert the new
-one. **Coalesce on insert** — a loop of sequential writes produces adjacent literals
-contiguous in the arena, and without merging you get one entry per write where one
-per run would do. This is not a micro-optimization; it is what keeps the common case
-at one or two segments.
+one.
 
 The two questions this answers directly: `Alloc(s1); Resize(s2)` folds to a single
 `Alloc(s2)` with the clip deciding what happens to writes in between, and
 `Resize(s1); Resize(s2)` folds to a single `Resize(s2)` — where, if `s1 < s2`, the
 bytes in `[s1, s2)` become `Undefined` and may be left on disk exactly as they are.
 That last part is legal only because of §2.1.
+
+### 4.1.1 Two kinds of coalescing, and only one of them saves I/O
+
+It is tempting to merge adjacent segments in the table and call that the
+optimization. It is not, and conflating the two costs a lot of confusion:
+
+- **Source contiguity** — can two segments be represented as one `Source`? Two
+  `Literal`s can only merge if their log positions are adjacent, which they are
+  *not* in general: consecutive `Write` records are separated by the next record's
+  header. Two `Storage(id, base)` merge iff same `id` and `left.base + left.len ==
+  right.base`; two `Undefined` always merge.
+- **Destination contiguity** — can two segments be written with one call? This holds
+  *by construction*, since adjacent segments in a piece table are adjacent in the
+  destination allocation.
+
+Only the second saves I/O, and it does not care where the bytes came from. So the
+**emitter walks the table and issues one write per maximal run of resolvable
+segments**, gathering from wherever the sources happen to live. Table coalescing
+demotes to a memory optimization: do it when the merged form has a compact
+representation (which is exactly the three cases above), skip it otherwise, and lose
+nothing.
+
+This is what keeps the common case at one or two entries, and it is why nothing here
+needs writes to arrive in offset order.
+
+**Bound the gather run.** Assembling one destination write from *n* scattered
+sources means either copying them into a staging buffer or handing the kernel a
+vectored write. Either way the run should be capped — a page or two of staging
+buffer is plenty — and emission split at that boundary, so a single enormous
+coalesced extent cannot turn into an unbounded allocation. The cap is a pure
+throughput knob: splitting a run only costs an extra write.
+
+§7 adds the one case where the emitter may merge across a segment it was *not*
+obliged to write.
 
 ### 4.2 What falls out unasked
 
@@ -229,6 +288,49 @@ That last part is legal only because of §2.1.
 - **An identity piece emits nothing.** `Storage(self, k)` with `k == seg_start`
   means the bytes are already where they belong. Without this check every untouched
   region of every persistent allocation would emit a self-copy.
+- **A sizedness conversion moves nothing** in the common case — §4.3, which is the
+  whole reason `make_*` decomposes.
+
+### 4.3 Sizedness conversion moves nothing
+
+`make_resizable`/`make_fixed_size` necessarily mint a new id, because sizedness
+rides on the id's low bit and there is nothing to re-tag in place. Today that is
+implemented as `alloc(new) → copy → free(old)`, so it relocates the allocation
+**every time, even when the size does not change**. Deferring that copy does not
+help: a `Claim(new)` issued while the old id is still live cannot be placed at the
+old address, so the bytes move regardless.
+
+The fix is to decompose, and the ordering is forced by `Resize` being defined only
+on resizable allocations:
+
+```
+make_resizable(p, s)   =  ChangeSizedness(p → p′)  ;  Resize(p′, s)
+make_fixed_size(p, s)  =  Resize(p, s)             ;  ChangeSizedness(p → p′)
+```
+
+`ChangeSizedness` is a pure relabel: same address, same size, new id, no bytes
+touched. What makes it *emit* nothing is a rule already stated above — relabelling
+**preserves the identity piece**. `{0 → Storage(old, 0)}` becomes
+`{0 → Storage(new, 0)}`, still identity under the new id, so §4.2 drops it. The
+`alloc`/`copy`/`free` form destroys that property, since the new id sits at a new
+address and the piece is no longer identity.
+
+The `Resize` half may still relocate, so this is not a guarantee — §2.1 never
+promised one. What it removes is the *unconditional* move.
+
+Why it matters: consider a chunked vector whose length oscillates across a chunk
+boundary, so the last chunk converts between resizable and fixed on every
+`push`/`pop` pair. Under the old form each transition copies the entire chunk. Under
+the decomposition, `push` resizes the chunk up (no move if there is room after it,
+which is what the lift machinery in `augmented-segment-tree.md` tends to arrange
+after the first evacuation) and then relabels; `pop` relabels and then shrinks, and
+shrinking never relocates. The steady state costs two index operations per
+transition instead of a chunk copy.
+
+The real cost is placement *policy*, not correctness: an allocation that became
+fixed-size by relabel sits at an address the resizable policy chose, and vice versa,
+so the dense size classes dilute over time. That is a question for `size_classes.rs`
+and is worth measuring on exactly the oscillating workload above.
 
 ## 5. Phase B — the schedule
 
@@ -236,23 +338,24 @@ Vertices are the **emitted actions**, not the log's ops — the fold changed the
 set:
 
 ```
-Claim(id, size)          Release(id)
+Claim(id, size)          Release(id)          Relabel(from → to)
 Reshape(id, size)        Transfer(src, src_off → dst, dst_off, len)
 Write(id, off, bytes)
 ```
 
 `Reshape` stays **one vertex**. It is tempting to decompose it into
-`Claim`/`Transfer`/`Release` — that decomposition is a good explanation of why
-`make_*` and the multi-transaction `resize` are the same latent hole — but it is the
-wrong granularity here. The heap decides the new placement and moves the bytes as
-one atomic operation; splitting it would put the old range's release into the
-schedule as a separate vertex, and a frees-first pass could then hand that range to
-another `Claim` before the copy ran.
+`Claim`/`Transfer`/`Release`, but that is the wrong granularity: the heap decides
+the new placement and moves the bytes as one atomic operation, and splitting it
+would put the old range's release into the schedule as a separate vertex, where a
+frees-first pass could hand that range to another `Claim` before the copy ran.
+
+`Relabel` is the cheapest vertex there is — an index rekey, no I/O (§4.3). It has
+one edge, below, and never appears in a cycle.
 
 ### 5.1 Edges
 
-1. `Claim(id)` → every action writing into `id`.
-2. `Transfer` reading `id` → `Release(id)`. *(the `make_*` edge)*
+1. `Claim(id)` → every action writing into `id`. `Relabel(from → id)` likewise.
+2. `Transfer` reading `id` → `Release(id)`. *(the `Copy`-then-`free` edge)*
 3. `Transfer` reading a range of `id`'s storage → later actions writing that range
    (a WAR anti-dependency — easy to forget, since it runs backwards from the usual
    intuition).
@@ -265,9 +368,10 @@ a higher one.
 ### 5.2 Frees-first is a preference, not an edge
 
 Running `Release`s before `Claim`s gives the placement pass more space to work with.
-It must be encoded as a *priority*, never as an edge. `make_*` on a persistent id
-produces `Claim(new) → Transfer → Release(old)`; add `Release → Claim` as a hard
-edge and that is a three-cycle.
+It must be encoded as a *priority*, never as an edge. A `Copy` into a fresh
+allocation out of one that is then freed produces
+`Claim(dst) → Transfer → Release(src)` — the §6.1 scenario; add `Release → Claim` as
+a hard edge and that is a three-cycle.
 
 So: **Kahn's algorithm with a priority queue over the ready set**, in order
 
@@ -277,9 +381,9 @@ So: **Kahn's algorithm with a priority queue over the ready set**, in order
 4. `Reshape`, `Transfer`, `Write`.
 
 FFD is therefore *best-effort over the ready set* rather than global — a `Claim`
-blocked behind a `Transfer` is placed after smaller ones. Only `make_*`-style chains
-block, but the guarantee is weaker than the current unconditional sort and that
-should be stated where it is relied on.
+blocked behind a `Transfer` is placed after smaller ones. Only `Copy` chains block,
+but the guarantee is weaker than the current unconditional sort and that should be
+stated where it is relied on.
 
 Compaction stays outside the graph as a final phase: it moves only live ranges, and
 by then every `Storage` read has been resolved.
@@ -364,11 +468,16 @@ Disturbed means any of:
 All three are known during the fold, which already runs at flush with full read
 access to storage.
 
+A sizedness change needs no bullet of its own: the `ChangeSizedness` half relocates
+nothing, and the `Resize` half is covered by "reshaped" (§4.3). It is only
+conservative in one direction — a reshape that turns out not to relocate will have
+hoisted a read it did not need, which costs memory and no correctness.
+
 Applied to §6.1: A1 is released, so A2's middle piece becomes a `Literal` during the
 fold. The `Transfer` disappears, `Release(A1)` loses its only predecessor, and the
 schedule is `Release(A1)` → `Claim(A3)` at 1000 → `Write(A2, 32, lit)` →
 `Write(A3, 0, …)`. Same result as §6.3 and §6.4, and the only cost is 64 bytes held
-in the arena between fold and execution — bytes that were going to be read anyway.
+in the log between fold and execution — bytes that were going to be read anyway.
 
 **Hoisting every disturbed read collapses the DAG.** Every surviving `Transfer` then
 reads a range that is not released, not written and not reshaped, and its source
@@ -379,26 +488,47 @@ is `Claim(dst) → Transfer`, which the fixed phase order
 So §5 describes the general mechanism, but the recommendation is to **build
 hoisting first and skip the graph entirely**. It is dramatically simpler and it is
 correct; its only cost is memory proportional to the volume of disturbed reads,
-which for kladde's containers is small (`make_*` moves one allocation's content,
-once). Build the scheduler when a workload shows the buffering hurting — the
+which for kladde's containers is small — with `make_*` decomposed (§4.3), the only
+op that produces one at all is `Copy`. Build the scheduler when a workload shows the buffering hurting — the
 differential oracle of §8 makes that transition safe, and the fold is the same
 function either way.
 
 ## 7. The content-blind fast path
 
 Set a flag when any op produces a piece `Storage(other_id, …)` with
-`other_id != self`. That is `Copy` and `make_*` on a persistent id, and nothing
-else — in particular **not** plain `resize` (which is why `Reshape` must stay one
-vertex, §5) and **not** `splice` (source and destination are the same id, so it
-creates no cross-id constraint; it needs correct memmove direction internally, but
-that is local).
+`other_id != self`. That is `Copy`, and nothing else — in particular **not** plain
+`resize` (which is why `Reshape` must stay one vertex, §5), **not** `splice` (source
+and destination are the same id, so it creates no cross-id constraint; it needs
+correct memmove direction internally, but that is local), and **not**
+`ChangeSizedness`, whose rewrite is a relabel rather than a read (§4.3).
 
 When the flag is clear at flush — the overwhelming majority of transactions — run
-`releases → FFD claims → reshapes → writes` with no graph, no hoisting and no
-per-piece analysis. Today's cost is preserved for the common case and the general
-machinery only bills the transactions that need it.
+`releases → relabels → FFD claims → reshapes → writes` with no graph, no hoisting
+and no *cross-id* piece analysis. The fold still runs: both paths emit from
+`Folded`, never from the raw log, so the per-byte deduplication below is not
+something the fast path gives up.
 
-### 7.1 Representing a piece table cheaply
+### 7.1 What the fold already deduplicates
+
+The piece table holds exactly one `Source` per byte, by construction — `overwrite`
+splits both boundaries and drops everything strictly inside. So a log containing a
+thousand writes to the same eight bytes emits **one** eight-byte write, on either
+path. No byte is written twice in a flush.
+
+What the fast path does not do by itself is merge across a segment it was not
+obliged to write at all. Two literals separated by a short `Undefined` or identity
+`Storage` gap emit two writes and a seek, where one write would do. §2.1 licenses
+closing that gap: **an `Undefined` region may legally receive arbitrary bytes**, so
+the emitter is free to write straight through one. An identity gap can be closed the
+same way at the cost of rewriting bytes that were already correct.
+
+A threshold of roughly one page is the obvious rule, and it turns a scattered set of
+small updates into a single sequential write — which is the main lever the piece
+table offers for making replay I/O sequential rather than random. It composes with
+the gather-run cap of §4.1.1: merge across gaps first, then split the result at the
+cap.
+
+### 7.2 Representing a piece table cheaply
 
 Most touched allocations have exactly one segment. Allocating a `BTreeMap` each is
 wasteful, so:
@@ -504,16 +634,19 @@ geometry only.
    post-checkpoint `size`/`resolve`/`free`/`resize` holes and the counter leak.
 3. **The differential oracle** (§8), against the naive in-order replayer. Before any
    optimization, so every later step is a validated rewrite.
-4. **The fold** (§4) with the `Uniform`/spill representation (§7.1), and the
+4. **The fold** (§4) with the `Uniform`/spill representation (§7.2), and the
    fold-agreement assertion. Bugs 1–3 all become consequences of the per-piece
-   bounds rather than three separate fixups.
-5. **Read hoisting** (§6.5) and the content-blind fast path (§7). At this point
-   `splice` and `make_*` become implementable, and `Copy` becomes addable.
-6. **The scheduler** (§5) — only if buffering measured in step 5 proves too
+   bounds rather than three separate fixups. Emit by gathering runs (§4.1.1).
+5. **`ChangeSizedness`** (§4.3), needing a `relabel` on `RelocatableHeap`. This is
+   what makes `make_*` implementable *and* stops it relocating; it is independent of
+   the two steps below and can land before them.
+6. **Read hoisting** (§6.5) and the content-blind fast path (§7). `splice` becomes
+   implementable and `Copy` becomes addable.
+7. **The scheduler** (§5) — only if buffering measured in step 6 proves too
    expensive.
 
-Steps 1–3 are prerequisites for anything else. Steps 4–5 are where the I/O
-reductions live. Step 6 may never be needed.
+Steps 1–3 are prerequisites for anything else. Steps 4–6 are where the I/O
+reductions live. Step 7 may never be needed.
 
 ## References
 
