@@ -119,6 +119,19 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> WriteBackend
     fn write(&self, anchor: Self::Pointer, offset: Self::Size, bytes: &[u8]) {
         self.inner.borrow_mut().write(anchor, offset, bytes);
     }
+    fn copy(
+        &self,
+        src: Self::Pointer,
+        src_offset: Self::Size,
+        len: Self::Size,
+        dst: Self::Pointer,
+        dst_offset: Self::Size,
+    ) {
+        self.inner
+            .borrow_mut()
+            .copy_between(src, src_offset, len, dst, dst_offset)
+    }
+
     fn splice(
         &self,
         p: &UniquePointerResizable<Self::Pointer>,

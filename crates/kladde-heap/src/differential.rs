@@ -79,6 +79,15 @@ pub(crate) enum Action {
         old_len: u32,
         bytes: Vec<u8>,
     },
+    /// The only action that makes one allocation's content depend on another's,
+    /// and so the only one that exercises hoisting and the scheduler.
+    Copy {
+        src: Handle,
+        src_offset: u32,
+        len: u32,
+        dst: Handle,
+        dst_offset: u32,
+    },
 }
 
 impl Action {
@@ -90,6 +99,7 @@ impl Action {
             | Action::ChangeSizedness { handle, .. }
             | Action::Write { handle, .. }
             | Action::Splice { handle, .. } => *handle,
+            Action::Copy { dst, .. } => *dst,
         }
     }
 }
@@ -189,6 +199,30 @@ impl Model {
                 let replacement: Vec<Option<u8>> = bytes.iter().map(|b| Some(*b)).collect();
                 a.content
                     .splice(*offset as usize..tail_start, replacement);
+            }
+            Action::Copy {
+                src,
+                src_offset,
+                len,
+                dst,
+                dst_offset,
+            } => {
+                let (Some(s), Some(d)) = (self.live.get(src), self.live.get(dst)) else {
+                    return false;
+                };
+                if *src_offset as usize + *len as usize > s.content.len()
+                    || *dst_offset as usize + *len as usize > d.content.len()
+                {
+                    return false;
+                }
+                // Cloned out first, so a copy within one allocation behaves like
+                // `memmove` rather than a byte-at-a-time overlap.
+                let taken: Vec<Option<u8>> = self.live[src].content
+                    [*src_offset as usize..*src_offset as usize + *len as usize]
+                    .to_vec();
+                let d = self.live.get_mut(dst).expect("checked above");
+                d.content[*dst_offset as usize..*dst_offset as usize + *len as usize]
+                    .copy_from_slice(&taken);
             }
         }
         true
@@ -303,6 +337,19 @@ where
                 };
                 backend.splice(p, *offset, *old_len, bytes);
             }
+            Action::Copy {
+                src,
+                src_offset,
+                len,
+                dst,
+                dst_offset,
+            } => backend.copy(
+                owned.get(src).expect("sanitized").raw(),
+                *src_offset,
+                *len,
+                owned.get(dst).expect("sanitized").raw(),
+                *dst_offset,
+            ),
         }
     }
 
@@ -483,6 +530,19 @@ fn reductions(actions: &[Action], i: usize) -> Vec<Vec<Action>> {
                 });
             }
         }
+        Action::Copy {
+            src,
+            src_offset,
+            len,
+            dst,
+            dst_offset,
+        } if *len > 1 => push(Action::Copy {
+            src: *src,
+            src_offset: *src_offset,
+            len: len / 2,
+            dst: *dst,
+            dst_offset: *dst_offset,
+        }),
         Action::Splice {
             handle,
             offset,
@@ -539,8 +599,19 @@ pub(crate) fn generate(rng: &mut Rng, len: usize, handles: u32) -> Vec<Action> {
         // excluded: `GainGreedyHeap` keys allocations by address and assumes a
         // positive extent, so a zero-sized one is outside its model (see
         // `later.md`).
-        let size = [1u32, 2, 3, 8, 16, 17, 64][rng.below(7) as usize];
-        out.push(match rng.below(10) {
+        let size = [1u32, 3, 4, 8, 16, 17, 64][rng.below(7) as usize];
+        let other = rng.below(u64::from(handles)) as u32;
+        out.push(match rng.below(12) {
+            // Offsets and lengths stay well under the smaller allocation sizes,
+            // or almost every copy would be out of bounds and sanitized away --
+            // leaving the whole cross-id path untested.
+            10 | 11 => Action::Copy {
+                src: other,
+                src_offset: rng.below(3) as u32,
+                len: 1 + rng.below(4) as u32,
+                dst: handle,
+                dst_offset: rng.below(3) as u32,
+            },
             0..=2 => Action::Alloc {
                 handle,
                 size,
@@ -634,6 +705,33 @@ mod tests {
                 panic!("seed {seed} disagrees; minimal case:\n{minimal:#?}");
             }
         }
+    }
+
+    /// Coverage, not correctness: a generator that produced no *valid* `Copy`
+    /// would leave hoisting and the whole cross-id path untested while every
+    /// test still passed.
+    #[test]
+    fn the_generator_actually_produces_valid_copies() {
+        let mut copies = 0;
+        let mut sequences_with_a_copy = 0;
+        for seed in 1..200u64 {
+            let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let actions = sanitize(&generate(&mut rng, 40, 6));
+            let n = actions
+                .iter()
+                .filter(|a| matches!(a, Action::Copy { len, .. } if *len > 0))
+                .count();
+            copies += n;
+            sequences_with_a_copy += usize::from(n > 0);
+        }
+        // Thresholds are deliberately loose: the point is to fail loudly if a
+        // generator change ever drops cross-id coverage to near zero, not to pin
+        // an exact rate.
+        assert!(copies > 100, "only {copies} valid non-empty copies survived");
+        assert!(
+            sequences_with_a_copy > 50,
+            "only {sequences_with_a_copy} of 199 sequences exercised a copy",
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //! exactly one source per byte; and an allocation created and freed inside one
 //! transaction never touches storage at all.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::journal::{Log, Op, Pending, Span};
 use crate::pointer::Pointer;
@@ -83,6 +83,11 @@ pub(crate) struct Folded<W: Word, S: Word> {
     entries: BTreeMap<Pointer<W>, Entry<W, S>>,
     /// One tree for the whole flush, not one per allocation.
     spill: BTreeMap<(Pointer<W>, usize), Source<W>>,
+    /// Ids whose storage this flush changes -- released, resized, or written
+    /// into. A cross-id piece reading one of these must be hoisted (§6.5), since
+    /// after the flush touches it the bytes are no longer the ones the piece
+    /// meant.
+    disturbed: BTreeSet<Pointer<W>>,
 }
 
 impl<W: Word, S: Word> Default for Folded<W, S> {
@@ -90,6 +95,7 @@ impl<W: Word, S: Word> Default for Folded<W, S> {
         Self {
             entries: BTreeMap::new(),
             spill: BTreeMap::new(),
+            disturbed: BTreeSet::new(),
         }
     }
 }
@@ -178,11 +184,24 @@ impl<W: Word, S: Word> Folded<W, S> {
     }
 
     /// Overwrite `[start, start + len)` with `src`.
+    fn overwrite(&mut self, id: Pointer<W>, size: usize, start: usize, len: usize, src: Source<W>) {
+        self.overwrite_pieces(id, size, start, len, vec![(0, src)]);
+    }
+
+    /// Overwrite `[start, start + len)` with `pieces`, given at offsets relative
+    /// to `start`.
     ///
     /// The only non-trivial primitive: materialize both boundaries from the
-    /// segments they fall inside, drop everything strictly between, insert the new
-    /// segment.
-    fn overwrite(&mut self, id: Pointer<W>, size: usize, start: usize, len: usize, src: Source<W>) {
+    /// segments they fall inside, drop everything strictly between, splice the new
+    /// ones in.
+    fn overwrite_pieces(
+        &mut self,
+        id: Pointer<W>,
+        size: usize,
+        start: usize,
+        len: usize,
+        pieces: Vec<(usize, Source<W>)>,
+    ) {
         if len == 0 {
             return;
         }
@@ -193,12 +212,28 @@ impl<W: Word, S: Word> Folded<W, S> {
             .into_iter()
             .filter(|(off, _)| *off < start || *off > end)
             .collect();
-        segments.push((start, src));
+        segments.extend(pieces.into_iter().map(|(rel, src)| (start + rel, src)));
         if let Some(r) = right {
             segments.push((end, r));
         }
         segments.sort_by_key(|(off, _)| *off);
         self.set_segments(id, segments);
+    }
+
+    /// The pieces covering `[start, start + len)`, rebased so the first sits at
+    /// offset 0. What a `Copy` takes out of its source's table.
+    fn slice(&self, id: Pointer<W>, start: usize, len: usize, size: usize) -> Vec<(usize, Source<W>)> {
+        let mut out = Vec::new();
+        let segments = self.segments(id);
+        for (i, &(seg_start, src)) in segments.iter().enumerate() {
+            let seg_end = segments.get(i + 1).map_or(size, |(s, _)| *s).min(size);
+            let from = seg_start.max(start);
+            let to = seg_end.min(start + len);
+            if from < to {
+                out.push((from - start, src.advance(from - seg_start)));
+            }
+        }
+        out
     }
 
     /// Clip to `new_size`, or extend the tail with `Undefined`.
@@ -337,6 +372,51 @@ impl<W: Word, S: Word> Folded<W, S> {
         runs
     }
 
+    /// Every cross-id read whose source this flush disturbs, as
+    /// `(reader, offset, len, source_id, source_offset)`.
+    ///
+    /// These are exactly the reads that force an ordering on the schedule: the
+    /// bytes have to be taken before the source is released, rewritten or moved.
+    /// Resolving them up front (§6.5) is what lets releases run *first*, where
+    /// they give the placement pass more room -- and, once the log is durable,
+    /// what would make replay idempotent.
+    pub(crate) fn hoistable(&self, sizes: &[(Pointer<W>, S)]) -> Vec<(Pointer<W>, usize, usize, Pointer<W>, usize)> {
+        let mut out = Vec::new();
+        for &(id, size) in sizes {
+            let size = size.to_usize();
+            let segments = self.segments(id);
+            for (i, &(start, src)) in segments.iter().enumerate() {
+                let end = segments.get(i + 1).map_or(size, |(s, _)| *s).min(size);
+                if start >= end {
+                    continue;
+                }
+                if let Source::Storage(other, off) = src {
+                    if other != id && self.disturbed.contains(&other) {
+                        out.push((id, start, end - start, other, off));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Replace a hoisted range with the literal that now holds its bytes.
+    pub(crate) fn resolve(&mut self, id: Pointer<W>, start: usize, len: usize, at: usize) {
+        let size = self.size_of(id).map_or(0, |s| s.to_usize());
+        self.overwrite(id, size, start, len, Source::Literal(at));
+    }
+
+    /// Whether any table reads another allocation's storage -- the content-blind
+    /// flag of §7. Only `Copy` and a sizedness conversion can set it, and the
+    /// conversion's rewrite clears it again, so in practice this means `Copy`.
+    pub(crate) fn has_cross_id_reads(&self, sizes: &[(Pointer<W>, S)]) -> bool {
+        sizes.iter().any(|&(id, _)| {
+            self.segments(id)
+                .iter()
+                .any(|(_, src)| matches!(src, Source::Storage(other, _) if *other != id))
+        })
+    }
+
     /// What the fold decided about `id`, or `None` if the log never mentioned it.
     /// Feeds the fold-agreement assertion (§2).
     pub(crate) fn geometry_of(&self, id: Pointer<W>) -> Option<Pending<W, S>> {
@@ -380,6 +460,7 @@ pub(crate) fn fold<W: Word, S: Word>(
             }
             Op::Free { id } => {
                 touch(&mut f, id);
+                f.disturbed.insert(id);
                 if let Some(e) = f.entries.get_mut(&id) {
                     e.geometry = Pending::Freed;
                 }
@@ -388,6 +469,9 @@ pub(crate) fn fold<W: Word, S: Word>(
             Op::Resize { id, size } => {
                 touch(&mut f, id);
                 let old = f.size_of(id).map_or(0, |s| s.to_usize());
+                if old != size.to_usize() {
+                    f.disturbed.insert(id);
+                }
                 f.set_size(id, size);
                 f.resize_content(id, old, size.to_usize());
             }
@@ -443,6 +527,7 @@ pub(crate) fn fold<W: Word, S: Word>(
                 payload,
             } => {
                 touch(&mut f, id);
+                f.disturbed.insert(id);
                 let size = f.size_of(id).map_or(0, |s| s.to_usize());
                 f.overwrite(
                     id,
@@ -459,6 +544,7 @@ pub(crate) fn fold<W: Word, S: Word>(
                 payload,
             } => {
                 touch(&mut f, id);
+                f.disturbed.insert(id);
                 let size = f.size_of(id).map_or(0, |s| s.to_usize());
                 let new_size = size + payload.len - old_len.to_usize();
                 f.splice_content(
@@ -470,6 +556,30 @@ pub(crate) fn fold<W: Word, S: Word>(
                     payload.len,
                 );
                 f.set_size(id, Word::from_usize(new_size));
+            }
+            Op::Copy {
+                src,
+                src_offset,
+                len,
+                dst,
+                dst_offset,
+            } => {
+                touch(&mut f, src);
+                touch(&mut f, dst);
+                f.disturbed.insert(dst);
+                let src_size = f.size_of(src).map_or(0, |s| s.to_usize());
+                let dst_size = f.size_of(dst).map_or(0, |s| s.to_usize());
+                // Pieces, not bytes: a copy out of a fresh allocation resolves to
+                // the literals already in the log, so it never forces that
+                // allocation to be materialized at all (§4.2).
+                let pieces = f.slice(src, src_offset.to_usize(), len.to_usize(), src_size);
+                f.overwrite_pieces(
+                    dst,
+                    dst_size,
+                    dst_offset.to_usize(),
+                    len.to_usize(),
+                    pieces,
+                );
             }
         }
     }

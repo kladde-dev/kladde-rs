@@ -76,6 +76,16 @@ pub(crate) enum Op<W: Word, S: Word> {
         old_len: S,
         payload: Span,
     },
+    /// The only op that makes one allocation's content depend on another's, and
+    /// therefore the only one that puts a cross-id `Storage` piece in a table
+    /// (design note §7). Everything about hoisting and scheduling exists for it.
+    Copy {
+        src: Pointer<W>,
+        src_offset: S,
+        len: S,
+        dst: Pointer<W>,
+        dst_offset: S,
+    },
 }
 
 /// The ordered log plus its payload arena.

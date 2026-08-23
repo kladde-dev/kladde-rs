@@ -218,32 +218,59 @@ pub(crate) fn apply<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word>(
             } => inner
                 .composed
                 .splice_by_id(id, offset, old_len, log.payload(payload)),
+            Op::Copy {
+                src,
+                src_offset,
+                len,
+                dst,
+                dst_offset,
+            } => inner
+                .composed
+                .copy_between(src, src_offset, len, dst, dst_offset),
         }
     }
     inner.deltas.clear();
 }
 
-/// Apply the log through the fold (design note §4 and §5).
+/// Apply the log through the fold (design note §4, §5 and §6).
 ///
-/// Phase order is `relabels -> claims -> reshapes -> writes -> releases`.
-/// Releases come **last** because a piece may still name a released allocation's
-/// storage: a sizedness conversion hands its table to the new id, whose pieces
-/// read the old one. Read hoisting (§6.5) is what removes those reads and lets
-/// releases move to the front, where they give the placement pass more room.
+/// Phase order is `hoist -> releases -> relabels -> claims -> reshapes -> writes`.
+///
+/// Releases run **first**, which is what gives the placement pass the freed space
+/// to work with. That is only sound because hoisting has already resolved every
+/// read of an allocation this flush disturbs; without it a released allocation's
+/// bytes could be handed to a claim before a piece that still names them was
+/// read, and releases would have to run last instead.
 pub(crate) fn apply_folded<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word>(
     inner: &mut JournaledInner<S, H, W>,
 ) {
-    let log = std::mem::take(&mut inner.log);
-    let folded = {
+    let mut log = std::mem::take(&mut inner.log);
+    let mut folded = {
         let heap = &inner.composed.heap;
         fold(&log, |id| heap.lookup(id).map(|(_, size)| size))
     };
+    let survivors = folded.survivors();
+
+    // The content-blind fast path (§7): with no cross-id read there is nothing to
+    // hoist and nothing to order, so the overwhelming majority of transactions
+    // skip this entirely. Only `Copy` can set the flag.
+    if folded.has_cross_id_reads(&survivors) {
+        for (id, start, len, src, src_off) in folded.hoistable(&survivors) {
+            let bytes = inner.composed.read_bytes(src, src_off, len);
+            let span = log.intern(&bytes);
+            folded.resolve(id, start, len, span.start);
+        }
+    }
 
     debug_assert!(
         inner.deltas.agrees_with(|id| folded.geometry_of(id)),
         "fold agreement: the geometry derived from the log must equal what the \
          write phase recorded incrementally",
     );
+
+    for id in folded.releases() {
+        inner.composed.release(id);
+    }
 
     for action in folded.before_writes() {
         match action {
@@ -265,14 +292,10 @@ pub(crate) fn apply_folded<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: W
         }
     }
 
-    for (id, size) in folded.survivors() {
+    for (id, size) in survivors {
         for (start, pieces) in folded.runs(id, size.to_usize()) {
             emit(inner, &log, id, start, &pieces);
         }
-    }
-
-    for id in folded.releases() {
-        inner.composed.release(id);
     }
 
     inner.deltas.clear();
@@ -411,6 +434,23 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> WriteBackend
             id: anchor,
             offset,
             payload,
+        });
+    }
+
+    fn copy(
+        &self,
+        src: Self::Pointer,
+        src_offset: Self::Size,
+        len: Self::Size,
+        dst: Self::Pointer,
+        dst_offset: Self::Size,
+    ) {
+        self.inner.borrow_mut().log.push(Op::Copy {
+            src,
+            src_offset,
+            len,
+            dst,
+            dst_offset,
         });
     }
 
@@ -1038,6 +1078,93 @@ mod tests {
 
         assert_eq!(rb.size(id).unwrap(), 32);
         assert_eq!(read_back::<_, 16>(&mut rb, id), [5; 16]);
+    }
+
+    // ---- hoisting, and what frees-first buys (design note §6) ----
+
+    #[test]
+    fn a_copy_out_of_an_allocation_that_is_then_freed_still_reads_it() {
+        // The §6.1 scenario. Without hoisting the read has to happen before the
+        // release, which forces releases to the end of the schedule.
+        let wb = write_backend();
+        let a1 = wb.alloc_fixed_size(256);
+        wb.write(a1.raw(), 0, &[0xAB; 256]);
+        let a2 = wb.alloc_fixed_size(128);
+        wb.write(a2.raw(), 0, &[0; 128]);
+        let rb = wb.flush();
+
+        let wb = rb.reopen();
+        wb.copy(a1.raw(), 0, 64, a2.raw(), 32);
+        wb.free_fixed_size(a1);
+        let a3 = wb.alloc_fixed_size(200);
+        wb.write(a3.raw(), 0, &[7; 200]);
+        let (a2_id, a3_id) = (a2.raw(), a3.raw());
+
+        let mut rb = wb.flush();
+        let a2_bytes = read_back::<_, 128>(&mut rb, a2_id);
+        assert_eq!(&a2_bytes[..32], &[0; 32], "before the copied range");
+        assert_eq!(&a2_bytes[32..96], &[0xAB; 64], "the copied range");
+        assert_eq!(&a2_bytes[96..], &[0; 32], "after it");
+        assert_eq!(read_back::<_, 200>(&mut rb, a3_id), [7; 200]);
+    }
+
+    #[test]
+    fn hoisting_lets_a_new_allocation_reuse_the_freed_range() {
+        // The payoff §6.3 and §6.5 are about: because the read of A1 is resolved
+        // up front, `Release(A1)` has nothing waiting on it and can run before the
+        // claim -- so A3 lands in A1's space instead of extending the file.
+        let wb = write_backend();
+        let a1 = wb.alloc_fixed_size(256);
+        wb.write(a1.raw(), 0, &[0xAB; 256]);
+        let a2 = wb.alloc_fixed_size(128);
+        let rb = wb.flush();
+        let a1_addr = rb.inner.composed.heap.lookup(a1.raw()).unwrap().0;
+        let len_before = rb.len();
+
+        let wb = rb.reopen();
+        wb.copy(a1.raw(), 0, 64, a2.raw(), 32);
+        wb.free_fixed_size(a1);
+        let a3 = wb.alloc_fixed_size(200);
+        let a3_id = a3.raw();
+        let rb = wb.flush();
+
+        assert_eq!(
+            rb.inner.composed.heap.lookup(a3_id).unwrap().0,
+            a1_addr,
+            "A3 reuses the range A1 vacated",
+        );
+        assert!(rb.len() <= len_before, "and the file did not grow");
+    }
+
+    #[test]
+    fn a_copy_out_of_a_transient_allocation_never_materializes_it() {
+        // The copy takes *pieces*, not bytes, so it resolves to the literals
+        // already in the log and the source never has to reach storage (§4.2).
+        let (wb, writes, bytes) = counting();
+        let dst = wb.alloc_fixed_size(32);
+        let scratch = wb.alloc_resizable(32);
+        wb.write(scratch.raw(), 0, &[9; 32]);
+        wb.copy(scratch.raw(), 0, 32, dst.raw(), 0);
+        wb.free_resizable(scratch);
+        let id = dst.raw();
+
+        let mut rb = wb.flush();
+        assert_eq!(writes.get(), 1, "one write, for the destination only");
+        assert_eq!(bytes.get(), 32);
+        assert_eq!(read_back::<_, 32>(&mut rb, id), [9; 32]);
+        assert_eq!(rb.live_count(), 1);
+    }
+
+    #[test]
+    fn a_copy_within_one_allocation_behaves_like_memmove() {
+        let wb = write_backend();
+        let p = wb.alloc_fixed_size(8);
+        wb.write(p.raw(), 0, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        wb.copy(p.raw(), 0, 6, p.raw(), 2); // overlapping, shifting up
+        let id = p.raw();
+
+        let mut rb = wb.flush();
+        assert_eq!(read_back::<_, 8>(&mut rb, id), [1, 2, 1, 2, 3, 4, 5, 6]);
     }
 
     #[test]

@@ -90,6 +90,17 @@ impl WriteBackend for MockBackend {
     fn write(&self, anchor: Self::Pointer, offset: Self::Size, bytes: &[u8]) {
         self.0.write(anchor, offset, bytes);
     }
+    fn copy(
+        &self,
+        src: Self::Pointer,
+        src_offset: Self::Size,
+        len: Self::Size,
+        dst: Self::Pointer,
+        dst_offset: Self::Size,
+    ) {
+        self.0.copy(src, src_offset, len, dst, dst_offset)
+    }
+
     fn splice(
         &self,
         p: &UniquePointerResizable<Self::Pointer>,

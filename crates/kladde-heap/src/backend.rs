@@ -178,6 +178,23 @@ pub trait WriteBackend: Backend {
     /// backends; a fuller pass returns `Result<(), BackendError>`.)
     fn write(&self, anchor: Self::Pointer, offset: Self::Size, bytes: &[u8]);
 
+    /// Copy `len` bytes from `src + src_offset` to `dst + dst_offset`. Neither
+    /// allocation changes size; overlapping ranges within one allocation move as
+    /// if by `memmove`.
+    ///
+    /// Belongs here rather than on `ReadBackend` despite reading: the split is
+    /// about what the *caller* can observe, and this returns nothing. A journaled
+    /// backend does not even perform the read when the call is made -- it records
+    /// the dependency symbolically and resolves it at flush.
+    fn copy(
+        &self,
+        src: Self::Pointer,
+        src_offset: Self::Size,
+        len: Self::Size,
+        dst: Self::Pointer,
+        dst_offset: Self::Size,
+    );
+
     /// Atomic resize + tail-shift + content overwrite of one region: replace the
     /// `old_len` bytes at `offset` with `new`, shifting the trailing bytes.
     fn splice(

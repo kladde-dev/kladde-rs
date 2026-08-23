@@ -319,6 +319,24 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Composed<S, H, W>
         self.storage.write_all(&tail).expect("write tail");
     }
 
+    /// Copy `len` bytes between two allocations (or within one).
+    ///
+    /// `copy_bytes` stages the source in full before writing, so an overlapping
+    /// range within a single allocation moves correctly.
+    pub(crate) fn copy_between(
+        &mut self,
+        src: Pointer<W>,
+        src_offset: H::Size,
+        len: H::Size,
+        dst: Pointer<W>,
+        dst_offset: H::Size,
+    ) {
+        let from = self.address_of(src).to_usize() + src_offset.to_usize();
+        let to = self.address_of(dst).to_usize() + dst_offset.to_usize();
+        self.copy_bytes(Word::from_usize(from), Word::from_usize(to), len.to_usize())
+            .expect("copy between allocations");
+    }
+
     /// Read `len` bytes from `id`'s address plus `offset`.
     ///
     /// The flush emitter's gather step: a destination run is assembled from
