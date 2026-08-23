@@ -589,12 +589,28 @@ Two properties worth asserting separately, because they fail differently:
 
 ### 9.1 Terminology
 
-First, two names for one byte stream. The **journal** is the ordered sequence of
-ops — a *logical* log, recording operations rather than page images. The
-**write-ahead log** is that same sequence made durable *ahead of* the data writes it
-describes. So they are not two structures: "journal" names what it contains,
-"write-ahead log" names when it is written relative to the data region. This note
-says "journal" throughout except where the write-ahead property is the point.
+First, two structures, not one. Both are written before the data writes they
+describe; the journal's records go down as each op executes, the rest at flush.
+What separates them is not *when* they are written but whether they are
+**sufficient**.
+
+The **journal** is the ordered sequence of ops — a *logical* log, recording what the
+application did in the application's own terms: ids and offsets, never addresses or
+byte ranges in the file. That is what makes it compact, and it is also what makes it
+insufficient on its own. Replaying `Write(id, offset, bytes)` requires an address for
+`id`, and the address is a decision the flush makes; replaying `Copy` requires its
+source bytes, which a partly-finished flush may already have overwritten. So a crash
+part-way through a flush can leave the file in a state the journal cannot describe —
+neither the old state nor the new one is recoverable from it.
+
+The **write-ahead log** is what closes that gap: the journal's records *plus*
+everything else recovery needs to finish an interrupted flush. At minimum that is
+the hoisted bytes (§6.5) and a marker delimiting the journal range the flush is
+applying; §9.4 works out what else, which is an open question. The journal's records
+are therefore a proper subset of the write-ahead log, never the whole of it.
+
+This note says "journal" for the op sequence and "write-ahead log" for the durable
+whole.
 
 Four more words that have to be kept apart:
 
@@ -693,7 +709,71 @@ is the expensive part and should be chosen deliberately rather than inherited.
 Even at layer 1, `write_all` loops over short writes, so a process dying mid-loop
 leaves a partially written record. Framing (§9.5) is required at every layer.
 
-### 9.4 What has to be in the write-ahead log
+### 9.4 What has to be in the write-ahead log — **open**
+
+Everything §9.1 lists as a minimum is settled: the journal's records, the hoisted
+bytes, the flush marker. What is *not* settled is whether the **plan** — the
+schedule's output, each `Claim`'s concrete address — goes in as well, or is
+re-derived by recovery. That single question produces three architectures, and this
+note does not pick one.
+
+#### 9.4.1 The three architectures
+
+| | what the write-ahead log carries | logging style |
+| --- | --- | --- |
+| **A** | journal records, hoisted bytes, flush marker | **logical**, made replayable by requiring deterministic placement |
+| **B** | the plan (addresses and byte extents) | **physical** |
+| **C** | both | logical for durability, physical for redo |
+
+This is the textbook logical-versus-physical logging axis. A *logical* record is
+compact but can only be replayed from a state where no operation is half-applied —
+which is exactly the state a crash mid-flush does not leave. A *physical* record
+names addresses and byte ranges, so replaying it is idempotent regardless of how far
+the interrupted flush got. ARIES (Mohan et al., 1992) is the canonical treatment,
+and its "physiological" logging is the standard compromise.
+
+**A — recovery re-derives the plan.** Nothing the optimizer produces is written. The
+journal was going to be written anyway, so a flush appends only the hoist blob and
+the marker.
+
+**B — the plan is the write-ahead log.** Recovery is a loop over
+`(source, destination, length)`; placement stays an implementation detail. Note this
+conflicts with §9.5's per-op durability: if the journal is not durable as ops arrive,
+a crash loses everything since the last flush. Pure B therefore means moving the
+durability boundary to the flush, which is a different product.
+
+**C — both.** The journal gives per-op durability, the plan gives state-independent
+redo. Recovery replays the plan and never runs the optimizer.
+
+#### 9.4.2 What it costs to re-derive rather than record (A versus C)
+
+The plan is smaller than it first appears: an entry need not carry bytes, since
+those are already in the journal as `Write` payloads and in the hoist blob. An entry
+is roughly `{ source: journal offset, destination address, length }` ≈ 20 bytes. A
+flush touching a thousand allocations emits perhaps 1000–3000 write actions, so
+20–60 KB of plan against a data-region write volume typically an order of magnitude
+larger — call it 5–10 %.
+
+Against that, re-deriving costs two things:
+
+- **Determinism becomes load-bearing.** No `HashMap` iteration order, no time, no
+  addresses-as-input, no floats — anywhere in the fold, the placement policy, or the
+  compaction policy. Some of that discipline exists already (today's flush sorts
+  pending FFD partly "so the layout is reproducible from one run to the next"), and
+  the determinism assertion is in place (§10 step 3). But a violation is silent until
+  a crash.
+- **It couples the file format to the placement algorithm.** Any other
+  implementation of kladde must reproduce `GainGreedyHeap`'s exact decisions to
+  recover a torn flush — a heavy constraint against the cross-language goal in
+  `later.md`'s design constraints.
+
+And one that is easy to miss: under A, **the crash-recovery path re-runs the entire
+optimizer** — fold, placement, scheduler. A bug there that is deterministic but wrong
+corrupts the file on the path hardest to test. Under B or C, recovery is a loop.
+Given the adversarial-workload stance, that robustness difference may matter more
+than the 5–10 %.
+
+#### 9.4.3 What is settled either way
 
 The organizing question is **what is derivable**:
 
@@ -703,49 +783,32 @@ The organizing question is **what is derivable**:
 | hoisted bytes (§6.5) | no, *after partial application* | **yes** — and this is new work at flush time |
 | the fold, and the schedule's shape | yes, from the journal | no |
 | ids of claimed regions | — | **yes**, but for free: `Alloc` and `ChangeSizedness` already carry them |
-| the address each `Claim` receives | yes, **if** placement is deterministic and the pre-flush heap state is recoverable | no |
-
-Two things this makes precise.
+| the address each `Claim` receives | yes, **if** placement is deterministic and the pre-flush heap state is recoverable | **A**: no. **B**/**C**: yes |
 
 **Only the hoisted bytes are new at flush time.** The ops are in the file already —
 that is what the journal is for. Hoisting, by contrast, happens *during* the fold, so
 flush begins with a genuine append: the hoist blob, plus a marker naming the journal
 range this flush covers. That append is what must be ordered before the data writes.
 
-**Id minting stays unspecified; placement does not.** Because `Alloc(id, size)` and
-`ChangeSizedness(old → new)` record their ids, recovery never re-derives them, and
-the id allocator is free to be an implementation detail — including its `free_counters`
-LIFO, whose order affects only *future* ids, which future ops will record in turn.
-After recovery it is enough to rebuild a non-colliding allocator (e.g.
-`next_counter = max(live id) + 1` with an empty free list), at the cost of some
+**Id minting stays an implementation detail** under all three. Because
+`Alloc(id, size)` and `ChangeSizedness(old → new)` record their ids, recovery never
+re-derives them, so the id allocator is free to do as it likes — including its
+`free_counters` LIFO, whose order affects only *future* ids, which future ops will
+record in turn. After recovery it is enough to rebuild a non-colliding allocator
+(e.g. `next_counter = max(live id) + 1` with an empty free list), at the cost of some
 counter density.
 
-Placement is the opposite: the schedule is **deterministic and specified**, so
-recovery re-derives each `Claim`'s address rather than reading it from the
-write-ahead log. That saves writing a plan proportional to touched ids on every
-flush, and costs two things:
+**A durable heap snapshot is needed regardless.** Recovery must know the heap's
+`id → (address, size)` table as of the last checkpoint — under A to re-derive
+placement against, under B and C to carry on allocating afterwards. It is also the
+same thing `JournaledWriteBackend::open` needs (the self-hosting bootstrap currently
+sitting at `todo!()`), so it is not extra work for this section to justify.
 
-- **Determinism becomes load-bearing.** No `HashMap` iteration order, no time, no
-  addresses-as-input, no floats — anywhere in the fold, the placement policy, or the
-  compaction policy. Some of that discipline exists already (today's flush sorts
-  pending FFD partly "so the layout is reproducible from one run to the next"), but
-  it must become a *tested* property: re-derive the schedule twice from the same
-  inputs and assert byte-equality. A violation is silent until a crash.
-- **It couples the file format to the placement algorithm.** Any other
-  implementation of kladde must reproduce `GainGreedyHeap`'s exact decisions to
-  recover a torn flush. That is a heavy constraint given the cross-language goal in
-  `later.md`'s design constraints, and it is the argument for recording the plan
-  instead. Worth revisiting when the format is specified.
-
-Either way, recovery needs the heap's `id → (address, size)` table as of the last
-checkpoint, to re-derive placement against. That is a durable snapshot — and it is
-the same thing `JournaledWriteBackend::open` needs anyway (the self-hosting bootstrap
-currently sitting at `todo!()`), so it is not extra work.
-
-One nicety of a re-derivable schedule: if the schedule is re-derivable then so is
-the fold, so the number and order of hoisted reads is known to recovery, which can
-consume the hoist blob **positionally**. No per-item delimiters — one length and one
-checksum over the whole blob.
+One nicety available only under A: if the schedule is re-derivable then so is the
+fold, so the number and order of hoisted reads is known to recovery, which can
+consume the hoist blob **positionally** — no per-item delimiters, one length and one
+checksum over the whole blob. Under B and C the plan names each hoisted extent
+anyway.
 
 ### 9.5 Framing, and the unit of durability
 
@@ -871,8 +934,9 @@ That is an argument for their priority, not just their performance.
 
 ### 9.6 Which actions survive being replayed
 
-Recovery re-derives the schedule and re-runs it, which is sound only if every action
-survives partial application followed by repetition.
+Recovery re-runs the schedule — re-derived under **A**, read from the plan under
+**B**/**C** (§9.4). Either way that is sound only if every action survives partial
+application followed by repetition, so what follows applies to all three.
 
 **Re-runnable.** `Write` (bytes come from the write-ahead log; the address
 re-derives identically). `Claim`, `Release`, `Relabel` (heap operations re-derived
@@ -924,8 +988,9 @@ Steps 1–7 are **done**; step 8 is not.
 3. **The differential oracle** (§8), against the naive in-order replayer. Before any
    optimization, so every later step is a validated rewrite. Add the **determinism
    assertion** here too — re-derive the schedule twice, assert byte-equality — even
-   though nothing depends on it until step 8. It is cheap now and near-impossible to
-   retrofit a diagnosis for later (§9.4).
+   though nothing depends on it unless §9.4 settles on architecture **A**. It is
+   cheap now, near-impossible to retrofit a diagnosis for later, and keeping **A**
+   available is itself a reason to have it (§9.4).
 4. **The fold** (§4) with the `Uniform`/spill representation (§7.2), and the
    fold-agreement assertion. Bugs 1–3 all become consequences of the per-piece
    bounds rather than three separate fixups. Emit by gathering runs (§4.1.1).
@@ -940,7 +1005,8 @@ Steps 1–7 are **done**; step 8 is not.
 8. **Durability** (§9): self-delimiting frames with chained CRC-32C (§9.5), the
    durable heap snapshot that `open` needs anyway, ordering the write-ahead log's
    append before the data writes, and the commit-prefix policy. Restartable flush
-   arrives here.
+   arrives here — and §9.4's choice between architectures **A**, **B** and **C** has
+   to be made before it can be built.
 
 Steps 1–3 are prerequisites for anything else. Steps 4–6 are where the I/O
 reductions live. Step 7 may never be needed.
