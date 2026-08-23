@@ -417,6 +417,23 @@ pub(crate) fn check(actions: &[Action]) {
     );
     agrees("journaled (folded)", &journaled, &expected, &actions);
 
+    // Hoisting off: the same cross-id reads become scheduling constraints
+    // instead, so this is what actually exercises the graph's edges rather than
+    // the degenerate case where nothing is ever blocked.
+    let unhoisted = run(
+        &actions,
+        {
+            let mut b = JournaledWriteBackend::<_, Heap>::new(
+                InMemoryStorage::default(),
+                GainGreedyHeap::new(),
+            );
+            b.set_hoisting(false);
+            b
+        },
+        |b| b.flush(),
+    );
+    agrees("journaled (unhoisted)", &unhoisted, &expected, &actions);
+
     // The reference implementation §8 calls for: same log, one `Composed` call
     // per op, no folding and no reordering. Comparing it too is what makes the
     // fold a *validated* rewrite rather than a hopeful one.

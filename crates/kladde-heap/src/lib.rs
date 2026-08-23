@@ -35,6 +35,7 @@ mod journaled;
 mod mock;
 mod pointer;
 mod repr;
+mod schedule;
 mod size_classes;
 mod storage;
 mod unjournaled;

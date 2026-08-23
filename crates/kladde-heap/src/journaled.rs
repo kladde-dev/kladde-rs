@@ -28,7 +28,8 @@ use std::io::{Read, Seek};
 use crate::backend::{Backend, BackendError, ReadBackend, WriteBackend};
 use crate::composed::{resolved, Composed};
 use crate::heap::{CompactionProgress, IncrementallyCompactableHeap, RelocatableHeap};
-use crate::fold::{fold, literal, Action, Source};
+use crate::fold::{fold, literal, Source, Task};
+use crate::schedule::schedule;
 use crate::journal::{Deltas, Geometry, Log, Op};
 use crate::pointer::{
     Pointer, ResolvedPointer, Sizedness, UniquePointerFixedSize, UniquePointerResizable,
@@ -60,6 +61,7 @@ pub(crate) struct JournaledInner<S, H: RelocatableHeap, W: Word = u32> {
 pub struct JournaledWriteBackend<S, H: RelocatableHeap, W: Word = u32> {
     inner: RefCell<JournaledInner<S, H, W>>,
     compaction_budget: usize,
+    hoist: bool,
 }
 
 impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> JournaledWriteBackend<S, H, W> {
@@ -71,7 +73,18 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> JournaledWriteBac
                 deltas: Deltas::default(),
             }),
             compaction_budget: DEFAULT_COMPACTION_BUDGET,
+            hoist: true,
         }
+    }
+
+    /// Whether the flush resolves cross-id reads up front (design note §6.5).
+    ///
+    /// On by default. Hoisting costs memory proportional to the volume of
+    /// disturbed reads and buys the scheduler its freedom to release first; with
+    /// it off those reads become ordering constraints instead, and a claim can be
+    /// blocked behind a transfer. Both are correct.
+    pub fn set_hoisting(&mut self, hoist: bool) {
+        self.hoist = hoist;
     }
 
     /// How many bytes of compaction work [`flush`](Self::flush) will attempt.
@@ -102,7 +115,8 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> JournaledWriteBac
     /// End the write transaction: apply the log, compact within the budget, and
     /// hand back a read-only view.
     pub fn flush(self) -> JournaledReadBackend<S, H, W> {
-        self.finish(apply_folded)
+        let hoist = self.hoist;
+        self.finish(move |inner| apply_folded(inner, hoist))
     }
 
     /// [`flush`](Self::flush) via the naive in-order replayer instead of the fold.
@@ -232,17 +246,16 @@ pub(crate) fn apply<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word>(
     inner.deltas.clear();
 }
 
-/// Apply the log through the fold (design note §4, §5 and §6).
+/// Apply the log through the fold and the scheduler (design note §4, §5 and §6).
 ///
-/// Phase order is `hoist -> releases -> relabels -> claims -> reshapes -> writes`.
-///
-/// Releases run **first**, which is what gives the placement pass the freed space
-/// to work with. That is only sound because hoisting has already resolved every
-/// read of an allocation this flush disturbs; without it a released allocation's
-/// bytes could be handed to a claim before a piece that still names them was
-/// read, and releases would have to run last instead.
+/// `hoist` resolves every cross-id read whose source this flush disturbs, which
+/// frees the scheduler to run releases first -- where they give the placement
+/// pass the space to work with. With it off the same reads become ordering
+/// constraints instead, which is the trade §6.5 describes and what keeps the
+/// scheduler's edges honest.
 pub(crate) fn apply_folded<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word>(
     inner: &mut JournaledInner<S, H, W>,
+    hoist: bool,
 ) {
     let mut log = std::mem::take(&mut inner.log);
     let mut folded = {
@@ -251,10 +264,16 @@ pub(crate) fn apply_folded<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: W
     };
     let survivors = folded.survivors();
 
+    debug_assert!(
+        inner.deltas.agrees_with(|id| folded.geometry_of(id)),
+        "fold agreement: the geometry derived from the log must equal what the \
+         write phase recorded incrementally",
+    );
+
     // The content-blind fast path (§7): with no cross-id read there is nothing to
     // hoist and nothing to order, so the overwhelming majority of transactions
     // skip this entirely. Only `Copy` can set the flag.
-    if folded.has_cross_id_reads(&survivors) {
+    if hoist && folded.has_cross_id_reads(&survivors) {
         for (id, start, len, src, src_off) in folded.hoistable(&survivors) {
             let bytes = inner.composed.read_bytes(src, src_off, len);
             let span = log.intern(&bytes);
@@ -262,39 +281,25 @@ pub(crate) fn apply_folded<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: W
         }
     }
 
-    debug_assert!(
-        inner.deltas.agrees_with(|id| folded.geometry_of(id)),
-        "fold agreement: the geometry derived from the log must equal what the \
-         write phase recorded incrementally",
-    );
-
-    for id in folded.releases() {
-        inner.composed.release(id);
-    }
-
-    for action in folded.before_writes() {
-        match action {
-            Action::Claim(id, size) => inner.composed.claim(id, size),
-            Action::Reshape(id, size) => inner
+    for task in schedule(&folded, &survivors) {
+        match task {
+            Task::Claim(id, size) => inner.composed.claim(id, size),
+            Task::Reshape(id, size) => inner
                 .composed
                 .resize_by_id(id, size)
                 .expect("reshape of a live id"),
             // No bytes move: the allocation keeps its address and its size, and
             // only its key changes. The pending size, if any, is a separate
             // `Resize` that folded into the same entry.
-            Action::Relabel { from, to, size } => {
+            Task::Relabel { from, to, size } => {
                 inner.composed.relabel(from, to).expect("relabel of a live id");
                 inner
                     .composed
                     .resize_by_id(to, size)
                     .expect("reshape of a live id");
             }
-        }
-    }
-
-    for (id, size) in survivors {
-        for (start, pieces) in folded.runs(id, size.to_usize()) {
-            emit(inner, &log, id, start, &pieces);
+            Task::Release(id) => inner.composed.release(id),
+            Task::Write { id, start, pieces } => emit(inner, &log, id, start, &pieces),
         }
     }
 
@@ -524,6 +529,7 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> JournaledReadBack
         JournaledWriteBackend {
             inner: RefCell::new(self.inner),
             compaction_budget: DEFAULT_COMPACTION_BUDGET,
+            hoist: true,
         }
     }
 }
@@ -825,8 +831,6 @@ mod tests {
     // ---- pre-existing behaviour that must survive ----
 
     #[test]
-    #[ignore = "FFD claim ordering returns with the scheduler (design note §5.2); \
-                the naive replayer claims in log order"]
     fn flush_claims_the_largest_pending_allocations_first() {
         let wb = write_backend();
         let small = wb.alloc_fixed_size(10);
@@ -1134,6 +1138,41 @@ mod tests {
             "A3 reuses the range A1 vacated",
         );
         assert!(rb.len() <= len_before, "and the file did not grow");
+    }
+
+    #[test]
+    fn without_hoisting_the_read_becomes_an_ordering_constraint_instead() {
+        // The same scenario as above with hoisting off. Still correct -- the
+        // scheduler holds the release behind the write that reads it -- but the
+        // release can no longer run first, so A3 cannot reuse A1's range. That is
+        // exactly the trade §6.5 describes: memory for ordering.
+        let mut wb = write_backend();
+        wb.set_hoisting(false);
+        let a1 = wb.alloc_fixed_size(256);
+        wb.write(a1.raw(), 0, &[0xAB; 256]);
+        let a2 = wb.alloc_fixed_size(128);
+        let mut rb = wb.flush();
+        let a1_addr = rb.inner.composed.heap.lookup(a1.raw()).unwrap().0;
+
+        let mut wb = rb.reopen();
+        wb.set_hoisting(false);
+        wb.set_compaction_budget(0); // so the placement is observable
+        wb.copy(a1.raw(), 0, 64, a2.raw(), 32);
+        wb.free_fixed_size(a1);
+        let a3 = wb.alloc_fixed_size(200);
+        let (a2_id, a3_id) = (a2.raw(), a3.raw());
+        rb = wb.flush();
+
+        assert_eq!(
+            &read_back::<_, 128>(&mut rb, a2_id)[32..96],
+            &[0xAB; 64],
+            "the copy still reads the right bytes",
+        );
+        assert_ne!(
+            rb.inner.composed.heap.lookup(a3_id).unwrap().0,
+            a1_addr,
+            "but A3 cannot have A1's range, since the release could not run first",
+        );
     }
 
     #[test]

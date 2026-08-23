@@ -100,8 +100,9 @@ impl<W: Word, S: Word> Default for Folded<W, S> {
     }
 }
 
-/// What the flush must do about one id before any byte is written.
-pub(crate) enum Action<W: Word, S: Word> {
+/// One unit of work the flush has to perform. The scheduler orders these.
+#[derive(Debug)]
+pub(crate) enum Task<W: Word, S: Word> {
     Claim(Pointer<W>, S),
     Reshape(Pointer<W>, S),
     /// Rekey in place: no bytes move (design note §4.3).
@@ -109,6 +110,14 @@ pub(crate) enum Action<W: Word, S: Word> {
         from: Pointer<W>,
         to: Pointer<W>,
         size: S,
+    },
+    Release(Pointer<W>),
+    /// One gathered destination write: `pieces` are `(len, source)` in order,
+    /// starting at `start` within `id`.
+    Write {
+        id: Pointer<W>,
+        start: usize,
+        pieces: Vec<(usize, Source<W>)>,
     },
 }
 
@@ -288,40 +297,28 @@ impl<W: Word, S: Word> Folded<W, S> {
         self.set_segments(id, segments);
     }
 
-    /// The geometry that must be in place *before* any byte is written:
-    /// relabels, then claims, then reshapes.
-    pub(crate) fn before_writes(&self) -> Vec<Action<W, S>> {
-        let mut claims = Vec::new();
-        let mut reshapes = Vec::new();
-        let mut relabels = Vec::new();
+    /// Every unit of work this flush has to perform, in the fold's own
+    /// deterministic order. The scheduler decides the actual sequence.
+    pub(crate) fn tasks(&self, survivors: &[(Pointer<W>, S)]) -> Vec<Task<W, S>> {
+        let mut tasks = Vec::new();
         for (id, entry) in &self.entries {
-            match entry.geometry {
-                Pending::New(s) => claims.push(Action::Claim(*id, s)),
-                Pending::Resized(s) => reshapes.push(Action::Reshape(*id, s)),
-                Pending::Relabelled { from, size } => relabels.push(Action::Relabel {
+            tasks.push(match entry.geometry {
+                Pending::New(s) => Task::Claim(*id, s),
+                Pending::Resized(s) => Task::Reshape(*id, s),
+                Pending::Relabelled { from, size } => Task::Relabel {
                     from,
                     to: *id,
                     size,
-                }),
-                Pending::Freed => {}
+                },
+                Pending::Freed => Task::Release(*id),
+            });
+        }
+        for &(id, size) in survivors {
+            for (start, pieces) in self.runs(id, size.to_usize()) {
+                tasks.push(Task::Write { id, start, pieces });
             }
         }
-        relabels.into_iter().chain(claims).chain(reshapes).collect()
-    }
-
-    /// The releases, which run **last**.
-    ///
-    /// A piece may still name a released allocation's storage -- a sizedness
-    /// conversion transfers its table to the new id, whose pieces read the old one
-    /// -- and frees-last makes those reads trivially safe. It costs the placement
-    /// benefit of frees-first, which read hoisting (§6.5) buys back by removing
-    /// the reads that force the ordering.
-    pub(crate) fn releases(&self) -> Vec<Pointer<W>> {
-        self.entries
-            .iter()
-            .filter(|(_, e)| matches!(e.geometry, Pending::Freed))
-            .map(|(id, _)| *id)
-            .collect()
+        tasks
     }
 
     /// Ids that will hold bytes after the flush, with their final sizes.
