@@ -25,8 +25,9 @@
 //! in memory, so state lives only as long as the process does. That is why there
 //! is no `open`/`create` taking a `Path` yet.
 
-// Everything else this crate needs is in scope via the `pub use` below.
-use kladde_persist::CompactingBackend;
+// Re-exported rather than merely imported: it is the bound on `flush` and
+// `compact`, so code generic over the backend has to be able to name it.
+pub use kladde_persist::CompactingBackend;
 
 /// The derive macro, re-exported so an application needs only this crate.
 ///
@@ -52,7 +53,8 @@ pub use kladde_persist::{
 // The schema/fingerprint surface, so an application can inspect its root type's
 // schema (`T::schema()`/`T::fingerprint()`) without naming `kladde-schema`.
 pub use kladde_persist::{
-    Field, Fingerprint, SchemaBuilder, TypeDescriptor, TypeRef, TypeTable, Variant, Version,
+    Field, Fingerprint, Primitive, SchemaBuilder, TypeDescriptor, TypeRef, TypeTable, Variant,
+    Version,
 };
 
 pub use kladde_heap::CompactionProgress;
@@ -122,8 +124,8 @@ where
         &self.root
     }
 
-    /// A [`Guard`](kladde_persist::Guard) through which mutations to the root
-    /// value are recorded and applied.
+    /// A [`Guard`] through which mutations to the root value are recorded and
+    /// applied.
     pub fn guard(&mut self) -> <T as Persistable<B::Pointer>>::Guard<'_, B> {
         let location = Location::new(self.root_pointer.raw(), Word::zero());
         self.root.guard(&self.backend, location)
@@ -177,8 +179,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    // Deliberately through the facade, exactly as an application would write
+    // it: if a name an impl needs stops being re-exported, this stops building.
     use super::*;
-    use kladde_persist::{Guard, PointerRepr, Word};
     use std::io::Read;
 
     struct Counter(u32);
@@ -224,10 +227,8 @@ mod tests {
             Counter(u32::from_le_bytes(bytes))
         }
 
-        fn describe_local(
-            _builder: &mut kladde_persist::SchemaBuilder,
-        ) -> kladde_persist::TypeDescriptor {
-            kladde_persist::TypeDescriptor::Primitive(kladde_persist::Primitive::U32)
+        fn describe_local(_builder: &mut SchemaBuilder) -> TypeDescriptor {
+            TypeDescriptor::Primitive(Primitive::U32)
         }
     }
 
