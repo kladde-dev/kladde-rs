@@ -24,6 +24,8 @@
 
 mod backend;
 mod composed;
+#[cfg(test)]
+mod differential;
 mod evacuation_index;
 mod gain_greedy;
 mod heap;
