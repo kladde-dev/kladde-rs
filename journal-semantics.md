@@ -1,7 +1,7 @@
 # Journal semantics, and the flush optimizer
 
 Status: **§§1-8 implemented**, in `journal.rs`, `fold.rs`, `schedule.rs` and
-`journaled.rs`. §9 (durability) is not: the log lives in memory, `open` is still
+`journaled.rs`. §9 (durability) is not: the journal lives in memory, `open` is still
 a `todo!()`, and nothing survives a crash. §10 tracks what landed.
 
 The three bugs in §1 were real and are fixed; each has a regression test naming
@@ -23,7 +23,7 @@ itself (see [augmented-segment-tree.md](augmented-segment-tree.md)).
 
 - `pending: HashMap<Pointer, Size>` — a *state snapshot*. Unordered,
   last-writer-wins, self-annihilating. `alloc`/`free`/`resize`/`make_*` fold into it.
-- `journal: Vec<(Pointer, Size, Vec<u8>)>` — an *operation log*. Ordered,
+- `journal: Vec<(Pointer, Size, Vec<u8>)>` — an ordered *op sequence*:
   append-only, replayed verbatim.
 
 No order relates the two, so any operation that invalidates an earlier journal entry
@@ -51,20 +51,20 @@ The more fundamental statement of the same defect is not any of these. It is tha
 **the journal does not record every mutation**, so a crash mid-transaction is
 unrecoverable in a way that has nothing to do with annihilation: a `Persistable`
 that allocates a child and writes the child's id into its own header emits an
-`Alloc` that the log does not contain and a `Write` that it does. Recovery then
+`Alloc` that the journal does not contain and a `Write` that it does. Recovery then
 reads a live pointer out of the parent that names an allocation nothing ever
 created. Two operations, no `free` in sight, and the result is a dangling pointer
 in recovered application data.
 
 ## 2. The model
 
-> **The log is the sole authority.** It is a totally ordered sequence of every
+> **The journal is the sole authority.** It is a totally ordered sequence of every
 > mutation. Everything else is derived from it and may be discarded and rebuilt.
 
-The log carries six operation kinds, which is exactly the closure under "an entry
+The journal carries six operation kinds, which is exactly the closure under "an entry
 whose absence would make some other entry unreplayable or misinterpretable":
 
-| op | why it must be logged |
+| op | why it must be journalled |
 | --- | --- |
 | `Alloc(id, size)` | otherwise a `Write` has no target and a serialized id dangles. Sizedness rides on the id, so it needs no separate field. |
 | `Free(id)` | annihilation, and the id's release |
@@ -73,7 +73,7 @@ whose absence would make some other entry unreplayable or misinterpretable":
 | `Write(id, offset, bytes)` | content |
 | `Splice(id, offset, old_len, bytes)` | content, with a tail shift |
 
-`make_resizable`/`make_fixed_size` are **not** log ops. They decompose into a
+`make_resizable`/`make_fixed_size` are **not** journal ops. They decompose into a
 `ChangeSizedness` and a `Resize` (§4.3), which is what lets the common case move no
 bytes at all.
 
@@ -85,13 +85,13 @@ Two derived structures, and it matters that they are derived:
 
 - **`pending`** (§3) — write-phase geometry, so `size`/`resolve` are O(1).
   Discarded at checkpoint.
-- **`Folded`** (§4) — geometry *and* content, built at flush from the log alone,
+- **`Folded`** (§4) — geometry *and* content, built at flush from the journal alone,
   consumed by the scheduler, then dropped.
 
 `Folded` recomputes the geometry `pending` already had. That redundancy is the
 point: comparing them on every flush is the consistency check that all three bugs
 in §1 would have tripped, and it is asymptotically free (the fold is already
-O(log length); the comparison is O(touched ids)).
+O(journal length); the comparison is O(touched ids)).
 
 ### 2.1 Content semantics
 
@@ -112,7 +112,7 @@ what licenses most of §4's folding rules; without it they would be unsound.
 
 `Composed::free` already couples `heap.free` and `recycle`; the deferred path must
 keep them coupled. This is a precondition for everything below, not an
-optimization: the log and both derived structures are keyed by id, so if a counter
+optimization: the journal and both derived structures are keyed by id, so if a counter
 could be recycled mid-transaction then
 
 ```
@@ -193,13 +193,13 @@ heap second. Never trust the typestate alone.
 
 ## 4. Phase A — the fold
 
-Per id, linear, no graph. For each id the log touches, walk its op subsequence
+Per id, linear, no graph. For each id the journal touches, walk its op subsequence
 maintaining whether it exists, its current size, and a **piece table** over its
 bytes.
 
 ```rust
 enum Source {
-    Literal(LogOffset),     // bytes carried by a record in the log
+    Literal(JournalOffset), // bytes carried by a record in the journal
     Storage(Id, Offset),    // must be read from the file
     Undefined,              // uninitialized; may be anything (§2.1)
 }
@@ -213,14 +213,14 @@ that advance is meaningful — which is also what lets a `Literal` survive being
 partially overwritten, the survivor simply pointing into the middle of the original
 payload.
 
-`Literal` names a position in **the log**, whatever the log currently is: an
+`Literal` names a position in **the journal**, whatever the journal currently is: an
 in-memory byte buffer today, a framed on-disk record later. Nothing below depends on
 which, and §4.1 is written so the representation does not have to change when that
 does.
 
 The distinction that drives everything:
 
-- **Fresh** ids (an `Alloc` appears in this log) start `{0 → Undefined}`. Their
+- **Fresh** ids (an `Alloc` appears in this journal) start `{0 → Undefined}`. Their
   content is *fully symbolic* — nothing about them ever needs to be read.
 - **Persistent** ids (live from an earlier checkpoint) start
   `{0 → Storage(self, 0)}`.
@@ -256,7 +256,7 @@ It is tempting to merge adjacent segments in the table and call that the
 optimization. It is not, and conflating the two costs a lot of confusion:
 
 - **Source contiguity** — can two segments be represented as one `Source`? Two
-  `Literal`s can only merge if their log positions are adjacent, which they are
+  `Literal`s can only merge if their journal positions are adjacent, which they are
   *not* in general: consecutive `Write` records are separated by the next record's
   header. Two `Storage(id, base)` merge iff same `id` and `left.base + left.len ==
   right.base`; two `Undefined` always merge.
@@ -289,7 +289,7 @@ obliged to write.
 - **`splice` on a fresh allocation costs zero I/O.** It is a table edit; the shift
   never touches bytes. Since `PersistableString`/`PersistableVec` splice in loops,
   this is probably the largest single win available.
-- **A transient allocation — fresh and freed in the same log — never touches
+- **A transient allocation — fresh and freed in the same journal — never touches
   storage.** Recycle its counter and emit nothing. A `Copy` *out* of it resolves to
   literals, so the read does not force it to be materialized.
 - **An identity piece emits nothing.** `Storage(self, k)` with `k == seg_start`
@@ -341,7 +341,7 @@ and is worth measuring on exactly the oscillating workload above.
 
 ## 5. Phase B — the schedule
 
-Vertices are the **emitted actions**, not the log's ops — the fold changed the op
+Vertices are the **emitted actions**, not the journal's ops — the fold changed the op
 set:
 
 ```
@@ -369,7 +369,7 @@ one edge, below, and never appears in a cycle.
 4. Earlier writes to a range → a `Transfer` reading it. The fold has usually already
    turned these into literals, so this edge mostly evaporates.
 
-**It is a DAG by construction**: every hard edge points from a lower log position to
+**It is a DAG by construction**: every hard edge points from a lower journal position to
 a higher one.
 
 ### 5.2 Frees-first is a preference, not an edge
@@ -400,7 +400,7 @@ by then every `Storage` read has been resolved.
 ### 6.1 The scenario
 
 After an earlier checkpoint the heap holds `A1` at address 1000, size 256, and `A2`
-at address 2000, size 128 — both persistent. This transaction logs:
+at address 2000, size 128 — both persistent. This transaction records:
 
 ```
 1.  Copy(src = A1, src_off = 0, len = 64, dst = A2, dst_off = 32)
@@ -464,13 +464,13 @@ precede the read for placement reasons the priority cannot reach, which is exoti
 
 ### 6.5 Hoisting, which makes the question moot
 
-At fold time, if a `Storage(src, …)` piece references a range that this log will
+At fold time, if a `Storage(src, …)` piece references a range that this journal will
 **disturb**, read those bytes immediately and turn the piece into a `Literal`.
 Disturbed means any of:
 
-- `src` is released this log,
-- the range is written this log,
-- `src` is reshaped this log (it may relocate).
+- `src` is released this journal,
+- the range is written this journal,
+- `src` is reshaped this journal (it may relocate).
 
 All three are known during the fold, which already runs at flush with full read
 access to storage.
@@ -484,7 +484,7 @@ Applied to §6.1: A1 is released, so A2's middle piece becomes a `Literal` durin
 fold. The `Transfer` disappears, `Release(A1)` loses its only predecessor, and the
 schedule is `Release(A1)` → `Claim(A3)` at 1000 → `Write(A2, 32, lit)` →
 `Write(A3, 0, …)`. Same result as §6.3 and §6.4, and the only cost is 64 bytes held
-in the log between fold and execution — bytes that were going to be read anyway.
+in the journal between fold and execution — bytes that were going to be read anyway.
 
 **Hoisting every disturbed read collapses the DAG.** Every surviving `Transfer` then
 reads a range that is not released, not written and not reshaped, and its source
@@ -496,9 +496,9 @@ So §5 describes the general mechanism, but the recommendation is to **build
 hoisting first and skip the graph entirely**. It is dramatically simpler and it is
 correct; its only cost is memory proportional to the volume of disturbed reads,
 which for kladde's containers is small — with `make_*` decomposed (§4.3), the only
-op that produces one at all is `Copy`. Build the scheduler when a workload shows the buffering hurting — the
-differential oracle of §8 makes that transition safe, and the fold is the same
-function either way.
+op that produces one at all is `Copy`. Build the scheduler when a workload shows the
+buffering hurting — the differential oracle of §8 makes that transition safe, and
+the fold is the same function either way.
 
 ## 7. The content-blind fast path
 
@@ -512,13 +512,13 @@ correct memmove direction internally, but that is local), and **not**
 When the flag is clear at flush — the overwhelming majority of transactions — run
 `releases → relabels → FFD claims → reshapes → writes` with no graph, no hoisting
 and no *cross-id* piece analysis. The fold still runs: both paths emit from
-`Folded`, never from the raw log, so the per-byte deduplication below is not
+`Folded`, never from the raw journal, so the per-byte deduplication below is not
 something the fast path gives up.
 
 ### 7.1 What the fold already deduplicates
 
 The piece table holds exactly one `Source` per byte, by construction — `overwrite`
-splits both boundaries and drops everything strictly inside. So a log containing a
+splits both boundaries and drops everything strictly inside. So a journal containing a
 thousand writes to the same eight bytes emits **one** eight-byte write, on either
 path. No byte is written twice in a flush.
 
@@ -562,14 +562,14 @@ write-phase-only (§2).
 This is a small optimizing compiler, so build the oracle before the optimizer.
 
 Keep the naive in-order replayer as a reference implementation. Differential-test
-the optimized flush against it: same log, then compare the observable state, with
+the optimized flush against it: same journal, then compare the observable state, with
 `Undefined` ranges masked out (§2.1 makes them unconstrained, so comparing them
-would reject legal schedules). Randomized logs with shrinking.
+would reject legal schedules). Randomized journals with shrinking.
 
 **Adjusted in implementation.** This section originally said to compare
 `heap.iter()`. That is too strong: addresses are not observable through the
 backend API, and two correct implementations legitimately place things
-differently — naive replay claims in log order, the scheduler claims
+differently — naive replay claims in journal order, the scheduler claims
 first-fit-decreasing. Comparing addresses would reject the optimization the
 oracle exists to validate. The compared surface is therefore which allocations
 are live, how big each is, and what bytes it holds.
@@ -589,9 +589,16 @@ Two properties worth asserting separately, because they fail differently:
 
 ### 9.1 Terminology
 
-Four words that have to be kept apart:
+First, two names for one byte stream. The **journal** is the ordered sequence of
+ops — a *logical* log, recording operations rather than page images. The
+**write-ahead log** is that same sequence made durable *ahead of* the data writes it
+describes. So they are not two structures: "journal" names what it contains,
+"write-ahead log" names when it is written relative to the data region. This note
+says "journal" throughout except where the write-ahead property is the point.
 
-- A **prefix** of the log is op₁…opₖ — the log truncated at a point.
+Four more words that have to be kept apart:
+
+- A **prefix** of the journal is op₁…opₖ — the journal truncated at a point.
 - A **commit boundary** is a position marking a completed logical change: a
   guard-method boundary in the auto-checkpoint model, or an explicit `commit()`
   inside a transaction. A **committed prefix** is one ending exactly on such a
@@ -626,7 +633,7 @@ then writes. A guard method is the natural atomic unit, being the smallest thing
 application author perceives as one change.
 
 **`flush` splits into two knobs**: fold-and-apply (bounds memory, safe whenever the
-fold is consistent) and truncate-the-log (safe only up to the last commit). They are
+fold is consistent) and truncate-the-journal (safe only up to the last commit). They are
 currently one operation.
 
 ### 9.2 Two failure modes, two unrelated fixes
@@ -638,8 +645,9 @@ Both leave torn state on disk, which is why they are easy to conflate:
 | **A** | ops applied that the application never committed | choosing *what* to apply |
 | **B** | a crash midway through applying | making apply *restartable* |
 
-**(a) Write-ahead the log** — persist records before applying them, mark commits with
-a commit record, recover by replaying the durable log. Fixes **B**.
+**(a) A write-ahead log** — make the journal durable *before* applying it, mark
+commits with a commit record, and recover by replaying the write-ahead log.
+Fixes **B**.
 
 **(b) Checkpoint only committed prefixes** — stop at the most recent commit boundary
 rather than partway into an in-flight change, so storage never holds uncommitted
@@ -676,8 +684,8 @@ detail:
 
 The stated requirement — recover after the application crashes anywhere inside
 `flush` — is process death, so **layer 1 suffices**. The page cache outlives the
-process, and one process's `write()` calls land in program order, so issuing the log
-write before the data writes gives the ordering for free. No `fsync` anywhere.
+process, and one process's `write()` calls land in program order, so writing the
+journal ahead of the data writes gives the ordering for free. No `fsync` anywhere.
 
 Surviving power loss means layer 2, which costs roughly one `fsync` per flush. That
 is the expensive part and should be chosen deliberately rather than inherited.
@@ -685,15 +693,15 @@ is the expensive part and should be chosen deliberately rather than inherited.
 Even at layer 1, `write_all` loops over short writes, so a process dying mid-loop
 leaves a partially written record. Framing (§9.5) is required at every layer.
 
-### 9.4 What has to be in the log
+### 9.4 What has to be in the write-ahead log
 
 The organizing question is **what is derivable**:
 
-| | derivable? | must be logged |
+| | derivable? | must be in the write-ahead log |
 | --- | --- | --- |
 | the ops themselves | no | **yes** — and they already are; the journal is written as ops are recorded |
 | hoisted bytes (§6.5) | no, *after partial application* | **yes** — and this is new work at flush time |
-| the fold, and the schedule's shape | yes, from the log | no |
+| the fold, and the schedule's shape | yes, from the journal | no |
 | ids of claimed regions | — | **yes**, but for free: `Alloc` and `ChangeSizedness` already carry them |
 | the address each `Claim` receives | yes, **if** placement is deterministic and the pre-flush heap state is recoverable | no |
 
@@ -701,7 +709,7 @@ Two things this makes precise.
 
 **Only the hoisted bytes are new at flush time.** The ops are in the file already —
 that is what the journal is for. Hoisting, by contrast, happens *during* the fold, so
-flush begins with a genuine append: the hoist blob, plus a marker naming the log
+flush begins with a genuine append: the hoist blob, plus a marker naming the journal
 range this flush covers. That append is what must be ordered before the data writes.
 
 **Id minting stays unspecified; placement does not.** Because `Alloc(id, size)` and
@@ -713,9 +721,9 @@ After recovery it is enough to rebuild a non-colliding allocator (e.g.
 counter density.
 
 Placement is the opposite: the schedule is **deterministic and specified**, so
-recovery re-derives each `Claim`'s address rather than reading it from the log. That
-saves writing a plan proportional to touched ids on every flush, and costs two
-things:
+recovery re-derives each `Claim`'s address rather than reading it from the
+write-ahead log. That saves writing a plan proportional to touched ids on every
+flush, and costs two things:
 
 - **Determinism becomes load-bearing.** No `HashMap` iteration order, no time, no
   addresses-as-input, no floats — anywhere in the fold, the placement policy, or the
@@ -866,12 +874,13 @@ That is an argument for their priority, not just their performance.
 Recovery re-derives the schedule and re-runs it, which is sound only if every action
 survives partial application followed by repetition.
 
-**Re-runnable.** `Write` (bytes come from the log; the address re-derives
-identically). `Claim`, `Release`, `Relabel` (heap operations re-derived from the
-snapshot plus the log). A `Transfer` whose source was hoisted — because hoisting
-turned it into a `Write`. This is the strongest argument for §6.5: hoisting is not
-merely a scheduling simplification, it is what makes replay idempotent, and §6.5's
-disturb set is exactly the set of bytes a partial apply could have clobbered.
+**Re-runnable.** `Write` (bytes come from the write-ahead log; the address
+re-derives identically). `Claim`, `Release`, `Relabel` (heap operations re-derived
+from the snapshot plus the write-ahead log). A `Transfer` whose source was hoisted —
+because hoisting turned it into a `Write`. This is the strongest argument for §6.5:
+hoisting is not merely a scheduling simplification, it is what makes replay
+idempotent, and §6.5's disturb set is exactly the set of bytes a partial apply could
+have clobbered.
 
 **Not re-runnable: compaction slides.** A `Step` has `to < from`, and its source and
 destination overlap whenever the gap is smaller than the run. Hoisting cannot help,
@@ -892,15 +901,15 @@ a test rather than corrupting files after a crash.
 
 ### 9.7 What (a) unlocks
 
-Two things become available once the log is durable and self-contained:
+Two things become available once the write-ahead log exists and is self-contained:
 
 - **Deferred replay.** Nothing in memory is needed to finish applying, so replay can
   be scheduled to idle time or run asynchronously.
-- **Log pruning.** An incrementally maintained piece table can drop literals that
-  have since been overwritten, shrinking the in-memory log and directly reducing how
+- **Journal pruning.** An incrementally maintained piece table can drop literals that
+  have since been overwritten, shrinking the in-memory journal and directly reducing how
   often the auto-checkpoint fires. Only safe once a durable copy exists.
 
-Until then, build the fold at flush (§4): it is a pure function of the log, which
+Until then, build the fold at flush (§4): it is a pure function of the journal, which
 makes it trivially checkable, and nothing pulls it earlier because `size`/`resolve`
 need geometry only.
 
@@ -908,7 +917,7 @@ need geometry only.
 
 Steps 1–7 are **done**; step 8 is not.
 
-1. **Log every mutation** (§2). This alone fixes the recovery hole and makes bugs
+1. **Journal every mutation** (§2). This alone fixes the recovery hole and makes bugs
    1–3 expressible; it is the only step that is not optional.
 2. **`pending` as the §3 delta**, replacing the current exhaustive map. Fixes the
    post-checkpoint `size`/`resolve`/`free`/`resize` holes and the counter leak.
@@ -928,25 +937,26 @@ Steps 1–7 are **done**; step 8 is not.
    implementable and `Copy` becomes addable.
 7. **The scheduler** (§5) — only if buffering measured in step 6 proves too
    expensive.
-8. **Durability** (§9): self-delimiting frames with chained CRC-32C (§9.5), the durable
-   heap snapshot that `open` needs anyway, ordering the log append before the data
-   writes, and the commit-prefix policy. Restartable flush arrives here.
+8. **Durability** (§9): self-delimiting frames with chained CRC-32C (§9.5), the
+   durable heap snapshot that `open` needs anyway, ordering the write-ahead log's
+   append before the data writes, and the commit-prefix policy. Restartable flush
+   arrives here.
 
 Steps 1–3 are prerequisites for anything else. Steps 4–6 are where the I/O
 reductions live. Step 7 may never be needed.
 
-Step 8 is deliberately last, and it is genuinely separable: the log is already the
-authority from step 1, so nothing above it changes shape when the log becomes
+Step 8 is deliberately last, and it is genuinely separable: the journal is already the
+authority from step 1, so nothing above it changes shape when the journal becomes
 durable. Two things make that separation hold rather than merely look plausible, and
 both are cheap enough to do early — the determinism assertion in step 3, and
-reserving the length/CRC frame-header fields in the record format from the start even while
-writing zeros into them. Without those two, step 8 becomes a retrofit rather than an
-addition.
+reserving the length/CRC frame-header fields in the record format from the start
+even while writing zeros into them. Without those two, step 8 becomes a retrofit
+rather than an addition.
 
 Of those two, only the first landed. The determinism assertion is in place; the
 record format is still an in-memory `Vec<Op>` plus a byte arena, with no framing
 at all, so step 8 will have to introduce it. `Source::Literal` already names a
-position in "the log" rather than a private arena, so the fold does not change
+position in "the journal" rather than a private arena, so the fold does not change
 when it does.
 
 Three things surfaced during implementation that the note had not anticipated:
