@@ -1,8 +1,14 @@
 # Journal semantics, and the flush optimizer
 
-Status: design note. Nothing here is implemented. The current
-`JournaledWriteBackend` (`crates/kladde-heap/src/journaled.rs`) contradicts §2 in
-three places and is known-broken; §10 gives the order in which to replace it.
+Status: **§§1-8 implemented**, in `journal.rs`, `fold.rs`, `schedule.rs` and
+`journaled.rs`. §9 (durability) is not: the log lives in memory, `open` is still
+a `todo!()`, and nothing survives a crash. §10 tracks what landed.
+
+The three bugs in §1 were real and are fixed; each has a regression test naming
+it. Two things below were adjusted against what the implementation found, and are
+marked where they occur: the oracle compares the *observable* surface rather than
+`heap.iter()`, and the scheduler needs hoisting to be switchable off before its
+edges do any work.
 
 The subject is the *deferred* write path: what a transaction records, what a flush
 is allowed to do with the recording, and what "the same thing happened" means when
@@ -556,10 +562,22 @@ write-phase-only (§2).
 This is a small optimizing compiler, so build the oracle before the optimizer.
 
 Keep the naive in-order replayer as a reference implementation. Differential-test
-the optimized flush against it: same log, then compare the entire observable state —
-`heap.iter()` plus every live allocation's bytes, with `Undefined` ranges masked out
-(§2.1 makes them unconstrained, so comparing them would reject legal schedules).
-Randomized logs with shrinking.
+the optimized flush against it: same log, then compare the observable state, with
+`Undefined` ranges masked out (§2.1 makes them unconstrained, so comparing them
+would reject legal schedules). Randomized logs with shrinking.
+
+**Adjusted in implementation.** This section originally said to compare
+`heap.iter()`. That is too strong: addresses are not observable through the
+backend API, and two correct implementations legitimately place things
+differently — naive replay claims in log order, the scheduler claims
+first-fit-decreasing. Comparing addresses would reject the optimization the
+oracle exists to validate. The compared surface is therefore which allocations
+are live, how big each is, and what bytes it holds.
+
+A third implementation is worth more than two: a pure in-memory model catches
+bugs both backends share, and it sidesteps id divergence, since the journaled
+backend's deferred frees recycle counters at different moments than the
+unjournaled one's. Actions therefore name model-level handles rather than ids.
 
 Two properties worth asserting separately, because they fail differently:
 
@@ -798,6 +816,8 @@ need geometry only.
 
 ## 10. Implementation order
 
+Steps 1–7 are **done**; step 8 is not.
+
 1. **Log every mutation** (§2). This alone fixes the recovery hole and makes bugs
    1–3 expressible; it is the only step that is not optional.
 2. **`pending` as the §3 delta**, replacing the current exhaustive map. Fixes the
@@ -832,6 +852,24 @@ both are cheap enough to do early — the determinism assertion in step 3, and
 reserving the epoch/CRC header fields in the record format from the start even while
 writing zeros into them. Without those two, step 8 becomes a retrofit rather than an
 addition.
+
+Of those two, only the first landed. The determinism assertion is in place; the
+record format is still an in-memory `Vec<Op>` plus a byte arena, with no framing
+at all, so step 8 will have to introduce it. `Source::Literal` already names a
+position in "the log" rather than a private arena, so the fold does not change
+when it does.
+
+Three things surfaced during implementation that the note had not anticipated:
+
+- **A zero-sized allocation overflows `GainGreedyHeap`**, which keys allocations
+  by address and assumes a positive extent. Unrelated to the journal; recorded in
+  `later.md`.
+- **`Freed` needs a lookup-guarded release.** §3 says so, but it is easy to miss:
+  an allocation minted and freed in one transaction never reached the heap, so
+  freeing it is `UnknownId` — while its counter is still owed.
+- **A gathered run that reads its own allocation must not be split.** A splice
+  shifting a tail produces one; splitting it lets the first write clobber bytes a
+  later piece still has to read.
 
 ## References
 

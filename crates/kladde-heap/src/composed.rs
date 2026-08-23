@@ -183,6 +183,12 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Composed<S, H, W>
             .heap
             .resize(id, new_size)
             .expect("resize of a dangling handle");
+        debug_assert!(
+            non_overlapping(&moved, old_size.to_usize().min(new_size.to_usize())),
+            "a heap-initiated move must not overlap: replaying a partially applied \
+             overlapping copy reads bytes the partial run already clobbered, which \
+             is what makes compaction slides non-restartable (see later.md)",
+        );
         match moved {
             Relocation::Single { old, new } => {
                 let copy_len = old_size.to_usize().min(new_size.to_usize());
@@ -428,6 +434,31 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Composed<S, H, W>
             return Err(BackendError::DanglingPointer);
         }
         Ok(resolved(id))
+    }
+}
+
+/// Whether a relocation's source and destination ranges are disjoint.
+///
+/// `GainGreedyHeap` finds a resize's new home *before* releasing the old one, and
+/// draws the lift's replacement from above the vacated gap, so this holds today
+/// -- but by an argument that is structural and implicit rather than stated. A
+/// placement policy that let an allocation grow *downward* into the gap below it
+/// would break it silently, and the consequence only shows up after a crash: a
+/// partially applied overlapping copy has already clobbered bytes that re-running
+/// it from the start would read. See `later.md`.
+fn non_overlapping<A: Word, Sz: Word>(moved: &Relocation<A, Sz>, copy_len: usize) -> bool {
+    let disjoint = |a: A, b: A, len: usize| {
+        let (a, b) = (a.to_usize(), b.to_usize());
+        len == 0 || a + len <= b || b + len <= a
+    };
+    match *moved {
+        Relocation::None => true,
+        Relocation::Single { old, new } => disjoint(old, new, copy_len),
+        Relocation::Double {
+            first,
+            then,
+            then_len,
+        } => disjoint(first.0, first.1, copy_len) && disjoint(then.0, then.1, then_len.to_usize()),
     }
 }
 
