@@ -11,8 +11,12 @@ kladde-persist = { workspace = true }
 kladde-derive = { workspace = true, optional = true }
 
 [features]
-# On by default, as serde does: `#[derive(Persistable)]` is what most
-# application code reaches for first, and generated code names `::kladde`,
-# so the macro and the items it needs arrive together or not at all.
+# On by default -- unlike `serde`, whose default is only `std`. Serde is
+# depended on by half the ecosystem, much of which only wants the traits, so
+# making everyone build a proc macro would be a poor trade there. This crate is
+# the application-facing facade (a library builds on `kladde-persist` instead),
+# and `#[derive(Persistable)]` is what application code reaches for first.
+# Generated code names `::kladde`, so the macro and the items it expands to
+# arrive together or not at all.
 default = ["derive"]
 derive = ["dep:kladde-derive"]
