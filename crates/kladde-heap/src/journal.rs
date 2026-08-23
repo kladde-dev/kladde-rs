@@ -150,7 +150,7 @@ pub(crate) enum Pending<W: Word, S: Word> {
 
 impl<W: Word, S: Word> Pending<W, S> {
     /// The size this id will have, or `None` if it is being released.
-    fn size(self) -> Option<S> {
+    pub(crate) fn size(self) -> Option<S> {
         match self {
             Pending::New(s) | Pending::Resized(s) | Pending::Relabelled { size: s, .. } => Some(s),
             Pending::Freed => None,
@@ -185,6 +185,26 @@ pub(crate) enum Geometry<S> {
 impl<W: Word, S: Word> Deltas<W, S> {
     pub(crate) fn clear(&mut self) {
         self.map.clear();
+    }
+
+    /// Fold agreement (design note §2): the geometry the fold derives from the
+    /// log must equal what this cache recorded incrementally.
+    ///
+    /// Compared by *size and liveness* rather than by the whole `Pending`, since
+    /// the two disagree on how a sizedness conversion is expressed until the fold
+    /// learns to relabel (§4.3). The redundancy is the point -- every divergence
+    /// bug in the predecessor would have tripped this.
+    ///
+    /// One-directional: the fold also carries ids this map never mentions, namely
+    /// persistent allocations that were only *written* and so have no geometry
+    /// delta at all.
+    pub(crate) fn agrees_with(
+        &self,
+        folded: impl Fn(Pointer<W>) -> Option<Option<S>>,
+    ) -> bool {
+        self.map
+            .iter()
+            .all(|(id, pending)| folded(*id) == Some(pending.size()))
     }
 
     /// Answer a `size`/`resolve` query. Deltas first, heap second -- never the

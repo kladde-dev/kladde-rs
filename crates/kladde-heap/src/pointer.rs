@@ -135,6 +135,25 @@ impl<W: Word> PartialEq for Pointer<W> {
     }
 }
 impl<W: Word> Eq for Pointer<W> {}
+/// Ordered by raw value, so an id can key a `BTreeMap`.
+///
+/// The flush path needs *some* total order it can iterate in: hashing would make
+/// the resulting layout depend on iteration order, and
+/// `journal-semantics.md` §9.4 makes that determinism load-bearing for recovery.
+/// The order itself carries no meaning -- it interleaves the two sizednesses,
+/// since the low bit is the sizedness flag.
+impl<W: Word> PartialOrd for Pointer<W> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<W: Word> Ord for Pointer<W> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.raw().cmp(&other.raw())
+    }
+}
 impl<W: Word> Hash for Pointer<W> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {

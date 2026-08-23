@@ -28,6 +28,7 @@ use std::io::{Read, Seek};
 use crate::backend::{Backend, BackendError, ReadBackend, WriteBackend};
 use crate::composed::{resolved, Composed};
 use crate::heap::{CompactionProgress, IncrementallyCompactableHeap, RelocatableHeap};
+use crate::fold::{fold, literal, Action, Source};
 use crate::journal::{Deltas, Geometry, Log, Op};
 use crate::pointer::{
     Pointer, ResolvedPointer, Sizedness, UniquePointerFixedSize, UniquePointerResizable,
@@ -37,6 +38,14 @@ use crate::word::Word;
 
 /// Bytes of compaction work attempted per flush when nothing else is configured.
 pub const DEFAULT_COMPACTION_BUDGET: usize = 64 * 1024;
+
+/// How many bytes one gathered destination write may assemble before it is split.
+///
+/// Design note §4.1.1: a destination run can name arbitrarily many scattered
+/// sources, and assembling it means staging them somewhere. Capping keeps that
+/// staging bounded; splitting a run only costs an extra write, so this is a pure
+/// throughput knob.
+const GATHER_CAP: usize = 8 * 1024;
 
 pub(crate) struct JournaledInner<S, H: RelocatableHeap, W: Word = u32> {
     pub(crate) composed: Composed<S, H, W>,
@@ -93,9 +102,26 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> JournaledWriteBac
     /// End the write transaction: apply the log, compact within the budget, and
     /// hand back a read-only view.
     pub fn flush(self) -> JournaledReadBackend<S, H, W> {
+        self.finish(apply_folded)
+    }
+
+    /// [`flush`](Self::flush) via the naive in-order replayer instead of the fold.
+    ///
+    /// Kept as the reference implementation §8 calls for: it performs one
+    /// `Composed` call per logged op, with no folding and no reordering, so it is
+    /// the simplest thing that can be correct. The differential oracle runs both.
+    #[cfg(test)]
+    pub(crate) fn flush_naively(self) -> JournaledReadBackend<S, H, W> {
+        self.finish(apply)
+    }
+
+    fn finish(
+        self,
+        how: impl FnOnce(&mut JournaledInner<S, H, W>),
+    ) -> JournaledReadBackend<S, H, W> {
         let budget = self.compaction_budget;
         let mut inner = self.inner.into_inner();
-        apply(&mut inner);
+        how(&mut inner);
         // Unconditional: a non-compacting heap proposes nothing and this is free.
         let progress = inner
             .composed
@@ -150,6 +176,7 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> JournaledWriteBac
 /// folding, no reordering. It is deliberately the simplest thing that can be
 /// correct, because `journal-semantics.md` §8 keeps it as the reference
 /// implementation the optimized path is differentially tested against.
+#[cfg(test)]
 pub(crate) fn apply<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word>(
     inner: &mut JournaledInner<S, H, W>,
 ) {
@@ -194,6 +221,103 @@ pub(crate) fn apply<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word>(
         }
     }
     inner.deltas.clear();
+}
+
+/// Apply the log through the fold (design note §4 and §5).
+///
+/// Phase order is `relabels -> claims -> reshapes -> writes -> releases`.
+/// Releases come **last** because a piece may still name a released allocation's
+/// storage: a sizedness conversion hands its table to the new id, whose pieces
+/// read the old one. Read hoisting (§6.5) is what removes those reads and lets
+/// releases move to the front, where they give the placement pass more room.
+pub(crate) fn apply_folded<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word>(
+    inner: &mut JournaledInner<S, H, W>,
+) {
+    let log = std::mem::take(&mut inner.log);
+    let folded = {
+        let heap = &inner.composed.heap;
+        fold(&log, |id| heap.lookup(id).map(|(_, size)| size))
+    };
+
+    debug_assert!(
+        inner.deltas.agrees_with(|id| folded.geometry_of(id)),
+        "fold agreement: the geometry derived from the log must equal what the \
+         write phase recorded incrementally",
+    );
+
+    for action in folded.before_writes() {
+        match action {
+            Action::Claim(id, size) => inner.composed.claim(id, size),
+            Action::Reshape(id, size) => inner
+                .composed
+                .resize_by_id(id, size)
+                .expect("reshape of a live id"),
+            Action::Relabel { .. } => {
+                unreachable!("relabels arrive with `ChangeSizedness` (design note §4.3)")
+            }
+        }
+    }
+
+    for (id, size) in folded.survivors() {
+        for (start, pieces) in folded.runs(id, size.to_usize()) {
+            emit(inner, &log, id, start, &pieces);
+        }
+    }
+
+    for id in folded.releases() {
+        inner.composed.release(id);
+    }
+
+    inner.deltas.clear();
+}
+
+/// Assemble one destination run and put it down with as few writes as the cap
+/// allows.
+fn emit<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word>(
+    inner: &mut JournaledInner<S, H, W>,
+    log: &Log<W, H::Size>,
+    id: Pointer<W>,
+    start: usize,
+    pieces: &[(usize, Source<W>)],
+) {
+    // A run that reads *its own* allocation is a memmove (splice shifts a tail
+    // that way). Splitting it would let the first write clobber bytes a later
+    // piece still has to read, so such a run is staged whole -- bounded by the
+    // allocation's own size either way.
+    let self_referential = pieces
+        .iter()
+        .any(|(_, src)| matches!(src, Source::Storage(other, _) if *other == id));
+    let cap = if self_referential { usize::MAX } else { GATHER_CAP };
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut offset = start;
+    let put = |inner: &mut JournaledInner<S, H, W>, buf: &mut Vec<u8>, offset: &mut usize| {
+        if !buf.is_empty() {
+            inner.composed.write(id, Word::from_usize(*offset), buf);
+            *offset += buf.len();
+            buf.clear();
+        }
+    };
+
+    for &(len, src) in pieces {
+        let mut done = 0;
+        while done < len {
+            let take = (len - done).min(cap - buf.len());
+            match src {
+                Source::Literal(pos) => buf.extend_from_slice(literal(log, pos + done, take)),
+                Source::Storage(other, off) => {
+                    let bytes = inner.composed.read_bytes(other, off + done, take);
+                    buf.extend_from_slice(&bytes);
+                }
+                Source::Undefined => unreachable!("undefined segments are not emitted"),
+            }
+            done += take;
+            if buf.len() >= cap {
+                put(inner, &mut buf, &mut offset);
+            }
+        }
+    }
+    put(inner, &mut buf, &mut offset);
 }
 
 impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Backend
@@ -394,16 +518,73 @@ mod tests {
     use super::*;
     use crate::storage::InMemoryStorage;
     use crate::GainGreedyHeap;
+    use std::cell::Cell;
     use std::io::Read;
+    use std::rc::Rc;
 
     type Wb = JournaledWriteBackend<InMemoryStorage, GainGreedyHeap<Pointer<u32>>>;
+
+    /// Counts writes reaching the store, so the fold's claims about *how much*
+    /// I/O it removes can be asserted rather than asserted-in-prose.
+    struct Counting {
+        inner: InMemoryStorage,
+        writes: Rc<Cell<usize>>,
+        bytes: Rc<Cell<usize>>,
+    }
+
+    impl std::io::Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+    impl std::io::Write for Counting {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes.set(self.writes.get() + 1);
+            self.bytes.set(self.bytes.get() + buf.len());
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    impl std::io::Seek for Counting {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+    impl crate::storage::Storage for Counting {
+        fn resize(&mut self, new_len: u64) -> std::io::Result<()> {
+            self.inner.resize(new_len)
+        }
+        fn len(&self) -> std::io::Result<u64> {
+            self.inner.len()
+        }
+    }
+
+    type CountingWb = JournaledWriteBackend<Counting, GainGreedyHeap<Pointer<u32>>>;
+
+    /// A backend whose store counts writes, plus the two counters.
+    fn counting() -> (CountingWb, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+        let writes = Rc::new(Cell::new(0));
+        let bytes = Rc::new(Cell::new(0));
+        let storage = Counting {
+            inner: InMemoryStorage::default(),
+            writes: Rc::clone(&writes),
+            bytes: Rc::clone(&bytes),
+        };
+        (
+            JournaledWriteBackend::new(storage, GainGreedyHeap::new()),
+            writes,
+            bytes,
+        )
+    }
 
     fn write_backend() -> Wb {
         JournaledWriteBackend::new(InMemoryStorage::default(), GainGreedyHeap::new())
     }
 
-    fn read_back<const N: usize>(
-        rb: &mut JournaledReadBackend<InMemoryStorage, GainGreedyHeap<Pointer<u32>>>,
+    fn read_back<St: Storage, const N: usize>(
+        rb: &mut JournaledReadBackend<St, GainGreedyHeap<Pointer<u32>>>,
         id: Pointer<u32>,
     ) -> [u8; N] {
         let mut buf = [0u8; N];
@@ -419,7 +600,7 @@ mod tests {
         let id = p.raw();
 
         let mut rb = wb.flush();
-        assert_eq!(read_back::<4>(&mut rb, id), [1, 2, 3, 4]);
+        assert_eq!(read_back::<_, 4>(&mut rb, id), [1, 2, 3, 4]);
     }
 
     #[test]
@@ -445,7 +626,7 @@ mod tests {
         let id = p.raw();
 
         let mut rb = wb.flush();
-        assert_eq!(read_back::<8>(&mut rb, id), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(read_back::<_, 8>(&mut rb, id), [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -473,7 +654,7 @@ mod tests {
 
         let id = q.raw();
         let mut rb = wb.flush();
-        assert_eq!(read_back::<4>(&mut rb, id), [1, 2, 3, 4]);
+        assert_eq!(read_back::<_, 4>(&mut rb, id), [1, 2, 3, 4]);
     }
 
     // ---- the three bugs from `journal-semantics.md` §1 ----
@@ -514,8 +695,8 @@ mod tests {
         let (a_id, b_id) = (a.raw(), b.raw());
 
         let mut rb = wb.flush();
-        assert_eq!(read_back::<8>(&mut rb, b_id), [2; 8], "B keeps its own bytes");
-        assert_eq!(read_back::<64>(&mut rb, a_id), [1; 64], "and A keeps its own");
+        assert_eq!(read_back::<_, 8>(&mut rb, b_id), [2; 8], "B keeps its own bytes");
+        assert_eq!(read_back::<_, 64>(&mut rb, a_id), [1; 64], "and A keeps its own");
     }
 
     #[test]
@@ -531,7 +712,7 @@ mod tests {
         let q = wb.make_resizable(p, 16).unwrap();
         let id = q.raw();
         let mut rb = wb.flush();
-        assert_eq!(read_back::<16>(&mut rb, id), [9; 16]);
+        assert_eq!(read_back::<_, 16>(&mut rb, id), [9; 16]);
     }
 
     // ---- the `pending`-as-a-delta fixes ----
@@ -561,7 +742,7 @@ mod tests {
         let id = p.raw();
         let mut rb = wb.flush();
         assert_eq!(rb.size(id).unwrap(), 8);
-        assert_eq!(read_back::<4>(&mut rb, id), [1, 2, 3, 4]);
+        assert_eq!(read_back::<_, 4>(&mut rb, id), [1, 2, 3, 4]);
     }
 
     #[test]
@@ -669,10 +850,100 @@ mod tests {
         let mut rb = wb.flush();
         assert_eq!(rb.len(), 64, "the survivor slid down into the freed range");
         assert_eq!(
-            read_back::<64>(&mut rb, b_id),
+            read_back::<_, 64>(&mut rb, b_id),
             [7; 64],
             "compaction moved the bytes, not just the entry",
         );
+    }
+
+    // ---- what the fold buys (design note §4.2) ----
+
+    #[test]
+    fn repeated_writes_to_one_range_collapse_to_a_single_write() {
+        // The piece table holds exactly one source per byte, so this is a
+        // consequence of the representation rather than a special case.
+        let (wb, writes, bytes) = counting();
+        let p = wb.alloc_fixed_size(8);
+        for i in 0..100u8 {
+            wb.write(p.raw(), 0, &[i; 8]);
+        }
+        let id = p.raw();
+        let mut rb = wb.flush();
+
+        assert_eq!(writes.get(), 1, "one write, not a hundred");
+        assert_eq!(bytes.get(), 8);
+        assert_eq!(read_back::<_, 8>(&mut rb, id), [99; 8], "and the last one wins");
+    }
+
+    #[test]
+    fn a_transient_allocation_never_touches_storage() {
+        // Fresh and freed inside one transaction: its content is fully symbolic,
+        // so nothing about it ever needs to reach the file.
+        let (wb, writes, _) = counting();
+        let p = wb.alloc_resizable(64);
+        wb.write(p.raw(), 0, &[7; 64]);
+        wb.write(p.raw(), 32, &[8; 32]);
+        wb.free_resizable(p);
+
+        let rb = wb.flush();
+        assert_eq!(writes.get(), 0);
+        assert!(rb.is_empty());
+    }
+
+    #[test]
+    fn splice_on_a_fresh_allocation_is_a_table_edit() {
+        // The shift never touches bytes: only the spliced *result* is written,
+        // once. `PersistableString`/`PersistableVec` splice in loops, so this is
+        // the largest single win the fold offers.
+        let (wb, writes, bytes) = counting();
+        let p = wb.alloc_resizable(6);
+        wb.write(p.raw(), 0, &[1, 2, 3, 4, 5, 6]);
+        wb.splice(&p, 1, 2, &[9, 9, 9]);
+        wb.splice(&p, 0, 0, &[0]);
+        let id = p.raw();
+
+        let mut rb = wb.flush();
+        assert_eq!(writes.get(), 1, "one write for the whole result");
+        assert_eq!(bytes.get(), 8);
+        assert_eq!(read_back::<_, 8>(&mut rb, id), [0, 1, 9, 9, 9, 4, 5, 6]);
+    }
+
+    #[test]
+    fn an_untouched_persistent_allocation_is_not_rewritten() {
+        // Its whole table is one identity piece, which emits nothing. Without
+        // that rule every flush would copy every live allocation onto itself.
+        let (wb, writes, _) = counting();
+        let p = wb.alloc_fixed_size(64);
+        wb.write(p.raw(), 0, &[3; 64]);
+        let q = wb.alloc_fixed_size(64);
+        wb.write(q.raw(), 0, &[4; 64]);
+        let rb = wb.flush();
+        let before = writes.get();
+
+        // A second transaction that touches only `q`.
+        let wb = rb.reopen();
+        wb.write(q.raw(), 0, &[5; 64]);
+        let (p_id, q_id) = (p.raw(), q.raw());
+        let mut rb = wb.flush();
+
+        assert_eq!(writes.get() - before, 1, "only `q` is written");
+        assert_eq!(read_back::<_, 64>(&mut rb, p_id), [3; 64]);
+        assert_eq!(read_back::<_, 64>(&mut rb, q_id), [5; 64]);
+    }
+
+    #[test]
+    fn writing_a_range_twice_across_a_resize_writes_only_what_survives() {
+        // The clip is what makes this safe: the first write is bounded by the
+        // size at the time it was made, and the surviving prefix is emitted once.
+        let (wb, _, bytes) = counting();
+        let p = wb.alloc_resizable(64);
+        wb.write(p.raw(), 0, &[1; 64]);
+        wb.resize(&p, 8).unwrap();
+        let id = p.raw();
+
+        let mut rb = wb.flush();
+        assert_eq!(bytes.get(), 8, "only the 8 surviving bytes are written");
+        assert_eq!(read_back::<_, 8>(&mut rb, id), [1; 8]);
     }
 
     #[test]
@@ -685,6 +956,6 @@ mod tests {
 
         let mut rb = wb.flush();
         assert_eq!(rb.size(id).unwrap(), 7);
-        assert_eq!(read_back::<7>(&mut rb, id), [1, 9, 9, 9, 4, 5, 6]);
+        assert_eq!(read_back::<_, 7>(&mut rb, id), [1, 9, 9, 9, 4, 5, 6]);
     }
 }

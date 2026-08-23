@@ -368,7 +368,17 @@ pub(crate) fn check(actions: &[Action]) {
         JournaledWriteBackend::<_, Heap>::new(InMemoryStorage::default(), GainGreedyHeap::new()),
         |b| b.flush(),
     );
-    agrees("journaled", &journaled, &expected, &actions);
+    agrees("journaled (folded)", &journaled, &expected, &actions);
+
+    // The reference implementation §8 calls for: same log, one `Composed` call
+    // per op, no folding and no reordering. Comparing it too is what makes the
+    // fold a *validated* rewrite rather than a hopeful one.
+    let naive = run(
+        &actions,
+        JournaledWriteBackend::<_, Heap>::new(InMemoryStorage::default(), GainGreedyHeap::new()),
+        |b| b.flush_naively(),
+    );
+    agrees("journaled (naive)", &naive, &expected, &actions);
 
     let unjournaled = run(
         &actions,

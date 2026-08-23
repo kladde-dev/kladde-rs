@@ -27,6 +27,7 @@ mod composed;
 #[cfg(test)]
 mod differential;
 mod evacuation_index;
+mod fold;
 mod gain_greedy;
 mod heap;
 mod journal;

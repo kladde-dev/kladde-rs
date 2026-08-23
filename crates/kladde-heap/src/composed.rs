@@ -142,6 +142,20 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Composed<S, H, W>
         self.recycle(id);
     }
 
+    /// Release `id`, whether or not it ever reached the heap.
+    ///
+    /// The deferred path needs this: an allocation minted and freed inside one
+    /// transaction is never claimed, so there is nothing for the heap to release
+    /// -- but its counter must still come back, or the id pool leaks. See design
+    /// note §3, which is why `free` of a `New` entry lands on `Freed` rather than
+    /// on absent.
+    pub(crate) fn release(&mut self, id: Pointer<W>) {
+        if self.heap.lookup(id).is_some() {
+            self.heap.free(id).expect("release of a live id");
+        }
+        self.recycle(id);
+    }
+
     pub(crate) fn free_resizable(&mut self, p: UniquePointerResizable<Pointer<W>>) {
         self.free(p.raw());
     }
@@ -295,6 +309,18 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Composed<S, H, W>
         self.seek_to(id, offset).expect("seek for splice write");
         self.storage.write_all(new).expect("write new");
         self.storage.write_all(&tail).expect("write tail");
+    }
+
+    /// Read `len` bytes from `id`'s address plus `offset`.
+    ///
+    /// The flush emitter's gather step: a destination run is assembled from
+    /// however many scattered sources it names before a single write puts it down.
+    pub(crate) fn read_bytes(&mut self, id: Pointer<W>, offset: usize, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        self.seek_to(id, Word::from_usize(offset))
+            .expect("seek for gather");
+        self.storage.read_exact(&mut buf).expect("gather bytes");
+        buf
     }
 
     /// Position the cursor and hand out the store as a seekable reader.
