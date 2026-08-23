@@ -6,9 +6,10 @@ three places and is known-broken; §10 gives the order in which to replace it.
 
 The subject is the *deferred* write path: what a transaction records, what a flush
 is allowed to do with the recording, and what "the same thing happened" means when
-the flush is permitted to reorder and elide work. It does not cover placement
-policy (see [incremental-compaction.md](incremental-compaction.md)) or the
-compaction step itself (see [augmented-segment-tree.md](augmented-segment-tree.md)).
+the flush is permitted to reorder and elide work. §9 covers what survives a crash.
+It does not cover placement policy (see
+[incremental-compaction.md](incremental-compaction.md)) or the compaction step
+itself (see [augmented-segment-tree.md](augmented-segment-tree.md)).
 
 ## 1. What is broken today, and why it is one bug
 
@@ -566,65 +567,234 @@ Two properties worth asserting separately, because they fail differently:
   on outside tests; it is the check all three §1 bugs would have tripped.
 - **schedule equivalence** — the differential comparison above.
 
-## 9. Open: checkpoint versus commit
+## 9. Durability: checkpoint, commit, and restartable flush
 
-Undecided, and deliberately so. The distinction:
+### 9.1 Terminology
 
-- A **checkpoint** applies buffered work to storage so the in-memory journal can be
-  released. It is triggered by resource pressure and lands wherever that pressure
-  happens to fall.
-- A **commit** is a boundary the recovered state is allowed to snap to. It is
-  triggered by the application's notion of a completed change.
+Four words that have to be kept apart:
 
-Today they are the same event, which is what gives atomicity for free. The intended
-model breaks them apart: application authors do not call `flush`, they mutate state;
-when the journal grows too long the guard method that would overflow it checkpoints
-automatically. A flush triggered by buffer size cannot also be a durability
-boundary, or durability would be determined by how much memory the journal happens
-to use.
+- A **prefix** of the log is op₁…opₖ — the log truncated at a point.
+- A **commit boundary** is a position marking a completed logical change: a
+  guard-method boundary in the auto-checkpoint model, or an explicit `commit()`
+  inside a transaction. A **committed prefix** is one ending exactly on such a
+  boundary, so it contains only whole logical changes.
+- A **checkpoint** takes some prefix, folds it, applies the resulting writes to the
+  data region, and releases that prefix from memory.
+- A **commit** is a boundary the recovered state is allowed to snap to.
 
-Three consequences follow immediately, and one decision does not.
+Elsewhere this note says "at flush" for what §3 calls "at checkpoint". They are the
+same event; *flush* is the operation and *checkpoint* is the role it plays when it
+runs for memory relief rather than for durability.
+
+The intended model separates checkpoint from commit. Application authors do not call
+`flush`; they mutate state, and when the journal grows too long the guard method that
+would overflow it checkpoints automatically. A flush triggered by buffer size cannot
+also be a durability boundary, or durability would be set by how much memory the
+journal happens to use.
+
+Three consequences follow immediately:
 
 **`flush` takes `&self`.** The auto-checkpoint fires from inside a guard method,
 which holds `&B`; there is no `&mut B` in reach. This is safe: callers hold ids and
 `Location`s, never addresses, and writes resolve addresses at write time, so
-relocation and compaction under a live guard are transparent. Note the checkpoint is
-a *reentrant* call into the backend, so no `WriteBackend` method may hold the
-interior `RefCell` borrow across a callback.
+relocation and compaction under a live guard are transparent. The checkpoint is a
+*reentrant* call into the backend — it is entered while the call stack already
+contains backend code — so no `WriteBackend` method may hold the interior `RefCell`
+borrow across anything that could trigger one, or the nested `borrow_mut` panics.
 
 **The check belongs at guard-method boundaries, not at append time.** A check on
-append can fire between two writes of one logical mutation — a `set` that resizes
-and then writes. A guard method is the natural atomic unit, being the smallest thing
-an application author perceives as one change.
+append can fire between two ops of one logical mutation — a `set` that resizes and
+then writes. A guard method is the natural atomic unit, being the smallest thing an
+application author perceives as one change.
 
 **`flush` splits into two knobs**: fold-and-apply (bounds memory, safe whenever the
 fold is consistent) and truncate-the-log (safe only up to the last commit). They are
 currently one operation.
 
-The undecided part is how uncommitted data is kept out of the recovered state:
+### 9.2 Two failure modes, two unrelated fixes
 
-**(a) Write-ahead the log.** Persist records before applying them; a commit record
-marks the boundary; recovery replays to the last commit and undoes past it. Bounds
-memory inside arbitrarily long transactions. Needs undo information or a no-steal
-policy, plus a real on-disk log format.
+Both leave torn state on disk, which is why they are easy to conflate:
 
-**(b) Checkpoint only committed prefixes.** Storage never holds uncommitted data, so
-recovery is redo-only and no undo exists. Far simpler. But memory cannot be bounded
-*inside* a transaction — a long one still pins its whole write set.
+| | what recovery sees | fixed by |
+| --- | --- | --- |
+| **A** | ops applied that the application never committed | choosing *what* to apply |
+| **B** | a crash midway through applying | making apply *restartable* |
 
-Since transactions are meant to be the explicit exception, (b) is the cheaper
-starting point: outside a transaction every auto-checkpoint already sits on a commit
-boundary, so (b) costs nothing there, and inside one the unbounded journal is an
-honest documented limit. (a) can be added later for long transactions without
-disturbing the common path. This note does not decide it.
+**(a) Write-ahead the log** — persist records before applying them, mark commits with
+a commit record, recover by replaying the durable log. Fixes **B**.
 
-Note also that (a) is what would make incremental construction of the piece tables
-worthwhile: an incrementally maintained table can **prune the arena**, dropping
-literals that have since been overwritten, which directly reduces how often the
-auto-checkpoint fires. That is only safe once a durable copy of the log exists. Until
-then, build the fold at flush (§4): it is a pure function of the log, which makes it
-trivially checkable, and nothing pulls it earlier because `size`/`resolve` need
-geometry only.
+**(b) Checkpoint only committed prefixes** — stop at the most recent commit boundary
+rather than partway into an in-flight change, so storage never holds uncommitted
+data. Fixes **A**.
+
+These are **not alternatives**: (a) is a mechanism for surviving a crash during
+apply, (b) is a policy about what to apply. Reading them as a choice is a mistake —
+(b) alone does nothing for a crash mid-apply, because a committed prefix folds to
+many writes and dying after some of them still leaves a half-applied change.
+
+The real menu:
+
+| | crash-tolerant? | needs undo? | memory bounded inside a transaction? |
+| --- | --- | --- | --- |
+| (b) alone | no | no | no |
+| (a) alone | yes | **yes** | yes |
+| **(a) + (b)** | **yes** | **no** | no |
+
+**Decision: (a) + (b).** Redo-only recovery with no undo machinery, at the cost of a
+long transaction pinning its own write set — an honest, documented limit, and the
+one that can be lifted later by adding undo without disturbing anything else.
+
+### 9.3 What "durable" means
+
+Three layers, and which one is needed is a decision about the failure model, not a
+detail:
+
+1. **`write()` returned** — bytes are in the OS page cache. Survives the *process*
+   dying.
+2. **`fsync`/`fdatasync` returned** — bytes are on the device. Survives power loss
+   and kernel panic.
+3. **Device write cache flushed** (FUA/barriers), plus an `fsync` on the *directory*
+   for a newly created file.
+
+The stated requirement — recover after the application crashes anywhere inside
+`flush` — is process death, so **layer 1 suffices**. The page cache outlives the
+process, and one process's `write()` calls land in program order, so issuing the log
+write before the data writes gives the ordering for free. No `fsync` anywhere.
+
+Surviving power loss means layer 2, which costs roughly one `fsync` per flush. That
+is the expensive part and should be chosen deliberately rather than inherited.
+
+Even at layer 1, `write_all` loops over short writes, so a process dying mid-loop
+leaves a partially written record. Framing (§9.5) is required at every layer.
+
+### 9.4 What has to be in the log
+
+The organizing question is **what is derivable**:
+
+| | derivable? | must be logged |
+| --- | --- | --- |
+| the ops themselves | no | **yes** — and they already are; the journal is written as ops are recorded |
+| hoisted bytes (§6.5) | no, *after partial application* | **yes** — and this is new work at flush time |
+| the fold, and the schedule's shape | yes, from the log | no |
+| ids of claimed regions | — | **yes**, but for free: `Alloc` and `ChangeSizedness` already carry them |
+| the address each `Claim` receives | yes, **if** placement is deterministic and the pre-flush heap state is recoverable | no |
+
+Two things this makes precise.
+
+**Only the hoisted bytes are new at flush time.** The ops are in the file already —
+that is what the journal is for. Hoisting, by contrast, happens *during* the fold, so
+flush begins with a genuine append: the hoist blob, plus a marker naming the log
+range this flush covers. That append is what must be ordered before the data writes.
+
+**Id minting stays unspecified; placement does not.** Because `Alloc(id, size)` and
+`ChangeSizedness(old → new)` record their ids, recovery never re-derives them, and
+the id allocator is free to be an implementation detail — including its `free_counters`
+LIFO, whose order affects only *future* ids, which future ops will record in turn.
+After recovery it is enough to rebuild a non-colliding allocator (e.g.
+`next_counter = max(live id) + 1` with an empty free list), at the cost of some
+counter density.
+
+Placement is the opposite: the schedule is **deterministic and specified**, so
+recovery re-derives each `Claim`'s address rather than reading it from the log. That
+saves writing a plan proportional to touched ids on every flush, and costs two
+things:
+
+- **Determinism becomes load-bearing.** No `HashMap` iteration order, no time, no
+  addresses-as-input, no floats — anywhere in the fold, the placement policy, or the
+  compaction policy. Some of that discipline exists already (today's flush sorts
+  pending FFD partly "so the layout is reproducible from one run to the next"), but
+  it must become a *tested* property: re-derive the schedule twice from the same
+  inputs and assert byte-equality. A violation is silent until a crash.
+- **It couples the file format to the placement algorithm.** Any other
+  implementation of kladde must reproduce `GainGreedyHeap`'s exact decisions to
+  recover a torn flush. That is a heavy constraint given the cross-language goal in
+  `later.md`'s design constraints, and it is the argument for recording the plan
+  instead. Worth revisiting when the format is specified.
+
+Either way, recovery needs the heap's `id → (address, size)` table as of the last
+checkpoint, to re-derive placement against. That is a durable snapshot — and it is
+the same thing `JournaledWriteBackend::open` needs anyway (the self-hosting bootstrap
+currently sitting at `todo!()`), so it is not extra work.
+
+One nicety of a re-derivable schedule: if the schedule is re-derivable then so is
+the fold, so the number and order of hoisted reads is known to recovery, which can
+consume the hoist blob **positionally**. No per-item delimiters — one length and one
+checksum over the whole blob.
+
+### 9.5 Framing: checksums and epochs
+
+Two distinct jobs, and a checksum only does one of them.
+
+**Checksums detect a torn tail.** Use **CRC-32C** (Castagnoli): 4 bytes, hardware
+accelerated on x86-64 (SSE4.2 `crc32`) and AArch64 (the CRC32 extension), and with
+*provable* burst-error detection up to 32 bits, which XXH3 and friends do not offer.
+Speed is not the deciding factor here — correctness guarantees on short records are.
+
+Where to put it matters more than which function:
+
+| scheme | overhead on a ~20-byte op | notes |
+| --- | --- | --- |
+| per-op CRC-32C | +4 bytes ≈ **20–25%** | per-op recovery granularity, but ruinous for small ops |
+| per-4 KiB-block CRC-32C | 4 bytes / 4096 ≈ **0.1%** | what SQLite's WAL and PostgreSQL's page CRCs do |
+
+kladde's ops are deliberately fine-grained and therefore small, so **per-block wins
+decisively**. Let ops span block boundaries (rather than padding, as SQLite does) and
+validate the block chain on recovery. A full block header of
+`{ epoch: u64, seq: u32, byte_len: u32, crc32c: u32 }` is 20 bytes per 4 KiB — about
+**0.5%**. The hoist blob is one contiguous region written once per flush, so a single
+CRC over the whole thing is negligible.
+
+**Epochs defeat stale records, which checksums cannot.** After a checkpoint releases
+a log prefix, that file region gets reused. A stale record left there has a
+*perfectly valid* CRC — a checksum has no way to know it is from a previous life. So
+each block header carries a monotonically increasing **epoch**, bumped whenever the
+log is reset or wrapped, and recovery accepts a block only if its epoch is the one it
+expects. This is what SQLite's rotating WAL salt and PostgreSQL's timeline IDs are
+for. A `u64` epoch never wraps in practice; a `u32` would need a rollover story and
+is not worth the 4 bytes saved.
+
+### 9.6 Which actions survive being replayed
+
+Recovery re-derives the schedule and re-runs it, which is sound only if every action
+survives partial application followed by repetition.
+
+**Re-runnable.** `Write` (bytes come from the log; the address re-derives
+identically). `Claim`, `Release`, `Relabel` (heap operations re-derived from the
+snapshot plus the log). A `Transfer` whose source was hoisted — because hoisting
+turned it into a `Write`. This is the strongest argument for §6.5: hoisting is not
+merely a scheduling simplification, it is what makes replay idempotent, and §6.5's
+disturb set is exactly the set of bytes a partial apply could have clobbered.
+
+**Not re-runnable: compaction slides.** A `Step` has `to < from`, and its source and
+destination overlap whenever the gap is smaller than the run. Hoisting cannot help,
+because it resolves the reads the *fold* can see, and the heap's own byte moves
+appear in no piece table. Recorded as an open problem in
+[later.md](later.md#regarding-write-ahead-logging-discipline), with three candidate
+fixes.
+
+**`Reshape` is safe — but only incidentally.** `GainGreedyHeap::resize` finds the new
+home before releasing the old one (with a comment saying exactly why), so
+`Relocation::Single` never overlaps; the lift's `Relocation::Double` does not either,
+because its target sits at or above `addr + size` and its replacement is drawn from
+above the vacated gap — which holds only because nothing live can sit *inside* a gap.
+That argument is structural and implicit, and nothing tests it. **Add a debug
+assertion that no `Relocation` a heap returns has overlapping ranges**, so a future
+placement policy that lets an allocation grow *downward* into the gap below it fails
+a test rather than corrupting files after a crash.
+
+### 9.7 What (a) unlocks
+
+Two things become available once the log is durable and self-contained:
+
+- **Deferred replay.** Nothing in memory is needed to finish applying, so replay can
+  be scheduled to idle time or run asynchronously.
+- **Log pruning.** An incrementally maintained piece table can drop literals that
+  have since been overwritten, shrinking the in-memory log and directly reducing how
+  often the auto-checkpoint fires. Only safe once a durable copy exists.
+
+Until then, build the fold at flush (§4): it is a pure function of the log, which
+makes it trivially checkable, and nothing pulls it earlier because `size`/`resolve`
+need geometry only.
 
 ## 10. Implementation order
 
@@ -633,20 +803,35 @@ geometry only.
 2. **`pending` as the §3 delta**, replacing the current exhaustive map. Fixes the
    post-checkpoint `size`/`resolve`/`free`/`resize` holes and the counter leak.
 3. **The differential oracle** (§8), against the naive in-order replayer. Before any
-   optimization, so every later step is a validated rewrite.
+   optimization, so every later step is a validated rewrite. Add the **determinism
+   assertion** here too — re-derive the schedule twice, assert byte-equality — even
+   though nothing depends on it until step 8. It is cheap now and near-impossible to
+   retrofit a diagnosis for later (§9.4).
 4. **The fold** (§4) with the `Uniform`/spill representation (§7.2), and the
    fold-agreement assertion. Bugs 1–3 all become consequences of the per-piece
    bounds rather than three separate fixups. Emit by gathering runs (§4.1.1).
 5. **`ChangeSizedness`** (§4.3), needing a `relabel` on `RelocatableHeap`. This is
    what makes `make_*` implementable *and* stops it relocating; it is independent of
-   the two steps below and can land before them.
+   the two steps below and can land before them. Add the **`Relocation` overlap
+   debug assertion** (§9.6) with it, since both touch the heap's relocation surface.
 6. **Read hoisting** (§6.5) and the content-blind fast path (§7). `splice` becomes
    implementable and `Copy` becomes addable.
 7. **The scheduler** (§5) — only if buffering measured in step 6 proves too
    expensive.
+8. **Durability** (§9): framed records with epochs and CRC-32C (§9.5), the durable
+   heap snapshot that `open` needs anyway, ordering the log append before the data
+   writes, and the commit-prefix policy. Restartable flush arrives here.
 
 Steps 1–3 are prerequisites for anything else. Steps 4–6 are where the I/O
 reductions live. Step 7 may never be needed.
+
+Step 8 is deliberately last, and it is genuinely separable: the log is already the
+authority from step 1, so nothing above it changes shape when the log becomes
+durable. Two things make that separation hold rather than merely look plausible, and
+both are cheap enough to do early — the determinism assertion in step 3, and
+reserving the epoch/CRC header fields in the record format from the start even while
+writing zeros into them. Without those two, step 8 becomes a retrofit rather than an
+addition.
 
 ## References
 
