@@ -233,18 +233,26 @@ impl<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: Word> Composed<S, H, W>
         new_id: Pointer<W>,
         new_size: H::Size,
     ) -> Result<(), BackendError> {
-        let (old_addr, old_size) = self
-            .heap
-            .lookup(old_id)
-            .ok_or(BackendError::DanglingPointer)?;
-        let new_addr = self
-            .heap
-            .alloc(new_id, new_size)
-            .expect("in-memory heap never runs out of address space");
-        let copy_len = old_size.to_usize().min(new_size.to_usize());
-        self.cover(new_addr, new_size)?;
-        self.copy_bytes(old_addr, new_addr, copy_len)?;
-        self.free(old_id);
+        self.relabel(old_id, new_id)?;
+        self.resize_by_id(new_id, new_size)
+    }
+
+    /// Rekey an allocation in place, recycling the old counter.
+    ///
+    /// This is what makes a sizedness conversion cheap: **no bytes move**. The
+    /// previous implementation allocated a fresh range, copied across and freed
+    /// the old one, so every conversion relocated the allocation even when its
+    /// size was unchanged -- ruinous for a chunked container oscillating across a
+    /// chunk boundary. See `journal-semantics.md` §4.3.
+    pub(crate) fn relabel(
+        &mut self,
+        from: Pointer<W>,
+        to: Pointer<W>,
+    ) -> Result<(), BackendError> {
+        self.heap
+            .relabel(from, to)
+            .map_err(|_| BackendError::DanglingPointer)?;
+        self.recycle(from);
         Ok(())
     }
 

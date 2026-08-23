@@ -252,8 +252,15 @@ pub(crate) fn apply_folded<S: Storage, H: RelocatableHeap<Id = Pointer<W>>, W: W
                 .composed
                 .resize_by_id(id, size)
                 .expect("reshape of a live id"),
-            Action::Relabel { .. } => {
-                unreachable!("relabels arrive with `ChangeSizedness` (design note §4.3)")
+            // No bytes move: the allocation keeps its address and its size, and
+            // only its key changes. The pending size, if any, is a separate
+            // `Resize` that folded into the same entry.
+            Action::Relabel { from, to, size } => {
+                inner.composed.relabel(from, to).expect("relabel of a live id");
+                inner
+                    .composed
+                    .resize_by_id(to, size)
+                    .expect("reshape of a live id");
             }
         }
     }
@@ -944,6 +951,93 @@ mod tests {
         let mut rb = wb.flush();
         assert_eq!(bytes.get(), 8, "only the 8 surviving bytes are written");
         assert_eq!(read_back::<_, 8>(&mut rb, id), [1; 8]);
+    }
+
+    // ---- sizedness conversions move nothing (design note §4.3) ----
+
+    #[test]
+    fn a_sizedness_conversion_keeps_the_address_and_writes_nothing() {
+        let (wb, writes, _) = counting();
+        let p = wb.alloc_fixed_size(64);
+        wb.write(p.raw(), 0, &[3; 64]);
+        let filler = wb.alloc_fixed_size(64);
+        wb.write(filler.raw(), 0, &[4; 64]);
+        let rb = wb.flush();
+        let before_addr = rb.inner.composed.heap.lookup(p.raw()).unwrap().0;
+        let before_writes = writes.get();
+
+        let wb = rb.reopen();
+        let q = wb.make_resizable(p, 64).unwrap();
+        let id = q.raw();
+        let mut rb = wb.flush();
+
+        assert_eq!(
+            writes.get(),
+            before_writes,
+            "a size-preserving conversion is a relabel: no byte moves",
+        );
+        assert_eq!(
+            rb.inner.composed.heap.lookup(id).unwrap().0,
+            before_addr,
+            "and the allocation keeps its address",
+        );
+        assert_eq!(read_back::<_, 64>(&mut rb, id), [3; 64]);
+        assert_eq!(id.sizedness(), Sizedness::Resizable);
+    }
+
+    #[test]
+    fn oscillating_a_chunk_across_a_sizedness_boundary_copies_nothing() {
+        // The motivating case: a chunked vector whose length oscillates across a
+        // chunk boundary converts its last chunk on every push/pop pair. The
+        // allocate-copy-free form copied the whole chunk each time.
+        let (wb, _, bytes) = counting();
+        let chunk = wb.alloc_fixed_size(256);
+        wb.write(chunk.raw(), 0, &[1; 256]);
+        let neighbour = wb.alloc_fixed_size(256);
+        wb.write(neighbour.raw(), 0, &[2; 256]);
+        let rb = wb.flush();
+        let addr = rb.inner.composed.heap.lookup(chunk.raw()).unwrap().0;
+        let baseline = bytes.get();
+
+        let mut owned = Owned::Fixed(chunk);
+        let mut rb = rb;
+        for _ in 0..8 {
+            let wb = rb.reopen();
+            owned = match owned {
+                Owned::Fixed(f) => Owned::Resizable(wb.make_resizable(f, 256).unwrap()),
+                Owned::Resizable(r) => Owned::Fixed(wb.make_fixed_size(r, 256).unwrap()),
+            };
+            rb = wb.flush();
+        }
+
+        assert_eq!(bytes.get(), baseline, "sixteen conversions, zero bytes copied");
+        let id = match &owned {
+            Owned::Fixed(p) => p.raw(),
+            Owned::Resizable(p) => p.raw(),
+        };
+        assert_eq!(rb.inner.composed.heap.lookup(id).unwrap().0, addr);
+        assert_eq!(read_back::<_, 256>(&mut rb, id), [1; 256]);
+    }
+
+    enum Owned {
+        Fixed(UniquePointerFixedSize<Pointer<u32>>),
+        Resizable(UniquePointerResizable<Pointer<u32>>),
+    }
+
+    #[test]
+    fn a_growing_conversion_still_preserves_the_leading_bytes() {
+        let (wb, _, _) = counting();
+        let p = wb.alloc_fixed_size(16);
+        wb.write(p.raw(), 0, &[5; 16]);
+        let rb = wb.flush();
+
+        let wb = rb.reopen();
+        let q = wb.make_resizable(p, 32).unwrap();
+        let id = q.raw();
+        let mut rb = wb.flush();
+
+        assert_eq!(rb.size(id).unwrap(), 32);
+        assert_eq!(read_back::<_, 16>(&mut rb, id), [5; 16]);
     }
 
     #[test]

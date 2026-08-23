@@ -98,10 +98,7 @@ impl<W: Word, S: Word> Default for Folded<W, S> {
 pub(crate) enum Action<W: Word, S: Word> {
     Claim(Pointer<W>, S),
     Reshape(Pointer<W>, S),
-    /// Populated once `ChangeSizedness` becomes a relabel rather than an
-    /// allocate-copy-free (design note §4.3); until then the fold never produces
-    /// `Pending::Relabelled`, so this arm is unreachable.
-    #[allow(dead_code)]
+    /// Rekey in place: no bytes move (design note §4.3).
     Relabel {
         from: Pointer<W>,
         to: Pointer<W>,
@@ -340,10 +337,10 @@ impl<W: Word, S: Word> Folded<W, S> {
         runs
     }
 
-    /// This id's folded size, or `None` if it is released. The outer `Option` is
-    /// "the log never mentioned it". Feeds the fold-agreement assertion (§2).
-    pub(crate) fn geometry_of(&self, id: Pointer<W>) -> Option<Option<S>> {
-        self.entries.get(&id).map(|_| self.size_of(id))
+    /// What the fold decided about `id`, or `None` if the log never mentioned it.
+    /// Feeds the fold-agreement assertion (§2).
+    pub(crate) fn geometry_of(&self, id: Pointer<W>) -> Option<Pending<W, S>> {
+        self.entries.get(&id).map(|e| e.geometry)
     }
 }
 
@@ -396,26 +393,49 @@ pub(crate) fn fold<W: Word, S: Word>(
             }
             Op::ChangeSizedness { old, new } => {
                 touch(&mut f, old);
-                let size = f.size_of(old).expect("conversion of a live id");
+                let old_geometry = f.entries[&old].geometry;
                 let content = f.entries[&old].content;
-                let segments = f.segments(old);
 
-                // The new id is a fresh claim whose bytes are read out of the old
-                // one. §4.3 replaces this with a relabel, which keeps the pieces
-                // *identity* and so emits nothing at all; until then a conversion
-                // costs one copy of the allocation.
-                f.entries.insert(
-                    new,
-                    Entry {
-                        geometry: Pending::New(size),
-                        content,
-                    },
-                );
-                f.set_segments(new, segments);
+                // The bytes do not move, so a piece naming the old id names the
+                // same physical bytes under the new one. Rewriting it keeps the
+                // piece *identity*, which is what makes a conversion emit nothing
+                // at all (§4.3). The allocate-copy-free form destroyed that
+                // property, since the new id sat at a new address.
+                let segments: Vec<(usize, Source<W>)> = f
+                    .segments(old)
+                    .into_iter()
+                    .map(|(off, src)| {
+                        let src = match src {
+                            Source::Storage(id, k) if id == old => Source::Storage(new, k),
+                            other => other,
+                        };
+                        (off, src)
+                    })
+                    .collect();
 
-                if let Some(e) = f.entries.get_mut(&old) {
-                    e.geometry = Pending::Freed;
+                let geometry = match old_geometry {
+                    // Never reached the heap: nothing to relabel, the entry just
+                    // moves. The old counter is still owed, hence the `Freed`
+                    // below rather than dropping the entry.
+                    Pending::New(size) => Pending::New(size),
+                    Pending::Resized(size) => Pending::Relabelled { from: old, size },
+                    // A chain of conversions: `from` stays whichever id the heap
+                    // actually holds.
+                    Pending::Relabelled { from, size } => Pending::Relabelled { from, size },
+                    Pending::Freed => unreachable!("conversion of a released id"),
+                };
+
+                if matches!(old_geometry, Pending::New(_)) {
+                    f.entries.get_mut(&old).expect("touched").geometry = Pending::Freed;
+                    f.spill.retain(|(o, _), _| *o != old);
+                } else {
+                    // The relabel owns both halves, including recycling `from`.
+                    f.entries.remove(&old);
+                    f.spill.retain(|(o, _), _| *o != old);
                 }
+
+                f.entries.insert(new, Entry { geometry, content });
+                f.set_segments(new, segments);
             }
             Op::Write {
                 id,

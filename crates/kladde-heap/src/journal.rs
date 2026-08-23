@@ -190,21 +190,20 @@ impl<W: Word, S: Word> Deltas<W, S> {
     /// Fold agreement (design note §2): the geometry the fold derives from the
     /// log must equal what this cache recorded incrementally.
     ///
-    /// Compared by *size and liveness* rather than by the whole `Pending`, since
-    /// the two disagree on how a sizedness conversion is expressed until the fold
-    /// learns to relabel (§4.3). The redundancy is the point -- every divergence
-    /// bug in the predecessor would have tripped this.
+    /// The redundancy is the point -- every divergence bug in the predecessor
+    /// would have tripped this, and it is asymptotically free next to the fold
+    /// that produced the other side.
     ///
     /// One-directional: the fold also carries ids this map never mentions, namely
     /// persistent allocations that were only *written* and so have no geometry
     /// delta at all.
     pub(crate) fn agrees_with(
         &self,
-        folded: impl Fn(Pointer<W>) -> Option<Option<S>>,
+        folded: impl Fn(Pointer<W>) -> Option<Pending<W, S>>,
     ) -> bool {
         self.map
             .iter()
-            .all(|(id, pending)| folded(*id) == Some(pending.size()))
+            .all(|(id, pending)| folded(*id).as_ref() == Some(pending))
     }
 
     /// Answer a `size`/`resolve` query. Deltas first, heap second -- never the
@@ -267,21 +266,25 @@ impl<W: Word, S: Word> Deltas<W, S> {
         size: S,
         live_in_heap: bool,
     ) {
-        let was_claimed = match self.map.remove(&old) {
+        let entry = match self.map.remove(&old) {
             // Never reached the heap, so there is nothing to relabel: the entry
-            // simply moves to the new id.
-            Some(Pending::New(_)) => false,
-            Some(Pending::Resized(_)) | Some(Pending::Relabelled { .. }) => true,
+            // moves to the new id. The old id's counter is still owed, so it is
+            // marked `Freed` rather than dropped -- the release is lookup-guarded
+            // and will recycle without touching the heap.
+            Some(Pending::New(_)) => {
+                self.map.insert(old, Pending::Freed);
+                Pending::New(size)
+            }
+            // The relabel owns both halves, including recycling `from`, which is
+            // why the old id ends with no entry at all.
+            Some(Pending::Resized(_)) => Pending::Relabelled { from: old, size },
+            Some(Pending::Relabelled { from, .. }) => Pending::Relabelled { from, size },
             Some(Pending::Freed) => {
                 debug_assert!(false, "sizedness change of a released id");
-                false
+                Pending::New(size)
             }
-            None => live_in_heap,
-        };
-        let entry = if was_claimed {
-            Pending::Relabelled { from: old, size }
-        } else {
-            Pending::New(size)
+            None if live_in_heap => Pending::Relabelled { from: old, size },
+            None => Pending::New(size),
         };
         self.map.insert(new, entry);
     }

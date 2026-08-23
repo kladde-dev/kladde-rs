@@ -1548,6 +1548,29 @@ impl<Id: AllocationId> RelocatableHeap for GainGreedyHeap<Id> {
         Ok(())
     }
 
+    fn relabel(&mut self, from: Id, to: Id) -> Result<(), HeapError> {
+        let addr = *self.by_id.get(&from).ok_or(HeapError::UnknownId)?;
+        if self.by_id.contains_key(&to) {
+            return Err(HeapError::DuplicateId);
+        }
+        let len = self.allocations[&addr].len;
+        // Not a byte moves. The index key encodes sizedness (`Key::alloc`'s
+        // `fixed` bit), so the entry has to be re-inserted under the new class --
+        // but at the same address and the same size, which is exactly what makes
+        // a sizedness conversion free. `remove_raw`/`insert_raw` rebuild the gap
+        // structure around the same span, so it comes out unchanged.
+        let e = self.remove_raw(addr);
+        debug_assert!(e.id == from);
+        self.insert_raw(addr, len, to);
+        // The shrink counter follows the allocation, not the id: a conversion is
+        // not the churn the lift is watching for.
+        if let Some(count) = self.shrink_counts.remove(&from) {
+            self.shrink_counts.insert(to, count);
+        }
+        debug_assert!(self.by_id.get(&to) == Some(&addr));
+        Ok(())
+    }
+
     fn resize(&mut self, id: Id, new_size: u32) -> Result<Relocation<u64, u32>, HeapError> {
         let addr = *self.by_id.get(&id).ok_or(HeapError::UnknownId)?;
         let old_len = self.allocations[&addr].len;

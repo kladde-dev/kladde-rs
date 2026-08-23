@@ -128,6 +128,24 @@ pub trait RelocatableHeap {
     /// neighbouring gaps.
     fn free(&mut self, id: Self::Id) -> Result<(), HeapError>;
 
+    /// Rekey one allocation in place: same address, same size, new id.
+    ///
+    /// Sizedness rides on the id (see [`AllocationId::is_fixed_size`]), so a
+    /// sizedness conversion cannot re-tag an allocation where it stands -- it
+    /// necessarily names a new id. Without this method the only way to express
+    /// that is `alloc` + copy + `free`, which relocates the bytes on **every**
+    /// conversion even when the size does not change. A chunked container whose
+    /// length oscillates across a chunk boundary would then copy a whole chunk on
+    /// every `push`/`pop` pair. See `journal-semantics.md` §4.3.
+    ///
+    /// The heap may still classify the two ids differently -- that is the point --
+    /// so an implementation that indexes by sizedness must re-index. It must not
+    /// move any bytes.
+    ///
+    /// `Err(UnknownId)` if `from` is not live, `Err(DuplicateId)` if `to` already
+    /// is.
+    fn relabel(&mut self, from: Self::Id, to: Self::Id) -> Result<(), HeapError>;
+
     /// Resize the allocation named by `id`.
     ///
     /// `Ok(None)` if it kept its address; `Ok(Some((old, new)))` if it had to
