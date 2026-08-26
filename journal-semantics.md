@@ -10,6 +10,27 @@ marked where they occur: the oracle compares the *observable* surface rather tha
 `heap.iter()`, and the scheduler needs hoisting to be switchable off before its
 edges do any work.
 
+**One structural finding and three defects, from answering the questions inline
+below. None fixed yet.**
+
+The finding, which reframes the other three: the implementation hoists **every**
+disturbed read, and that policy makes most of §5 unreachable. Edge 2, edges 3–4 and
+priority rule 1 all exist to order reads that hoisting has already turned into
+literals. Instrumented over the whole suite, they fire **once in 122 tests** — in
+the one test that disables hoisting. The scheduler's live content is edge 1 plus
+FFD ordering (§6.6).
+
+- **`set_hoisting(false)` is unsound** (§6.6). Two allocations that copy from each
+  other produce wrong bytes, because the switch drops hoisting to zero rather than
+  to the cycle-breaking minimum. It was added in `91569d1` to give the scheduler's
+  edges something to do, which is the wrong reason for a switch to exist.
+- **Priority rule 1 is not transitive** (§5.2, §6.3), so §6.3's worked example does
+  not behave as that section claims, and a test enshrines the shortfall as expected.
+  Only observable with hoisting off, so on the shipping path this is latent.
+- **The fold emits no-op `Reshape` tasks** for persistent allocations whose size
+  never changed (§6.3). Independent of hoisting, and the only one of the three that
+  costs something on every flush.
+
 The subject is the *deferred* write path: what a transaction records, what a flush
 is allowed to do with the recording, and what "the same thing happened" means when
 the flush is permitted to reorder and elide work. §9 covers what survives a crash.
@@ -170,6 +191,31 @@ would otherwise have to be processed in the right sequence.
 | checkpoint | `New` / `Resized` / `Relabelled` | `Absent/live` | map cleared |
 | | `Freed` | `Absent/dead` | counters recycled here, and only here |
 
+**Question:** in the second row for `ChangedSizedness`, what is `new.from` if `old` is `Relabelled`? First reason about what it *should* be, then verify if it matches the implementation.
+
+> **Answer.** It must be `old.from`, **not** `old`.
+>
+> `from` does not mean "the id this entry replaces". It means "the id the *heap*
+> currently holds", because the entry's whole purpose is to name the argument of
+> `heap.relabel(from, id)` at checkpoint. In a chain `a → b → c` within one
+> transaction, the heap never sees `b` at all: `b` existed only as a pending entry,
+> and no relabel ran. So `c`'s entry must still name `a`, or the checkpoint would
+> call `heap.relabel(b, c)` and get `UnknownId`.
+>
+> Put differently, `from` is *invariant along a chain* — it is fixed by the first
+> conversion of a claimed allocation and carried unchanged thereafter, exactly as
+> `Relabelled`'s size is *replaced* by each subsequent `Resize`.
+>
+> Verified in both places, which have to agree or the fold-agreement assertion
+> trips: `fold.rs:505` and `journal.rs:291` both match
+> `Pending::Relabelled { from, .. }` and re-emit that same `from` with the new size.
+>
+> The table row above is therefore imprecise as written: `Relabelled { from: old, S }`
+> is right only for the `Absent/live` and `Resized(S)` cases. Corrected:
+
+| | old: `Absent/live` / `Resized(S)`, and&nbsp;new: `Absent/dead` | old: `Absent/dead`, and&nbsp;new: `Relabelled { from: old, S }` | first conversion of a claimed allocation |
+| | old: `Relabelled { from: f, S }`, and&nbsp;new: `Absent/dead` | old: `Absent/dead`, and&nbsp;new: `Relabelled { from: f, S }` | `from` is invariant along a chain |
+
 `ChangeSizedness` is the **only** op that mutates two entries in one call, which is
 why its rows name the old and the new id explicitly: the two columns of one row fire
 *together*, they are not alternatives.
@@ -228,6 +274,42 @@ The distinction that drives everything:
 Every table therefore begins with exactly **one** entry, which is what makes §7's
 representation natural rather than bolted on.
 
+**Question:** Where does the fold keep track of current sizes of allocations? Or is this not necessary? With "current", I mean the position in the journal where the fold currently is when it iterates over the journal. This is opposed to the sizes *before* applying the journal (which are on `heap`) and the sizes *after* applying the journal (which are in `pending`), if I understand this correctly.
+
+> **Answer.** In the geometry field itself — there is no separate structure, and
+> the three sizes you name are three *readings of the same slot at different
+> times*, not three places.
+>
+> Each `Folded` entry holds a `Pending<W, S>`, and every non-`Freed` variant
+> carries a size: `New(s)`, `Resized(s)`, `Relabelled { size: s, .. }`. That size
+> is the **running** one. `Folded::size_of` reads it and `set_size` rewrites it,
+> so each `Resize`/`Splice` op advances it as the fold walks past. When the walk
+> ends, the running size *is* the final size, and the same field is then read as
+> the checkpoint action's argument.
+>
+> Your framing needs one correction. `pending` (`Deltas`) is not "the sizes after
+> applying the journal" in a sense distinct from the fold's — it is the same
+> quantity, maintained incrementally during the write phase instead of derived at
+> flush. That is precisely the redundancy §2 calls the point: the fold-agreement
+> assertion compares the two, and every divergence bug in the predecessor would
+> have tripped it.
+>
+> So: **before** = the heap's table; **during** = the entry's own `Pending`, mutated
+> in place; **after** = that same `Pending`, once the walk finishes — which must
+> equal `pending`'s.
+>
+> Why the fold needs the running size at all, rather than only the final one: every
+> content rule is bounded by it. `Write` is clipped to the size *at that point* in
+> the journal, `Resize` needs the old size to know whether to clip or extend with
+> `Undefined`, and `Splice` needs it to locate the tail. Using the final size for
+> any of those is exactly bug 2 of §1.
+
+**Todo:** add another example with cyclic copies: a transfer from A1 to A2 followed from a transfer from A2 to A1 that partially overlaps. Make sure the example is nontrivial and then walk through what each phase would do. Put this example in the section where it makes most sense (does it require hoisting?).
+
+> **Done — §6.6.** It belongs after hoisting, because the answer to "does it require
+> hoisting?" is **yes, unavoidably**: it is the case that proves hoisting cannot be
+> optional, and running it against the implementation found a live bug. See §6.6.
+
 ### 4.1 Per-op rules
 
 | op | effect on the table |
@@ -239,6 +321,27 @@ representation natural rather than bolted on.
 | `Copy(src, …)` | overwrite the destination range with pieces taken from *src's current table* |
 | `ChangeSizedness(old → new)` | move the table to `new`, rewriting `Storage(old, k)` → `Storage(new, k)` (§4.3) |
 | `Free` | mark released |
+
+**Question:** What entry does `ChangeSizedness` leave for the old ID? Mention that in the table if relevant.
+
+> **Answer.** It is relevant, and it differs by case — so the row above is now
+> split:
+
+| op | effect on the table |
+| --- | --- |
+| `ChangeSizedness(old → new)`, `old` **claimed** | move the table to `new`; `old`'s entry is **removed entirely**, because the relabel owns recycling `from` |
+| `ChangeSizedness(old → new)`, `old` **never claimed** | move the table to `new`; `old`'s entry becomes `Freed` |
+
+> The asymmetry is the counter, not the bytes. A claimed `old` is recycled by
+> `heap.relabel`'s own bookkeeping (`Composed::relabel` calls `recycle(from)`), so
+> leaving an entry behind would double-count it. An `old` that was minted this same
+> transaction and never reached the heap has no relabel to ride on, yet its counter
+> is still owed — so it needs `Freed`, whose release is lookup-guarded and therefore
+> recycles without touching the heap. Dropping the entry instead would leak the
+> counter, which is the same trap as `free` of a `New` entry two sections down.
+>
+> Either way `old`'s spill entries are dropped, so the piece table exists under
+> exactly one id at a time.
 
 Overwrite is the only non-trivial primitive: split at both boundaries (materializing
 them from the covering segment), drop the entries strictly inside, insert the new
@@ -261,8 +364,26 @@ optimization. It is not, and conflating the two costs a lot of confusion:
   header. Two `Storage(id, base)` merge iff same `id` and `left.base + left.len ==
   right.base`; two `Undefined` always merge.
 - **Destination contiguity** — can two segments be written with one call? This holds
-  *by construction*, since adjacent segments in a piece table are adjacent in the
+  *by construction*, since adjacent segments (with the same allocation ID) in a piece table are adjacent in the
   destination allocation.
+
+**Questions:**
+- Is the parenthetical I added above correct?
+- Does the current implementation check for it?
+
+> **Answers.** Correct, but it describes something stronger than a condition: a
+> piece table *belongs to* one allocation, so every segment in one shares its id by
+> construction. There is no such thing as a piece table containing segments of two
+> allocations. Read that way the parenthetical is a clarification rather than a
+> qualifier — worth keeping, since "adjacent segments" could otherwise be misread
+> as "adjacent entries in the flush-wide spill map", where it would be false.
+>
+> Not checked, because it is *enforced by the key*. The spill map is
+> `BTreeMap<(Id, Offset), Source>` and `Folded::segments(id)` reads it with
+> `range((id, 0)..=(id, usize::MAX))`, so a segment of another allocation cannot
+> appear in the result. That is also why the tuple key was chosen over one map per
+> allocation (§7.2): one tree, and the id in the key does the partitioning that
+> separate trees would otherwise do.
 
 Only the second saves I/O, and it does not care where the bytes came from. So the
 **emitter walks the table and issues one write per maximal run of resolvable
@@ -280,6 +401,34 @@ vectored write. Either way the run should be capped — a page or two of staging
 buffer is plenty — and emission split at that boundary, so a single enormous
 coalesced extent cannot turn into an unbounded allocation. The cap is a pure
 throughput knob: splitting a run only costs an extra write.
+
+**Todo:** clarify the current state of the gather run. What is currently implemented, what's deferred?
+
+> **Current state.** `journaled.rs::emit`, `GATHER_CAP = 8 KiB`.
+>
+> *Implemented:* a run is assembled into a staging `Vec<u8>`, and emission splits
+> whenever the buffer reaches the cap. Each piece is consumed in `min(remaining,
+> cap - buffered)` slices, so one oversized piece is split too, not just a run of
+> many small ones.
+>
+> *One exception, and it is a correctness rule rather than a tuning choice:* a run
+> containing a `Storage(self, …)` piece — which a splice shifting a tail produces —
+> is staged **whole**, `cap = usize::MAX`. Splitting it would let the first write
+> land on bytes a later piece still has to read. The bound is then the allocation's
+> own size, so it is not unbounded, but it is not the cap either.
+>
+> *Deferred:*
+>
+> - **Vectored I/O.** The design above offers "a staging buffer *or* handing the
+>   kernel a vectored write"; only the former exists. `preadv`/`pwritev` would
+>   remove the copy, and would make the cap a bound on the iovec count rather than
+>   on bytes.
+> - **Merging across gaps** (§7.1) — nothing writes through an `Undefined` or
+>   identity gap today, so a scattered set of small updates still emits one write
+>   per run. That is the larger of the two, and it is the one that actually turns
+>   random writes into sequential ones.
+>
+> The cap itself has never been measured; 8 KiB was picked as "a page or two".
 
 §7 adds the one case where the emitter may merge across a segment it was *not*
 obliged to write.
@@ -365,7 +514,36 @@ one edge, below, and never appears in a cycle.
 2. `Transfer` reading `id` → `Release(id)`. *(the `Copy`-then-`free` edge)*
 3. `Transfer` reading a range of `id`'s storage → later actions writing that range
    (a WAR anti-dependency — easy to forget, since it runs backwards from the usual
-   intuition).
+   intuition). **Questions:** does "later actions writing that range" include shrinking (if the range overlaps with what the shrinking removes)? Is this implemented?
+
+   > **Answers.** Yes to the first — and to more than shrinking. What matters is not
+   > "is the range overwritten" but "do those bytes still hold what the read meant",
+   > and a `Reshape` can break that two ways: a shrink makes the tail reusable by
+   > some later claim, and a *relocating* resize moves the whole allocation, so even
+   > an unshrunk range is no longer at the address the read named. `Release` is the
+   > third way. Those three are exactly §6.5's disturb set, which is not a
+   > coincidence: hoisting and this edge are two ways of discharging the same
+   > obligation.
+   >
+   > **No to the second.** `schedule.rs` implements edges 1 and 2 only, with a
+   > comment claiming 3 and 4 "cannot arise here". That claim is true *because of
+   > the hoisting policy*, not because of anything about the fold — and the comment
+   > gives the wrong reason. With `set_hoisting(false)` the claim is false, and
+   > §6.6 reproduces wrong bytes.
+   >
+   > Implementing edge 3 would not by itself fix that, which is the more interesting
+   > half of the answer. Two allocations that read each other produce edges in *both*
+   > directions, so the graph acquires a cycle and the topological sort has no
+   > answer at all. Breaking it needs hoisting for at least one of the two reads.
+   >
+   > But the sharper point cuts the other way: **edge 2 is itself unreachable on the
+   > shipping path**, for exactly the reason you would expect edges 3 and 4 to be.
+   > A release disturbs, so every read of a released allocation is already a literal
+   > before the scheduler runs, and there is no `Transfer` left for edge 2 to order.
+   > Measured: one firing in 122 tests, in the sole hoisting-off test. So the
+   > implemented-versus-unimplemented split between edge 2 and edges 3–4 does not
+   > track anything real — under the current policy all three are dead, and under a
+   > minimal-hoisting policy all three would be needed. See §6.6.
 4. Earlier writes to a range → a `Transfer` reading it. The fold has usually already
    turned these into literals, so this edge mostly evaporates.
 
@@ -386,6 +564,89 @@ So: **Kahn's algorithm with a priority queue over the ready set**, in order
 2. `Release`,
 3. `Claim`, largest size first (FFD),
 4. `Reshape`, `Transfer`, `Write`.
+
+**Questions:**
+- How is the queue for Item 1 built or maintained? What's the asymptotic complexity to maintain it? Explain in prose and with pseudocode.
+- How does the current implementation order vertices *within* each of these 4 priorities? Is the current implementation deterministic (i.e., independent of new addresses, hash map iteration order, ...)? What deterministic ordering would you recommend if I decide to go with Architecture A of Section 9?
+
+> **How rule 1 is computed.** It is not maintained at all — it is precomputed once,
+> before the sort, as a plain `Vec<bool>`:
+>
+> ```text
+> for each task i:
+>     unblocks_release[i] = any successor of i is a Release
+> ```
+>
+> One pass over the adjacency lists, so **O(V + E)** to build and **O(1)** to
+> consult. Nothing updates it as the sort proceeds.
+>
+> **That is a defect, and §6.3 is where it shows.** "Unblocks a `Release`" is
+> implemented as *directly precedes* one, not *transitively enables* one. A task
+> that must run before the task that unblocks a release gets no priority at all, so
+> it sits in the ready set behind a `Claim` and the release never gets its chance.
+> §6.3's own scenario hits this — see the walkthrough there.
+>
+> **Latent, though, not live.** Rule 1 only matters when some `Release` is blocked,
+> and under the hoisting policy the implementation actually ships none ever is
+> (§6.6): instrumented over the whole suite, rule 1 marks a task exactly once, in
+> the one test that disables hoisting. So this is a defect in machinery that is
+> currently unreachable — worth fixing if minimal hoisting is ever adopted, and
+> worth deleting along with the rest of §5's edge set if it is not.
+>
+> The fix is to propagate the flag backwards, which is one reverse pass and keeps
+> the same complexity:
+>
+> ```text
+> # 1. mark direct predecessors of every Release
+> for each Release r, for each predecessor p of r:
+>     enables[p] = true
+>
+> # 2. close under predecessors, in reverse topological order
+> for each task t in reverse topological order:
+>     if any successor of t has enables set:
+>         enables[t] = true
+> ```
+>
+> Still **O(V + E)**, since a reverse topological order is the same Kahn's run on
+> the transposed graph. Ranking on `enables` rather than `unblocks_release` makes
+> rule 1 mean what §5.2 says.
+>
+> **The "priority queue" is not one.** The ready set is a `Vec<usize>` scanned with
+> `min_by_key` on every pop: **O(V)** per step, **O(V²)** overall, plus `retain`.
+> For a flush touching a thousand allocations that is a million comparisons of a
+> cheap key — tolerable but pointless. A `BinaryHeap<Reverse<(Rank, usize)>>` makes
+> it **O((V + E) log V)** and is a smaller change than the transitivity fix.
+>
+> **Ordering within a priority.** By task index, and the index order is: all
+> geometry tasks first, in `BTreeMap<Pointer>` order — that is, ascending id — then
+> the write tasks, per surviving allocation in the same id order, and within an
+> allocation in ascending offset.
+>
+> **Deterministic, yes.** Nothing in the ordering reads an address, a wall clock, a
+> pointer value, or a hash iteration order. `Folded`'s two maps are both `BTreeMap`,
+> which is why `Pointer` grew `Ord`; the rank key uses sizes, which come from the
+> journal; the tie-break is the index. The `Deltas` map *is* a `HashMap`, but it is
+> never iterated to produce output — only probed by key for the fold-agreement
+> assertion. The determinism assertion in §10 step 3 covers the whole path.
+>
+> **Recommendation for architecture A.** The current ordering already qualifies, so
+> the recommendation is not to change it but to *pin* it:
+>
+> - **State the invariant where it can be violated**, on `Folded::tasks` and on
+>   `rank` — "output order is a function of the journal and the pre-flush heap
+>   snapshot alone" — because the next person to reach for a `HashMap` here will not
+>   otherwise know it matters.
+> - **Never tie-break on anything the heap chose.** Ranking claims by size is safe;
+>   ranking them by, say, the address a previous claim received would not be, and
+>   that is a tempting optimization once placement quality is being tuned.
+> - **Make the assertion cross-process, not just cross-call.** Re-deriving twice in
+>   one process misses a global-state dependency that is stable within a run. Under
+>   A the real property is that a *fresh* process re-deriving from the same journal
+>   and snapshot produces the same plan, so the test should serialize the snapshot,
+>   rebuild from scratch, and compare.
+>
+> Under B or C none of this is load-bearing, since recovery reads the plan rather
+> than re-deriving it — which is precisely §9.4.2's argument for the extra 5–10 %.
 
 FFD is therefore *best-effort over the ready set* rather than global — a `Claim`
 blocked behind a `Transfer` is placed after smaller ones. Only `Copy` chains block,
@@ -438,9 +699,58 @@ becomes ready and top-priority, opening the gap at 1000; `Claim(A3, 200)` lands 
 1000; `Write(A3)` follows. A3 reuses A1's space, with no address-level reasoning
 whatsoever.
 
+**Todo:** make sure the implementation has a test for this example. Report back here where that example is and what exactly it tests.
+
+> **There is no such test, because the implementation does not do this.** Reporting
+> the discrepancy rather than papering over it.
+>
+> The nearest test is `journaled.rs::without_hoisting_the_read_becomes_an_ordering_constraint_instead`,
+> and it asserts the **opposite** of §6.3: with hoisting off, A3 does *not* get A1's
+> range. It passes. So the note claims a behaviour the code does not have, and a
+> test enshrines the shortfall as expected.
+>
+> Dumping the schedule for exactly this scenario shows why:
+>
+> ```text
+> pick rank=(2, …) Claim     <- A3, placed while A1 is still live
+> pick rank=(4, 0) Reshape   <- A2
+> pick rank=(0, 0) Write     <- the transfer; rule 1 did fire, too late
+> pick rank=(1, 0) Release   <- A1
+> A3 landed at 384 (A1 was at 0)
+> ```
+>
+> Two independent causes, both fixable:
+>
+> 1. **Rule 1 is not transitive** (see §5.2). The transfer *is* ranked 0, but it is
+>    not in the initial ready set, so nothing consults that rank until after `Claim`
+>    has already run.
+> 2. **A spurious `Reshape` is what blocks it.** A2 is persistent and its size never
+>    changes, yet the fold's `touch` enters every persistent id as `Resized(size)`,
+>    which becomes a `Reshape` task and hence an edge `Reshape(A2) → Write(A2)`.
+>    A no-op reshape is cheap at the heap (`Relocation::None`) but not free in the
+>    schedule: it is the entire reason the transfer is not ready.
+>
+> Fixing (2) alone would make this scenario pass while leaving the general case
+> broken; fixing (1) alone would leave the spurious edge. Both are worth doing, and
+> (2) also removes work from every flush that touches a persistent allocation
+> without resizing it — which is most of them.
+
 This is why the priority-queue formulation beats a fixed phase order. A fixed order
 cannot express it: if `A2` were fresh rather than persistent the correct sequence is
 `Claim(A2) → Transfer → Release(A1) → Claim(A3)`, interleaving claims and releases.
+
+**Todo:** make sure the implementation also has a test for this example. Report back here where that example is and what exactly it tests.
+
+> **Also absent**, and it would fail for cause 1 above even though cause 2 does not
+> apply. With `A2` fresh there is a real `Claim(A2) → Write(A2)` edge, so the
+> transfer is again not initially ready; `Claim(A3)` and `Claim(A2)` are, and FFD
+> picks between them by size with no notion that one of them leads to a release.
+> Only the transitive rule 1 makes `Claim(A2)` outrank `Claim(A3)` here.
+>
+> This example is the sharper of the two: cause 2 can be argued away as a fold
+> inefficiency, whereas this one isolates the priority defect with nothing else
+> confounding it. Worth writing as the regression test *after* the fix, since it
+> fails for the right reason today.
 
 ### 6.4 The aggressive alternative, and why not to build it
 
@@ -463,6 +773,60 @@ the same* reads, writes and placement as §6.3. It wins only when the free must
 precede the read for placement reasons the priority cannot reach, which is exotic.
 
 ### 6.5 Hoisting, which makes the question moot
+
+**Todo:** this section is a bit confusing. It's not clear whether it describes a proposal, an alternative to the proposal in this document, or a stop-gap that was implemented first but has now been superseded. Clarify what the current implementation does. Is really everything that gets disturbed hoisted or was that a stop-gap? Mention the commits that implemented and/or reverted the implementation of what is described in this section.
+
+> **Status: this is what ships, and it is not optional.** The confusion is the
+> section's own fault — it was written as a *recommendation between alternatives*
+> ("build hoisting first and skip the graph entirely"), and §6.6 has since shown
+> that the alternative is not merely slower but wrong. Read the closing paragraph
+> of this section as superseded; the rest describes current behaviour.
+>
+> **Commits.** `257b4e1` implemented it, together with `Copy` and the content-blind
+> fast path. `91569d1` added the scheduler and, with it, `set_hoisting(false)` — a
+> switch introduced solely so the scheduler's edges would be exercised rather than
+> vestigial. Nothing has been reverted. §6.6 shows that switch to be unsound; no
+> commit fixes that yet.
+>
+> **Is everything disturbed hoisted?** Yes, with one wrinkle in each direction:
+>
+> - **Coarser than described.** The disturb set is tracked *per allocation*, not per
+>   range: `Folded::disturbed` is a `BTreeSet<Pointer>`. A read of A2's byte 90 is
+>   hoisted if *anything* in A2 is written, even at byte 0. Always safe, sometimes
+>   wasteful — and §6.6 is a case where the waste is real.
+> - **Narrower than described.** Only *cross-id* reads are hoisted. A
+>   `Storage(self, k)` piece is left alone and handled by the emitter as a memmove
+>   within one staged run (§4.1.1), which is correct and cheaper than hoisting.
+>
+> Neither was a stop-gap; both are deliberate.
+
+**Question:** How is it detected that hoisting is necessary? What is the asymptotic runtime complexity of this detection?
+
+> **Answer.** Two passes, both over the same data.
+>
+> `Folded::has_cross_id_reads` walks every surviving allocation's segments looking
+> for any `Storage(other, _)` with `other != self`. That is the content-blind flag
+> of §7: if it is clear, hoisting is skipped wholesale. `Folded::hoistable` then
+> repeats the walk, keeping the segments whose source is also in `disturbed`.
+>
+> Let **S** be the total number of segments across all surviving allocations and
+> **A** the number of surviving allocations. Both passes are **O(S log A)** —
+> `S` segment inspections, each `disturbed` probe `O(log A)`, and `segments(id)` is
+> a `BTreeMap` range query. Since a table is one segment in the common case, S is
+> normally proportional to A.
+>
+> Two costs worth naming, neither asymptotic:
+>
+> - `segments()` **allocates a `Vec` per call**, and both passes call it per
+>   allocation, so the detection allocates `O(A)` vectors before deciding whether
+>   there is anything to do. An iterator would remove that.
+> - The two passes are redundant: `hoistable` alone determines both answers, since
+>   an empty result *is* "nothing to hoist". The separate flag exists to skip the
+>   second walk, and then does the same walk anyway.
+>
+> With `Copy` being the only op that creates a cross-id piece (§7), the flag is
+> clear for the overwhelming majority of transactions, so the wasted walk is the
+> one that runs every time.
 
 At fold time, if a `Storage(src, …)` piece references a range that this journal will
 **disturb**, read those bytes immediately and turn the piece into a `Literal`.
@@ -500,6 +864,117 @@ op that produces one at all is `Copy`. Build the scheduler when a workload shows
 buffering hurting — the differential oracle of §8 makes that transition safe, and
 the fold is the same function either way.
 
+### 6.6 Cyclic copies, and how much hoisting is actually owed
+
+The example that decides the question §6.5 left open. Two persistent allocations,
+each 96 bytes, `A1` holding `0..96` and `A2` holding `100..196`:
+
+```
+1.  Copy(src = A1, src_off =  0, len = 64, dst = A2, dst_off = 0)
+2.  Copy(src = A2, src_off = 32, len = 64, dst = A1, dst_off = 0)
+```
+
+The second copy reads a range the first one partly wrote — `A2[32..64)` is inside
+the first copy's destination, `A2[64..96)` is not — so it is a genuine cycle at the
+allocation level, and non-trivial at the byte level.
+
+**Fold.** After op 1, A2's table is `{0 → Storage(A1,0), 64 → Storage(A2,64)}`. Op 2
+takes A2's pieces over `[32, 96)` and rebases them onto A1:
+
+```
+A1: { 0 → Storage(A1,32),  32 → Storage(A2,64),  64 → Storage(A1,64) }
+A2: { 0 → Storage(A1,0),   64 → Storage(A2,64) }
+```
+
+The essential thing has already happened: **the fold has broken the cycle**. Every
+piece names *pre-flush* storage, because a `Copy` takes pieces rather than bytes
+(§4.1), so op 2 resolved against the table op 1 left rather than against A2's future
+contents. No piece anywhere refers to a value this flush is about to produce.
+
+What survives is not a cycle but two **write/read conflicts**. Emission covers
+`A1[0..64)` — the piece at 64 is identity — and `A2[0..64)`; and A2 reads `A1[0..64)`
+while A1 reads `A2[64..96)`. Only the first of those overlaps a write, but the
+per-allocation disturb set (§6.5) does not distinguish, so both are hoisted.
+
+**Hoisting.** A1 and A2 are both written, hence both disturbed. A2's
+`Storage(A1,0)` and A1's `Storage(A2,64)` become literals; A1's `Storage(A1,32)` is
+a self-reference and stays, handled as a memmove. Every remaining read is of
+untouched storage, and the schedule is free.
+
+**Without hoisting it is simply wrong.** Whichever of the two writes runs first
+destroys what the other reads. Measured — A1's first eight bytes should be
+`[32..40)` and A2's should be `[0..8)`:
+
+| | A1[0..8] | A2[0..8] |
+| --- | --- | --- |
+| hoisting on | `32,33,…,39` ✓ | `0,1,…,7` ✓ |
+| hoisting off | `32,33,…,39` ✓ | `32,33,…,39` ✗ |
+
+A2 has read A1 *after* A1 was rewritten. This is not a scheduling infelicity: as
+§5.1 notes, edge 3 would put edges in both directions here and the sort would have
+no answer at all.
+
+#### What this proves, and what it does not
+
+It proves that **hoisting cannot be dropped entirely**: the read-before-disturb
+constraints can cycle, and then no schedule exists at any priority. Breaking the
+cycle requires resolving at least one of the two reads up front.
+
+It does **not** prove that every disturbed read must be hoisted. The minimum a
+correct implementation owes is "hoist enough to make the constraint graph acyclic";
+every read outside a cycle can be ordered by an edge, which is precisely what
+edges 2–4 are for. Hoisting *everything* disturbed is a **policy**, and it is the
+implementation's policy — a choice, not an obligation.
+
+#### Why the maximal policy is nonetheless the right one
+
+It is close to free. A hoisted read performs the same I/O a `Transfer` would — read
+*n* bytes, write *n* bytes — and differs only in holding them between fold and
+emission, so the cost is transient memory proportional to the volume of disturbed
+cross-id reads, and nothing else. Against that it buys two things: the constraint
+graph is acyclic by construction, with no cycle detection to write or test, and
+releases become unblocked, so they can run first and hand the placement pass the
+freed space (§6.3).
+
+The minimal policy buys back that memory and pays for it in cycle detection, three
+more edge kinds, and worse placement. On these numbers that is a bad trade.
+
+#### But then most of §5 is unreachable
+
+This is the honest consequence, and it is worth stating plainly rather than leaving
+implicit. If every read of a released allocation has already become a literal, then
+edge 2 — `Transfer` reading `id` → `Release(id)` — **can never fire**, because there
+is no surviving `Transfer` for it to constrain. The same argument retires edges 3
+and 4 (never implemented) and priority rule 1, whose whole job is to unblock a
+`Release` that is now never blocked.
+
+Measured over the whole test suite, instrumenting the scheduler to report any
+blocked `Release` or any task marked by rule 1: **one occurrence in 122 tests**, in
+`without_hoisting_the_read_becomes_an_ordering_constraint_instead` — the single test
+that turns hoisting off. On the shipping path, provably zero.
+
+So the live content of §5 is edge 1 (`Claim`/`Relabel`/`Reshape(X)` → `Write(X)`,
+which is real and load-bearing) plus first-fit-decreasing claim ordering. §6.5
+predicted exactly this, and §10 step 7 says "may never be needed"; both were right,
+and the scheduler was built anyway.
+
+#### Consequences
+
+- **`set_hoisting(false)` is unsound** and should not be public API in its present
+  form. It was introduced (`91569d1`) to give the scheduler's edges something to do,
+  which is the wrong motivation for a switch: it drops hoisting to *zero* rather
+  than to the cycle-breaking minimum. Either remove it, or make it mean "hoist the
+  minimum" — but note that the minimum requires implementing edges 3 and 4 and
+  detecting cycles, none of which exists.
+- **§6.5's closing recommendation stands, with a corrected reason.** "Build hoisting
+  first and skip the graph" is right; the reason is not that the graph is
+  *insufficient* without hoisting — a full edge set plus cycle-breaking would be
+  sufficient — but that hoisting makes the graph unnecessary at a cost of transient
+  memory alone.
+- **The oracle missed this.** `differential.rs` runs both modes, so the gap is in
+  generation, not comparison: two copies whose ranges conflict in both directions
+  are rare under uniform sampling. Worth generating deliberately.
+
 ## 7. The content-blind fast path
 
 Set a flag when any op produces a piece `Storage(other_id, …)` with
@@ -534,6 +1009,13 @@ small updates into a single sequential write — which is the main lever the pie
 table offers for making replay I/O sequential rather than random. It composes with
 the gather-run cap of §4.1.1: merge across gaps first, then split the result at the
 cap.
+
+**Todo:** Add these two ways of "writing through gaps" to `later.md`.
+
+> **Done** — added under "Miscellaneous ideas" in [later.md](later.md), as one entry
+> with the two gap kinds split out (an `Undefined` gap is free; an identity gap
+> costs re-writing correct bytes), the page-sized threshold, and how it composes
+> with the gather-run cap. Neither is implemented today.
 
 ### 7.2 Representing a piece table cheaply
 
@@ -578,6 +1060,25 @@ A third implementation is worth more than two: a pure in-memory model catches
 bugs both backends share, and it sidesteps id divergence, since the journaled
 backend's deferred frees recycle counters at different moments than the
 unjournaled one's. Actions therefore name model-level handles rather than ids.
+
+**Question:** is this implemented? How much work and disturbance would it introduce?
+
+> **Answer: already implemented — this paragraph describes what `differential.rs`
+> does, not a proposal.** It reads as future tense because it was written as a
+> correction to the section above it; no work outstanding.
+>
+> Concretely, `check(actions)` runs one sanitized action sequence against four
+> implementations and compares all of them to the model: the model itself, the
+> journaled backend via the fold, the same via `flush_naively`, and the unjournaled
+> backend. Actions name model-level handles precisely because the journaled
+> backend's deferred frees recycle counters at different moments, so the same
+> sequence yields different ids.
+>
+> The one thing the section still overstates is coverage rather than machinery: the
+> comparison is right, but the *generator* is what decides which shapes ever reach
+> it, and §6.6 is a case it never produced. The outstanding work is there, not here
+> — biased generation for mutually-conflicting copies, which is a few lines in
+> `generate` and no disturbance to anything else.
 
 Two properties worth asserting separately, because they fail differently:
 
