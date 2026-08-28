@@ -38,7 +38,9 @@ The only places where the journal is observable are:
   > Worth also stating the *frequency*: at 3000 ops per flush and, say, 100 ops/s of interactive editing, that is one spike every 30 seconds, which no user perceives.
   > The number that matters for perceived latency is spike duration × spike rate, and it is the rate that makes this design comfortable, not the duration.
 - while kladde gives the journal precedence over any stale data and therefore never hands out stale overwritten data, forensic tools may be able to recover outdated data before the journal is flushed (this is a somewhat pedantic since closing the file ordinarily will flush the journal, and since stale data can prevail in kladde files anyway due to fragmentation unless [[privacy-cleanups]] are performed); and
-- while the journal is guaranteed to survive an application crash, it is not guaranteed to survive a power outage; kladde still guarantees that the file is in a consistent state even after a power outage, but a power outage may reset a file to its state after the last flush (which is never in the middle of a transaction). Lifting this limitation would make mutations orders of magnitude slower.
+- while the journal is guaranteed to survive an application crash, it is not guaranteed to survive a power outage: a power outage may reset a file to its state after the last flush (which is never in the middle of a transaction). Lifting this limitation would make mutations orders of magnitude slower.
+  A power outage additionally carries a narrower risk to *content*, because the unit of writeback is the page rather than the byte range that was written, so bytes that were never modified can be damaged as passengers in a page that was in flight.
+  kladde's guarantee is therefore [[#durability-guarantees|tiered]]: the file's structure always survives and it always opens, and torn content is **detected and reported** rather than silently returned.
 
 ## Guiding principles
 ### Goals and non-goals
@@ -77,7 +79,7 @@ The above goals impose the following requirements:
 
 The journal is an append-only sequence of *transactions*, where each transaction consists of a single or multiple operations (*ops*).
 Every transaction that is fully recorded in the journal is considered committed, i.e., its state change is persisted in the file and will survive an application crash.
-A subsequent flushing operation does not promote the "level of persistence" (except that it introduces an `fsync`, which guards against power outage).
+A subsequent flushing operation does not promote the "level of persistence" (except that its `fsync` barriers make the effects durable against a power outage, subject to the [[#durability-guarantees|tiering]] below).
 
 ### Transactions and ordering discipline
 
@@ -86,8 +88,8 @@ Journaling operates only on a flattened list of transactions — [[../kladde-doc
 
 Kladde guarantees two properties for transactions:
 
-- **Atomicity**: every transaction is either persisted completely or not at all, even if the application crashes or the device suffers a power outage.
-- **Immediate persistence:** *as soon as a transaction is fully recorded in the journal*, it is considered persisted to the file and will survive an application crash (but not necessarily a power outage, which may reset the file to an empty journal or a prefix of the journal up until any transaction boundary).
+- **Atomicity**: every transaction is either persisted completely or not at all, even if the application crashes or the device suffers a power outage (in the latter case subject to the [[#durability-guarantees|content tiering]] — a transaction is never *partly* recorded, but a power outage can damage bytes elsewhere in a page a flush was writing).
+- **Immediate persistence:** *as soon as a transaction is fully recorded in the journal*, it is considered persisted to the file and will survive an application crash (but not necessarily a power outage, which may reset the file to an empty journal or a prefix of the journal up until any transaction boundary, and which carries the separate content risk covered in [[#durability-guarantees]]).
 
 The immediate persistence property imposes an **ordering discipline** on authors of application code and type implementations, which the atomicity property allows them to break temporarily:
 
@@ -318,6 +320,8 @@ That is what lets a `Literal` survive being partially overwritten: the surviving
 **The single most important property, and the one to state as an invariant:**
 
 > Every `Storage(Z, k)` in a completed fold names **`Z`'s content as it was before this flush began** — never a value that this flush is going to produce.
+> The id in a `Storage` source is always an id that **existed before this flush**.
+> `Storage` sources are looked up in the *pre-flush* address map; destinations are looked up in the *post-flush* one.
 
 This holds because `Copy` and `Splice` take *pieces from the source's current table*, not bytes.
 By the time the fold reaches op *n*, the source's table already reflects ops 1…*n*−1, so the copy inherits their resolution rather than referring to them.
@@ -329,7 +333,7 @@ It is worth being explicit about this because almost everything downstream depen
   Their content is fully symbolic; nothing about them ever needs to be read from the file.
 - **Persistent** ids (live from before this journal) start as a single identity segment `{0 → Storage(self, 0)}`.
 
-Every table therefore begins with exactly one entry, which is worth exploiting in the representation: the overwhelmingly common case is that it still has one entry at the end.
+Every table therefore begins with exactly one entry, which is worth exploiting in the representation (TODO): the overwhelmingly common case is that it still has one entry at the end.
 
 **Per-op rules.**
 
@@ -342,29 +346,6 @@ Every table therefore begins with exactly one entry, which is worth exploiting i
 | `Write(id, offset, bytes)`           | —                                    | overwrite `[offset, offset+len)` with `Literal`                                                    |
 | `Splice(id, offset, old_len, bytes)` | size                                 | overwrite, then shift the suffix segments                                                          |
 | `Copy(src, so, len, dst, do)`        | —                                    | overwrite `dst`'s `[do, do+len)` with the pieces `src`'s *current* table holds over `[so, so+len)` |
-
-> **Claude: you are right, and the rewrite is now removed from the table above.**
-> It was carried over from the previous design without checking whether it still made sense here, and it does not — it contradicts exactly the invariant you quote.
->
-> **Why it existed.** In the previous design the identity test was *offset-based*: a piece was identity iff it read `Storage(self, k)` with `k` equal to its own segment start.
-> After a conversion, `new`'s table still said `Storage(old, 0)`, which is not `self` under the new id, so it failed the test and emitted a pointless self-copy.
-> Rewriting it to `Storage(new, 0)` restored the test.
->
-> **Why it is wrong here.** §2b makes the identity test *address-based*: `pre_addr(Z) + k == post_addr(id) + seg_start`.
-> A conversion is a relabel, so `post_addr(new) == pre_addr(old)`, and `Storage(old, 0)` in `new`'s table already satisfies it.
-> The rewrite is therefore unnecessary — and actively harmful, because `pre_addr(new)` **does not exist**: `new` was minted during this journal and had no address before the flush.
-> A `Storage(new, k)` piece is unlowerable.
->
-> That gives a clean invariant worth stating alongside the one above:
->
-> > The id in a `Storage` source is always an id that **existed before this flush**.
-> > `Storage` sources are looked up in the *pre-flush* address map; destinations are looked up in the *post-flush* one.
->
-> **And to your second question — no, and that is the other reason to drop the rewrite.**
-> If `Convert` rewrote its own table, consistency would demand rewriting every `Storage(old, k)` in *every other* allocation's table too, since those pieces mean the same physical bytes.
-> That is a scan over the whole fold state per conversion, turning a cheap op into an expensive one, and it would have been a silent correctness bug the moment any other allocation had copied out of `old` earlier in the same journal.
-> With no rewrite, those references keep working untouched: `old` still has a pre-flush address, which is all they need.
-
 Overwrite is the only non-trivial primitive: split at both boundaries (materialising each from the segment it falls inside), drop everything strictly between, splice the new pieces in.
 
 **The running size matters, not just the final one.**
@@ -374,10 +355,16 @@ Keep it in the geometry record and mutate it as the walk proceeds; the value it 
 **Four things fall out without being coded as special cases**, and they are most of why folding is worth doing:
 
 - **Repeated writes to the same range emit one write**, because the table holds exactly one source per byte by construction.
-- **An allocation created and freed within one journal never touches storage at all**, and a `Copy` out of it resolves to literals rather than forcing it to be materialised.
+- **An allocation created and freed within one journal never touches storage at all**, and a `Copy` out of it resolves to literals rather than forcing it to be materialized.
 - **An identity piece emits nothing.** `Storage(self, k)` with `k` equal to the segment start means the bytes are already where they belong; without this check every untouched region of every persistent allocation would be copied onto itself.
-- **A size-preserving `Convert` emits nothing**, because a relabel keeps the address, so every piece that was identity before is still identity after.
-  This is what makes a chunked container that oscillates across a chunk boundary cheap, and it is worth a test.
+- **A `Convert` that does not relocate emits nothing**, because a relabel keeps the address, so every piece that was identity before is still identity after; this is worth a test.
+
+  > **Claude: agreed on the correction, and it makes the property *stronger* than I had it.**
+  > You are right that a chunked container's conversion is not size-preserving — the promoted chunk gains a `next` pointer and a length field, so `new_size > old_size`.
+  > But the condition that matters is **non-relocating**, not size-preserving, and the growing case still qualifies whenever there is room above the allocation: the original pieces stay identity (the address test does not care that the extent grew), and the new tail is `Undefined`, which emits nothing either.
+  > So a growing conversion that fits in place still costs **zero bytes**, and only a conversion that has to relocate costs a full copy.
+  > That is the version worth stating, and it keeps the motivation intact — the oscillating-chunk workload is cheap because the chunk stays put, not because its size is unchanged.
+  > It also connects to the lift machinery in `augmented-segment-tree.md`, which exists precisely to arrange that there *is* room above an allocation that keeps growing.
 
 **The fold does not describe the same point in time as `pending`.**
 The fold describes the transition ending at `committed_cursor`; `pending` describes the state at `ops.len()`.
@@ -405,11 +392,59 @@ That conflict does not disappear — it becomes visible, and §2c handles it as 
 
 **Order within this step: space-releasing operations first, then space-consuming ones largest-first.**
 
-1. **Frees, and the shrinking half of every resize** — everything that returns space to the heap.
-2. **Claims, and the growing half of every resize** — everything that takes space, processed in **descending size order** (first-fit-decreasing), so the large ones are served while the large gaps are still intact.
-3. **Relabels**, which change no geometry at all and can go anywhere.
+1. **Releases** — frees, and the tail of every shrink.
+2. **Placements** — claims and grows, in **descending final size order** (first-fit-decreasing, FFD), each under its allocation's *final* id.
+
+> **Claude: this replaces a three-phase list that had `Relabel` as its own step, which was wrong — see below.**
+>
+> **On grouping the frees hidden inside a relocation.** A relocating resize *is* a release plus a claim, so the temptation is to split it and put the release in phase 1.
+> That would maximise the space available to phase 2, but it costs more than it gains: releasing an allocation's whole extent before placing it forfeits the in-place case, and the placement policy would have to rediscover "put it back where it was" — which for a shrink it would probably do, and for a grow it might not, turning a free operation into a full copy.
+>
+> The cheaper arrangement is to keep the resize atomic and let phase 2 release lazily: **when a placement decides to relocate, return the old extent to the free pool immediately**, so the subsequent (smaller) placements in the same descending-size pass can use it.
+> Since phase 2 is a sequential pass and §2a touches no bytes, that costs nothing and recovers most of the space that splitting would have.
+>
+> **On relabels needing to move up: the question dissolves, and I had the phase list wrong.**
+> `Relabel` is not a separate step at all, because the fold has already collapsed `Convert` and any following `Resize` into a *single* entry — `Relabelled { from, size }`.
+> §2a therefore performs one action per allocation: rekey `from` to the new id and give it its final size.
+> There is no relabel-then-resize ordering to get right here; that ordering constraint lives in the journal op vocabulary (§4.3), and the fold consumes it.
+>
+> What I got wrong was calling relabels geometry-neutral so they "can go anywhere".
+> They change no *extent*, but they change the allocation's **class** — sizedness rides on the id, and `GainGreedyHeap` keys its evacuation index on `is_fixed` — so the class affects placement.
+> A relabelled allocation must therefore be placed under its **final** id, which the two-phase list above now says explicitly.
 
 Both of these were *best-effort* in the previous design and are **unconditional** here, which is worth dwelling on because it is the clearest single benefit of separating the decision from the action.
+
+**Question:** I understand that any order is *correct*, but don't we still want to prefer an order that minimizes dependencies in the conflict graph (Step 2c below)?
+I'm not sure how we could do that or even if that's maybe already (partially) achieved by construction.
+Try to find examples where the order of frees and claims has an effect on the number of dependencies in the conflict graph and explain the general principles that this search or logical arguments brought up.
+
+> **Claude: yes, and the effect is real — though it is *placement* rather than *order* that does the work.**
+>
+> **Where edges come from.** An edge exists iff a **post-flush destination** overlaps a **pre-flush range that something reads**.
+> Destinations are chosen in §2a; the read ranges are fixed by the fold.
+> So §2a is exactly the step that decides how many edges there will be.
+>
+> **The worked example.** `A1` at `[1000, 1256)` is freed, but some piece still reads `A1[0..64)`, i.e. `[1000, 1064)`. A new allocation `A3` of 200 bytes is claimed.
+>
+> - Placed at 1000 — reusing the freed range — its write covers `[1000, 1200)`, which overlaps the read. **One edge**, and by §2d the reading piece's 64 bytes go into the write-ahead plan.
+> - Placed anywhere else, including past the end of the file: **no edge**, but the file grows by 200 bytes until compaction reclaims it.
+>
+> So frees-before-claims, which exists to *encourage* reuse, is precisely what *creates* these edges. That is not an argument against it — it is the trade made visible.
+>
+> **The general principles this brings out:**
+>
+> 1. **Only "hot" ranges matter.** A range is hot if some surviving piece reads it, which is computable from the fold before any placement happens.
+>    Placing over cold free space — the overwhelming majority of it — costs nothing, so this is not a pervasive tax.
+> 2. **The cost of an edge is the size of the *read*, not of the claim.** The buffered bytes are the reading piece's source.
+>    So reuse is *most* attractive for a large claim over a small hot range, and least attractive for a small claim over a large hot range.
+>    That asymmetry is the useful part: it says which reuses to avoid, not that reuse is bad.
+> 3. **The benefit of reuse is the size of the claim**, in avoided file growth — which compaction would otherwise have to work off later.
+>    So the comparison is roughly "read bytes into the plan now" against "claim bytes of temporary file growth plus future compaction".
+> 4. **A flush with no `Storage`-sourced pieces has no hot ranges at all**, so placement cannot create edges however it chooses. Whatever pressure this puts on §2a is proportional to how much cross-allocation copying and relocation the flush contains.
+>
+> **What I would actually do:** pass the hot set to §2a as a *placement hint* — "prefer not to place over these ranges when an equally good alternative exists" — rather than as a constraint.
+> It is a tie-break, it costs one interval-set lookup per placement, and it leaves the heap free to ignore it when the alternative is worse.
+> I would not build it before measuring, but the hot set is free to compute, so it is worth threading through even if the hint is initially ignored.
 
 Previously, releasing an allocation early was unsafe whenever some transfer still had to read it, so "frees before claims" could only be a *priority* over a ready set — and a release could sit blocked behind a transfer that was itself blocked, which is why the previous design needed an "unblocks a release" priority rule and why that rule had to be transitive to work at all.
 For the same reason FFD degraded to best-effort: a claim stuck behind a transfer got placed after smaller ones.
@@ -433,9 +468,18 @@ Merging the shrink half of a resize into step 1 is a small extra gain the previo
 > A slide is the only compaction move whose destination overlaps its own source, and it is therefore the only one that needs the treatment in §2d.
 > So the cost of folding compaction into the flush is proportional to the *slide* volume, not to the compaction budget.
 > Worth exploiting: a flush-time compaction pass could prefer evacuations and defer slides, or bound slides by how many bytes they would add to the plan.
+
+**Question:** can we exploit the fact that evacuations write into free space to optimize construction of the conflict graph? I.e., avoid searching for edges that cannot exist by construction.
+
+> **Claude: yes, and it prunes the *index* rather than the search — which is the cheaper end.**
 >
-> **On `memmove` for slides:** it does not make them crash-resistant, only correct within a single uninterrupted execution — see the answer under §2d.
-> And yes, `compact_incrementally` collating its byte movements and returning them rather than performing them is exactly the shape this wants; that is the same "report, don't act" change, applied one layer up.
+> An evacuation's destination is space that was free **before the flush**. An edge points *at* a destination only if that destination overlaps a pre-flush range something reads, and nothing reads free space.
+> So **a destination lying entirely in pre-flush-free space can never receive an edge**, and can be left out of the interval index in §2c altogether.
+>
+> That is a pure win: a smaller sorted array means a cheaper binary search and fewer scan steps for every query, and it costs one interval-set membership test per destination while building the index — which you are already iterating.
+> Destinations past the pre-flush `end` are the trivial case of the same rule and can be excluded by a comparison.
+>
+> Note the asymmetry, because it is easy to get backwards: an evacuation piece receives no *incoming* edges, but it may well have *outgoing* ones — its source is the allocation's old location, which is about to be freed and possibly reused. So evacuations still have to be queried; they just do not have to be *indexed*.
 
 #### 2b. Lower pieces to address ranges
 
@@ -447,6 +491,11 @@ dst: [post_addr(id) + seg_start,  + len)   ←   src: Literal(offset in `committ
                                             |   Undefined
 ```
 
+Note: `len` is the same on the destination and source side, so the actual data structure should store it only once per entry.
+
+> **Claude: agreed, and it is forced rather than merely economical** — a piece copies a range onto a range of equal length by definition, so storing `len` twice would create a representable-but-invalid state.
+> The natural shape is `{ dst_start, len, src }` with `src` an enum, which also makes the §2c index a projection of the first two fields.
+
 Two things become simpler at this level:
 
 - **The identity test is now an address comparison**, `pre_addr(Z) + k == post_addr(id) + seg_start`, rather than an offset comparison.
@@ -454,9 +503,16 @@ Two things become simpler at this level:
 - **All destinations are globally disjoint.** Within an allocation the piece table partitions it, and distinct live allocations never overlap.
   §2c exploits this.
 
-Drop `Undefined` pieces here: they need no write, by the content contract.
+Drop `Undefined` pieces here: they need no write, by the content contract (note: we may have to keep short `Undefined` pieces that are flanked by `Literal` and/or `Storage` on both sides to enable the write-through optimization discussed below; to be determined).
 Drop identity pieces here: the bytes are already correct.
 What remains is exactly the set of writes the flush must perform.
+
+> **Claude: agreed on keeping them, with one refinement.**
+> The emitter could in principle *infer* the gaps rather than keep the pieces, since a piece table partitions its allocation and so any gap in the emitted set is exactly where something was dropped.
+> But inference is not enough, because the two gap kinds have different costs: writing through an `Undefined` gap is free, while writing through an identity gap rewrites bytes that were already correct.
+> The emitter has to tell them apart to apply a threshold sensibly.
+>
+> So keep a discriminant rather than a full piece — a gap marker carrying only "undefined" or "identity" is enough, and it keeps the dropped-piece set from costing what the kept-piece set costs.
 
 #### 2c. The conflict graph
 
@@ -476,10 +532,28 @@ Note what it subsumes, all of which were separate edge kinds or separate mechani
 Two structural facts make this cheap and make the graph small:
 
 - **Only `Storage`-sourced pieces have outgoing edges.** A `Literal` piece reads the in-memory journal, not the file, so nothing in the file can invalidate it.
-  In a flush with no `Copy` and no relocation — the overwhelmingly common case — *every* piece is `Literal`-sourced and the graph has **no edges at all**.
+  In a flush with no `Copy` and no relocation *every* piece is `Literal`-sourced and the graph has **no edges at all** — though see the note below on how common that stays once compaction is folded in.
 - **Destinations are disjoint**, so they can be sorted into one array of non-overlapping intervals over the address space.
   Finding all destinations overlapping a given source range is then a binary search plus a contiguous scan, giving **O(V log V + E)** rather than the O(V²) that pairwise comparison would cost.
   This is the reason not to coarsen the graph: per-piece edges are already cheap to build, and coarsening to allocations reintroduces exactly the false cycles §2d is about.
+
+**Note:**
+I am not sure if flushes with no `Storage`-sourced pieces will really be the the "overwhelmingly common case" now that the idea is to include compaction steps in the modifications that get folded into the target state.
+But if we hold an explicit list of `Storage`-sourced pieces rather than a flag "are there any `Storage`-sourced pieces" then the algorithm below still has a fast-pass even in the general case.
+Comment if you disagree.
+
+> **Claude: I agree on both counts, and the "overwhelmingly common case" claim should come out of this document wherever it appears.**
+>
+> Once compaction is folded in, every compaction move is a `Storage`-sourced piece, so a flush that does any compaction at all has some — and if compaction runs on every flush, the edgeless case stops being common and becomes the *empty-compaction* case.
+> The claim was inherited from a design where compaction lived outside the flush entirely, and it did not survive the move.
+>
+> Your replacement is strictly better, and the reason is that it changes the complexity rather than just the branch.
+> Let `S` be the number of `Storage`-sourced pieces and `V` the total.
+> With a flag, you either skip everything or pay `O(V log V + E)`.
+> With a list, you always pay `O(|S| · log V + E)` — the query loop iterates `S`, not `V` — and since the edits dominate `V` while compaction contributes only `S`, that is a large constant-factor difference in exactly the regime you are worried about.
+> It also degrades gracefully instead of falling off a cliff the first time a flush contains one `Copy`.
+>
+> The pseudocode below already loops over `Storage`-sourced pieces only; the accompanying prose about `E == 0` being expected is what needs rewording, which I have done there.
 
 > **Claude: the O(V log V + E) is the total for all source ranges, not for one.** My sentence was ambiguous; here is the derivation.
 >
@@ -503,7 +577,7 @@ Two structural facts make this cheap and make the graph small:
 >     i = lower_bound(D, P.src.start) - 1
 >     if i < 0: i = 0
 >     while i < len(D) and D[i].start < P.src.end:
->         if D[i].end > P.src.start and D[i].vertex != P:
+>         if D[i].end > P.src.start:
 >             succ[P].append(D[i].vertex)   # P must run before D[i]
 >         i += 1
 > ```
@@ -512,15 +586,77 @@ Two structural facts make this cheap and make the graph small:
 >
 > **Edge representation.** Adjacency lists (`Vec<Vec<u32>>`) are fine and are what Tarjan and Kahn both want.
 > If the allocation churn shows up in a profile, count degrees in a first pass and pack into CSR — one `Vec<u32>` of neighbours plus one `Vec<u32>` of offsets — but do not start there.
-> The expected case is `E == 0`: without `Copy` and without relocation, no vertex has a `Storage` source at all, the loop body never runs, and every adjacency list stays empty.
-> That is worth special-casing at the top (`if no vertex has a Storage source: skip Steps 2c–2d entirely`), because it turns the common flush into a sort plus a linear emit.
+> The loop is driven by the list of `Storage`-sourced pieces, so its cost is `O(|S| · log V + E)` where `S` is that list — not `O(V log V + E)`.
+> In a flush that does no copying and no relocation `S` is empty and the loop does not run at all; once compaction is folded in, `S` is the compaction moves plus any `Copy`, which is small next to the edits that dominate `V`.
 
-#### 2d. Cycles
+**Questions:**
+- How would the algorithm change if we wanted to exploit knowledge that certain `Storage` pieces cannot emit edges (see my earlier comment on evacuations)?
+- Doesn't the condition `D[i].vertex != P` in the code above prevent us from detecting self-cycles?
+  Or are they detected separately?
+  I think, at this point, any `Storage` where source and destination are exactly equal (not just overlapping) should have been removed already (see above: "Drop identity pieces here").
 
-> **Why cycle-breaking was an issue in the old design, and whether the piece table is a DAG by construction.**
+> **Claude — answers, and the second one was a bug that is now fixed above.**
 >
-> Taking the second question first, because the phrasing hides the answer: **the piece table is not a graph, so it cannot be a DAG.**
-> What can cycle is the *conflict graph over pieces*, which is a different object, and it depends on the granularity you build it at.
+> **On pruning.** The knowledge is about *destinations*, not sources, so it changes the index rather than the loop: build `D` only from destinations that overlap the pre-flush **live** region, since a destination lying in pre-flush-free space can never be the target of an edge.
+> The loop body is unchanged; it simply queries a shorter array.
+> Combined with driving the loop from the `Storage` list, the two prunings hit the two different factors of `|S| · log V`, which is why both are worth doing.
+>
+> **On the self-loop: you are right, and `D[i].vertex != P` was wrong.** I have removed it.
+>
+> Your reasoning is exactly the justification: §2b has already dropped every piece whose source and destination are *exactly* equal, so a piece that reaches §2c and overlaps itself must overlap *partially* — which is a `memmove`, and precisely the thing that has to be detected rather than skipped.
+> The guard was defensive against a self-edge that cannot arise, and it suppressed the only self-edge that can.
+>
+> With it gone, a self-overlapping piece records an edge to itself, which is exactly what the SCC step expects — a single-vertex component with a self-loop is one of the two shapes it treats as needing to be broken.
+
+#### 2d. Preserving endangered reads
+
+**Note:** re-consider whether these complications are really limited to cycles.
+Remember that execution has to be *idempotent*.
+Consider the piece table `[0, 10) ← [30, 40); [30, 40) ← [70, 80)`.
+No cycles, and yet I don't see how this can be executed in an idempotent way without copying out some data to a write-ahead log.
+Explain where I'm wrong or rewrite this section (Step 2d): state what kind of subgraphs are problematic and explain why (and why only these); propose how to find them and how to break them in a way minimizes the write-ahead log.
+
+> **Claude: you are right, and the section is rewritten below. This is the same conclusion the swap walkthrough under Step 3 reached from the other direction; §2d had not been updated to match.**
+>
+> Your example is the minimal witness. `P1 = [0,10) ← [30,40)` and `P2 = [30,40) ← [70,80)` give one edge `P1 → P2` and no cycle.
+> Run `P1` then `P2`: correct.
+> Crash *after both* but before the salt overwrite — which is a perfectly ordinary crash, since the salt is the last thing written — and re-run from the start: `P1` now reads `[30,40)`, which `P2` has already overwritten.
+> Wrong bytes, deterministically, on every subsequent attempt.
+>
+> So the problematic structure is not a cycle but **any edge at all**, and the reason is that the two properties are different:
+>
+> | property | problematic subgraph | why |
+> | --- | --- | --- |
+> | **schedulable** — a valid execution order exists | cycles only | an acyclic graph has a topological order, and running it once in that order is correct |
+> | **restartable** — re-running the whole plan is correct | any edge | the tail of an edge reads a range the head overwrites, so after a completed run its source is gone |
+>
+> Restartability strictly subsumes schedulability, and since a flush must be restartable, the weaker property never governs.
+
+**What must be preserved.** Exactly the ranges that are *read* by one piece and *overwritten* by another — call them **endangered reads**.
+For every piece `P` whose source overlaps some other piece's destination, the overlapping bytes must be read up front and carried in the write-ahead plan, so that re-execution reads them from the plan rather than from a file that may already have moved on.
+
+**Why only those.** A piece whose source range no other piece writes has a source that is stable for the whole flush, however many times execution is restarted; it needs nothing.
+A piece whose source is a `Literal` reads the journal, not the file, and is stable by construction.
+
+**Finding them** is the §2c query with the result used differently: for each `Storage`-sourced piece, enumerate the destinations overlapping its source.
+No adjacency lists, no indegrees, no SCC pass — the graph was only ever needed to *locate* these, not to order anything.
+
+**Minimising the plan** turns on splitting rather than on choosing victims:
+
+- **Split at overlap boundaries.** If only part of `P`'s source is overwritten, split `P` into the endangered part (buffered) and the safe part (left as `Storage`). Only genuinely endangered bytes reach the plan.
+- **Avoid creating the overlap in the first place**, which is the placement hint in §2a: an edge exists because a destination was placed over a hot range.
+- **Prefer evacuations to slides** when compaction is folded in, since an evacuation's destination is pre-flush-free space and so overlaps no read at all.
+
+**What this collapses.** After the endangered reads are buffered, **no edges remain** — every surviving `Storage` piece reads a range nothing writes, and every buffered piece reads the plan.
+So the conflict graph is edgeless by construction at the end of §2d, and with it go the topological sort, the cycle detection and the priority queue:
+
+- **Cycles need no separate treatment.** A cycle is a set of pieces that all have outgoing edges, so buffering every edge tail breaks every cycle as a side effect. The swap below is handled without ever being recognised as a swap.
+- **Self-overlaps need no separate treatment.** A `memmove` is a piece whose destination overlaps its own source, i.e. a self-edge, so its overlapping `L − d` bytes are buffered by the same rule.
+- **§2e's scheduling reduces to sorting** by destination address, because any order is now legal.
+
+> **Why cycle-breaking was an issue in the old design.**
+
+> **Why cycle-breaking was an issue in the old design.**
 >
 > **Most old cycles were indeed artifacts of allocation granularity.**
 > The old design had one vertex per allocation, so "A1 reads A2" and "A2 reads A1" produced a two-cycle regardless of *which parts* of A1 and A2 were involved.
@@ -548,43 +684,31 @@ Two structural facts make this cheap and make the graph small:
 >
 > That is a **swap**, and it is intrinsic: no ordering of two writes can exchange two byte ranges, with or without a graph.
 > The general statement is that a cycle in the conflict graph is exactly a **cyclic permutation of content**, and every such cycle needs one buffer.
-> Notice the fold cannot remove these but *does* remove the near misses — a swap written without the witness `W` folds to a no-op, because the second copy reads through the first.
+> Notice the fold cannot remove these but *does* remove the near misses — without the temporary (i.e., `Copy(V, 0, 8, Z, 0); Copy(Z, 0, 8, V, 0)`), the second copy reads through the first, folding to an identity piece that gets dropped; only `Pz` survives and there is no cycle.
 >
 > So cycle-breaking is still needed, but it goes from "triggered by any mutual reference between two allocations" to "triggered by an actual rotation of bytes", which is rare enough that you can afford to handle it in the obviously-correct way.
 
-**Detection and breaking.** Run Tarjan's SCC over the conflict graph.
-Any component with more than one vertex, plus any self-looping vertex, must be broken.
-Break by picking the **smallest-byte-count vertex** in the component, reading its source range into memory, and rewriting it as a `Literal`.
-That removes its outgoing edges — a literal reads nothing in the file — and therefore its participation in every cycle through it.
-Repeat until the graph is acyclic; each break strictly reduces the number of `Storage`-sourced vertices, so it terminates.
+**Detection and buffering**, concretely:
 
-> **Claude — pseudocode.** You do not have to implement Tarjan yourself; `petgraph`'s `tarjan_scc` (or `kosaraju_scc`) does it, and either is a fine starting point.
-> What matters for the mental model is the shape of the loop around it:
->
-> ```text
-> loop:
->     components = strongly_connected_components(graph)   # Tarjan, O(V + E)
->     bad = [c for c in components
->              if len(c) > 1 or c[0] has an edge to itself]
->     if bad is empty:
->         break                       # graph is now a DAG
->     for c in bad:
->         victim = the vertex in c with the fewest bytes
->         read victim.src from the file into memory
->         victim.src = Literal(that buffer)   # now reads nothing in the file
->         delete every outgoing edge of victim
-> ```
->
-> **Why it terminates:** each pass converts at least one `Storage`-sourced vertex into a `Literal`-sourced one, and a `Literal` vertex can never be in a cycle (a cycle needs every member to have an outgoing edge).
-> So the number of `Storage` vertices strictly decreases, and in the worst case the graph ends up entirely `Literal` and trivially acyclic.
->
-> **Intuition for what a "component" means here:** a strongly connected component is a set of pieces that all transitively wait for each other, i.e. a rotation of content.
-> Picking the smallest one to buffer is what breaks the rotation with the least I/O — the same trick as picking the smallest element to hold in a temporary when swapping.
->
-> In practice this loop runs zero times, because `bad` is empty on the first pass in every flush that has no cycle.
+```text
+for P in storage_sourced_pieces:
+    for D in destinations overlapping P.src:      # the §2c query
+        overlap = intersect(P.src, D)
+        split P at overlap's boundaries
+        read overlap from the file into the plan
+        mark that fragment of P as Literal(plan offset)
+```
 
-**Self-loops** — a piece whose `dst` overlaps its own `src` — arise from a splice shifting a tail or from a compaction slide.
-They are handled by the same rule as any other cycle: buffer the overlapping bytes.
+The cost is the §2c query plus the bytes read, and both are proportional to the endangered set rather than to the flush.
+
+> **Claude — on Tarjan, which this replaces.**
+> An earlier draft of this section detected strongly connected components and buffered the cheapest vertex in each.
+> That is the right algorithm for *schedulability* and the wrong one for *restartability*: it buffers a strict subset of what is needed, so it produces plans that are correct on a first run and wrong on a restart.
+> Since restartability is not optional, the SCC pass has no job left — every cycle is broken as a by-product of buffering edge tails, and nothing has to notice that a cycle existed.
+> Worth stating explicitly because "run Tarjan here" is the intuitive answer and it is a trap: it is more machinery producing a weaker guarantee.
+
+**Self-overlaps** — a piece whose `dst` overlaps its own `src` — arise from a splice shifting a tail or from a compaction slide.
+They are self-edges, so the rule above already buffers their overlapping bytes; the `L − d` figure below is exactly the size of that overlap.
 
 > **Claude — on your `memmove` question, and it is the one that changes the design most.**
 >
@@ -592,7 +716,15 @@ They are handled by the same rule as any other cycle: buffer the overlapping byt
 > Linux's `copy_file_range` rejects overlapping ranges within one file; macOS's `fcopyfile` and Windows have no intra-file equivalent at all.
 > The closest thing is `mmap` plus a real `memmove`, which works but hands you `msync`'s durability semantics instead of `write`'s — a different set of problems, not fewer.
 > So in practice an overlapping in-file move is a loop of bounded reads and writes in the direction that reads ahead of where it writes, i.e. you are buffering anyway, just a chunk at a time.
+
+**Question:** *briefly* mention what the "different set of problems" with `mmap` and `msync`'s durability semantics are.
+
+> **Claude, briefly:** three, of which the third is the one that matters here.
 >
+> - **You lose control of *when*.** The kernel may write back dirty pages at any time in any order, so "nothing has reached disk yet" stops being something you can arrange — which is fatal to a barrier discipline that depends on the plan landing before the data.
+> - **Errors arrive as `SIGBUS`**, not as a return value, so an I/O failure or a truncation under the mapping becomes a signal to handle rather than an error to propagate.
+> - **`msync` is weaker and less portable than `fsync`**: it says nothing about ordering between mappings, and Windows needs `FlushViewOfFile` *plus* `FlushFileBuffers` to get an equivalent guarantee.
+
 > **It is efficient but not crash-resistant, and the second part is what matters.**
 > Take a slide of `L` bytes down by `d`, copying ascending.
 > When you read byte `s+i` you have already written up to `s−d+i`, so once the move completes, source bytes `[s, s−d+L)` — that is `L−d` bytes, the overlap — hold their *new* values, not their old ones.
@@ -611,14 +743,18 @@ They are handled by the same rule as any other cycle: buffer the overlapping byt
 > **Does piece granularity cost sequentiality?**
 > No — and it is *better* placed to deliver sequentiality than allocation granularity was, for two reasons.
 >
-> First, **the graph is nearly always edgeless**, as noted in §2c: without `Copy` and without relocation there are no `Storage` sources at all, so the topological constraint is vacuous and you are free to emit in whatever order you like.
-> Coarse vertices did not give you that freedom; they gave you *fewer* vertices with the *same* constraints.
->
 > Second, a topological order is a *partial* order, so even when there are edges you choose among the ready set.
 > Spend that freedom on locality rather than on anything else.
 
-Emit with Kahn's algorithm over a priority queue keyed by **destination address**, taking the ready vertex whose destination is nearest above the last one written and wrapping to the lowest when none is (the elevator heuristic).
-This produces long ascending runs of destinations, which is what the device wants.
+**Sort the pieces by destination address and emit them in that order.**
+After §2d the conflict graph is edgeless, so every order is legal and the only thing left to optimise is locality — which one ascending sweep delivers, and which is what the device wants.
+
+> **Claude: this used to say "Kahn's algorithm over a priority queue with an elevator heuristic", and the §2d rewrite retired it.**
+> Once every endangered read is buffered there is nothing to schedule around: no edges, no ready set, no topological order, no elevator.
+> A sort is not a degenerate case of the scheduler here, it is the whole of it.
+>
+> The pseudocode below is kept because it is the right answer *if* a future variant reintroduces edges — for instance by buffering less than §2d requires and accepting a non-restartable flush, or by hoisting lazily under memory pressure.
+> It is not what this design needs.
 
 > **Claude — pseudocode.** Kahn's algorithm is just "repeatedly take a vertex nothing is waiting on":
 >
@@ -646,14 +782,48 @@ This produces long ascending runs of destinations, which is what the device want
 > Wrapping only when nothing remains above the cursor is what produces long ascending runs — it is the same reason a lift serves everyone going up before reversing.
 >
 > **Correctness does not depend on the heuristic.** Any vertex from `ready` is a legal choice; the elevator only decides *which* legal order you get.
-> So this can be replaced wholesale by "emit `ready` sorted by `dst.start`" if the graph is edgeless — which, again, is the common case, and is why the edgeless fast path is worth having.
+> With no edges, `ready` contains everything from the start and the whole loop degenerates to sorting by `dst.start` — which is why the section above now simply says that.
+
+**Question:** briefly explain why you proposed a `BTreeSet` keyed by `(dst.start, vertex_id)` and not a `BTreeHashMap` keyed by `dst.start` with value `vertex_id` (I think their memory layout is almost identical but I'm not sure, and the hash map sorts only by `dst.start` out of the box).
+
+> **Claude: `BTreeMap<dst.start, vertex_id>` is the better choice and I should have proposed it. Two corrections, and then a caveat that makes the whole question moot.**
+>
+> I reached for the tuple set out of habit, to guarantee a total order when keys might collide. **Here they cannot**: destinations are globally disjoint (§2b), so `dst.start` is already unique across all vertices, and the extra tuple component buys nothing.
+>
+> On layout, your instinct is right and slightly understates the case. `BTreeMap` stores keys and values in *separate* arrays inside each node, so a `u64` key array and a `u32` value array pack tightly. A `BTreeSet<(u64, u32)>` stores 16-byte tuples — the `u32` is padded to the `u64`'s alignment — so it is meaningfully *worse*, not merely equal.
+>
+> **The caveat:** after the §2d rewrite the graph is edgeless, so there is no `ready` set to maintain and no Kahn's algorithm to run. Emission is a sort of the pieces by destination address. Keep this answer for the day the scheduler comes back, but do not build the structure now.
 
 Then **merge adjacent emitted writes**, and merge *across short gaps*:
 
-- across an `Undefined` gap for free, since uninitialized bytes may legally receive anything;
-- across an identity gap at the cost of rewriting bytes that were already correct.
+- across an `Undefined` gap for free, since uninitialized bytes may legally receive anything (note: requires keeping `Undefined` around, see my earlier comment);
+- across an identity gap at the cost of rewriting bytes that were already correct (note: this probably needs to be decided in the write-ahead log because I think a torn write over an identity gap can corrupt it — is that correct?).
 
-A threshold of about a page for both is the obvious rule.
+  > **Claude: the answer splits by failure model — safe against a program crash, *not* unconditionally safe against power loss.**
+  >
+  > **Against a program crash: safe.** Each `write()` that returns is fully applied to the page cache; an interrupted `write_all` loop leaves a prefix of *completed* calls. The bytes going into an identity gap are the bytes already there, so any prefix of them leaves the gap unchanged, and re-running is idempotent for the same reason.
+  >
+  > **Against power loss: not safe, and this is worth being precise about**, because "torn" covers three quite different outcomes:
+  >
+  > 1. **Reordering.** Writeback order is not issue order, so what survives is an arbitrary *subset* of dirty pages, not a prefix. Harmless for an identity gap — every page holds the same bytes either way.
+  > 2. **A partially updated sector**, old bytes in one part and new in the other. Also harmless here, for the same reason: old and new are equal.
+  > 3. **A corrupt sector.** A sector interrupted mid-write can come back with an ECC failure or arbitrary contents, and on flash a partial program of an internal page can damage data elsewhere in that page. **This is not harmless**, and it is the case my earlier answer waved away.
+  >
+  > **But the exposure is much smaller than that makes it sound, because the unit of writeback is the page, not the byte range.** A write of *any* size into a page dirties the whole page, and writeback submits the whole page — so every byte sharing a page with something the flush writes is already in flight whether or not the emitter merges across it. Merging changes nothing for those bytes.
+  >
+  > That gives the criterion directly. Merging `[a1, b1)` and `[a2, b2)` across a gap dirties `pages(a1..b2)` instead of `pages(a1..b1) ∪ pages(a2..b2)`; the difference is exactly the pages lying **wholly inside the gap**. Hence:
+  >
+  > > Merging across an identity gap adds no exposure at all unless the gap wholly contains a page — which a gap smaller than a page never can.
+  >
+  > So the safety criterion and the throughput heuristic coincide at the page size, which is a pleasant accident and means there is nothing extra to tune. Note it applies only to identity gaps: an `Undefined` gap has no contents worth protecting and can be merged across on throughput grounds alone.
+  >
+  > What does *not* improve is repair. If a gap's page is corrupted by a power outage, the data pieces in it are restored from the plan on the next recovery, but the gap is not: the emitter reads the gap from the file to fill its staging buffer, so a re-run reads the corrupt bytes and writes them back. The corruption is confined to the gap, and it survives — which is exactly the residual risk [[#durability-guarantees]] chooses to *detect* rather than prevent.
+  >
+  > **The separate point stands: this write must not count as a write for §2d's purposes.** If some piece reads the gap and the emitter merges across it, a naive edge test would see a destination overlapping that read and demand the reader be buffered — paying real bytes for a write that changes nothing.
+  >
+  > The clean way to avoid that is ordering: **do gap merging in the emitter, after §2d has finished.** The analysis then only ever sees writes that actually change bytes. This stays correct across a restart even though the plan does not describe the merged writes, because merging is deterministic given the plan and, in any case, writes identical bytes — recovery reaches the same final state whether or not it merges the same way.
+
+A threshold of about a page is the right rule for both, though for different reasons: throughput for `Undefined` gaps, and page-level write exposure for identity gaps (see above).
 This is the main lever the piece table offers for turning a scattered set of small edits into one sequential write, and it is worth building at the same time as the emitter rather than later — it is the step that converts the fold's *logical* deduplication into an actual reduction in I/O operations.
 
 Reads need less care than writes: `Literal` sources are in memory, and `Storage` sources were, in the common case, written by this same process recently and are in page cache.
@@ -724,7 +894,7 @@ Deferred for now until planning is designed (I'm not sure if we'll need it).
 >
 > This is worth dwelling on because it retroactively explains the previous design: its rule of "hoist every read this flush disturbs" was not the overkill I called it, it was *exactly* the restartability requirement — the previous design simply never articulated that this was why, and so could not tell which of its mechanisms were load-bearing.
 >
-> **What this does not change.** In the overwhelmingly common flush there are no `Storage` sources at all, hence no edges, hence nothing to buffer — so re-derivation *is* viable there, and step 3 really does reduce to recording addresses. The hybrid is therefore well defined and worth stating as the rule:
+> **What this does not change.** In a flush with no `Storage` sources at all there are no edges and hence nothing to buffer — so re-derivation *is* viable there, and step 3 really does reduce to recording addresses. That case is less common than it first appeared, since folding compaction into the flush gives every compacting flush some `Storage` pieces. The hybrid is nevertheless well defined and worth stating as the rule:
 >
 > > If the conflict graph is edgeless, the plan needs only addresses (or nothing at all, under re-derivation).
 > > Otherwise it must additionally carry the bytes of every piece with an outgoing edge.
@@ -746,9 +916,30 @@ Deferred for now until it is clear whether hoisting is still required.
    >
    > A **program crash** is benign: the kernel survives, the page cache survives, and every `write()` that returned is visible to any later reader, in the order issued. The set of surviving writes is exactly "all of them".
    >
-   > A **power outage** loses the page cache, and what reaches the platter is an **arbitrary subset** of the pending writes — not a prefix. Devices and the block layer reorder freely. On top of that, the sector being written at the moment power fails can be **torn**: partially updated, or on some consumer SSDs garbage, because the drive was mid-way through a read-modify-write of a larger internal page.
+   > A **power outage** loses the page cache, and what reaches the platter is an **arbitrary subset** of the pending writes — not a prefix. Devices and the block layer reorder freely.
    >
-   > So a power outage can produce states no program crash could: write B present without write A, or a single sector holding neither its old nor its new contents. `fsync` returning is the only thing that converts "issued" into "durable", and a power outage *during* `fsync` simply means it never returned, so nothing it was flushing is guaranteed.
+   > So a power outage can produce states no program crash could: write B present without write A, or a block holding neither its old nor its new contents. `fsync` returning is the only thing that converts "issued" into "durable", and a power outage *during* `fsync` simply means it never returned, so nothing it was flushing is guaranteed.
+   >
+   > **Three different units are in play here, and conflating them makes this much harder to reason about than it is:**
+   >
+   > | unit | typical size | what it is |
+   > | --- | --- | --- |
+   > | **byte range** | any | what your `write()` call names |
+   > | **page** | 4 KiB (16 KiB on Apple Silicon) | what the kernel tracks dirtiness in, and the unit of writeback |
+   > | **sector** | 512 B or 4 KiB | the device's atomic write unit |
+   >
+   > None of them is "the bytes you modified". The kernel does **not** remember byte ranges: a `write()` of four bytes marks the whole enclosing page dirty, and if that page was not already cached it must first be **read in** so the rest of it can be preserved. Writeback then submits the **whole page**.
+   >
+   > **The consequence, which is the part that matters here: a power outage can damage bytes your program never wrote.** They were passengers in a page that was in flight because *some* byte in it was modified. Their correct values were in the page cache and were duly submitted; the damage is at the device, below the level where "which bytes did the application care about" still exists.
+   >
+   > How likely that is depends on the device and the filesystem, and the layers disagree about what they promise:
+   >
+   > - A drive that honours single-sector atomicity gives you all-or-nothing *per sector*, and nothing at all across sectors — so a multi-sector page can land half old and half new.
+   > - Intra-sector tearing is not supposed to happen but is observed on cheap devices.
+   > - On flash, a partial program of an internal page (often 16 KiB) can damage *unrelated* logical blocks that share it. Drives with power-loss protection capacitors avoid this; many consumer drives do not.
+   > - Copy-on-write filesystems (btrfs, ZFS) never overwrite in place, so the hazard largely disappears — but `ext4` in its default `data=ordered` mode does overwrite in place.
+   >
+   > **This is a real design question, not a footnote**, and it is now decided: see [[#durability-guarantees]], which surveys how SQLite, PostgreSQL, InnoDB and LMDB handle it and settles on detecting torn content rather than preventing it. The short version is that full-page writes — PostgreSQL's answer — cost roughly a hundredfold amplification on kladde's scattered writes, so the plan instead carries a checksum per dirtied page and recovery reports the ranges that fail.
    >
    > **How SQLite and friends handle it**, three techniques, all applicable here:
    >
@@ -757,7 +948,7 @@ Deferred for now until it is clear whether hoisting is still required.
    > - **A single-sector commit record**, small enough that the device's own atomicity guarantee covers it. SQLite assumes 512-byte sector atomicity by default and exposes `SQLITE_IOCAP_ATOMIC` for devices promising more.
    >
    > **What this means for kladde, and it is a real consequence for the current design.**
-   > The introduction promises the file is *consistent* after a power outage even though it is not *durable*. That promise needs barriers — without them, the salt overwrite could reach the platter while some of the data writes it commits do not, and recovery would then discard a journal whose effects are only partly applied. That is precisely the corruption the design is trying to avoid.
+   > The barriers are what make the *structural* half of the [[#durability-guarantees|tiered guarantee]] hold. Without them the salt overwrite could reach the platter while some of the data writes it commits do not, and recovery would discard a journal whose effects are only partly applied — corruption that no amount of checksumming would let it repair, because the journal describing the repair would be gone.
    >
    > The minimum is **two `fsync`s per flush**:
    >
@@ -775,6 +966,101 @@ Deferred for now until it is clear whether hoisting is still required.
    > **One caveat, which is about tearing rather than ordering.** `write()` may return a *short* count, so a loop like `write_all` can be interrupted part-way and leave a partially written buffer. That applies to the salt too if it were ever written by a loop — so write it with a single `write` call of 4 bytes (or `pwrite`), which either happens or does not. This is exactly why the salt wants to be small.
    >
    > **The important qualification is scope.** All of the above holds *only* for program crashes. Under power loss, question 1's answer applies and the ordering guarantee evaporates entirely — which is why the salt overwrite needs an `fsync` barrier before it if the post-power-loss consistency promise is to hold, even though it needs nothing at all for the crash-resistance promise.
+
+**Question:** explain how a torn write to the salt can be an issue. I understand that this is a pedantic point for a 4-byte salt but I want to understand the principle behind it.
+
+> **Claude: the principle is that a commit record must have exactly two readings, and every failure must land in the *safe* one — which for this design it does, but only because of the ordering, not because of the size.**
+>
+> The salt is the commit record: its old value means "journal valid, flush not committed", its new value means "journal invalid, flush committed". A torn write produces a third state that is neither.
+>
+> Enumerate what recovery does with that third state. The chained CRCs are computed *from* the salt, so a garbage salt makes the very first frame fail its check, and recovery concludes the journal is empty — which is the *committed* reading. That is safe here **only because the salt is written last, after the barrier**: execution had already finished, so "committed" is true.
+>
+> Invert the ordering and the same tear becomes catastrophic. If the salt were written before execution, a torn salt would still read as "committed" while the file was still half-updated, and the journal that could have repaired it would have been discarded. So the atomicity of the salt is not what makes this work — **the ordering is**, and the atomicity is a second line of defence.
+>
+> What the second line actually defends against is narrow and worth naming: a garbage salt that happens to make some prefix of frames validate, which would replay a fabricated journal. A chained 4-byte CRC makes that negligible rather than impossible, and keeping the write inside one sector removes the possibility rather than shrinking it.
+>
+> The general rule to carry forward: **for any commit record, ask which reading an unreadable value falls into, and arrange the write order so that reading is the conservative one.** Making the record small is how you avoid needing the answer; knowing the answer is how you stay correct when you cannot.
+## Durability guarantees
+
+The guarantee is **tiered**, and saying so plainly is better than a flat promise that only holds on some hardware.
+
+| failure | structure | content |
+| --- | --- | --- |
+| **program crash** | intact | intact — every transaction fully recorded in the journal is recovered |
+| **power outage** | intact | recovered to either its pre-flush or post-flush value **for everything the plan rewrites**; anything else in a page that was in flight may be torn, and torn regions are **detected and reported**, not silently returned |
+
+Structure survives unconditionally because the heap's `id → address` table and the journal are protected separately from the data region: the file always opens and walks, whatever happened to the bytes inside it.
+
+### Why content cannot be protected for free
+
+The unit of writeback is the **page**, not the byte range you wrote (see the answer to question 1 under Step 5).
+A four-byte write dirties a whole page and submits the whole page, so every byte sharing that page is in flight — including bytes the flush never intended to change.
+A power outage mid-writeback can therefore damage **passengers**: identity gaps, `Undefined` regions, and neighbouring allocations that happen to share a page.
+
+Note what is *not* at risk, because it narrows the problem considerably: **the plan is already a repair mechanism.**
+Recovery replays it until the salt flips, so any torn write inside the plan's destination set is simply rewritten.
+The exposure is only the uncovered remainder of the pages the flush dirties:
+
+```
+plan bytes = changed bytes + uncovered bytes in dirtied pages
+```
+
+The second term is what full protection costs. For fifty scattered forty-byte writes it is roughly 200 KiB to protect 2 KiB of change — a hundredfold amplification, and the heap-like layout of a kladde file makes scattered writes the expected case rather than the exception.
+
+### How other systems solve this
+
+Every one of them either writes full pages somewhere durable before overwriting in place, or never overwrites in place at all.
+There is no third mechanism.
+
+| system | mechanism | cost |
+| --- | --- | --- |
+| **SQLite** (rollback journal) | copy the *original* page to a journal file, fsync, then modify in place; recovery rolls back | each modified page written twice; 2–4 fsyncs per transaction |
+| **SQLite** (WAL) | append full pages as checksummed frames; readers consult the WAL first; checkpoint copies back | full pages, but written sequentially |
+| **PostgreSQL** | `full_page_writes`: the *first* modification of a block after a checkpoint puts the whole block image in the WAL; later changes in that interval are deltas | amortised — one full page per block per checkpoint interval |
+| **InnoDB** | doublewrite buffer: pages go to a contiguous staging area, fsync, then to their final home; restore from staging on checksum failure | each page written twice, but the staging write is sequential |
+| **LMDB** | copy-on-write B+ tree; live data is never overwritten; a single-sector meta page flip commits | write amplification from copying the path to the root |
+| **ZFS / btrfs** | copy-on-write plus checksums, at the filesystem layer | absorbed by the filesystem — which is why PostgreSQL and InnoDB let you *disable* their own protection on ZFS |
+
+**Why it is affordable for them and not for us.** All of them organise data as arrays of fixed-size pages, so "the modified page" is a natural bounded unit, and their workloads are page-oriented: a row update dirties one or two pages, a B-tree update O(log n).
+PostgreSQL additionally amortises across a checkpoint interval.
+kladde has neither property — allocations are arbitrary-sized and arbitrarily placed, and a flush's writes are scattered by construction.
+
+Worth noting how Postgres *knows* where its page boundaries are, since it is a fair question: it does not discover them, it **imposes** them.
+A relation file is a flat array of 8 KiB blocks from offset 0, so block *N* sits at offset *N* × 8192; alignment to the device follows from filesystem blocks being sector-aligned and partitions being 1 MiB-aligned.
+The unit it protects is its own structural unit, not the OS page — and kladde has no such unit, which is the root of the difficulty.
+
+### The options, and the decision
+
+**Option 1 — give up the promise.** Concede content integrity for passenger regions after a power outage.
+Cheaper than it sounds, since structure survives regardless and the file always opens.
+The fatal flaw is that it is **silent**: the application reads plausible garbage and computes on it.
+
+**Option 1′ — detect rather than prevent. ← chosen.**
+The flush already knows every page it dirties, and — the useful observation — **tearing can only happen during a flush**, because that is the only time writes are in flight.
+So the plan carries a **checksum per dirtied page**, and recovery verifies each one and reports the ranges that fail.
+
+Cost: four bytes per dirtied page, in a structure that is discarded at the end of the flush anyway.
+It converts silent corruption into a detected, localised error that the application can surface or repair from a backup — which is most of the value of full protection for a fraction of a percent of the cost.
+
+**Option 2 — locality.** Co-locate allocations that are edited together so a flush dirties few pages, making full-page writes affordable.
+The mechanism is sound; it is PostgreSQL's amortisation in another form.
+Two objections to the *adaptive* version: learning co-edit statistics is exactly the tune-for-observed-workloads approach this project avoids, and it does not bound the worst case, since an application that genuinely edits scattered data still scatters.
+It also fights compaction, which packs by size class and address rather than by access pattern.
+
+The **declarative** version avoids both objections and already has a home: `later.md`'s **segments**, where allocations in a segment are co-located by construction from a hint the container gives rather than from learned statistics.
+If segments happen this becomes nearly free; on its own, affinity tracking is not worth building.
+
+**Option 3 — detect the substrate and skip.** PostgreSQL and InnoDB both allow disabling their protection on filesystems that already provide it.
+Cheap to expose as a configuration knob, unreliable to detect automatically.
+
+**Full-page writes remain available as an opt-in mode** for deployments on hardware that is not trusted, at the cost model above.
+
+### The number that decides whether more is needed
+
+**Distinct pages dirtied per flush.**
+If the fold's coalescing and compaction's densification already keep it low, full-page writes may turn out affordable after all and this question closes.
+If it is high, that is the evidence for segments — and a considerably better argument for them than the peak-memory one in `later.md`.
+It is measurable as soon as the emitter exists, and it should be measured before anything beyond Option 1′ is built.
 
 ## Recovery
 
@@ -887,7 +1173,7 @@ Chained salted CRCs give both end-of-journal detection and invalidation of stale
 
 **Power-outage durability is explicitly given up**, where the previous design left it open.
 This is the right call — an `fsync` per transaction would cost orders of magnitude — but it is now a *stated* limitation rather than an unexamined one, and it deserves prominent documentation, because "persisted immediately" and "survives power loss" are the same thing to most readers.
-Worth also saying what the fallback is: a power outage may reset the file to the state at the last flush, which is a consistent state but may be seconds or minutes old.
+Worth also saying what the fallback is: a power outage may reset the file to the state at the last flush, which is structurally valid but may be seconds or minutes old, and may contain content ranges reported as torn ([[#durability-guarantees]]).
 
 **Very large transactions cost file growth rather than only memory.**
 The previous design's journal was an unbounded `Vec` in memory, so an oversized transaction was merely expensive.
@@ -1003,7 +1289,7 @@ Ranked by how much I would want them resolved before writing code:
    Sharper than it was: evacuations are free (no edges, nothing to buffer), slides cost `L − d` bytes of plan each.
    So the question is not "compaction or not" but "how many slide-bytes per flush", which is a budget that can be set once the plan's size is measurable.
 4. **Deferred id recycling**, now stated as an invariant but still easy to violate silently, since the natural implementation of `Free` recycles at once.
-5. **The `fsync` policy**, which the consistency-after-power-loss promise turns out to require — two barriers per flush, and they belong in the latency budget.
+5. **The `fsync` policy**, which the structural half of the [[#durability-guarantees|guarantee]] turns out to require — two barriers per flush, and they belong in the latency budget.
 6. **The testing strategy**, which is absent rather than unresolved.
    It is last in this list only because it is not a *design* question; in implementation order it comes first, for the same reason it did previously.
 
