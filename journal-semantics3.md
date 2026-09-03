@@ -118,7 +118,7 @@ It contains a header, a sequence of serialized and framed transactions, and an o
 
 ```
 journal      := header transaction* tail:byte*  ; tail is ignored; it may be any data left over from before the last flush
-header       := salt (wal_pointer | 0x00{12})   ; wal_pointer points to write-ahead log when it exists (see section "Hoisting"), else all 0.
+header       := salt wal_pointer                ; wal_pointer points to write-ahead log when valid (see section "Hoisting").
 salt         := byte{4}                         ; e.g., CRC of previous journal ++ its wal_pointer ++ its write-ahead log (not normative)
 wal_pointer  := address:byte{8} crc             ; address is little-endian; CRC is over `salt`, all `ops` in the journal, and `address`
 transaction  := (op | multiple_ops), crc        ; CRC is cumulative over `salt` and all `op`s to this point (but not `wal_pointer`), see below
@@ -289,7 +289,7 @@ The piece table (`pieces`) records all changes to the byte content of allocation
 pieces: BTreeMap<(Id, Offset), Piece>, // `Offset` is the heap's `Size` type used as an offset
 
 enum Piece {
-    Literal(Size),     // an offset into `committed`, naming payload bytes of a Write/Splice op
+    Literal(Offset),   // an offset into `committed`, naming payload bytes of a Write/Splice op
     Storage(Address),  // the *pre-flush* content of another (or the same) allocation
     Undefined,         // uninitialized; may legally hold anything
 }
@@ -342,7 +342,7 @@ All folding rules are expressed in terms of four operations, so that the boundar
 
 The `Relabeled` row is the reason `Lineage` carries `old_id` at all: `new_id` has no pre-flush address, so the only way to name its bytes is through the id it replaced.
 
-- **`advance(piece, k)`** — the same source shifted `k` bytes forward: `Literal(o) → Literal(o + k)`, `Storage(a) → Storage(a + k)`, `Undefined → Undefined`.
+- **`advance(piece, k)`** — the same source shifted `k >= 0` bytes forward: `Literal(o) → Literal(o + k)`, `Storage(a) → Storage(a + k)`, `Undefined → Undefined`.
 - **`split(id, offset)`** — ensure a key exists at `(id, offset)`, so a range boundary can be cut there.
   If an entry covers `offset` at key `(id, b)` with `b < offset`, insert `(id, offset) → advance(value, offset − b)`.
   If *nothing* covers `offset`, the covering source is `base(id)` conceptually anchored at 0, so insert `(id, offset) → advance(base(id), offset)`.
@@ -350,24 +350,26 @@ The `Relabeled` row is the reason `Lineage` carries `old_id` at all: `new_id` ha
 - **`read(id, offset, len) → Vec<(rel, Piece)>`** — the pieces covering `[offset, offset + len)`, rebased so the first has `rel == 0`.
   Resolves through `base(id)` where the table is silent, exactly as `split` does, but without mutating the table.
 - **`write(id, offset, len, pieces)`** — replace `[offset, offset + len)`:
-  `split(id, offset)`, `split(id, offset + len)`, remove all keys strictly inside, insert `pieces` rebased to `offset`, then **fuse** at both boundaries.
+  `split(id, offset + len)`, remove every key strictly inside `(offset, offset + len)`, insert `pieces` rebased to `offset`, then **fuse** at both boundaries.
 - **`shift_tail(id, from, delta)`** — re-key every entry `(id, k ≥ from)` to `(id, k + delta)`, in an order that avoids collisions (descending for `delta > 0`, ascending for `delta < 0`).
 
-**Fusion** drops the boundary between adjacent entries `(id, a) → P` and `(id, b) → Q` whenever `advance(P, b − a) == Q`.
+**Fusion** drops the boundary between adjacent entries `(id, a) → P` and `(id, b) → Q` with `a < b` whenever `advance(P, b − a) == Q`.
 This is what keeps the table small: a run of sequential `Write`s whose payloads happen to be adjacent in `committed` collapses to one `Literal`, two adjacent `Undefined`s always collapse, and two `Storage`s collapse when their addresses are contiguous (which is why invariant 6 admits a `Storage` range that crosses an allocation boundary).
 Fusing after every `write` keeps the table in a canonical form, so no separate compaction pass over it is needed.
 
 **Folding rules:**
 
-| Op | Effect on `pieces` |
-| --- | --- |
-| `Alloc(id, size)` | nothing. The table stays silent and `base(id) == Undefined` covers it; invariant 3 is stated accordingly. |
-| `Free(id)` | remove all `(id, _)` |
-| `Resize(id, new_size)` | if shrinking: `split(id, new_size)` and remove all `(id, ≥ new_size)`.<br>If growing: `split(id, old_size)` — which materialises `base(id)` for the prefix if the table was silent — then `write(id, old_size, new_size − old_size, [(0, Undefined)])`. |
-| `Convert{old_id, new_id, new_size}` | apply the `Resize` rule to `old_id` with `new_size`, then re-key every `(old_id, k)` to `(new_id, k)` with values unchanged. **The values are not rewritten**: a `Storage(a)` piece names a pre-flush *address*, which the relabel does not move, and `new_id` has no pre-flush address for it to name. |
-| `Write(id, offset, bytes)` | `write(id, offset, bytes.len(), [(0, Literal(p))])`, where `p` is the offset of `bytes` within `committed`. |
-| `Splice(id, offset, old_len, bytes)` | let `delta = bytes.len() − old_len` (signed).<br>If `delta ≠ 0`: `shift_tail(id, offset + old_len, delta)` — this moves the tail and effects the size change in one step, so no `Undefined` region ever appears.<br>Then `write(id, offset, bytes.len(), [(0, Literal(p))])` if `bytes` is non-empty; for an empty `bytes` the shift alone is the whole effect. |
+| Op                                            | Effect on `pieces`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Alloc(id, size)`                             | nothing. The table stays silent and `base(id) == Undefined` covers it; invariant 3 is stated accordingly.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `Free(id)`                                    | remove all `(id, _)`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `Resize(id, new_size)`                        | if shrinking: remove every `(id, ≥ new_size)`.<br>If growing: insert `(id, old_size) → Undefined`, fused away if the entry it follows is already `Undefined`. |
+| `Convert{old_id, new_id, new_size}`           | walk `(old_id, _)` **once**: remove each entry and re-insert it as `(new_id, offset)` with its value unchanged, keeping only those with `offset < new_size`.<br>Then, if growing, insert `(new_id, old_size) → Undefined`, fusing as above.<br>**Values are never rewritten**: a `Storage(a)` piece names a pre-flush *address*, which the relabel does not move, and `new_id` has no pre-flush address for it to name. |
+| `Write(id, offset, bytes)`                    | `write(id, offset, bytes.len(), [(0, Literal(p))])`, where `p` is the offset of `bytes` within `committed`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `Splice(id, offset, old_len, bytes)`          | let `delta = bytes.len() − old_len` (signed).<br>If `delta ≠ 0`: `shift_tail(id, offset + old_len, delta)` — this moves the tail and effects the size change in one step, so no `Undefined` region ever appears.<br>Then `write(id, offset, bytes.len(), [(0, Literal(p))])` if `bytes` is non-empty; for an empty `bytes` the shift alone is the whole effect.                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `Copy{src, src_offset, len, dst, dst_offset}` | `write(dst, dst_offset, len, read(src, src_offset, len))`.<br>Taking *pieces* rather than bytes is what upholds invariant 5 and what makes a copy out of a transient allocation resolve to the original sources. |
+
+Two edge cases that the rule for `Convert` handles without extra code, worth naming so they get tests: a **silent** `old_id` re-keys nothing, and the new id's content resolves through `base(new_id) = Storage(heap.resolve(old_id) + k)` via its `Relabeled` lineage; and a piece that **straddles** `new_size` is re-keyed unchanged and simply covers less afterwards, since its source is a prefix of what it named before.
 
 Two things are worth noticing in that table because they are the whole reason the rules are this short.
 
@@ -416,7 +418,7 @@ claimed_addresses: HashMap<id, Address>
 reshapes: Vec<Reshape>
 
 struct Claim {
-	id: Id,
+	id: Id,  // `Id == Heap::Id == Pointer<W>`, the same id the journal ops carry.
 	size: Size,
 	kind: ClaimKind
 }
@@ -439,12 +441,6 @@ enum ReshapeKind {
 	Resize,
 	Relabel(old_id)
 }
-
-// One type throughout: `Id == H::Id == Pointer<W>`, the same id the journal ops carry.
-// Sizedness is a bit inside the pointer (`Pointer::from_parts`), not a separate type, so
-// there is no fixed/resizable distinction to thread through here -- `id.is_fixed_size()`
-// answers it wherever placement needs to know. `Address` and `Size` are `H::Address` and
-// `H::Size`, i.e. `u64` and `u32` for `GainGreedyHeap`.
 ```
 
 Thus, iterate over `shapes` (consuming it) and, for each entry:
@@ -464,8 +460,9 @@ The ordering principle is **release space before consuming it**, so that every c
    Doing all relabels up front also means step 3 never has to reason about a half-applied conversion.
 3. **In-place reshapes:** iterate over `reshapes` (consuming it) in order of **decreasing `old_address`**.
    For each entry, call a (to be added) `heap.resize_in_place(id, new_size) -> bool` that performs the resize only if it can keep the address, and otherwise frees the old extent and returns `false`.
-   Descending order is what makes this pay: a shrink high in the file releases the range immediately below its old end, which is exactly where the *next* entry — at a lower address — may want to grow into.
-   Ascending order would consume that space before it was released.
+   Descending order is what makes this pay, and the effect that pays is the *freeing* half of a **failed** in-place reshape: when a reshape cannot keep its address, this step releases the allocation's entire old extent, and the entries processed after it — at lower addresses — can grow into it.
+   Ascending order would attempt the lower allocation first, fail while the higher one was still in the way, and evacuate it unnecessarily.
+   A *successful* shrink, by contrast, releases only `[old_address + new_size, old_address + old_size)`, which lies **above** the allocation and so cannot help anything below it; that space is picked up by step 4's claims instead.
 
    Doing the free inside the method rather than making the caller call `heap.free` afterwards is worth it only if it lets the implementation reuse a cursor it has already descended to; otherwise the simpler signature is better.
 
@@ -507,39 +504,47 @@ Also add `id` to `claimed_addresses` and `non_derivable_claims` where appropriat
 
 When finding the best compaction step subject to a given budget, the heap internally estimates the cost of compaction steps by the size of the moved allocation, which is probably fine.
 But on the caller side, we might want to use a more accurate estimate of the cost:
-- the actual size of the moved bytes in the allocation (full size if `id` was not in the piece table, otherwise only the number of pre-move no-ops for `id` in the piece table); plus
+
+- the actual size of the moved bytes in the allocation — computable as `L − |[A, A+L) ∩ W|` *inclusive* of `id`'s own pre-move destination, which comes to the full size when `id` is not in the piece table and to just the pre-move no-ops when it is; plus
 - the write-ahead amount that the move adds, which is computable in `O(log n + k)` per candidate — see below.
 
 **Computing a step's WAL cost.**
-Your instinct is right: the two indexes hoisting needs (§ *Conflict detection*) are exactly the two this query needs, so build them **before** compaction and maintain them incrementally as steps are accepted.
+The two indexes hoisting needs (§ *Conflict detection*) are exactly the two this query needs, so build them **before** compaction and maintain them incrementally as steps are accepted.
 
 - `W` — post-flush destination ranges, disjoint, sorted.
 - `R` — source ranges of `Storage` pieces, sorted (not necessarily disjoint).
 
-A candidate step moving allocation `id` of length `L` from `A` to `B` adds, at most, three overlaps:
+A candidate step moving allocation `id` of length `L` from `A` to `B` adds, at most, two overlaps:
 
-| overlap | meaning |
-| --- | --- |
-| `[B, B+L) ∩ R` | bytes some other piece reads that this move would now overwrite |
-| `[A, A+L) ∩ W` | bytes this move reads that some other piece overwrites |
-| `[A, A+L) ∩ [B, B+L)` | the move overlaps itself — a *slide* |
+| overlap               | meaning                                                         |
+| --------------------- | --------------------------------------------------------------- |
+| `[B, B+L) ∩ R`        | bytes some other piece reads that this move would now overwrite |
+| `[A, A+L) ∩ [B, B+L)` | the move overlaps itself — a *slide*                            |
 
 Each is a binary search plus an output-sensitive scan, and their total length is the extra WAL the step costs.
 Accepting a step then updates both indexes: `[B, B+L)` replaces the allocation's old destination range in `W`, and `[A, A+L)` joins `R` if the allocation had no `Storage` piece yet.
 
 This makes the evacuation/slide asymmetry quantitative rather than folklore.
-An **evacuation** writes into space that was free before the flush, so `[B, B+L) ∩ R = ∅` by construction and its only possible cost is the second row.
+An **evacuation** into space that was free before the flush costs *nothing*: `[B, B+L) ∩ R = ∅` by construction, and it cannot overlap itself.
+An evacuation into space vacated by an earlier accepted step is not free in the same way — those bytes may still be the source of a piece that reads them — and the first row is what catches it.
 A **slide** always hits the third row, and a slide of `L` bytes by `d` overlaps itself in `L − d` bytes — so a small shift over a long run puts nearly the whole run into the WAL, which is the concrete reason to prefer evacuations at flush time and to budget compaction by *WAL bytes added* rather than by bytes moved.
 
-**One easily-missed detail about `old_address`.**
-In the rule above, `old_address` is the address the allocation had *immediately before this compaction step*, which for an allocation the fold and placement never touched is its pre-flush address — i.e. where its bytes actually are.
-For an allocation that placement already relocated, `(id, 0) → Storage(pre_flush_address)` exists from step 2 and must **not** be rewritten: its source is still the pre-flush address, and only the destination moves.
+**Rule: a compaction move changes a piece's destination, never its source.**
+`Storage` names where the bytes *are*, which is the pre-flush address, and moving an allocation does not change that.
+So:
+
+- If `(id, 0)` already exists — placement relocated this allocation, or the fold wrote to it — leave its value alone and let destination lowering pick up the new address.
+- If `(id, 0)` does not exist, insert `Storage(a)` where `a` is the address the allocation occupied *immediately before this step*, which for an allocation neither the fold nor placement touched is its pre-flush address (or that of its `old_id` in case `shapes[id].1 == Relabeled(old_id)`).
+
+Getting this wrong by writing the post-placement address into a newly created piece is easy and would be silent: it only diverges for an allocation that placement already relocated, which is exactly the case the first branch covers.
 
 ### Step 4: Destination lowering
 
 Transform `pieces` into a new representation:
+
 - from `BTreeMap<(Id, Size), Piece>` (keys are `(id, offset)`)
 - to `Vec<(Address, Size, Piece)>` (entries are `(start, len, piece)`)
+
 by mapping `(id, offset)` keys to `start = heap.resolve(id) + offset` and `len` implied by the `offset` of the next key (if it has the same `id`) or the (new) length of the allocation otherwise.
 
 While iterating:
@@ -555,7 +560,6 @@ Sorting once here rather than twice is the only reason this is a separate step f
 
 #### Conflict detection
 
-**Conflict detection.**
 The two sets to intersect are:
 
 - **`W`, the write set** — every destination range in the lowered `pieces`.
@@ -578,6 +582,14 @@ Total cost `O(|W| log |W| + |R| log |W| + k)` with `k` the number of overlaps, a
 Note only `Storage` pieces are queried: a `Literal` reads `committed`, which lives in memory and cannot be disturbed by any write to the file, and `Undefined` reads nothing.
 That is the guarantee the `Literal`/`Storage` distinction buys, and it is why lowering literals to storage addresses would be a pessimisation and not just an inconvenience.
 
+> `Note on `k` in `O(... + k)`:** it can dominate and is not bounded by `|W| + |R|`.
+>
+> The worst case is `|R| · |W|`: take `|R|` source ranges each spanning most of the file and `|W|` small destinations scattered across it, and every source overlaps every destination. Disjointness of `W` does not help, because it constrains the destinations against each other, not against a source range that simply covers many of them.
+>
+> But `k` is also exactly the number of **splits** the result contains — each overlap cuts one piece — so it is the output size, and any correct algorithm has to enumerate it. The scan is output-sensitive, which is the best available: `O(|W| log |W| + |R| log |W| + k)` with the `k` term unavoidable.
+>
+> The consequence worth carrying forward is downstream rather than here: after hoisting, `|pieces|` has grown to `|pieces| + k`, so execution's sort and sweep inherit it. If `k` ever shows up in a profile, the lever is not a better intersection algorithm but fewer conflicts — which is the placement hint in step 2 and the evacuation-over-slide preference in step 3.
+
 Then merge the recorded source ranges into a canonical set of **disjoint** ranges sorted by address — two pieces may hoist overlapping bytes and should not store them twice — and concatenate their bytes into `hoisted_content`.
 Each hoisted fragment's offset into the WAL is then the prefix sum of merged range lengths before it, plus its own start minus that range's start.
 
@@ -592,7 +604,7 @@ Deferring it means the analysis only ever sees writes that actually change bytes
 It stays correct across a restart even though the WAL does not describe the merged writes: a no-op gap is rewritten with the bytes already there, and an `Undefined` gap is unconstrained, so recovery reaches the same final state whether or not it merges identically.
 
 **Skipping the WAL entirely.**
-If `claimed_addresses` is empty and nothing is hoisted, there is nothing to record: skip this step, write no WAL, and leave `wal_pointer` zeroed.
+If `claimed_addresses` is empty and nothing is hoisted, there is nothing to record: skip this step, write no WAL, and leave `wal_pointer` invalid.
 Execution is then idempotent on its own, because every piece is either a `Literal` or a `Storage` whose source no write disturbs.
 
 **Placing the WAL.**
@@ -610,6 +622,22 @@ The file grows by the WAL's size for the duration of the flush and is truncated 
 Then write out the WAL and update `wal_pointer` in the on-storage representation of the journal.
 Note that both the CRC in `wal_pointer` and in the WAL itself start from the CRC of the last committed transaction in the journal, i.e., they are not chained.
 This is so that a writer can calculate the CRC of the wall before knowing its placement and a reader can check whether `wal_pointer` is valid without attempting to read the WAL first (which can be expensive if `wal_pointer` is corrupted and points to a location that has a massive number where the WAL size is expected).
+
+**`fsync` placement:** after both writes.
+The precise order is:**
+
+1. write the WAL body — `header`, `nonderivable_claimed_ids`, `claimed_addresses`, `hoisted_content` — at `wal_start`;
+2. write the WAL's trailing `crc`, and seek back to fill in `size` if it was streamed;
+3. write `wal_pointer` (address plus its own CRC) into the journal header;
+4. **`fsync`**;
+5. begin execution.
+
+Thus: if execution has begun, the WAL is durable.
+
+**The `fsync` can be omitted when step 5 is skipped,** i.e., `claimed_addresses` is empty *and* nothing is hoisted.
+Then no address was chosen that recovery would have to reproduce, and every source is either a `Literal` in memory or a `Storage` no write disturbs — so execution is idempotent on its own and there is nothing to make durable.
+Such a flush costs **one** `fsync`, not two.
+It is the pure-content-update case: writes into existing allocations, no allocation, no relocation, no compaction.
 
 #### On-storage representation of the write-ahead log (WAL)
 
@@ -642,9 +670,57 @@ For each piece:
 Gather adjacent pieces into a single `write` where their destinations are contiguous, and merge across short `Undefined` or no-op gaps up to a page (see § *Hoisting*).
 Cap the staging buffer at a page or two and split emission there, so one enormous contiguous run cannot become an unbounded allocation.
 
+Resolve offsets once during hoisting and store the result in the piece, so execution does no lookup at all.
+
+Give `Piece` a fourth variant, `Hoisted(WalOffset)`.
+Conflict detection is then a join between two sorted lists:
+
+```text
+# phase 1
+#   conflicting_ranges = merge(R) ∩ W -- disjoint, ascending by source address.
+#     Each carries `wal_offset`, the running sum of the lengths before it, so the WAL is
+#     exactly the concatenation of their bytes in this order.
+#   pieces = every piece with a `Storage` source, ascending by source address. This is `R`.
+
+# phase 2 -- join; the relationship between the two lists falls out of the sweep
+r = 0                                   # shared cursor, only ever moves forward
+for piece in pieces:
+    while r < len(conflicting_ranges) and conflicting_ranges[r].end <= piece.src:
+        r += 1                          # already handled by earlier pieces; unreachable now
+
+    k = r                               # local scan -- must not disturb `r`
+    while k < len(conflicting_ranges) and conflicting_ranges[k].start < piece.src + piece.len:
+        range = conflicting_ranges[k]
+        overlap = [max(range.start, piece.src),
+                   min(range.end,   piece.src + piece.len))
+        split `piece` at `overlap`'s boundaries
+        fragment_covering(overlap).source =
+            Hoisted(range.wal_offset + (overlap.start - range.start))
+        k += 1
+```
+
+The WAL bytes themselves are written in a separate sequential pass over `conflicting_ranges`, which depends on nothing in phase 2.
+
+**If conflicts become rare enough to be worth exploiting.**
+Phase 2 spends one comparison on every `Storage` piece, including the great majority that conflict with nothing, so its cost does *not* shrink as conflicts become rarer.
+Today that does not matter: phase 1 builds and merges `R` from the pieces, so the flush is `Ω(|R|)` regardless, and an interval tree could only trade a comparison per piece for a query per conflict range — very likely a loss.
+It starts to matter if `R` is ever maintained **incrementally** rather than rebuilt per flush, which the design already contemplates for compaction's cost queries (§ *Computing a step's WAL cost* builds `R` and `W` before compaction and updates them as steps are accepted).
+In that world phase 2's scan is the last remaining full pass over the pieces, and removing it means driving from the few conflict ranges and *searching* for the pieces each one hits, rather than looking at all of them.
+A list sorted by `src` cannot answer that search: the pieces overlapping a range `c` are those with `src < c.end` **and** `src + len > c.start`, and the second condition is not monotone in `src`, so they do not form a contiguous run.
+An interval tree over the piece sources does, in `O(log |R| + hits)`, making phase 2 `O(|conflicting_ranges| · log |R| + fragments)` — independent of how many pieces conflict with nothing.
+Recovery is indifferent to the choice: phase 2's output is a function of `conflicting_ranges` and the pieces alone, so any correct implementation assigns identical offsets and the tree's shape is never observable.
+
+`hoisted_content` is the concatenation of `conflicting_ranges`' bytes in that same order, which is what makes it delimiterless.
+
+Two reasons to prefer this over keeping a side table and looking up at execution time.
+It is **cheaper**: one inner-loop step per hoisted fragment at plan time, versus a lookup per fragment during the write sweep, where it would sit in the inner loop.
+And it is **simpler for recovery**, which runs the identical join over an identically re-derived conflict set and therefore assigns identical offsets — so nothing about the mapping has to be stored in the WAL, only the bytes.
+
+Merging `R` before the sweep matters even though it looks like a micro-optimisation: two pieces can read overlapping source ranges, and without merging their bytes would be written into the WAL twice, which is both wasteful and would make the "recovery re-derives the same offsets" argument depend on a tie-break.
+
 **Then, in this order:**
 
-1. **Update the on-disk `id → address` table** to its post-flush state.
+1. **Update the on-disk `id → address` table** to its post-flush state (deferred, will be designed next).
 2. **`fsync`** — the second and last barrier of the flush.
 3. **Overwrite the `salt`** with the CRC of the last committed transaction.
 
@@ -656,6 +732,42 @@ So the table must be durable *before* the barrier, which puts it in step 6.
 > **Unresolved, and on the critical path:** how the table is itself protected against a torn write.
 > It cannot be covered by the journal (the journal is addressed *through* it), so it needs its own scheme — plausibly the same chained-CRC treatment, or a two-copy alternating scheme in the style of LMDB's meta pages.
 > This is the largest remaining unknown in the design; see § *Risks*.
+
+#### Protecting the `id → address` table
+
+The table cannot be covered by the journal, because the journal is addressed *through* it, so it needs a scheme of its own.
+Two shapes are worth considering, and it is worth understanding the second properly first because it is the one most storage engines converge on.
+
+**LMDB's two-copy alternating scheme.**
+LMDB keeps two *meta pages* at fixed offsets — page 0 and page 1 — each holding a transaction id, a root pointer and a checksum.
+A commit writes the meta page that was **not** used last time, then `fsync`s.
+On open, both are read and the one with the higher transaction id *that passes its checksum* wins.
+The property this buys is that the copy being written is never the copy being relied on: a torn write damages only the stale one, and the previous state is still intact at a known location.
+It needs no log, no recovery scan, and no notion of replay — the commit is a single small write to a known offset, and it is atomic because the reader can always fall back.
+
+**Alternative A — chained CRCs, journal-style.**
+Treat the table as an append-only log of `(id, address, size)` deltas, framed with chained salted CRCs exactly as the journal is, and have recovery walk the chain.
+Incremental updates are then cheap: a flush appends only the ids it changed, which is proportional to the flush rather than to the file.
+The problem is that the log grows without bound, so it eventually has to be folded into a full snapshot — and writing that snapshot is itself an in-place overwrite with a torn-write hazard, which is the very problem this was meant to solve.
+The recursion is not fatal (the snapshot can be written to a fresh location and switched to atomically) but at that point the design has become alternative B with extra steps.
+
+**Alternative B — two-copy alternating, LMDB-style.**
+Keep two complete copies of the table, each with a generation counter and a checksum, and alternate.
+Simple and non-recursive, but it writes the whole table on every flush — `O(live allocations)` — which for a large file dwarfs the flush that triggered it.
+
+**What I would actually suggest: B applied only to the root.**
+Make the table a self-hosting structure inside the heap, updated **copy-on-write** — a modified node is written to free space rather than overwritten — and keep only a small fixed-offset header holding `(root_pointer, generation, checksum)` in *two* alternating copies.
+Then:
+
+- a torn write to a table node is harmless, because no live node is ever overwritten;
+- a torn write to the header is harmless, because the other copy still describes the previous consistent state;
+- the commit is the header flip, which is a single small write and can share the flush's existing barrier; and
+- the per-flush cost is `O(log n)` copied nodes rather than the whole table.
+
+This is LMDB's design narrowed to the one structure that needs it, and it composes with the rest of this document rather than competing with it: the header flip can be sequenced immediately before the salt overwrite in step 6, so the two commit points become one.
+
+The open question it leaves is where the free space for copy-on-write table nodes comes from, since the heap's own free-space structure is what the table describes.
+The likely answer is a small reserved region managed outside the heap, which is the same shape as the reservation the journal allocation itself needs.
 
 **Why the salt overwrite is last, and why it needs no `fsync` after it.**
 It is the flush's only irreversible act: before it, a crash re-runs the whole flush, which is idempotent; after it, the journal is gone and the file must already be complete.
@@ -685,7 +797,7 @@ Nothing here is observable in the file's logical state — the flush committed a
 3. **Reset the journal's in-memory state:** clear `committed`, and **repopulate** `pending` from whatever ops remain past `committed_cursor` rather than clearing it — a flush can be triggered with a completed transaction still outstanding, so the two do not describe the same point in the op sequence.
 4. **Resize the journal allocation** if an oversized transaction grew it, shrinking it back to its normal capacity.
    The journal is empty at this moment, which is what makes the resize a free-and-reallocate rather than a move.
-5. **Zero `wal_pointer`** — optional, and worth skipping. The salt overwrite has already invalidated it, so this write buys only tidiness on a path where every write costs.
+5. **Don't zero `wal_pointer`** — the salt overwrite has already invalidated it.
 
 ## Durability guarantees
 
@@ -805,7 +917,7 @@ The contrapositive is the useful form: **if execution has begun, the WAL is dura
 This is the whole reason the pointer is published after the content and before the barrier, and it is worth stating as an invariant rather than leaving it implicit.
 
 **Adopting the recorded placement.**
-The WAL records addresses, not decisions, so recovery installs them instead of making its own:
+The WAL records the *outcome* of placement and compaction — the addresses themselves — rather than anything about how they were reached, so recovery installs them instead of re-running the policy that produced them:
 
 1. Run *folding* as usual — it is a pure function of `committed`, so it reproduces `shapes`, `freed`, `recycle` and `pieces` exactly.
 2. Reconstruct which ids the recorded addresses belong to.
@@ -815,7 +927,7 @@ The WAL records addresses, not decisions, so recovery installs them instead of m
 
    Sorting their union by id and pairing it with the address sequence recovers the full `id → address` map.
 3. For every id in that map that is **not** `New`, its bytes still sit at its pre-flush address, which the heap — untouched by the crash — still reports.
-   So insert `(id, 0) → Storage(heap.resolve(id))` if `pieces` has no entry at `(id, 0)`, exactly as steps 2 and 3 would have.
+   So insert `(id, 0) → Storage(base(id))` if `pieces` has no entry at `(id, 0)`, exactly as steps 2 and 3 would have.
    This is what turns the fold's silence about an unchanged allocation into the byte movement its relocation requires, and it is why the non-derivable set has to name *every* claimed id that folding cannot infer, including relocating relabels and compaction moves.
 4. Install the addresses with a `heap.place_at(id, address, size)` that records a decision rather than making one, after applying `freed` and the relabels so the heap's id set matches.
 5. Skip *compaction*: its moves are already baked into the recorded addresses, and re-running it would produce different ones.
@@ -830,6 +942,14 @@ Otherwise a reader would see pre-flush bytes for something the journal still hol
 `heap.place_at(id, address, size)` installs an address rather than choosing one.
 It is worth having regardless — an offline compactor or file-format tool needs the same thing — but it can produce overlapping allocations if misused, so it belongs behind a boundary that ordinary code cannot reach.
 Reconstructing the id pool needs the same treatment: after recovery, `next_counter` must exceed every live id, and `free_counters` may be rebuilt empty at the cost of some id density.
+
+> **TODO:** I would go further than `place_at` and have recovery rebuild the post-flush heap outright.
+>
+> `place_at(id, address, size)` alone is sufficient, because recovery knows the *complete* final geometry of every surviving allocation: the recorded address if the id is in the claimed set, and the pre-flush address otherwise. In-place resizes need no special primitive — they are just `place_at(id, unchanged_address, new_size)`.
+>
+> The reason not to *mutate* the pre-flush heap with those calls is that a sequence of `place_at`s passes through transiently overlapping states — the allocation being moved into a range is placed there before the one vacating it has left — so the heap would have to tolerate an inconsistent index mid-sequence. Building the post-flush state **from scratch** avoids the question entirely: iterate the surviving ids with their final `(address, size)` and construct a fresh heap, which is also the cheapest way to rebuild the evacuation index and the free-space structure.
+>
+> That suggests the primitive to add is a bulk constructor — `GainGreedyHeap::from_placements(iter)` — with `place_at` as its single-entry cousin for tools. Both are dangerous enough (overlapping allocations are representable) to keep off the ordinary API surface.
 
 ## Differences to the previous design (`journal-semantics2.md`)
 
@@ -886,13 +1006,14 @@ It needs `sync_data()` at minimum, and ideally positional `read_at`/`write_at` s
 **`RelocatableHeap`** — the heap must stop moving bytes and start only reporting decisions:
 
 - `resize` currently returns a `Relocation` that the caller acts on by copying. Replace with `resize_in_place(id, new_size) -> bool` that succeeds only without relocating, so step 3 can fall through to a claim.
-- `propose_compaction_step`/`commit_compaction_step` return a `Step { from, to, len }` in *addresses*. Step 3 needs `(id, old_address, new_address)` so it can find the allocation's piece-table entry without a reverse lookup.
-- `commit_compaction_step` must not move bytes; the flush does.
+- `propose_compaction_step`/`commit_compaction_step` return a `Step { from, to, len }` in *addresses*.
+  Step 3 needs `(id, old_address, new_address)` so it can find the allocation's piece-table entry without a reverse lookup.
+  (Note: in the current implementation, `propose_compaction_step` can move more than one allocation at a time)
 - `place_at(id, address, size)` for recovery — install rather than choose.
 - `end()` before and after the flush, for WAL placement. `len()` already provides it; it just needs to be captured at two points.
 - `relabel` exists already.
 
-**`Composed`** — `resize`, `convert`, `splice` and the compaction path all copy bytes today; all of that moves into the flush's execution step. What remains of `Composed` is the id pool, the storage handle and the heap.
+**`Composed`** — `resize`, `convert`, `splice` and `compact_incrementally` all copy bytes today; all of that moves into the flush's execution step, and `compact_incrementally` becomes a function that *reports* the steps it would take rather than performing them. What remains of `Composed` is the id pool, the storage handle and the heap.
 
 **The id pool** — must defer `recycle` to cleanup rather than pushing on `free`, and must be reconstructible after recovery.
 
