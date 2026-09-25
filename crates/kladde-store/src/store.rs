@@ -1267,6 +1267,17 @@ impl Seek for AllocationReader<'_> {
 }
 
 impl ReadBackend for Store {
+    fn read_size(&mut self, p: Pointer) -> Result<u32, Error> {
+        let id = p.raw();
+        let inner = self.inner.get_mut();
+        Ok(inner
+            .state
+            .allocs
+            .get(&id)
+            .ok_or(Error::DanglingPointer(id))?
+            .size)
+    }
+
     fn read_at(&mut self, anchor: Pointer, offset: u32) -> Result<impl Read + Seek + '_, Error> {
         let inner = self.inner.get_mut();
         let id = anchor.raw();

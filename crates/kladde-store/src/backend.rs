@@ -50,6 +50,22 @@ pub trait Backend {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub trait ReadBackend: Backend {
+    /// The size of allocation `p` as reads see it: as of the last flush.
+    /// Fails with [`Error::DanglingPointer`] if `p` did not exist then.
+    ///
+    /// ```
+    /// use kladde_store::{Backend, MemoryStorage, ReadBackend, Store, WriteBackend};
+    ///
+    /// let mut store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
+    /// let p = store.alloc(3)?;
+    /// store.flush()?;
+    /// store.resize(&p, 5)?;
+    /// assert_eq!(store.size(p.raw())?, 5); // everything recorded so far
+    /// assert_eq!(store.read_size(p.raw())?, 3); // what reads see
+    /// # Ok::<(), kladde_store::Error>(())
+    /// ```
+    fn read_size(&mut self, p: Self::Pointer) -> Result<Self::Size, Error>;
+
     /// A reader positioned at `offset` within allocation `anchor`, running to
     /// the allocation's end, or [`Error::DanglingPointer`] if `anchor` did
     /// not exist at the last flush.
