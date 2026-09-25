@@ -1,10 +1,17 @@
-//! Consolidation (`impl/consolidation.md`).
+//! Consolidation (`impl/consolidation.md`): evacuating sparse data pages,
+//! in the room of pages the flush writes anyway and on pages of their own,
+//! and the controller that paces it.
 
+use crate::consts::MAX_PAGE_CONTENT;
 use crate::error::Error;
 use crate::flush::{DataPage, Output};
+use crate::hash::{IdMap, IdSet};
 use crate::state::*;
 use crate::stats::Stats;
 use crate::store::Inner;
+
+/// A page's content capacity.
+const C: u32 = MAX_PAGE_CONTENT as u32;
 
 /// What consolidation carries from flush to flush.
 #[derive(Debug, Default)]
@@ -13,13 +20,49 @@ pub struct ConsState {
     pub cursor: Key,
     /// The per-flush budget in pages, as the controller moved it.
     pub budget: f64,
+    /// Where sampling starts within a bucket; rotates so that no prefix of
+    /// a bucket is examined forever.
+    pub rot: usize,
+    /// Victims this flush found unusable, so that it does not pick them again.
+    pub skip: IdSet,
+}
+
+/// A live fragment in a data page being evacuated.
+#[derive(Clone, Copy, Debug)]
+struct Survivor {
+    id: u32,
+    start: u32,
+    end: u32,
+    /// The statement stating it, or `None` if the flush took it already.
+    stmt: Option<StmtRef>,
+    /// Where its bytes are.
+    addr: u64,
+}
+
+impl Survivor {
+    fn len(&self) -> u32 {
+        self.end - self.start
+    }
+}
+
+/// What one budgeted data page would hold, and what it would reclaim.
+#[derive(Debug)]
+struct Offer {
+    /// Victims evacuated whole into the page.
+    whole: Vec<u32>,
+    /// One more victim whose survivors fill the page and lead the next one.
+    cut: Option<u32>,
+    reclaimed: f64,
+    written: f64,
+    /// How full the page would close, as a fraction of its capacity.
+    fill: f64,
 }
 
 impl Inner {
     pub(crate) fn seed_after_load(&mut self) {
         self.cons.budget = self.opts.budget_pages as f64;
         // Content ages fall back to the youngest page holding a fragment.
-        let mut youngest: crate::hash::IdMap<u64> = Default::default();
+        let mut youngest: IdMap<u64> = Default::default();
         for (&k, &f) in &self.state.frags {
             let page = match f {
                 Fragment::Bytes { page, .. } => page,
@@ -35,27 +78,392 @@ impl Inner {
         }
     }
 
-    pub(crate) fn defrag_share(&mut self, _dirty: &mut Dirty) -> Result<(), Error> {
-        Ok(())
+    /// Resets what consolidation keeps for one flush only.
+    pub(crate) fn begin_consolidation(&mut self) {
+        self.cons.skip.clear();
     }
 
-    pub(crate) fn budget_loop(
+    // ------------------------------------------------------------ victims
+
+    /// LFS's cost-benefit score: sparse and long untouched first.
+    fn score(&self, p: u32) -> f64 {
+        let info = &self.state.pages[p as usize];
+        let u = info.coverage as f64 / C as f64;
+        let age = self.state.flush_epoch.saturating_sub(info.epoch) as f64;
+        (1.0 - u) * age / (1.0 + u)
+    }
+
+    /// Up to `sample` pages of a bucket, from a rotating start.
+    fn sample(&mut self, data: bool, bucket: usize) -> Vec<u32> {
+        let k = self.opts.sample.max(1);
+        let buckets = if data {
+            &self.state.data_buckets
+        } else {
+            &self.state.table_buckets
+        };
+        let list = &buckets.lists[bucket];
+        let n = list.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let start = self.cons.rot % n;
+        self.cons.rot = self.cons.rot.wrapping_add(1);
+        (0..k.min(n)).map(|i| list[(start + i) % n]).collect()
+    }
+
+    /// The best-scoring of the pages sampled from buckets `from..` that pass
+    /// `ok`, stopping at the first bucket that yields one, or at a bucket
+    /// whose pages all hold more than `max` bytes.
+    fn pick_victim(
         &mut self,
-        _dirty: &mut Dirty,
-        _out: &mut Output,
+        data: bool,
+        from: usize,
+        max: u32,
+        ok: &dyn Fn(&Inner, u32) -> bool,
+    ) -> Option<u32> {
+        for b in from..BUCKETS {
+            let lower = (b as u64 * (C as u64 + 1)).div_ceil(BUCKETS as u64) as u32;
+            if lower > max {
+                return None;
+            }
+            let best = self
+                .sample(data, b)
+                .into_iter()
+                .filter(|&p| {
+                    let cov = self.state.pages[p as usize].coverage;
+                    cov > 0 && cov <= max && !self.cons.skip.contains(&p) && ok(self, p)
+                })
+                .max_by(|&x, &y| self.score(x).total_cmp(&self.score(y)));
+            if best.is_some() {
+                return best;
+            }
+        }
+        None
+    }
+
+    /// The live fragments pointing into data page `v`, in key order. Narrows
+    /// the reverse index's windows to what it finds.
+    fn survivors(&mut self, v: u32) -> Vec<Survivor> {
+        let entries = self.state.reverse.remove(&v).unwrap_or_default();
+        let mut out = Vec::new();
+        let mut kept = Vec::new();
+        for (id, lo, hi) in entries {
+            let size = self.state.size_of(id);
+            let hi = hi.min(size);
+            if lo >= hi {
+                continue;
+            }
+            let first = match self.state.frags.range(..=key(id, lo)).next_back() {
+                Some((&k, _)) if kid(k) == id => k,
+                _ => key(id, lo),
+            };
+            let mut span: Option<(u32, u32)> = None;
+            let mut it = self.state.frags.range(first..key(id, hi)).peekable();
+            while let Some((&k, &f)) = it.next() {
+                let addr = match f {
+                    Fragment::Bytes { page, offset, .. } if page == v => address(page, offset),
+                    Fragment::Pending(p) => match self.state.pending[p as usize].place {
+                        Place::Data(a) if split_address(a).0 == v => a,
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                let end = match it.peek() {
+                    Some((&n, _)) => koff(n),
+                    None => self.state.frag_end(k),
+                };
+                out.push(Survivor {
+                    id,
+                    start: koff(k),
+                    end,
+                    stmt: f.stmt(),
+                    addr,
+                });
+                span = Some(span.map_or((koff(k), end), |(a, b)| (a.min(koff(k)), b.max(end))));
+            }
+            if let Some((a, b)) = span {
+                kept.push((id, a, b));
+            }
+        }
+        if !kept.is_empty() {
+            self.state.reverse.insert(v, kept);
+        }
+        out.sort_by_key(|s| key(s.id, s.start));
+        out
+    }
+
+    /// The survivors of victim `v`, if they account for all of its coverage;
+    /// otherwise the reverse index lost a referrer, and `v` is skipped.
+    fn all_survivors(&mut self, v: u32) -> Option<Vec<Survivor>> {
+        let surv = self.survivors(v);
+        let total: u64 = surv.iter().map(|s| s.len() as u64).sum();
+        if total != self.state.pages[v as usize].coverage as u64 {
+            debug_assert!(false, "the reverse index lost a referrer of page {v}");
+            self.cons.skip.insert(v);
+            return None;
+        }
+        Some(surv)
+    }
+
+    /// Takes `s` for the flush, as a chunk whose bytes stay where they are
+    /// until something places them.
+    fn take_survivor(&mut self, s: &Survivor, dirty: &mut Dirty) {
+        let heat = self.heat_of(s.id);
+        let p = Pending {
+            origin: Origin::File(s.addr),
+            place: Place::Unplaced,
+            heat,
+            rewrite: false,
+        };
+        self.state.take(s.id, s.start, s.end, p, dirty);
+    }
+
+    /// Relocates `survivors` into `dp`, which has room for them.
+    fn relocate(
+        &mut self,
+        survivors: &[Survivor],
+        dp: &mut DataPage,
+        dirty: &mut Dirty,
     ) -> Result<(), Error> {
+        for s in survivors {
+            self.take_survivor(s, dirty);
+            self.place(dp, key(s.id, s.start), s.len())?;
+        }
         Ok(())
     }
 
+    /// Evacuates all of `v` into `dp`, if it fits.
+    fn evacuate_into(
+        &mut self,
+        v: u32,
+        dp: &mut DataPage,
+        dirty: &mut Dirty,
+    ) -> Result<bool, Error> {
+        let Some(surv) = self.all_survivors(v) else {
+            return Ok(false);
+        };
+        let total: u32 = surv.iter().map(Survivor::len).sum();
+        if total as usize > dp.room() {
+            self.cons.skip.insert(v);
+            return Ok(false);
+        }
+        self.relocate(&surv, dp, dirty)?;
+        self.stats.evacuated_pages += 1;
+        self.stats.evacuated_bytes += total as u64;
+        Ok(true)
+    }
+
+    /// Evacuates `v` into what room `dp` has left, cutting the survivor that
+    /// crosses the boundary; returns the rest, taken but not placed.
+    fn evacuate_across(
+        &mut self,
+        v: u32,
+        dp: &mut DataPage,
+        dirty: &mut Dirty,
+    ) -> Result<Vec<Survivor>, Error> {
+        let Some(surv) = self.all_survivors(v) else {
+            return Ok(Vec::new());
+        };
+        let total: u64 = surv.iter().map(|s| s.len() as u64).sum();
+        let mut rest = Vec::new();
+        for s in surv {
+            self.take_survivor(&s, dirty);
+            let room = dp.room() as u32;
+            if !rest.is_empty() || room == 0 {
+                rest.push(s);
+            } else if s.len() <= room {
+                self.place(dp, key(s.id, s.start), s.len())?;
+            } else {
+                self.state.split(s.id, s.start + room);
+                self.place(dp, key(s.id, s.start), room)?;
+                rest.push(Survivor {
+                    start: s.start + room,
+                    ..s
+                });
+            }
+        }
+        self.stats.evacuated_pages += 1;
+        self.stats.evacuated_bytes += total;
+        Ok(rest)
+    }
+
+    // ------------------------------------------------------------ free filling
+
+    /// Fills the room of `open`, a page the flush writes anyway, with what
+    /// costs nothing to move there: whole victims that fit, then as many of
+    /// one victim's statements as fit, a whole statement's survivors at a
+    /// time.
     pub(crate) fn free_fill(
         &mut self,
-        _open: &mut DataPage,
-        _dirty: &mut Dirty,
+        open: &mut DataPage,
+        dirty: &mut Dirty,
     ) -> Result<(), Error> {
+        loop {
+            let room = open.room() as u32;
+            let Some(b) = self.state.data_buckets.lowest_non_empty() else {
+                return Ok(());
+            };
+            if room == 0 {
+                return Ok(());
+            }
+            match self.pick_victim(true, b, room, &|_, _| true) {
+                Some(v) => {
+                    if self.evacuate_into(v, open, dirty)? {
+                        self.stats.free_filled_pages += 1;
+                    }
+                }
+                None => return self.fill_with_part(b, open, dirty),
+            }
+        }
+    }
+
+    /// Moves the survivors of as many of one victim's statements as fit into
+    /// `open`, each statement's all or none; the victim is the best-scoring
+    /// sample of bucket `b`, the sparsest. It stays a victim, only a sparser
+    /// one.
+    fn fill_with_part(
+        &mut self,
+        b: usize,
+        open: &mut DataPage,
+        dirty: &mut Dirty,
+    ) -> Result<(), Error> {
+        let Some(v) = self.pick_victim(true, b, C, &|_, _| true) else {
+            return Ok(());
+        };
+        let Some(surv) = self.all_survivors(v) else {
+            return Ok(());
+        };
+        let mut groups: Vec<Vec<Survivor>> = Vec::new();
+        let mut group_of: IdMap<usize> = IdMap::default();
+        for s in surv {
+            match s.stmt {
+                Some(st) => {
+                    let g = *group_of.entry(st.idx() as u32).or_insert_with(|| {
+                        groups.push(Vec::new());
+                        groups.len() - 1
+                    });
+                    groups[g].push(s);
+                }
+                None => groups.push(vec![s]),
+            }
+        }
+        for g in groups {
+            let len: u32 = g.iter().map(Survivor::len).sum();
+            if len as usize <= open.room() {
+                self.relocate(&g, open, dirty)?;
+                self.stats.evacuated_bytes += len as u64;
+            }
+        }
         Ok(())
     }
 
+    // ------------------------------------------------------------ the budget
+
+    /// What one budgeted page could hold after `carry` bytes that must lead
+    /// it: whole victims within the churn floor, best score first, then, if
+    /// `may_cut` and the page would close more than θ empty, one more victim
+    /// cut at the page boundary.
+    fn data_offer(&mut self, carry: u32, may_cut: bool) -> Option<Offer> {
+        let max = (C as f64 / (1.0 + self.opts.churn_floor)) as u32;
+        let mut room = C - carry;
+        let mut offer = Offer {
+            whole: Vec::new(),
+            cut: None,
+            reclaimed: 0.0,
+            written: 0.0,
+            fill: 0.0,
+        };
+        let mut chosen = IdSet::default();
+        while let Some(b) = self.state.data_buckets.lowest_non_empty() {
+            let not_chosen = |_: &Inner, p: u32| !chosen.contains(&p);
+            let Some(v) = self.pick_victim(true, b, room.min(max), &not_chosen) else {
+                break;
+            };
+            let cov = self.state.pages[v as usize].coverage;
+            chosen.insert(v);
+            offer.whole.push(v);
+            offer.reclaimed += (C - cov) as f64;
+            offer.written += cov as f64;
+            room -= cov;
+        }
+        if may_cut && room as f64 > self.opts.theta * C as f64 && room < max {
+            let from = Buckets::bucket_of(room + 1) as usize;
+            let too_big = |i: &Inner, p: u32| {
+                !chosen.contains(&p) && i.state.pages[p as usize].coverage > room
+            };
+            if let Some(v) = self.pick_victim(true, from, max, &too_big) {
+                let cov = self.state.pages[v as usize].coverage;
+                offer.cut = Some(v);
+                offer.reclaimed += (C - cov) as f64;
+                offer.written += cov as f64;
+                room = 0;
+            }
+        }
+        if offer.whole.is_empty() && offer.cut.is_none() {
+            return None;
+        }
+        offer.fill = (C - room) as f64 / C as f64;
+        Some(offer)
+    }
+
+    /// Spends the flush's budget: pages opened only to reclaim, one at a
+    /// time, each only if its offer passes the churn floor and fills it. A
+    /// survivor cut at one page's end leads the next, which is opened
+    /// whatever its own offer, so the budget's last page cuts nothing.
+    pub(crate) fn budget_loop(&mut self, dirty: &mut Dirty, out: &mut Output) -> Result<(), Error> {
+        let pages = self.cons.budget.round().max(0.0) as u32;
+        let (lambda, theta) = (self.opts.churn_floor, self.opts.theta);
+        let mut carry: Vec<Survivor> = Vec::new();
+        for i in 0..pages {
+            let carry_len: u32 = carry.iter().map(Survivor::len).sum();
+            let offer = self.data_offer(carry_len, i + 1 < pages);
+            let good = |o: &Offer| o.reclaimed >= lambda * o.written && o.fill >= 1.0 - theta;
+            let offer = match offer {
+                Some(o) if !carry.is_empty() || good(&o) => Some(o),
+                _ if !carry.is_empty() => None,
+                _ => break,
+            };
+            let mut dp = self.new_data_page()?;
+            for s in std::mem::take(&mut carry) {
+                self.place(&mut dp, key(s.id, s.start), s.len())?;
+            }
+            if let Some(o) = offer {
+                for v in o.whole {
+                    self.evacuate_into(v, &mut dp, dirty)?;
+                }
+                if let Some(v) = o.cut {
+                    carry = self.evacuate_across(v, &mut dp, dirty)?;
+                }
+            }
+            self.stats.budget_pages += 1;
+            out.data.push(dp);
+        }
+        debug_assert!(carry.is_empty(), "the budget's last page cut a survivor");
+        Ok(())
+    }
+
+    /// Moves the budget toward the target fill, after each commit.
     pub(crate) fn after_commit(&mut self) -> Result<(), Error> {
+        if !self.opts.consolidate {
+            return Ok(());
+        }
+        let (mut live, mut pages) = (0u64, 0u64);
+        for info in self.state.pages.iter().skip(2) {
+            if matches!(
+                info.state,
+                PageState::Data | PageState::Table | PageState::Interior
+            ) {
+                live += info.coverage as u64;
+                pages += 1;
+            }
+        }
+        if pages == 0 {
+            return Ok(());
+        }
+        let fill = live as f64 / (pages as f64 * C as f64);
+        let step = (4.0 * (self.opts.target_fill - fill)).exp();
+        let (lo, hi) = (self.opts.budget_min as f64, self.opts.budget_max as f64);
+        self.cons.budget = (self.cons.budget.max(1.0) * step).clamp(lo, hi);
         Ok(())
     }
 

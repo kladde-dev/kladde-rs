@@ -17,8 +17,6 @@ pub(crate) struct DataPage {
     pub page: u32,
     pub buf: Box<PageBuf>,
     pub used: usize,
-    /// Whether it holds content of the flush's own.
-    pub own: bool,
 }
 
 impl DataPage {
@@ -80,6 +78,7 @@ impl Inner {
         self.state.pending.clear();
         self.state.dropped_candidates.clear();
         self.flush_rewritten.clear();
+        self.begin_consolidation();
         let mut dirty = Dirty::default();
 
         // 1. The header's content, taken whole.
@@ -92,22 +91,17 @@ impl Inner {
         self.hoist(&mut f)?;
         self.apply_fold(f, &mut dirty)?;
 
-        // 3. Description defragmentation's share, before anything is packed.
-        if self.opts.consolidate {
-            self.defrag_share(&mut dirty)?;
-        }
-
-        // 4. Data pages, with victims riding along, then budgeted pages.
+        // 3. Data pages, with victims riding along, then budgeted pages.
         let mut out = Output::default();
         self.pack(&mut dirty, &mut out)?;
         if self.opts.consolidate {
             self.budget_loop(&mut dirty, &mut out)?;
         }
 
-        // 5. The address table.
+        // 4. The address table.
         self.cut(&mut dirty, &mut out)?;
 
-        // 6. Write, fsync, commit.
+        // 5. Write, fsync, commit.
         self.commit(e, &dirty, out)
     }
 
@@ -510,7 +504,7 @@ impl Inner {
         out
     }
 
-    pub(crate) fn new_data_page(&mut self, own: bool) -> Result<DataPage, Error> {
+    pub(crate) fn new_data_page(&mut self) -> Result<DataPage, Error> {
         let page = take_page(
             &mut self.ready,
             &mut self.state,
@@ -522,7 +516,6 @@ impl Inner {
             page,
             buf: new_page(),
             used: 0,
-            own,
         })
     }
 
@@ -556,7 +549,7 @@ impl Inner {
             let (id, mut off, mut len) = (kid(ch.key), koff(ch.key), ch.len);
             while len >= c {
                 self.state.split(id, off + c);
-                let mut dp = self.new_data_page(true)?;
+                let mut dp = self.new_data_page()?;
                 self.place(&mut dp, key(id, off), c)?;
                 out.data.push(dp);
                 off += c;
@@ -574,7 +567,7 @@ impl Inner {
             return Ok(());
         }
         let theta = (self.opts.theta * c as f64) as usize;
-        let mut open = self.new_data_page(true)?;
+        let mut open = self.new_data_page()?;
         loop {
             let room = open.room() as u32;
             // 1. The first chunk that fits, within reach.
@@ -607,13 +600,24 @@ impl Inner {
                 let (id, off) = (kid(ch.key), koff(ch.key));
                 self.state.split(id, off + head);
                 self.place(&mut open, ch.key, head)?;
-                rem.push_front(Chunk {
+                let tail = Chunk {
                     key: key(id, off + head),
                     len: ch.len - head,
                     rewrite: ch.rewrite,
-                });
+                };
+                if tail.len <= self.opts.inline_threshold {
+                    // Too short to be worth a chunk: the cut states it inline.
+                    if let Some(Fragment::Pending(p)) = self.state.frags.get(&tail.key) {
+                        self.state.pending[*p as usize].place = Place::Inline;
+                    }
+                } else {
+                    rem.push_front(tail);
+                }
             }
-            let full = std::mem::replace(&mut open, self.new_data_page(true)?);
+            if rem.is_empty() {
+                break;
+            }
+            let full = std::mem::replace(&mut open, self.new_data_page()?);
             out.data.push(full);
         }
         out.data.push(open);

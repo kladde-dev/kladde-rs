@@ -40,6 +40,8 @@ pub struct Stats {
     pub evacuated_bytes: u64,
     /// Victims taken in pages the flush wrote anyway.
     pub free_filled_pages: u64,
+    /// Data pages opened only to take victims.
+    pub budget_pages: u64,
     /// Address-table pages the page rewrite drained.
     pub table_rewrites: u64,
     /// Fragments the rotating window restated.

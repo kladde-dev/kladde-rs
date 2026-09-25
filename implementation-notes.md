@@ -69,3 +69,19 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 - **Misusing the transaction and batch calls reports `Error::Corrupt`.**
   Ending a transaction that is not open is a caller's bug rather than a damaged file, and deserves an error variant of its own.
   The typed layers pair the calls through guards, so only direct users of `Store` can hit it.
+
+## Consolidation
+
+- **Free filling moves part of at most one victim per page, and the victim stays eligible.**
+  `impl/consolidation.md#packing-in-id-order-with-look-ahead` lists "part of a victim too big to take whole" as the last filler without saying how many victims to try.
+  Trying one per page is enough: a first version tried victim after victim while the room was too small for any statement's survivors, and each attempt excluded that victim from the rest of the flush, which starved the budget loop of exactly the sparse pages it wanted.
+- **An offer takes whole victims by score, not by best fit.**
+  `offer_page` in `impl/consolidation.md#victims-are-pulled-one-at-a-time` fills a budgeted page "by best fit".
+  The implementation takes, again and again, the best-scoring sampled victim that still fits, from the sparsest bucket up, and cuts one more victim across the boundary when the page would otherwise close more than `θ` empty.
+- **The churn floor also bounds each victim**: a budgeted page takes only victims with coverage at most `C / (1 + λ)`, besides checking the offer as a whole.
+- **The budget loop never continues the last page of `pack`.**
+  The design lets that page cut a victim's survivor whenever the loop opens another page, so that only the flush's very last data page can close short.
+  Here, `pack`'s last page is filled by free filling alone, and can close short even when the loop goes on.
+- **The controller moves the budget multiplicatively.**
+  After each commit it measures the live fraction of data and table pages and multiplies the budget by `exp(4 · (τ − fill))`, within `budget_min` and `budget_max`.
+  `impl/consolidation.md#constants-still-to-be-chosen` leaves the rule open.
