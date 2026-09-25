@@ -59,6 +59,11 @@
 - When adding pointer type to the schema, maybe also add unsized types (slices `[T]`, `str`). This would allow generic tools to understand data better and inspect more out-of-the-box.
 - Should we really support `char` as a primitive type? If so, how are `char`s serialized? Valid unicode scalar values seem to be <= 0x10FFFF, so they'd fit into 3 bytes. How future proof do we expect this restriction to be?
 - `Allocator::read` should probably return an `impl Read`. Analogously, `Allocator::write` should either return an `impl Write` or take an `impl Read` as argument. Returning an `impl Write` would simplify the caller's sites but is likely more complicated to implement on the callee's side.
+- Protect against zip-bomb like attacks:
+  - recursive use of pointers can lead to infinite loop during loading — backend should keep a stack (hash set + current pointer) of loaded pointers during loading and refuse to hand out pointers already in the stack;
+  - if we allow multiple address table entries to reference the same allocation, then a small file can logically contain enormous amounts of data;
+  - when `Segment`s land, keep zip-bomb issue in mind;
+  - if in-file compression ever enters, we might need a more dynamic protection anyway.
 
 
 ## Regarding write-ahead-logging discipline
