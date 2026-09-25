@@ -188,6 +188,23 @@ fn compaction_moves_content_off_the_end() {
 }
 
 #[test]
+fn the_budget_survives_a_reopen() {
+    let storage = MemoryStorage::new();
+    let store = Store::create(Box::new(storage.clone()), Options::default()).unwrap();
+    let p = store.alloc(0).unwrap();
+    for f in 0..40u32 {
+        store.write(p.raw(), f * 100, &[1; 100]).unwrap();
+        store.flush().unwrap();
+    }
+    let budget = store.stats().budget;
+    assert_ne!(budget, Options::default().budget_pages as u64);
+    drop(store);
+    let store = Store::open(Box::new(storage), Options::default()).unwrap();
+    assert_eq!(store.stats().budget, budget);
+    assert_eq!(store.allocations().len(), 1);
+}
+
+#[test]
 fn defragmentation_merges_appended_pieces() {
     let off = Options {
         mu: f64::INFINITY,

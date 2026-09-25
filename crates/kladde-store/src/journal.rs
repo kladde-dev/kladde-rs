@@ -51,6 +51,20 @@ pub enum Record {
     },
 }
 
+impl Record {
+    /// The ids the record names: one, or a source and a destination.
+    pub fn ids(&self) -> impl Iterator<Item = u32> {
+        let (a, b) = match *self {
+            Record::Free { id }
+            | Record::Resize { id, .. }
+            | Record::Write { id, .. }
+            | Record::Splice { id, .. } => (id, None),
+            Record::Copy { src, dst, .. } | Record::Move { src, dst, .. } => (src, Some(dst)),
+        };
+        std::iter::once(a).chain(b)
+    }
+}
+
 /// A sequence of records with their payloads in one arena.
 #[derive(Clone, Debug, Default)]
 pub struct Records {
@@ -69,11 +83,6 @@ impl Records {
 
     pub fn len(&self) -> usize {
         self.records.len()
-    }
-
-    pub fn clear(&mut self) {
-        self.records.clear();
-        self.arena.clear();
     }
 
     /// Stores `bytes` in the arena.
@@ -296,8 +305,6 @@ fn seeded_chain(epoch: u64) -> Crc32c {
 
 /// Appends transactions to one segment's chain of pages.
 pub struct SegmentWriter {
-    /// The segment's epoch, which salts its chain.
-    pub epoch: u64,
     /// The segment's pages in chain order; the first is the header's
     /// `journal_pointer`.
     pub pages: Vec<u32>,
@@ -312,10 +319,9 @@ pub struct SegmentWriter {
 }
 
 impl SegmentWriter {
-    /// An empty segment starting at `first_page`.
+    /// An empty segment of epoch `epoch`, starting at `first_page`.
     pub fn new(epoch: u64, first_page: u32) -> Self {
         SegmentWriter {
-            epoch,
             pages: vec![first_page],
             buf: new_page(),
             pos: 0,

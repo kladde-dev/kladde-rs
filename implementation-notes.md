@@ -66,6 +66,9 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 - **`Store::open` folds a recovered journal before it returns.**
   `spec/journal.md#the-start-of-a-session` asks only that a non-empty recovered journal be folded before anything is appended.
   Folding at open is simpler, and it lets reads, which see flushed state only, see every recovered transaction at once.
+- **Ids a recovered journal allocates must be withheld from the id allocator.**
+  The allocator is rebuilt at open from the loaded state, which knows nothing of the ids the unfolded journal brings into existence; before the fix, the first `alloc` after a recovery could hand one of them out again.
+  `impl/id-recycling.md` should say that recovery counts the journal's ids as used; the consolidator state, whose allocation the recovery flush creates, exposed it.
 - **Misusing the transaction and batch calls reports `Error::Corrupt`.**
   Ending a transaction that is not open is a caller's bug rather than a damaged file, and deserves an error variant of its own.
   The typed layers pair the calls through guards, so only direct users of `Store` can hit it.
@@ -108,6 +111,13 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
   `impl/consolidation.md#the-churn-floor-is-a-parameter-not-an-identity` says "`live_bytes / (pages · C)`" without saying which pages.
   Counting only live pages would let holes go unnoticed: in a test that frees three quarters of a file, the fill of the live pages stayed near 1, the budget fell to its minimum, and compaction mode moved one page per flush.
   Counting every page makes holes raise the budget like sparse pages do, which also matches the bound the budget is meant to buy, a file of `live_size / τ`.
+- **The consolidator state's layout is this implementation's own**, as `spec/file-format.md#the-consolidator-state` allows: the tag `kladders`, `up_to_date`, the budget as an `f32`, the window's key, the snapshot's length, and then the age records, as `impl/consolidator-state.md` describes them.
+  A fresh snapshot is due once the appended records outgrow the snapshot, or 64 bytes if the snapshot is smaller, so that a nearly empty snapshot does not force one every flush.
+  A state that does not parse is overwritten in place, keeping its allocation.
+- **An age record is current if no *live* statement naming its allocation is newer than `up_to_date`.**
+  `impl/consolidator-state.md#checking-it` asks about every statement naming it; statements that are physically present but dead are not in memory after a load.
+  A dead statement newer than every live one is rare (a `Grow` below the size, from another writer), and the cost of missing it is an age that errs toward old.
+- **The consolidator state's allocation is hidden from `Store::allocations` and the statistics**, since the application never allocated it.
 - **Compaction mode counts holes by scanning the page table once per flush**, reusable and retiring pages below the highest live page alike.
   `impl/consolidation.md#compaction-mode` keeps a cached index of the highest live page instead; the scan costs `O(pages)` per flush, which is small next to what a flush writes, but is not the `O(1)` amortised the design promises.
   Interior pages are passed over like journal pages, since every cut that needs them writes them afresh.

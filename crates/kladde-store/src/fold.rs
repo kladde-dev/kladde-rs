@@ -197,8 +197,6 @@ impl Table {
 pub struct IdFold {
     /// It existed at the start of the segment.
     pub existed: bool,
-    /// Its size at the start of the segment.
-    pub size_before: u32,
     /// Its committed incarnation ended during the segment.
     pub ended: bool,
     /// It exists at the end of the segment.
@@ -222,7 +220,6 @@ impl Fold {
         self.ids.entry(id).or_insert_with(|| match committed(id) {
             Some(size) => IdFold {
                 existed: true,
-                size_before: size,
                 exists: true,
                 committed_live: true,
                 table: Table::persistent(id, size),

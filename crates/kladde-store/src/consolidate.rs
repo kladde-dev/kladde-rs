@@ -40,6 +40,8 @@ pub struct ConsState {
     pub compaction: bool,
     /// Where the search for the highest live page resumes.
     pub tail: u32,
+    /// Where the consolidator state is kept.
+    pub kept: crate::constate::Kept,
 }
 
 /// A live fragment in a data page being evacuated.
@@ -74,25 +76,6 @@ struct Offer {
 }
 
 impl Inner {
-    pub(crate) fn seed_after_load(&mut self) {
-        self.cons.budget = self.opts.budget_pages as f64;
-        // Content ages fall back to the youngest page holding a fragment.
-        let mut youngest: IdMap<u64> = Default::default();
-        for (&k, &f) in &self.state.frags {
-            let page = match f {
-                Fragment::Bytes { page, .. } => page,
-                Fragment::ZeroExplicitly { stmt } => self.state.slab.page(stmt),
-                _ => continue,
-            };
-            let e = self.state.pages[page as usize].epoch;
-            let y = youngest.entry(kid(k)).or_default();
-            *y = (*y).max(e);
-        }
-        for (&id, m) in self.state.allocs.iter_mut() {
-            m.last_written = youngest.get(&id).copied().unwrap_or(self.epoch);
-        }
-    }
-
     /// Resets what consolidation keeps for one flush only.
     pub(crate) fn begin_consolidation(&mut self) {
         self.cons.skip.clear();
@@ -654,7 +637,7 @@ impl Inner {
     /// restates live fragments from the cursor on, in place, until `room`
     /// bytes of encoding are used, and moves the cursor past `walk`
     /// fragments either way.
-    fn window(&mut self, room: usize, main: &Dirty, fillers: &mut Dirty) {
+    pub(crate) fn window(&mut self, room: usize, main: &Dirty, fillers: &mut Dirty) {
         let n = self.opts.walk.min(self.state.frags.len());
         if n == 0 {
             return;
@@ -795,8 +778,11 @@ impl Inner {
                 _ => {}
             }
         }
-        s.allocations = self.state.allocs.len() as u64;
-        s.allocation_bytes = self.state.allocs.values().map(|m| m.size as u64).sum();
+        // The consolidator state is the store's own, not the application's.
+        let own = self.header.consolidator_state;
+        let apps = self.state.allocs.iter().filter(|(&id, _)| id != own);
+        s.allocations = apps.clone().count() as u64;
+        s.allocation_bytes = apps.map(|(_, m)| m.size as u64).sum();
         s.fragments = self.state.frags.len() as u64;
         s.statements = self.state.slab.live as u64;
         s.budget = self.cons.budget as u64;

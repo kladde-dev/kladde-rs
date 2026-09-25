@@ -17,17 +17,6 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub fn from_u8(v: u8) -> Kind {
-        match v {
-            0 => Kind::Ref,
-            1 => Kind::Zero,
-            2 => Kind::Shrink,
-            3 => Kind::Grow,
-            4 => Kind::Tombstone,
-            _ => Kind::Inline,
-        }
-    }
-
     /// `Ref`, `Zero`, and `Inline` state content over a range.
     pub fn is_content(self) -> bool {
         matches!(self, Kind::Ref | Kind::Zero | Kind::Inline)
@@ -199,10 +188,6 @@ impl TableWriter {
     /// The content length so far.
     pub fn len(&self) -> usize {
         self.buf.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
     }
 
     /// The encoded length `s` would add, inline payload included, given what

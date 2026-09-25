@@ -133,6 +133,31 @@ fn run(seed: u64, opts: &Options) {
     }
 }
 
+/// An id the recovered journal allocated is in use after recovery, for the
+/// application and for the store's own allocations alike.
+#[test]
+fn recovered_ids_are_not_handed_out_again() {
+    for consolidator_state in [false, true] {
+        let opts = Options {
+            consolidator_state,
+            ..Default::default()
+        };
+        let storage = MemoryStorage::new();
+        let store = Store::create(Box::new(storage.clone()), opts.clone()).unwrap();
+        let a = store.alloc(4).unwrap();
+        store.write(a.raw(), 0, b"kept").unwrap();
+        drop(store);
+        let store =
+            Store::open(Box::new(MemoryStorage::from_image(storage.image())), opts).unwrap();
+        let b = store.alloc(4).unwrap();
+        assert_ne!(a.raw(), b.raw());
+        store.flush().unwrap();
+        store.check();
+        assert_eq!(store.read_all(a.raw()).unwrap(), b"kept");
+        assert_eq!(store.allocations().len(), 2);
+    }
+}
+
 #[test]
 fn power_cuts_land_on_transaction_boundaries() {
     let opts = Options {

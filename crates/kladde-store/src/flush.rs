@@ -91,6 +91,9 @@ impl Inner {
         self.hoist(&mut f)?;
         self.apply_fold(f, &mut dirty)?;
         if self.opts.consolidate {
+            if self.opts.consolidator_state {
+                self.write_consolidator_state(&mut dirty)?;
+            }
             // Description defragmentation's share: rewrites chosen now are
             // written like the flush's own.
             self.defrag_share(&mut dirty)?;
@@ -257,7 +260,6 @@ impl Inner {
         written: bool,
         dirty: &'a mut Dirty,
     ) -> &'a mut IdRecord {
-        let existed = self.state.allocs.contains_key(&id);
         let size_before = self.state.size_of(id);
         if written {
             if let Some(m) = self.state.allocs.get_mut(&id) {
@@ -265,7 +267,6 @@ impl Inner {
             }
         }
         let rec = dirty.records.entry(id).or_insert(IdRecord {
-            existed,
             size_before,
             ..Default::default()
         });
@@ -378,7 +379,7 @@ impl Inner {
     /// anchor, unless the anchor lives in a page this flush retires: the
     /// statement the cut restates in its place anchors at the new size and
     /// covers none of that range, so the range is taken and stated as zeros.
-    fn grow(&mut self, id: u32, old: u32, new: u32, dirty: &mut Dirty) {
+    pub(crate) fn grow(&mut self, id: u32, old: u32, new: u32, dirty: &mut Dirty) {
         self.state.grow_size_to(id, new);
         let retired_anchor = dirty.records.get(&id).is_some_and(|r| r.replace_anchor);
         if retired_anchor && self.state.allocs[&id].anchor.is_some() {
@@ -440,7 +441,7 @@ impl Inner {
         Ok(())
     }
 
-    fn allocate(&mut self, id: u32, n: u32, dirty: &mut Dirty) {
+    pub(crate) fn allocate(&mut self, id: u32, n: u32, dirty: &mut Dirty) {
         let mut meta = AllocationMeta {
             last_written: self.state.flush_epoch,
             ..Default::default()

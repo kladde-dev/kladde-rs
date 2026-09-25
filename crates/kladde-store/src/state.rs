@@ -276,10 +276,6 @@ impl Buckets {
     pub fn lowest_non_empty(&self) -> Option<usize> {
         self.lists.iter().position(|l| !l.is_empty())
     }
-
-    pub fn len(&self) -> usize {
-        self.lists.iter().map(Vec::len).sum()
-    }
 }
 
 /// Every key range the flush has taken, merged and sorted, plus per touched id
@@ -294,7 +290,7 @@ pub struct Dirty {
 /// How an id changed during the flush.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IdRecord {
-    pub existed: bool,
+    /// Its size when the flush first touched it.
     pub size_before: u32,
     /// It existed and was freed.
     pub freed: bool,
@@ -365,8 +361,6 @@ pub struct State {
     /// The epoch of the flush in progress: pages written in it are never
     /// victims.
     pub flush_epoch: u64,
-    /// Ids whose `last_written` the flush set.
-    pub session_base: u64,
 }
 
 impl Default for State {
@@ -383,7 +377,6 @@ impl Default for State {
             pending: Vec::new(),
             dropped_candidates: IdSet::default(),
             flush_epoch: 0,
-            session_base: 0,
         }
     }
 }
@@ -854,15 +847,6 @@ impl State {
             }
         }
         v.push((id, lo, hi));
-    }
-
-    /// A pending fragment's entry.
-    #[inline]
-    pub fn pending_of(&self, f: Fragment) -> Option<&Pending> {
-        match f {
-            Fragment::Pending(p) => Some(&self.pending[p as usize]),
-            _ => None,
-        }
     }
 
     /// Checks the invariants tying the structures together. Expensive; for

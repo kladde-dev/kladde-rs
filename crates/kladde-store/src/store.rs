@@ -34,7 +34,7 @@ pub(crate) struct IdAllocator {
 }
 
 impl IdAllocator {
-    fn mint(&mut self) -> Result<u32, Error> {
+    pub(crate) fn mint(&mut self) -> Result<u32, Error> {
         if let Some(id) = self.free_dead.pop_first() {
             return Ok(id);
         }
@@ -215,6 +215,15 @@ impl Store {
             max_id = max_id.max(id);
             ids.release(id, r.tombstone.is_some());
         }
+        // Ids the recovered journal names are in use too, or will be once it
+        // is folded: none of them may be handed out again.
+        for r in &recovered.records.records {
+            for id in r.ids() {
+                max_id = max_id.max(id);
+                ids.free_dead.remove(&id);
+                ids.free_live.remove(&id);
+            }
+        }
         ids.next_fresh = max_id.checked_add(1).unwrap_or(0).max(1);
         let journal_pointer = loaded.header.fields.journal_pointer;
         let mut segment = SegmentWriter::new(epoch + 1, journal_pointer);
@@ -250,7 +259,7 @@ impl Store {
             cons: Default::default(),
             stats: Stats::default(),
         };
-        inner.seed_after_load();
+        inner.seed_after_load()?;
         // Replay: a recovered journal is folded now, so that what the
         // application loads is the state at its last transaction.
         if inner.must_flush_first {
@@ -276,10 +285,12 @@ impl Store {
     /// ```
     pub fn allocations(&self) -> Vec<(Pointer, u32)> {
         let i = self.inner.borrow();
+        let own = i.header.consolidator_state;
         let mut v: Vec<(Pointer, u32)> = i
             .state
             .allocs
             .iter()
+            .filter(|(&id, _)| id != own)
             .map(|(&id, m)| (Pointer::from_raw(id).unwrap(), m.size))
             .collect();
         v.sort_unstable_by_key(|(p, _)| p.raw());
