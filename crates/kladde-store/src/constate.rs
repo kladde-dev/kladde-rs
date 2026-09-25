@@ -1,6 +1,7 @@
-//! The consolidator state (`impl/consolidator-state.md`): what consolidation
-//! learned, kept in an ordinary allocation that the header names, so that a
-//! session resumes where the last one left off.
+//! The consolidator state (`impl/consolidator-state.md`, with what
+//! `drafts/ripeness.md` adds): what consolidation learned, kept in an
+//! ordinary allocation that the header names, so that a session resumes
+//! where the last one left off.
 //!
 //! The allocation's content, in this order:
 //!
@@ -8,14 +9,21 @@
 //! | --- | --- |
 //! | 8 | [`TAG`]: this implementation, and the layout's version |
 //! | 8 | `up_to_date`: the epoch of the flush that last wrote the state, little-endian |
-//! | 4 | the budget in pages, as an `f32`'s little-endian bits |
+//! | 4 | the price of space `κ`, as an `f32`'s little-endian bits |
 //! | 8 | the window: the id and offset at which the latest walk began, little-endian |
 //! | 4 | the length of the snapshot that starts the records, little-endian |
-//! | .. | age records: the snapshot, then one record per flush since |
+//! | .. | records: the snapshot, then those of every flush since |
 //!
-//! An age record is a varint epoch, a varint count, and that many varint id
-//! deltas, ascending from 0: the ids a flush wrote, or in the snapshot, the
-//! ids last written at that epoch.
+//! A record starts with its kind:
+//!
+//! - `0`, an age record: a varint epoch, a varint count, and that many
+//!   varint id deltas, ascending from 0: the ids a flush wrote, or in the
+//!   snapshot, the ids last written at that epoch.
+//! - `1`, a drain record: a varint count, and that many entries of a varint
+//!   page delta, ascending from 0, the page's epoch and coverage as varints,
+//!   its estimate's rate as an `f32`'s little-endian bits, and the estimate's
+//!   epoch as a varint. A flush records the pages whose estimate it changed;
+//!   the snapshot, every page no fuller than a page may close.
 
 use std::collections::BTreeMap;
 
@@ -25,17 +33,30 @@ use crate::state::*;
 use crate::store::Inner;
 
 /// Names this implementation and the layout's version.
-pub(crate) const TAG: [u8; 8] = *b"kladders";
-/// The bytes before the age records.
+pub(crate) const TAG: [u8; 8] = *b"kladdrsr";
+/// The bytes before the records.
 const FIXED: usize = 32;
+
+const AGE: u8 = 0;
+const DRAIN: u8 = 1;
+
+/// One page's estimate, as recorded.
+#[derive(Clone, Copy, Debug)]
+struct DrainEntry {
+    page: u32,
+    epoch: u64,
+    coverage: u32,
+    drain: Drain,
+}
 
 /// What a parsed state holds.
 struct Parsed {
     up_to_date: u64,
-    budget: f32,
+    kappa: f32,
     window: Key,
     snapshot_len: u32,
-    records: Vec<(u64, Vec<u32>)>,
+    ages: Vec<(u64, Vec<u32>)>,
+    drains: Vec<DrainEntry>,
     records_len: u32,
 }
 
@@ -44,7 +65,8 @@ fn put_varint(out: &mut Vec<u8>, v: u64) {
 }
 
 /// Encodes one age record.
-fn record(out: &mut Vec<u8>, epoch: u64, ids: &[u32]) {
+fn age_record(out: &mut Vec<u8>, epoch: u64, ids: &[u32]) {
+    out.push(AGE);
     put_varint(out, epoch);
     put_varint(out, ids.len() as u64);
     let mut prev = 0u32;
@@ -54,13 +76,28 @@ fn record(out: &mut Vec<u8>, epoch: u64, ids: &[u32]) {
     }
 }
 
+/// Encodes one drain record, of `entries` in ascending page order.
+fn drain_record(out: &mut Vec<u8>, entries: &[DrainEntry]) {
+    out.push(DRAIN);
+    put_varint(out, entries.len() as u64);
+    let mut prev = 0u32;
+    for e in entries {
+        put_varint(out, (e.page - prev) as u64);
+        prev = e.page;
+        put_varint(out, e.epoch);
+        put_varint(out, e.coverage as u64);
+        out.extend_from_slice(&e.drain.rho.to_bits().to_le_bytes());
+        put_varint(out, e.drain.at);
+    }
+}
+
 fn parse(bytes: &[u8]) -> Option<Parsed> {
     if bytes.len() < FIXED || bytes[..8] != TAG {
         return None;
     }
     let u32_at = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
     let up_to_date = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-    let budget = f32::from_bits(u32_at(16));
+    let kappa = f32::from_bits(u32_at(16));
     let window = key(u32_at(20), u32_at(24));
     let snapshot_len = u32_at(28);
     let mut rest = &bytes[FIXED..];
@@ -69,25 +106,53 @@ fn parse(bytes: &[u8]) -> Option<Parsed> {
         *rest = r;
         Some(v)
     };
-    let mut records = Vec::new();
-    while !rest.is_empty() {
-        let epoch = get(&mut rest)?;
-        let n = get(&mut rest)?;
-        let mut ids = Vec::with_capacity((n as usize).min(rest.len()));
-        let mut id = 0u64;
-        for _ in 0..n {
-            id += get(&mut rest)?;
-            ids.push(u32::try_from(id).ok()?);
+    let (mut ages, mut drains) = (Vec::new(), Vec::new());
+    while let Some((&kind, r)) = rest.split_first() {
+        rest = r;
+        match kind {
+            AGE => {
+                let epoch = get(&mut rest)?;
+                let n = get(&mut rest)?;
+                let mut ids = Vec::with_capacity((n as usize).min(rest.len()));
+                let mut id = 0u64;
+                for _ in 0..n {
+                    id += get(&mut rest)?;
+                    ids.push(u32::try_from(id).ok()?);
+                }
+                ages.push((epoch, ids));
+            }
+            DRAIN => {
+                let n = get(&mut rest)?;
+                let mut page = 0u64;
+                for _ in 0..n {
+                    page += get(&mut rest)?;
+                    let epoch = get(&mut rest)?;
+                    let coverage = u32::try_from(get(&mut rest)?).ok()?;
+                    let (rho, r) = rest.split_first_chunk::<4>()?;
+                    rest = r;
+                    let at = get(&mut rest)?;
+                    drains.push(DrainEntry {
+                        page: u32::try_from(page).ok()?,
+                        epoch,
+                        coverage,
+                        drain: Drain {
+                            rho: f32::from_bits(u32::from_le_bytes(*rho)),
+                            at,
+                        },
+                    });
+                }
+            }
+            _ => return None,
         }
-        records.push((epoch, ids));
     }
     let records_len = (bytes.len() - FIXED) as u32;
     Some(Parsed {
         up_to_date,
-        budget,
+        kappa,
         window,
         snapshot_len,
-        records,
+        ages,
+        drains,
         records_len,
     })
 }
@@ -142,12 +207,44 @@ impl Inner {
         (content, statements)
     }
 
-    /// Seeds consolidation after a load: content ages from the consolidator
-    /// state where it is current and from the pages holding each allocation
-    /// elsewhere, the budget and the window from the state, and then a
+    /// Seeds each page's estimate from its fill and its age, assuming that
+    /// it has drained at one rate since it was written: from its content size
+    /// then to its coverage now, over the epochs until the session's first
+    /// flush.
+    fn seed_drains(&mut self) {
+        let first = self.epoch + 1;
+        for info in self.state.pages.iter_mut().skip(2) {
+            if !matches!(info.state, PageState::Data | PageState::Table) {
+                continue;
+            }
+            let (written, live) = (info.written as f64, info.coverage as f64);
+            let age = first.saturating_sub(info.epoch).max(1) as f64;
+            let rho = if live > 0.0 && written > live {
+                (written / live).ln() / age
+            } else {
+                0.0
+            };
+            info.drain = Drain {
+                rho: rho as f32,
+                at: self.epoch,
+            };
+        }
+    }
+
+    /// Seeds consolidation after a load: content ages and page estimates
+    /// from the consolidator state where they are current, and from the
+    /// pages elsewhere; the price of space and the window from the state;
+    /// the cursor's pages from the governing header's epoch; and then a
     /// read-only walk that finds again the candidates the latest walk found.
     pub(crate) fn seed_after_load(&mut self) -> Result<(), Error> {
-        self.cons.budget = self.opts.budget_pages as f64;
+        self.cons.kappa = self.opts.kappa;
+        self.seed_drains();
+        self.cons.prev_data_pages = (2..self.file_pages)
+            .filter(|&p| {
+                let info = &self.state.pages[p as usize];
+                info.state == PageState::Data && info.epoch == self.epoch
+            })
+            .collect();
         let (content, statements) = self.youngest_pages();
         for (&id, m) in self.state.allocs.iter_mut() {
             m.last_written = content.get(&id).copied().unwrap_or(self.epoch);
@@ -175,7 +272,7 @@ impl Inner {
             }
             Some(Some(p)) => {
                 let current = p.up_to_date == self.epoch;
-                for (epoch, ids) in &p.records {
+                for (epoch, ids) in &p.ages {
                     for &i in ids {
                         let fresh =
                             current || statements.get(&i).is_none_or(|&e| e <= p.up_to_date);
@@ -184,8 +281,28 @@ impl Inner {
                         }
                     }
                 }
-                if p.budget.is_finite() && p.budget > 0.0 {
-                    self.cons.budget = p.budget as f64;
+                // A page's latest entry is current if the page is still the
+                // one it describes; what it lost since is a loss in the gap.
+                let mut latest: IdMap<DrainEntry> = IdMap::default();
+                for e in p.drains {
+                    latest.insert(e.page, e);
+                }
+                for e in latest.into_values() {
+                    let Some(info) = self.state.pages.get_mut(e.page as usize) else {
+                        continue;
+                    };
+                    let live = matches!(info.state, PageState::Data | PageState::Table);
+                    if !live || info.epoch != e.epoch {
+                        continue;
+                    }
+                    info.drain = e.drain;
+                    if info.coverage < e.coverage {
+                        info.drain
+                            .lose(e.coverage - info.coverage, e.coverage, self.epoch);
+                    }
+                }
+                if p.kappa.is_finite() && p.kappa > 0.0 {
+                    self.cons.kappa = p.kappa as f64;
                 }
                 window = Some(p.window);
                 self.cons.kept = Kept {
@@ -197,6 +314,9 @@ impl Inner {
                     appended_len: p.records_len.saturating_sub(p.snapshot_len),
                 };
             }
+        }
+        for p in 2..self.file_pages {
+            self.state.rerank(p);
         }
         self.cons.cursor = match window {
             Some(w) => w,
@@ -226,9 +346,29 @@ impl Inner {
         Ok(r.next_stmt()?.map_or(0, |s| key(s.stmt.id, s.stmt.offset)))
     }
 
+    /// The current entries of `pages`, in ascending page order.
+    fn drain_entries(&self, pages: impl IntoIterator<Item = u32>) -> Vec<DrainEntry> {
+        let mut out: Vec<DrainEntry> = pages
+            .into_iter()
+            .filter_map(|p| {
+                let info = self.state.pages.get(p as usize)?;
+                matches!(info.state, PageState::Data | PageState::Table).then_some(DrainEntry {
+                    page: p,
+                    epoch: info.epoch,
+                    coverage: info.coverage,
+                    drain: info.drain,
+                })
+            })
+            .collect();
+        out.sort_unstable_by_key(|e| e.page);
+        out.dedup_by_key(|e| e.page);
+        out
+    }
+
     /// Brings the consolidator state up to date with this flush, which has
-    /// just folded its segment: appends the flush's age record and rewrites
-    /// the fixed fields, or writes a fresh snapshot when one is due.
+    /// just folded its segment: appends the flush's age record and the
+    /// estimates it changed, and rewrites the fixed fields, or writes a fresh
+    /// snapshot when one is due.
     pub(crate) fn write_consolidator_state(&mut self, dirty: &mut Dirty) -> Result<(), Error> {
         let e = self.state.flush_epoch;
         let kept = std::mem::take(&mut self.cons.kept);
@@ -241,7 +381,11 @@ impl Inner {
         written.sort_unstable();
         let mut rec = Vec::new();
         if !written.is_empty() {
-            record(&mut rec, e, &written);
+            age_record(&mut rec, e, &written);
+        }
+        let drained = self.drain_entries(self.cons.drained.iter().copied());
+        if !drained.is_empty() {
+            drain_record(&mut rec, &drained);
         }
         let exists = kept.id != 0 && self.state.allocs.contains_key(&kept.id);
         let snapshot = !exists
@@ -251,7 +395,7 @@ impl Inner {
         let mut fixed = Vec::with_capacity(FIXED);
         fixed.extend_from_slice(&TAG);
         fixed.extend_from_slice(&e.to_le_bytes());
-        fixed.extend_from_slice(&(self.cons.budget as f32).to_bits().to_le_bytes());
+        fixed.extend_from_slice(&(self.cons.kappa as f32).to_bits().to_le_bytes());
         fixed.extend_from_slice(&kid(self.cons.cursor).to_le_bytes());
         fixed.extend_from_slice(&koff(self.cons.cursor).to_le_bytes());
         if snapshot {
@@ -292,8 +436,9 @@ impl Inner {
         Ok(())
     }
 
-    /// The snapshot: one record per epoch, naming every allocation whose
-    /// `last_written` the pages holding it after this flush would not give.
+    /// The snapshot: one age record per epoch, naming every allocation whose
+    /// `last_written` the pages holding it after this flush would not give;
+    /// then one drain record, of every page no fuller than a page may close.
     fn snapshot(&self, own: u32) -> Vec<u8> {
         let e = self.state.flush_epoch;
         let mut fallback: IdMap<u64> = IdMap::default();
@@ -322,7 +467,16 @@ impl Inner {
         let mut out = Vec::new();
         for (epoch, mut ids) in by_epoch {
             ids.sort_unstable();
-            record(&mut out, epoch, &ids);
+            age_record(&mut out, epoch, &ids);
+        }
+        let cap = ((1.0 - self.opts.theta) * crate::consts::MAX_PAGE_CONTENT as f64) as u32;
+        let below = (2..self.file_pages).filter(|&p| {
+            let c = self.state.pages[p as usize].coverage;
+            c > 0 && c <= cap
+        });
+        let entries = self.drain_entries(below);
+        if !entries.is_empty() {
+            drain_record(&mut out, &entries);
         }
         out
     }

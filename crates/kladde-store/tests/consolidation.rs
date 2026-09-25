@@ -213,7 +213,7 @@ fn compaction_moves_full_table_pages_too() {
 }
 
 #[test]
-fn the_budget_survives_a_reopen() {
+fn the_price_of_space_survives_a_reopen() {
     let storage = MemoryStorage::new();
     let store = Store::create(Box::new(storage.clone()), Options::default()).unwrap();
     let p = store.alloc(0).unwrap();
@@ -221,12 +221,64 @@ fn the_budget_survives_a_reopen() {
         store.write(p.raw(), f * 100, &[1; 100]).unwrap();
         store.flush().unwrap();
     }
-    let budget = store.stats().budget;
-    assert_ne!(budget, Options::default().budget_pages as u64);
+    let kappa = store.stats().kappa;
+    assert_ne!(kappa, Options::default().kappa);
     drop(store);
     let store = Store::open(Box::new(storage), Options::default()).unwrap();
-    assert_eq!(store.stats().budget, budget);
+    // Kept as an `f32`.
+    assert_eq!(store.stats().kappa, kappa as f32 as f64);
     assert_eq!(store.allocations().len(), 1);
+}
+
+#[test]
+fn estimates_survive_a_reopen() {
+    // Half of every page's content is overwritten, so pages drain; their
+    // estimates must come back from the consolidator state, not from the
+    // seed that assumes one rate since each page was written. Nothing is
+    // ripe at this price, and the window walks nothing, so few pages lose
+    // content to consolidation after their estimates are recorded, which a
+    // reopen takes for a loss in the gap.
+    let opts = Options {
+        kappa: 1e-6,
+        target_fill: 0.0,
+        walk: 0,
+        ..Default::default()
+    };
+    let rate = |&(_, rho, at): &(u32, f32, u64), now: u64| {
+        rho as f64 * (-0.1 * now.saturating_sub(at) as f64).exp()
+    };
+    let storage = MemoryStorage::new();
+    let store = Store::create(Box::new(storage.clone()), opts.clone()).unwrap();
+    let ptrs: Vec<_> = (0..64).map(|_| store.alloc(4000).unwrap()).collect();
+    for p in &ptrs {
+        store.write(p.raw(), 0, &[1; 4000]).unwrap();
+    }
+    store.flush().unwrap();
+    for (i, p) in ptrs.iter().enumerate() {
+        store
+            .write(p.raw(), (i % 2) as u32 * 2000, &[2; 2000])
+            .unwrap();
+        store.flush().unwrap();
+    }
+    let now = store.stats().flushes + 1;
+    let before = store.describe_drains();
+    drop(store);
+    let store = Store::open(Box::new(storage), opts).unwrap();
+    let after = store.describe_drains();
+    let same = before
+        .iter()
+        .filter(|b| {
+            after
+                .iter()
+                .any(|a| a.0 == b.0 && (rate(a, now) - rate(b, now)).abs() <= 0.01 * rate(b, now))
+        })
+        .count();
+    assert!(before.len() >= 60, "{before:?}");
+    assert!(
+        same * 10 >= before.len() * 9,
+        "{same} of {} estimates survived: {before:?} {after:?}",
+        before.len()
+    );
 }
 
 #[test]

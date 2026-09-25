@@ -6,6 +6,7 @@ use std::num::NonZeroU32;
 
 use crate::consts::{MAX_PAGE_CONTENT, PAGE_SIZE};
 use crate::hash::{IdMap, IdSet};
+pub use crate::ripeness::{Drain, Ripeness};
 use crate::statement::Kind;
 
 /// A fragment-map key: `(id, offset)` packed with the id in the high half, so
@@ -238,9 +239,8 @@ pub struct PageInfo {
     pub parent: u32,
     /// Its content size when written.
     pub written: u16,
-    /// Bucket membership: 255 for none.
-    pub bucket: u8,
-    pub slot: u32,
+    /// How fast its content still dies.
+    pub drain: Drain,
 }
 
 impl Default for PageInfo {
@@ -251,30 +251,8 @@ impl Default for PageInfo {
             coverage: 0,
             parent: 0,
             written: 0,
-            bucket: NO_BUCKET,
-            slot: 0,
+            drain: Drain::default(),
         }
-    }
-}
-
-pub const NO_BUCKET: u8 = 255;
-/// Buckets per page kind.
-pub const BUCKETS: usize = 16;
-
-/// Pages bucketed by live fraction, for `O(1)` victim selection.
-#[derive(Debug, Default)]
-pub struct Buckets {
-    pub lists: [Vec<u32>; BUCKETS],
-}
-
-impl Buckets {
-    pub fn bucket_of(coverage: u32) -> u8 {
-        ((coverage as usize * BUCKETS) / (MAX_PAGE_CONTENT + 1)).min(BUCKETS - 1) as u8
-    }
-
-    /// The sparsest non-empty bucket.
-    pub fn lowest_non_empty(&self) -> Option<usize> {
-        self.lists.iter().position(|l| !l.is_empty())
     }
 }
 
@@ -349,8 +327,15 @@ pub struct State {
     pub allocs: IdMap<AllocationMeta>,
     pub recyclable: BTreeMap<u32, Recyclable>,
     pub pages: Vec<PageInfo>,
-    pub data_buckets: Buckets,
-    pub table_buckets: Buckets,
+    /// Live data pages and leaves ranked by ripeness.
+    pub ripeness: Ripeness,
+    /// Whether coverage the flush releases now is a natural loss: one the
+    /// application's writes, frees, and shrinks caused, as opposed to
+    /// consolidation moving content.
+    pub natural: bool,
+    /// Page -> `(lost, live)`: the natural losses of the flush in progress,
+    /// and the page's coverage before the first of them.
+    pub losses: IdMap<(u32, u32)>,
     /// Data page -> `(id, lo, hi)`: ids that may have bytes in it, and the
     /// window of offsets they may occupy. A superset, pruned on use.
     pub reverse: IdMap<Vec<(u32, u32, u32)>>,
@@ -371,8 +356,9 @@ impl Default for State {
             allocs: IdMap::default(),
             recyclable: BTreeMap::new(),
             pages: Vec::new(),
-            data_buckets: Buckets::default(),
-            table_buckets: Buckets::default(),
+            ripeness: Ripeness::default(),
+            natural: false,
+            losses: IdMap::default(),
             reverse: IdMap::default(),
             pending: Vec::new(),
             dropped_candidates: IdSet::default(),
@@ -404,62 +390,36 @@ impl State {
         }
     }
 
-    /// The bucket `page` belongs in: live data pages and leaves by coverage,
-    /// and nothing for a page with no coverage left, which is no victim.
-    fn wanted_bucket(&self, page: u32) -> u8 {
-        let info = &self.pages[page as usize];
-        match info.state {
-            PageState::Data | PageState::Table if info.coverage > 0 => {
-                Buckets::bucket_of(info.coverage)
-            }
-            _ => NO_BUCKET,
-        }
+    /// Marks `page` for ranking again: its coverage, state, or estimate
+    /// changed.
+    #[inline]
+    pub fn rerank(&mut self, page: u32) {
+        self.ripeness.stale.insert(page);
     }
 
-    /// Moves `page` to the bucket its coverage calls for, or out of buckets.
-    pub fn rebucket(&mut self, page: u32) {
-        let want = self.wanted_bucket(page);
-        if self.pages[page as usize].bucket == want {
-            return;
-        }
-        self.unbucket(page);
-        if want != NO_BUCKET {
-            let is_data = self.pages[page as usize].state == PageState::Data;
-            let buckets = if is_data {
-                &mut self.data_buckets
-            } else {
-                &mut self.table_buckets
+    /// Takes `page` out of the ranking at once, before its state changes.
+    pub fn unrank(&mut self, page: u32) {
+        self.ripeness.remove(page);
+        self.ripeness.stale.remove(&page);
+    }
+
+    /// Ranks every stale page again as of `now`: a live data page or leaf
+    /// with coverage at most `cap`, written before the flush in progress;
+    /// anything else leaves the ranking.
+    pub fn refresh_ranking(&mut self, now: u64, cap: u32) {
+        for page in std::mem::take(&mut self.ripeness.stale) {
+            let Some(info) = self.pages.get(page as usize) else {
+                self.ripeness.remove(page);
+                continue;
             };
-            let list = &mut buckets.lists[want as usize];
-            let slot = list.len() as u32;
-            list.push(page);
-            let info = &mut self.pages[page as usize];
-            info.bucket = want;
-            info.slot = slot;
+            let live = matches!(info.state, PageState::Data | PageState::Table);
+            if live && info.coverage > 0 && info.coverage <= cap && info.epoch < now {
+                let u = info.coverage as f64 / MAX_PAGE_CONTENT as f64;
+                self.ripeness.insert(page, u, info.drain, now);
+            } else {
+                self.ripeness.remove(page);
+            }
         }
-    }
-
-    /// Takes `page` out of its bucket, before its state changes.
-    pub fn unbucket(&mut self, page: u32) {
-        let info = self.pages[page as usize];
-        if info.bucket == NO_BUCKET {
-            return;
-        }
-        let in_data =
-            self.data_buckets.lists[info.bucket as usize].get(info.slot as usize) == Some(&page);
-        let buckets = if in_data {
-            &mut self.data_buckets
-        } else {
-            &mut self.table_buckets
-        };
-        let list = &mut buckets.lists[info.bucket as usize];
-        let slot = info.slot as usize;
-        list.swap_remove(slot);
-        if slot < list.len() {
-            let moved = list[slot];
-            self.pages[moved as usize].slot = slot as u32;
-        }
-        self.pages[page as usize].bucket = NO_BUCKET;
     }
 
     #[inline]
@@ -468,9 +428,7 @@ impl State {
             return;
         }
         self.pages[page as usize].coverage += n;
-        if self.wanted_bucket(page) != self.pages[page as usize].bucket {
-            self.rebucket(page);
-        }
+        self.rerank(page);
     }
 
     #[inline]
@@ -480,11 +438,13 @@ impl State {
         }
         let info = &mut self.pages[page as usize];
         debug_assert!(info.coverage >= n, "coverage of page {page} underflows");
+        if self.natural {
+            let e = self.losses.entry(page).or_insert((0, info.coverage));
+            e.0 += n;
+        }
         info.coverage -= n;
         self.dropped_candidates.insert(page);
-        if self.wanted_bucket(page) != self.pages[page as usize].bucket {
-            self.rebucket(page);
-        }
+        self.rerank(page);
     }
 
     // ------------------------------------------------------------ allocations

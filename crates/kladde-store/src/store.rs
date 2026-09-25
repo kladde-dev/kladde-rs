@@ -496,6 +496,26 @@ impl Store {
         out
     }
 
+    /// Every live data page and leaf no fuller than a page may close, with
+    /// its estimate: `(page, rate at the estimate's epoch, that epoch)`. For
+    /// tests.
+    #[doc(hidden)]
+    pub fn describe_drains(&self) -> Vec<(u32, f32, u64)> {
+        let i = self.inner.borrow();
+        let cap = ((1.0 - i.opts.theta) * MAX_PAGE_CONTENT as f64) as u32;
+        (2..i.state.pages.len())
+            .filter_map(|p| {
+                let info = &i.state.pages[p];
+                let live = matches!(info.state, PageState::Data | PageState::Table);
+                (live && info.coverage > 0 && info.coverage <= cap).then_some((
+                    p as u32,
+                    info.drain.rho,
+                    info.drain.at,
+                ))
+            })
+            .collect()
+    }
+
     /// Checks the in-memory invariants, panicking at the first violation.
     ///
     /// Takes time linear in the size of the in-memory state; meant for

@@ -1,12 +1,14 @@
-//! Consolidation (`impl/consolidation.md`): evacuating sparse data pages,
-//! in the room of pages the flush writes anyway and on pages of their own,
-//! and the controller that paces it.
+//! Consolidation by ripeness (`drafts/ripeness.md`, on top of
+//! `impl/consolidation.md`): evacuating the pages for which waiting no
+//! longer pays, in the room of pages the flush writes anyway and on pages of
+//! their own, and the controller that sets the price of space.
 
 use crate::consts::MAX_PAGE_CONTENT;
 use crate::defrag::{Candidate, Weighed};
 use crate::error::Error;
 use crate::flush::{DataPage, Output};
 use crate::hash::{IdMap, IdSet};
+use crate::ripeness::BETA;
 use crate::state::*;
 use crate::stats::Stats;
 use crate::store::Inner;
@@ -19,29 +21,53 @@ const C: u32 = MAX_PAGE_CONTENT as u32;
 /// statements lose the dense delta encoding of their old neighbours.
 const RESTATE: f64 = 1.25;
 
+/// The most ripe pages one offer considers.
+const CANDIDATES: usize = 64;
+
+/// The cursor gives up a page older than this many epochs, and leaves the
+/// rest of it to ripeness.
+const W: u64 = 8;
+
+/// The bounds of the price of space.
+const KAPPA_MIN: f64 = 1e-6;
+const KAPPA_MAX: f64 = 1.0;
+
 /// What consolidation carries from flush to flush.
 #[derive(Debug, Default)]
 pub struct ConsState {
     /// The rotating window's cursor.
     pub cursor: Key,
-    /// The per-flush budget in pages, as the controller moved it.
-    pub budget: f64,
-    /// Where sampling starts within a bucket; rotates so that no prefix of
-    /// a bucket is examined forever.
-    pub rot: usize,
+    /// The price of space, as the controller moved it: the page writes that
+    /// a page of garbage kept for one flush is worth.
+    pub kappa: f64,
     /// Victims this flush found unusable, so that it does not pick them again.
     pub skip: IdSet,
     /// Description defragmentation's candidates from the latest walk, for
     /// the next flush.
     pub candidates: Vec<Candidate>,
-    /// This flush's candidates beyond its share, for free filling.
-    pub spare: Vec<Candidate>,
     /// Whether this flush runs in compaction mode.
     pub compaction: bool,
     /// Where the search for the highest live page resumes.
     pub tail: u32,
     /// Where the consolidator state is kept.
     pub kept: crate::constate::Kept,
+    /// The data page whose survivors fill the room of the flush's own pages.
+    pub cursor_page: Option<u32>,
+    /// The data pages of the latest flush that wrote any, where the cursor
+    /// finds its next page.
+    pub prev_data_pages: Vec<u32>,
+    /// The pages the latest flush wrote, whether data, and their coverage
+    /// then: what they lose next is what fresh pages lose.
+    pub just_written: Vec<(u32, bool, u32)>,
+    /// What pages lose in the flush after they are written, for data pages
+    /// and for leaves: the rate fresh content starts from.
+    pub fresh: [Option<f64>; 2],
+    /// Pages whose estimate this flush changed, for the consolidator state.
+    pub drained: Vec<u32>,
+    /// Victims this flush took, anywhere.
+    pub cleaned: u32,
+    /// Whether this flush spent its whole budget.
+    pub exhausted: bool,
 }
 
 /// A live fragment in a data page being evacuated.
@@ -62,7 +88,7 @@ impl Survivor {
     }
 }
 
-/// What one budgeted page would hold, and what it would reclaim.
+/// What one budgeted page would hold.
 #[derive(Debug, Default)]
 struct Offer {
     /// Victims evacuated, or rewritten, whole.
@@ -70,9 +96,9 @@ struct Offer {
     /// One more victim whose survivors fill the page and lead the next one.
     cut: Option<u32>,
     /// Whether the offer holds compaction mode's tail, which the budget
-    /// takes whatever the offer's ratio and fill.
+    /// takes whatever the offer's fill.
     tail: bool,
-    reclaimed: f64,
+    /// The bytes it would write.
     written: f64,
     /// How full the page would close, as a fraction of its capacity.
     fill: f64,
@@ -82,6 +108,8 @@ impl Inner {
     /// Resets what consolidation keeps for one flush only.
     pub(crate) fn begin_consolidation(&mut self) {
         self.cons.skip.clear();
+        self.cons.cleaned = 0;
+        self.cons.exhausted = false;
         // Compaction mode: while holes below the highest live page exceed a
         // share of the file, that page is every mechanism's first victim.
         self.cons.tail = self.file_pages.saturating_sub(1);
@@ -144,60 +172,63 @@ impl Inner {
 
     // ------------------------------------------------------------ victims
 
-    /// LFS's cost-benefit score: sparse and long untouched first.
-    fn score(&self, p: u32) -> f64 {
-        let info = &self.state.pages[p as usize];
-        let u = info.coverage as f64 / C as f64;
-        let age = self.state.flush_epoch.saturating_sub(info.epoch) as f64;
-        (1.0 - u) * age / (1.0 + u)
-    }
-
-    /// Up to `sample` pages of a bucket, from a rotating start.
-    fn sample(&mut self, data: bool, bucket: usize) -> Vec<u32> {
-        let k = self.opts.sample.max(1);
-        let buckets = if data {
-            &self.state.data_buckets
-        } else {
-            &self.state.table_buckets
-        };
-        let list = &buckets.lists[bucket];
-        let n = list.len();
-        if n == 0 {
-            return Vec::new();
-        }
-        let start = self.cons.rot % n;
-        self.cons.rot = self.cons.rot.wrapping_add(1);
-        (0..k.min(n)).map(|i| list[(start + i) % n]).collect()
-    }
-
-    /// The best-scoring of the pages sampled from buckets `from..` that pass
-    /// `ok`, stopping at the first bucket that yields one, or at a bucket
-    /// whose pages all hold more than `max` bytes.
-    fn pick_victim(
+    /// Up to `limit` pages ripe at the current price, highest index first:
+    /// of kind `kind` if given, holding at most `max` bytes, and neither in
+    /// `exclude` nor taken or found unusable by this flush already.
+    fn ripe_pages(
         &mut self,
-        data: bool,
-        from: usize,
+        kind: Option<PageState>,
         max: u32,
-        ok: &dyn Fn(&Inner, u32) -> bool,
-    ) -> Option<u32> {
-        for b in from..BUCKETS {
-            let lower = (b as u64 * (C as u64 + 1)).div_ceil(BUCKETS as u64) as u32;
-            if lower > max {
-                return None;
-            }
-            let best = self
-                .sample(data, b)
-                .into_iter()
-                .filter(|&p| {
-                    let cov = self.state.pages[p as usize].coverage;
-                    cov > 0 && cov <= max && !self.cons.skip.contains(&p) && ok(self, p)
-                })
-                .max_by(|&x, &y| self.score(x).total_cmp(&self.score(y)));
-            if best.is_some() {
-                return best;
-            }
+        exclude: &IdSet,
+        limit: usize,
+    ) -> Vec<u32> {
+        let now = self.state.flush_epoch;
+        let cap = ((1.0 - self.opts.theta) * C as f64) as u32;
+        self.state.refresh_ranking(now, cap);
+        let pages = &self.state.pages;
+        let (skip, rewritten) = (&self.cons.skip, &self.flush_rewritten);
+        let drain = |p: u32| pages[p as usize].drain;
+        let mut ok = |p: u32| {
+            let info = &pages[p as usize];
+            kind.is_none_or(|k| info.state == k)
+                && info.coverage <= max
+                && !exclude.contains(&p)
+                && !skip.contains(&p)
+                && !rewritten.contains(&p)
+        };
+        self.state
+            .ripeness
+            .ripe(now, self.cons.kappa, &drain, &mut ok, limit)
+    }
+
+    /// The cursor page, which the room of the flush's own pages takes
+    /// survivors from: the current one while it has content and is at most
+    /// `W` epochs old, else the least-filled data page of the latest earlier
+    /// flush that wrote any.
+    fn cursor_page(&mut self) -> Option<u32> {
+        let now = self.state.flush_epoch;
+        // A truncation may have taken the page away since.
+        let usable = |p: u32, i: &Inner| {
+            i.state.pages.get(p as usize).is_some_and(|info| {
+                info.state == PageState::Data
+                    && info.coverage > 0
+                    && info.epoch < now
+                    && now - info.epoch <= W
+                    && !i.cons.skip.contains(&p)
+            })
+        };
+        if let Some(p) = self.cons.cursor_page.filter(|&p| usable(p, self)) {
+            return Some(p);
         }
-        None
+        let next = self
+            .cons
+            .prev_data_pages
+            .iter()
+            .copied()
+            .filter(|&p| usable(p, self))
+            .min_by_key(|&p| self.state.pages[p as usize].coverage);
+        self.cons.cursor_page = next;
+        next
     }
 
     /// The live fragments pointing into data page `v`, in key order. Narrows
@@ -309,6 +340,7 @@ impl Inner {
         self.relocate(&surv, dp, dirty)?;
         self.stats.evacuated_pages += 1;
         self.stats.evacuated_bytes += total as u64;
+        self.cons.cleaned += 1;
         Ok(true)
     }
 
@@ -343,57 +375,54 @@ impl Inner {
         }
         self.stats.evacuated_pages += 1;
         self.stats.evacuated_bytes += total;
+        self.cons.cleaned += 1;
         Ok(rest)
     }
 
     // ------------------------------------------------------------ free filling
 
-    /// Fills the room of `open`, a page the flush writes anyway, with what
-    /// costs nothing to move there: whole victims that fit, then as many of
-    /// one victim's statements as fit, a whole statement's survivors at a
-    /// time.
+    /// Fills the room of `open`, a page the flush writes anyway: in
+    /// compaction mode with the tail first, whenever it fits and `open` lies
+    /// below it; then with whole ripe victims whose survivors take at most
+    /// `θ` of a page, highest index first; then with the cursor page's
+    /// survivors, a whole statement's at a time.
     pub(crate) fn free_fill(
         &mut self,
         open: &mut DataPage,
         dirty: &mut Dirty,
     ) -> Result<(), Error> {
-        while let Some(b) = self.state.data_buckets.lowest_non_empty() {
+        loop {
             let room = open.room() as u32;
-            if room == 0 {
-                return Ok(());
-            }
-            // In compaction mode, the tail first whenever it fits, and `open`
-            // lies below it.
             let tail = self
                 .compaction_tail(true)
                 .filter(|&t| open.page < t && self.state.pages[t as usize].coverage <= room);
-            let Some(v) = tail.or_else(|| self.pick_victim(true, b, room, &|_, _| true)) else {
-                break;
-            };
-            if self.evacuate_into(v, open, dirty)? {
+            let Some(t) = tail else { break };
+            if self.evacuate_into(t, open, dirty)? {
                 self.stats.free_filled_pages += 1;
             }
         }
-        self.fill_with_candidates(open, dirty)?;
-        match self.state.data_buckets.lowest_non_empty() {
-            Some(b) if open.room() > 0 => self.fill_with_part(b, open, dirty),
-            _ => Ok(()),
+        let small = ((self.opts.theta * C as f64) as u32).min(open.room() as u32);
+        if small > 0 {
+            let none = IdSet::default();
+            for v in self.ripe_pages(Some(PageState::Data), small, &none, CANDIDATES) {
+                let cov = self.state.pages[v as usize].coverage;
+                if cov as usize <= open.room() && self.evacuate_into(v, open, dirty)? {
+                    self.stats.free_filled_pages += 1;
+                }
+            }
         }
+        if open.room() > 0 {
+            if let Some(c) = self.cursor_page() {
+                self.fill_from(c, open, dirty)?;
+            }
+        }
+        Ok(())
     }
 
-    /// Moves the survivors of as many of one victim's statements as fit into
-    /// `open`, each statement's all or none; the victim is the best-scoring
-    /// sample of bucket `b`, the sparsest. It stays a victim, only a sparser
-    /// one.
-    fn fill_with_part(
-        &mut self,
-        b: usize,
-        open: &mut DataPage,
-        dirty: &mut Dirty,
-    ) -> Result<(), Error> {
-        let Some(v) = self.pick_victim(true, b, C, &|_, _| true) else {
-            return Ok(());
-        };
+    /// Moves the survivors of as many of `v`'s statements as fit into
+    /// `open`, each statement's all or none. What stays behind is left to
+    /// later flushes.
+    fn fill_from(&mut self, v: u32, open: &mut DataPage, dirty: &mut Dirty) -> Result<(), Error> {
         let Some(surv) = self.all_survivors(v) else {
             return Ok(());
         };
@@ -424,11 +453,11 @@ impl Inner {
     // ------------------------------------------------------------ the budget
 
     /// What one budgeted page could hold after `carry` bytes that must lead
-    /// it: whole victims within the churn floor, best score first, then, if
-    /// `may_cut` and the page would close more than θ empty, one more victim
-    /// cut at the page boundary.
+    /// it: in compaction mode the tail first, whatever its fill; then ripe
+    /// data pages, highest index first, whole while they fit, and, if
+    /// `may_cut` and the page would close more than θ empty, the first one
+    /// that does not fit, cut at the page boundary.
     fn data_offer(&mut self, carry: u32, may_cut: bool) -> Option<Offer> {
-        let max = (C as f64 / (1.0 + self.opts.churn_floor)) as u32;
         let mut room = C - carry;
         let mut offer = Offer::default();
         let mut chosen = IdSet::default();
@@ -450,36 +479,26 @@ impl Inner {
             if taken {
                 chosen.insert(t);
                 offer.tail = true;
-                offer.reclaimed += C as f64;
                 offer.written += cov as f64;
             }
         }
-        while let Some(b) = self.state.data_buckets.lowest_non_empty() {
-            if offer.cut.is_some() {
-                break;
-            }
-            let not_chosen = |_: &Inner, p: u32| !chosen.contains(&p);
-            let Some(v) = self.pick_victim(true, b, room.min(max), &not_chosen) else {
-                break;
-            };
-            let cov = self.state.pages[v as usize].coverage;
-            chosen.insert(v);
-            offer.whole.push(v);
-            offer.reclaimed += (C - cov) as f64;
-            offer.written += cov as f64;
-            room -= cov;
-        }
-        if may_cut && room as f64 > self.opts.theta * C as f64 && room < max {
-            let from = Buckets::bucket_of(room + 1) as usize;
-            let too_big = |i: &Inner, p: u32| {
-                !chosen.contains(&p) && i.state.pages[p as usize].coverage > room
-            };
-            if let Some(v) = self.pick_victim(true, from, max, &too_big) {
+        if offer.cut.is_none() && room > 0 {
+            let theta = self.opts.theta * C as f64;
+            for v in self.ripe_pages(Some(PageState::Data), C, &chosen, CANDIDATES) {
                 let cov = self.state.pages[v as usize].coverage;
-                offer.cut = Some(v);
-                offer.reclaimed += (C - cov) as f64;
-                offer.written += cov as f64;
-                room = 0;
+                if cov <= room {
+                    offer.whole.push(v);
+                    offer.written += cov as f64;
+                    room -= cov;
+                    if room == 0 {
+                        break;
+                    }
+                } else if may_cut && room as f64 > theta {
+                    offer.cut = Some(v);
+                    offer.written += cov as f64;
+                    room = 0;
+                    break;
+                }
             }
         }
         if offer.whole.is_empty() && offer.cut.is_none() {
@@ -489,19 +508,19 @@ impl Inner {
         Some(offer)
     }
 
-    /// Spends the flush's budget: pages opened only to reclaim, one at a
-    /// time, each only if its offer passes the churn floor and fills it. A
+    /// Spends the flush's budget, a cap on its work: pages opened only to
+    /// take ripe victims, one at a time, each only if its offer fills it. A
     /// survivor cut at one page's end leads the next, which is opened
-    /// whatever its own offer, so the budget's last page cuts nothing. An
-    /// offer holding compaction mode's tail passes whatever its ratio and
-    /// fill, and goes first, since the budget alone paces the mode.
+    /// whatever its own offer, so the budget's last page cuts nothing. The
+    /// page kind of the highest ripe page goes first; an offer holding
+    /// compaction mode's tail passes whatever its fill, and goes first, since
+    /// the budget alone paces the mode.
     pub(crate) fn budget_loop(&mut self, dirty: &mut Dirty, out: &mut Output) -> Result<(), Error> {
-        let pages = self.cons.budget.round().max(0.0) as u32;
-        let (lambda, theta) = (self.opts.churn_floor, self.opts.theta);
-        let good =
-            |o: &Offer| o.tail || (o.reclaimed >= lambda * o.written && o.fill >= 1.0 - theta);
-        let ratio = |o: &Offer| o.reclaimed / o.written.max(1.0);
+        let pages = self.opts.budget_pages;
+        let theta = self.opts.theta;
+        let good = |o: &Offer| o.tail || o.fill >= 1.0 - theta;
         let mut carry: Vec<Survivor> = Vec::new();
+        self.cons.exhausted = true;
         for i in 0..pages {
             let carry_len: u32 = carry.iter().map(Survivor::len).sum();
             let data = self.data_offer(carry_len, i + 1 < pages);
@@ -511,14 +530,23 @@ impl Inner {
             } else {
                 let data = data.filter(good);
                 let table = self.table_offer().filter(good);
+                let data_first = |i: &mut Inner| {
+                    let none = IdSet::default();
+                    let top = i.ripe_pages(None, C, &none, 1);
+                    top.first()
+                        .is_none_or(|&p| i.state.pages[p as usize].state == PageState::Data)
+                };
                 match (data, table) {
-                    (Some(d), Some(t)) if d.tail || (!t.tail && ratio(&d) >= ratio(&t)) => Some(d),
+                    (Some(d), Some(t)) if d.tail || (!t.tail && data_first(self)) => Some(d),
                     (_, Some(t)) => {
                         self.rewrite_table_victims(&t.whole, dirty)?;
                         continue;
                     }
                     (Some(d), None) => Some(d),
-                    (None, None) => break,
+                    (None, None) => {
+                        self.cons.exhausted = false;
+                        break;
+                    }
                 }
             };
             let mut dp = self.new_data_page()?;
@@ -540,12 +568,11 @@ impl Inner {
         Ok(())
     }
 
-    /// What rewriting table victims onto one budgeted leaf would hold and
-    /// reclaim, their restatements estimated from coverage, without taking
-    /// anything: the tail first in compaction mode, whatever its size, then
-    /// whole victims within the churn floor, best score first.
+    /// What rewriting table victims onto one budgeted leaf would hold, their
+    /// restatements estimated from coverage, without taking anything: the
+    /// tail first in compaction mode, whatever its size, then ripe leaves,
+    /// highest index first, while they fit.
     fn table_offer(&mut self) -> Option<Offer> {
-        let max = (C as f64 / (1.0 + self.opts.churn_floor)) as u32;
         let mut room = C as f64;
         let mut offer = Offer::default();
         let mut chosen = IdSet::default();
@@ -554,22 +581,19 @@ impl Inner {
             chosen.insert(t);
             offer.whole.push(t);
             offer.tail = true;
-            offer.reclaimed += C as f64;
             offer.written += cov as f64 * RESTATE;
             room -= cov as f64 * RESTATE;
         }
-        while let Some(b) = self.state.table_buckets.lowest_non_empty() {
-            let fresh = |i: &Inner, p: u32| !chosen.contains(&p) && !i.flush_rewritten.contains(&p);
-            let limit = ((room.max(0.0) / RESTATE) as u32).min(max);
-            let Some(v) = self.pick_victim(false, b, limit, &fresh) else {
-                break;
-            };
-            let cov = self.state.pages[v as usize].coverage;
-            chosen.insert(v);
-            offer.whole.push(v);
-            offer.reclaimed += (C - cov) as f64;
-            offer.written += cov as f64 * RESTATE;
-            room -= cov as f64 * RESTATE;
+        if room > 0.0 {
+            let limit = (room / RESTATE) as u32;
+            for v in self.ripe_pages(Some(PageState::Table), limit, &chosen, CANDIDATES) {
+                let w = self.state.pages[v as usize].coverage as f64 * RESTATE;
+                if w <= room {
+                    offer.whole.push(v);
+                    offer.written += w;
+                    room -= w;
+                }
+            }
         }
         if offer.whole.is_empty() {
             return None;
@@ -585,6 +609,7 @@ impl Inner {
             self.rewrite_table_page(v, dirty)?;
             self.flush_rewritten.insert(v);
             self.stats.table_rewrites += 1;
+            self.cons.cleaned += 1;
         }
         Ok(())
     }
@@ -601,9 +626,10 @@ impl Inner {
                 .is_ok_and(|ids| ids.iter().all(|id| !main.records.contains_key(id)))
     }
 
-    /// The fillers of the cut's last page: whole table victims that fit its
-    /// `room`, then the rotating window. Takes into `fillers`, and returns
-    /// the victims.
+    /// The fillers of the cut's last page: in compaction mode the tail,
+    /// whenever it fits its `room`, then ripe leaves that fit, highest index
+    /// first, then the rotating window. Takes into `fillers`, and returns the
+    /// victims.
     pub(crate) fn cut_fillers(
         &mut self,
         room: usize,
@@ -612,16 +638,24 @@ impl Inner {
     ) -> Result<Vec<u32>, Error> {
         let mut room = room as f64;
         let mut victims = Vec::new();
-        while let Some(b) = self.state.table_buckets.lowest_non_empty() {
+        loop {
             let limit = (room / RESTATE) as u32;
             let tail = self.compaction_victim(false).filter(|&t| {
                 self.state.pages[t as usize].coverage <= limit && self.filler_eligible(t, main)
             });
-            let eligible = |i: &Inner, p: u32| i.filler_eligible(p, main);
-            let Some(v) = tail.or_else(|| self.pick_victim(false, b, limit, &eligible)) else {
-                break;
-            };
+            let Some(v) = tail else { break };
             room -= self.state.pages[v as usize].coverage as f64 * RESTATE;
+            self.rewrite_table_victims(&[v], fillers)?;
+            victims.push(v);
+        }
+        let limit = (room / RESTATE) as u32;
+        let none = IdSet::default();
+        for v in self.ripe_pages(Some(PageState::Table), limit, &none, CANDIDATES) {
+            let w = self.state.pages[v as usize].coverage as f64 * RESTATE;
+            if w > room || !self.filler_eligible(v, main) {
+                continue;
+            }
+            room -= w;
             self.rewrite_table_victims(&[v], fillers)?;
             victims.push(v);
         }
@@ -728,31 +762,79 @@ impl Inner {
         self.stats.window_restated += take.len() as u64;
     }
 
-    /// Moves the budget toward the target fill, after each commit. The fill
-    /// is measured against the whole file, so that holes count against it as
-    /// much as sparse pages do.
+    /// Moves the price of space toward the target fill, after each commit:
+    /// up while the data pages and leaves are emptier than the target, which
+    /// makes fuller pages ripe, and down while they are fuller. Those pages
+    /// answer a change of price within a flush, where the whole file, whose
+    /// freed pages stay free until new writes reuse them, would answer it
+    /// only much later; holes are compaction mode's to return. The price
+    /// holds where moving it could change nothing: it does not fall after a
+    /// flush that cleaned nothing, nor rise after one that spent its whole
+    /// budget.
     pub(crate) fn after_commit(&mut self) -> Result<(), Error> {
         if !self.opts.consolidate {
             return Ok(());
         }
-        let mut live = 0u64;
+        let (mut live, mut pages) = (0u64, 0u64);
         for info in self.state.pages.iter().skip(2) {
-            if matches!(
-                info.state,
-                PageState::Data | PageState::Table | PageState::Interior
-            ) {
+            if matches!(info.state, PageState::Data | PageState::Table) {
                 live += info.coverage as u64;
+                pages += 1;
             }
         }
-        let pages = self.file_pages.saturating_sub(2) as u64;
         if pages == 0 {
             return Ok(());
         }
         let fill = live as f64 / (pages as f64 * C as f64);
-        let step = (4.0 * (self.opts.target_fill - fill)).exp();
-        let (lo, hi) = (self.opts.budget_min as f64, self.opts.budget_max as f64);
-        self.cons.budget = (self.cons.budget.max(1.0) * step).clamp(lo, hi);
+        let miss = self.opts.target_fill - fill;
+        let held = (miss < 0.0 && self.cons.cleaned == 0) || (miss > 0.0 && self.cons.exhausted);
+        if !held {
+            let step = (self.opts.kappa_gain * miss).exp();
+            self.cons.kappa = (self.cons.kappa * step).clamp(KAPPA_MIN, KAPPA_MAX);
+        }
         Ok(())
+    }
+
+    /// Turns the natural losses the flush has recorded since the last call
+    /// into estimates: each page that lost content drains that much faster.
+    /// On the flush's first call, what the pages the previous flush wrote
+    /// have lost also updates the rate that fresh content starts from.
+    pub(crate) fn apply_losses(&mut self, first: bool) {
+        let now = self.state.flush_epoch;
+        let losses = std::mem::take(&mut self.state.losses);
+        if first {
+            let mut sums = [(0u64, 0u64); 2];
+            for &(p, data, coverage) in &self.cons.just_written {
+                let lost = losses.get(&p).map_or(0, |l| l.0);
+                let s = &mut sums[usize::from(!data)];
+                s.0 += lost as u64;
+                s.1 += coverage as u64;
+            }
+            let alpha = 1.0 - (-BETA).exp();
+            for (fresh, (lost, live)) in self.cons.fresh.iter_mut().zip(sums) {
+                if live > 0 {
+                    let seen = lost as f64 / live as f64;
+                    *fresh = Some(fresh.map_or(seen, |f| f + alpha * (seen - f)));
+                }
+            }
+            // The estimates those pages started from are recorded too.
+            let just_written = std::mem::take(&mut self.cons.just_written);
+            self.cons.drained = just_written.into_iter().map(|(p, ..)| p).collect();
+        }
+        for (p, (lost, live)) in losses {
+            let info = &mut self.state.pages[p as usize];
+            if !matches!(info.state, PageState::Data | PageState::Table) {
+                continue;
+            }
+            info.drain.lose(lost, live, now);
+            self.state.rerank(p);
+            self.cons.drained.push(p);
+        }
+    }
+
+    /// The rate fresh content of a data page (`data`) or a leaf starts from.
+    pub(crate) fn fresh_rate(&self, data: bool) -> f64 {
+        self.cons.fresh[usize::from(!data)].unwrap_or(0.0)
     }
 
     pub(crate) fn fill_stats(&self, s: &mut Stats) {
@@ -781,6 +863,8 @@ impl Inner {
         s.allocation_bytes = apps.map(|(_, m)| m.size as u64).sum();
         s.fragments = self.state.frags.len() as u64;
         s.statements = self.state.slab.live as u64;
-        s.budget = self.cons.budget as u64;
+        s.budget = self.opts.budget_pages as u64;
+        s.kappa = self.cons.kappa;
+        s.ripe_ranked = self.state.ripeness.len() as u64;
     }
 }

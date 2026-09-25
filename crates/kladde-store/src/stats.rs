@@ -77,8 +77,14 @@ pub struct Stats {
     pub fragments: u64,
     /// Live statements.
     pub statements: u64,
-    /// The consolidation budget in pages.
+    /// The consolidation budget in pages: a cap on one flush's work.
     pub budget: u64,
+    /// The price of space the controller has reached: the page writes that
+    /// one page of garbage, kept for one flush, is worth.
+    pub kappa: f64,
+    /// Pages ranked by ripeness: live data pages and leaves no fuller than
+    /// a page may close.
+    pub ripe_ranked: u64,
 }
 
 impl Stats {

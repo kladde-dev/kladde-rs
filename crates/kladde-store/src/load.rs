@@ -517,7 +517,7 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
         info.written = (d.content.end - d.content.start) as u16;
     }
     for p in 2..file_pages {
-        state.rebucket(p);
+        state.rerank(p);
     }
     state.dropped_candidates.clear();
     let mut header = header;

@@ -5,7 +5,6 @@
 
 use crate::consts::{MAX_INLINE, MAX_PAGE_CONTENT};
 use crate::error::Error;
-use crate::flush::DataPage;
 use crate::state::*;
 use crate::statement::{Stmt, TableWriter};
 use crate::store::Inner;
@@ -203,21 +202,15 @@ impl Inner {
     }
 
     /// Takes all of `c` as one pending fragment holding its current bytes,
-    /// with the gaps as real zeros: a chunk, or, if `chunk` is false and it
-    /// is short enough, an `Inline`. Leaves `last_written` alone, since the
-    /// content does not change.
-    fn rewrite(
-        &mut self,
-        c: &Candidate,
-        age: u64,
-        chunk: bool,
-        dirty: &mut Dirty,
-    ) -> Result<(), Error> {
+    /// with the gaps as real zeros: a chunk, or, if it is short enough, an
+    /// `Inline`. Leaves `last_written` alone, since the content does not
+    /// change.
+    fn rewrite(&mut self, c: &Candidate, age: u64, dirty: &mut Dirty) -> Result<(), Error> {
         let mut bytes = vec![0u8; c.len() as usize];
         self.read_committed(c.id, c.start, &mut bytes)?;
         let pos = self.segment_records.arena.len() as u64;
         self.segment_records.arena.extend_from_slice(&bytes);
-        let inline = !chunk && c.len() <= self.opts.inline_threshold.min(MAX_INLINE as u32);
+        let inline = c.len() <= self.opts.inline_threshold.min(MAX_INLINE as u32);
         let place = if inline {
             Place::Inline
         } else {
@@ -238,7 +231,7 @@ impl Inner {
 
     /// Spends description defragmentation's reserved share, before anything
     /// is packed: the best of the candidates the latest walk found, re-checked,
-    /// become writes of the flush's own. The rest are kept for free filling.
+    /// become writes of the flush's own.
     pub(crate) fn defrag_share(&mut self, dirty: &mut Dirty) -> Result<(), Error> {
         let found = std::mem::take(&mut self.cons.candidates);
         let mut ok: Vec<(Candidate, u64)> = found
@@ -256,38 +249,10 @@ impl Inner {
             .collect();
         ok.sort_by(|x, y| y.0.score.total_cmp(&x.0.score));
         let mut share = self.opts.defrag_share as u64 * C as u64;
-        let mut spare = Vec::new();
         for (c, age) in ok {
             if c.len() as u64 <= share {
                 share -= c.len() as u64;
-                self.rewrite(&c, age, false, dirty)?;
-            } else {
-                spare.push(c);
-            }
-        }
-        self.cons.spare = spare;
-        Ok(())
-    }
-
-    /// Free filling's second choice: candidates beyond the share, re-checked,
-    /// that are too long for an `Inline` and fit the room of `open`.
-    pub(crate) fn fill_with_candidates(
-        &mut self,
-        open: &mut DataPage,
-        dirty: &mut Dirty,
-    ) -> Result<(), Error> {
-        let threshold = self.opts.inline_threshold;
-        let mut i = 0;
-        while i < self.cons.spare.len() {
-            let c = self.cons.spare[i];
-            if c.len() <= threshold || c.len() as usize > open.room() {
-                i += 1;
-                continue;
-            }
-            self.cons.spare.remove(i);
-            if let Some((_, age)) = self.recheck(&c) {
-                self.rewrite(&c, age, true, dirty)?;
-                self.place(open, key(c.id, c.start), c.len())?;
+                self.rewrite(&c, age, dirty)?;
             }
         }
         Ok(())
