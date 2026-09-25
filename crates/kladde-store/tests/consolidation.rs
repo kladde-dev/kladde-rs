@@ -135,9 +135,9 @@ fn page_rewrites_keep_leaves_full() {
 }
 
 /// Writes `n` allocations of a page each, frees all but every fourth, then
-/// runs `flushes` small flushes. Returns the file's length in pages before
-/// and after.
-fn shrink(opts: Options, n: usize, flushes: usize) -> (u64, u64) {
+/// runs `flushes` flushes, each of `patches` small writes into what is left
+/// and one to a note. Returns the file's length in pages before and after.
+fn shrink(opts: Options, n: usize, flushes: usize, patches: usize) -> (u64, u64) {
     use kladde_store::Storage;
     let storage = MemoryStorage::new();
     let store = Store::create(Box::new(storage.clone()), opts.clone()).unwrap();
@@ -154,13 +154,22 @@ fn shrink(opts: Options, n: usize, flushes: usize) -> (u64, u64) {
     let mut kept = Vec::new();
     for (i, p) in owned.drain(..).enumerate() {
         if i % 4 == 0 {
-            kept.push((i, p));
+            kept.push((p, vec![fill(i); 4000]));
         } else {
             store.free(p).unwrap();
         }
     }
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let note = store.alloc(8).unwrap();
     for f in 0..flushes {
+        for _ in 0..patches {
+            let (p, model) = &mut kept[rng.below(n as u64 / 4) as usize];
+            let off = rng.below(4000 - 32) as usize;
+            model[off..off + 32].fill(f as u8);
+            store
+                .write(p.raw(), off as u32, &model[off..off + 32])
+                .unwrap();
+        }
         store
             .write(note.raw(), 0, &(f as u64).to_le_bytes())
             .unwrap();
@@ -168,8 +177,8 @@ fn shrink(opts: Options, n: usize, flushes: usize) -> (u64, u64) {
     }
     store.close().unwrap();
     store.check();
-    for (i, p) in &kept {
-        assert_eq!(store.read_all(p.raw()).unwrap(), vec![fill(*i); 4000]);
+    for (p, model) in &kept {
+        assert!(store.read_all(p.raw()).unwrap() == *model);
     }
     (before, storage.len().unwrap() / 4096)
 }
@@ -180,11 +189,27 @@ fn compaction_moves_content_off_the_end() {
         hole_share: 1.0,
         ..Default::default()
     };
-    let (before, without) = shrink(off, 400, 60);
-    let (_, with) = shrink(Options::default(), 400, 60);
+    let (before, without) = shrink(off, 400, 60, 0);
+    let (_, with) = shrink(Options::default(), 400, 60, 0);
     println!("before {before}, without compaction {without}, with {with}");
     assert!(without * 10 > before * 9, "{without} of {before} pages");
     assert!(with * 2 < before, "{with} of {before} pages");
+}
+
+#[test]
+fn compaction_moves_full_table_pages_too() {
+    // The first flush after the frees states its patches inline, on leaves
+    // at the end of the file, since the freed pages are not reusable yet:
+    // a full table page becomes the tail. Without the rotating window, which
+    // in a large file drains such a page only slowly, compaction must
+    // rewrite it.
+    let opts = Options {
+        walk: 0,
+        ..Default::default()
+    };
+    let (before, with) = shrink(opts, 400, 30, 100);
+    println!("before {before}, with compaction {with}");
+    assert!(with * 4 < before, "{with} of {before} pages");
 }
 
 #[test]

@@ -62,13 +62,16 @@ impl Survivor {
     }
 }
 
-/// What one budgeted data page would hold, and what it would reclaim.
-#[derive(Debug)]
+/// What one budgeted page would hold, and what it would reclaim.
+#[derive(Debug, Default)]
 struct Offer {
-    /// Victims evacuated whole into the page.
+    /// Victims evacuated, or rewritten, whole.
     whole: Vec<u32>,
     /// One more victim whose survivors fill the page and lead the next one.
     cut: Option<u32>,
+    /// Whether the offer holds compaction mode's tail, which the budget
+    /// takes whatever the offer's ratio and fill.
+    tail: bool,
     reclaimed: f64,
     written: f64,
     /// How full the page would close, as a fraction of its capacity.
@@ -121,7 +124,7 @@ impl Inner {
 
     /// The tail, if compaction mode is on and the tail is a page of the kind
     /// asked for.
-    fn compaction_victim(&mut self, data: bool) -> Option<u32> {
+    fn compaction_tail(&mut self, data: bool) -> Option<u32> {
         if !self.cons.compaction {
             return None;
         }
@@ -132,6 +135,16 @@ impl Inner {
         };
         self.tail()
             .filter(|&t| self.state.pages[t as usize].state == want)
+    }
+
+    /// The compaction tail, if a page that is reusable now lies below it for
+    /// its content: moved to a page the file grows by, it would only become
+    /// the next tail. Right after a mass free, the holes are still in
+    /// quarantine.
+    fn compaction_victim(&mut self, data: bool) -> Option<u32> {
+        let lowest = self.ready.first().copied();
+        self.compaction_tail(data)
+            .filter(|&t| lowest.is_some_and(|l| l < t))
     }
 
     // ------------------------------------------------------------ victims
@@ -354,10 +367,11 @@ impl Inner {
             if room == 0 {
                 return Ok(());
             }
-            // In compaction mode, the tail first whenever it fits.
+            // In compaction mode, the tail first whenever it fits, and `open`
+            // lies below it.
             let tail = self
-                .compaction_victim(true)
-                .filter(|&t| self.state.pages[t as usize].coverage <= room);
+                .compaction_tail(true)
+                .filter(|&t| open.page < t && self.state.pages[t as usize].coverage <= room);
             let Some(v) = tail.or_else(|| self.pick_victim(true, b, room, &|_, _| true)) else {
                 break;
             };
@@ -421,13 +435,7 @@ impl Inner {
     fn data_offer(&mut self, carry: u32, may_cut: bool) -> Option<Offer> {
         let max = (C as f64 / (1.0 + self.opts.churn_floor)) as u32;
         let mut room = C - carry;
-        let mut offer = Offer {
-            whole: Vec::new(),
-            cut: None,
-            reclaimed: 0.0,
-            written: 0.0,
-            fill: 0.0,
-        };
+        let mut offer = Offer::default();
         let mut chosen = IdSet::default();
         // In compaction mode, the tail first, whatever its fill: it returns a
         // whole page to the file system, not only to the pool.
@@ -446,6 +454,7 @@ impl Inner {
             };
             if taken {
                 chosen.insert(t);
+                offer.tail = true;
                 offer.reclaimed += C as f64;
                 offer.written += cov as f64;
             }
@@ -488,11 +497,14 @@ impl Inner {
     /// Spends the flush's budget: pages opened only to reclaim, one at a
     /// time, each only if its offer passes the churn floor and fills it. A
     /// survivor cut at one page's end leads the next, which is opened
-    /// whatever its own offer, so the budget's last page cuts nothing.
+    /// whatever its own offer, so the budget's last page cuts nothing. An
+    /// offer holding compaction mode's tail passes whatever its ratio and
+    /// fill, and goes first, since the budget alone paces the mode.
     pub(crate) fn budget_loop(&mut self, dirty: &mut Dirty, out: &mut Output) -> Result<(), Error> {
         let pages = self.cons.budget.round().max(0.0) as u32;
         let (lambda, theta) = (self.opts.churn_floor, self.opts.theta);
-        let good = |o: &Offer| o.reclaimed >= lambda * o.written && o.fill >= 1.0 - theta;
+        let good =
+            |o: &Offer| o.tail || (o.reclaimed >= lambda * o.written && o.fill >= 1.0 - theta);
         let ratio = |o: &Offer| o.reclaimed / o.written.max(1.0);
         let mut carry: Vec<Survivor> = Vec::new();
         for i in 0..pages {
@@ -505,17 +517,12 @@ impl Inner {
                 let data = data.filter(good);
                 let table = self.table_offer().filter(good);
                 match (data, table) {
-                    (Some(d), Some(t)) if ratio(&t) > ratio(&d) => {
+                    (Some(d), Some(t)) if d.tail || (!t.tail && ratio(&d) >= ratio(&t)) => Some(d),
+                    (_, Some(t)) => {
                         self.rewrite_table_victims(&t.whole, dirty)?;
-                        self.stats.budget_pages += 1;
                         continue;
                     }
-                    (None, Some(t)) => {
-                        self.rewrite_table_victims(&t.whole, dirty)?;
-                        self.stats.budget_pages += 1;
-                        continue;
-                    }
-                    (Some(d), _) => Some(d),
+                    (Some(d), None) => Some(d),
                     (None, None) => break,
                 }
             };
@@ -539,32 +546,26 @@ impl Inner {
     }
 
     /// What rewriting table victims onto one budgeted leaf would hold and
-    /// reclaim, without taking anything: whole victims within the churn
-    /// floor, best score first, their restatements estimated from coverage.
+    /// reclaim, their restatements estimated from coverage, without taking
+    /// anything: the tail first in compaction mode, whatever its size, then
+    /// whole victims within the churn floor, best score first.
     fn table_offer(&mut self) -> Option<Offer> {
         let max = (C as f64 / (1.0 + self.opts.churn_floor)) as u32;
         let mut room = C as f64;
-        let mut offer = Offer {
-            whole: Vec::new(),
-            cut: None,
-            reclaimed: 0.0,
-            written: 0.0,
-            fill: 0.0,
-        };
+        let mut offer = Offer::default();
         let mut chosen = IdSet::default();
         if let Some(t) = self.compaction_victim(false) {
             let cov = self.state.pages[t as usize].coverage;
-            if cov as f64 * RESTATE <= room {
-                chosen.insert(t);
-                offer.whole.push(t);
-                offer.reclaimed += C as f64;
-                offer.written += cov as f64 * RESTATE;
-                room -= cov as f64 * RESTATE;
-            }
+            chosen.insert(t);
+            offer.whole.push(t);
+            offer.tail = true;
+            offer.reclaimed += C as f64;
+            offer.written += cov as f64 * RESTATE;
+            room -= cov as f64 * RESTATE;
         }
         while let Some(b) = self.state.table_buckets.lowest_non_empty() {
             let fresh = |i: &Inner, p: u32| !chosen.contains(&p) && !i.flush_rewritten.contains(&p);
-            let limit = ((room / RESTATE) as u32).min(max);
+            let limit = ((room.max(0.0) / RESTATE) as u32).min(max);
             let Some(v) = self.pick_victim(false, b, limit, &fresh) else {
                 break;
             };
