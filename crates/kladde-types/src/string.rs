@@ -177,7 +177,7 @@ impl<P: PointerRepr> Persistable<P> for PersistableString<P> {
         backend: &B,
         location: Location<P, B::Size>,
     ) -> Result<(), Error> {
-        self.0.store(backend, location)
+        self.0.store_bytes(backend, location)
     }
 
     fn load<B: ReadBackend<Pointer = P>>(

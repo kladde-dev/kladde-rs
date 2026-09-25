@@ -98,6 +98,24 @@ impl<T, P> Deref for PersistableVec<T, P> {
     }
 }
 
+impl<P: PointerRepr> PersistableVec<u8, P> {
+    /// `store` for bytes: a first content allocation is filled with one write
+    /// rather than one per element, which is what `PersistableString` and
+    /// `PersistableBlob` store through.
+    pub(crate) fn store_bytes<B: WriteBackend<Pointer = P>>(
+        &mut self,
+        backend: &B,
+        location: Location<P, B::Size>,
+    ) -> Result<(), Error> {
+        if self.pointer.is_none() && !self.data.is_empty() {
+            let pointer = backend.alloc(size(0)?)?;
+            backend.write(pointer.raw(), size(0)?, &self.data)?;
+            self.pointer = Some(pointer);
+        }
+        write_slot(backend, location, self.pointer.as_ref().map(|p| p.raw()))
+    }
+}
+
 impl<T, P> Default for PersistableVec<T, P> {
     fn default() -> Self {
         Self::new()

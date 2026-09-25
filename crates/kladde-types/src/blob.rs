@@ -114,7 +114,7 @@ where
         backend: &B,
         location: Location<P, B::Size>,
     ) -> Result<(), Error> {
-        self.serialized.store(backend, location)
+        self.serialized.store_bytes(backend, location)
     }
 
     fn load<B: ReadBackend<Pointer = P>>(
