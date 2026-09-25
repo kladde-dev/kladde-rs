@@ -183,3 +183,22 @@ The notes below say what the draft leaves open, and where the implementation dep
 - **A page's estimate is seeded at open from its content size, its coverage, and its age**, as the draft says, with the estimate's epoch at the governing header's.
 - **`Options::myopic_ripeness` runs the draft's ablation**: pages are ranked by `(1 − x)/x` over their rate, in place of `h(x)`, and nothing else changes.
   `KLADDE_BENCH_MYOPIC` sets it in kladde-bench.
+
+## Cleaning by ripeness with a static share (branch `ripeness2`)
+
+This branch implements `drafts/ripeness.md` as of kladde-docs commit `7c343b7`, on the kladde-docs branch `ripeness2`, on top of the branch `ripeness`.
+Each page fits a draining share and its rate to its own discounted losses, and keeps a static share only where the losses earn it; the notes on `ripeness` above still hold, except for the estimate.
+`tools/simulate-ripeness.py` in kladde-docs served as the reference for what the draft leaves implicit, and the fit here matches its `tested` estimator to within 0.1 % of the index where that fits on a fine grid of rates.
+
+- **The fits are solved exactly**, where the simulation fits rates on a grid: `E(r)` and the mean lag it predicts have closed forms as sums of two geometric series, so the fit of a draining share bisects on the mean lag, and the fit of one share alone on the slope of its log-likelihood, which is concave.
+  Rates are kept within `[0, 3]` per epoch, as the simulation's grid is.
+  On the draft's worked example, the index at epoch 50 comes out 43 where the draft reads 41 off the grid.
+- **Time is discrete, as in the simulation**: a draining share that lost `ℓ` in the epoch just past holds `ℓ/(e^r − 1)`, and one share of `x` bytes loses `x·(e^r − 1)`, where the draft writes `ℓ/r` and `r·x`.
+  The losses a start predicts for an epoch `j` of the page's life are `a0·e^(−r0·(j − 1))·(1 − e^(−r0))`.
+- **The draining share is kept as a fraction of the coverage**, `share: f32`, not in bytes as the draft's `fast: u16`.
+  Moving content out shrinks the share and the coverage in proportion, so the fraction stays, and a page that evacuation empties still carries the split its survivors take along into their new page.
+- **The unit of the test is measured per kind**: after every commit, the data pages' coverage over the live statements, and the leaves' coverage over the same count.
+  The draft speaks of the file's mean statement size, and a data page loses the bytes statements state, a leaf their encoding.
+- **A description defragmentation's rewrite is static in its new page**, as the single-rate branch starts it at the floor: it is cold by selection, and its source pages are unknown when it is placed.
+- **The seed's past runs to the governing header's epoch**, the epochs a page has been watched by the time the session starts, while its rate counts the epochs until the session's first flush, as the draft says.
+- **In memory, `Drain` is 24 bytes**, its epoch a `u64`; in the consolidator state, an entry holds the two sums, the rate, and the share as `f32`s, and the layout is tagged `kladrip3`.

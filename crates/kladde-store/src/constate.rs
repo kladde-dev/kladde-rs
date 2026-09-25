@@ -22,9 +22,10 @@
 //!   snapshot, the ids last written at that epoch.
 //! - `1`, a drain record: a varint count, and that many entries of a varint
 //!   page delta, ascending from 0, the page's epoch and coverage as varints,
-//!   its estimate's rate as an `f32`'s little-endian bits, and the estimate's
-//!   epoch as a varint. A flush records the pages whose estimate it changed;
-//!   the snapshot, every page emptier than the fill survivors are packed at.
+//!   its estimate's two sums, rate, and draining share, each as an `f32`'s
+//!   little-endian bits, and the estimate's epoch as a varint. A flush
+//!   records the pages whose estimate it changed; the snapshot, every page
+//!   emptier than the fill survivors are packed at.
 
 use std::collections::BTreeMap;
 
@@ -34,7 +35,7 @@ use crate::state::*;
 use crate::store::Inner;
 
 /// Names this implementation and the layout's version.
-pub(crate) const TAG: [u8; 8] = *b"kladrip2";
+pub(crate) const TAG: [u8; 8] = *b"kladrip3";
 /// The bytes before the records.
 const FIXED: usize = 40;
 
@@ -88,8 +89,11 @@ fn drain_record(out: &mut Vec<u8>, entries: &[DrainEntry]) {
         prev = e.page;
         put_varint(out, e.epoch);
         put_varint(out, e.coverage as u64);
-        out.extend_from_slice(&e.drain.rho.to_bits().to_le_bytes());
-        put_varint(out, e.drain.at);
+        let d = &e.drain;
+        for v in [d.s0, d.s1, d.rate, d.share] {
+            out.extend_from_slice(&v.to_bits().to_le_bytes());
+        }
+        put_varint(out, d.at);
     }
 }
 
@@ -131,15 +135,23 @@ fn parse(bytes: &[u8]) -> Option<Parsed> {
                     page += get(&mut rest)?;
                     let epoch = get(&mut rest)?;
                     let coverage = u32::try_from(get(&mut rest)?).ok()?;
-                    let (rho, r) = rest.split_first_chunk::<4>()?;
-                    rest = r;
+                    let mut f = [0f32; 4];
+                    for v in &mut f {
+                        let (bits, r) = rest.split_first_chunk::<4>()?;
+                        rest = r;
+                        *v = f32::from_bits(u32::from_le_bytes(*bits));
+                    }
                     let at = get(&mut rest)?;
+                    let [s0, s1, rate, share] = f;
                     drains.push(DrainEntry {
                         page: u32::try_from(page).ok()?,
                         epoch,
                         coverage,
                         drain: Drain {
-                            rho: f32::from_bits(u32::from_le_bytes(*rho)),
+                            s0,
+                            s1,
+                            rate,
+                            share,
                             at,
                         },
                     });
@@ -212,9 +224,9 @@ impl Inner {
     }
 
     /// Seeds each page's estimate from its fill and its age, assuming that
-    /// it has drained at one rate since it was written: from its content size
-    /// then to its coverage now, over the epochs until the session's first
-    /// flush.
+    /// all of it has drained at one rate since it was written: from its
+    /// content size then to its coverage now, over the epochs until the
+    /// session's first flush. Its past counts as watched.
     fn seed_drains(&mut self) {
         let first = self.epoch + 1;
         for info in self.state.pages.iter_mut().skip(2) {
@@ -222,16 +234,9 @@ impl Inner {
                 continue;
             }
             let (written, live) = (info.written as f64, info.coverage as f64);
+            let past = self.epoch.saturating_sub(info.epoch);
             let age = first.saturating_sub(info.epoch).max(1) as f64;
-            let rho = if live > 0.0 && written > live {
-                (written / live).ln() / age
-            } else {
-                0.0
-            };
-            info.drain = Drain {
-                rho: rho as f32,
-                at: self.epoch,
-            };
+            info.drain = Drain::seed(written, live, past, age, self.epoch);
         }
     }
 
@@ -243,6 +248,7 @@ impl Inner {
     /// the candidates the latest walk found.
     pub(crate) fn seed_after_load(&mut self) -> Result<(), Error> {
         self.cons.kappa = self.opts.kappa;
+        self.measure_statements();
         self.seed_drains();
         self.cons.prev_data_pages = (2..self.file_pages)
             .filter(|&p| {
@@ -292,6 +298,7 @@ impl Inner {
                 for e in p.drains {
                     latest.insert(e.page, e);
                 }
+                let statement = self.cons.statement;
                 for e in latest.into_values() {
                     let Some(info) = self.state.pages.get_mut(e.page as usize) else {
                         continue;
@@ -302,8 +309,10 @@ impl Inner {
                     }
                     info.drain = e.drain;
                     if info.coverage < e.coverage {
-                        info.drain
-                            .lose(e.coverage - info.coverage, e.coverage, self.epoch);
+                        let age = self.epoch.saturating_sub(info.epoch);
+                        let unit = statement[usize::from(info.state != PageState::Data)];
+                        let lost = e.coverage - info.coverage;
+                        info.drain.lose(lost, info.coverage, age, self.epoch, unit);
                     }
                 }
                 if p.kappa.is_finite() && p.kappa > 0.0 {

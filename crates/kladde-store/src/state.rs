@@ -409,20 +409,21 @@ impl State {
     /// ranking. Its fill counts relative to `packed`, in `h`, or in the
     /// myopic `g` if `myopic`.
     pub fn refresh_ranking(&mut self, now: u64, packed: f64, myopic: bool) {
+        let fill = if myopic {
+            crate::ripeness::g
+        } else {
+            crate::ripeness::h
+        };
         for page in std::mem::take(&mut self.ripeness.stale) {
             let Some(info) = self.pages.get(page as usize) else {
                 self.ripeness.remove(page);
                 continue;
             };
             let live = matches!(info.state, PageState::Data | PageState::Table);
-            let x = info.coverage as f64 / packed;
-            if live && info.coverage > 0 && x < 1.0 && info.epoch < now {
-                let f = if myopic {
-                    crate::ripeness::g(x)
-                } else {
-                    crate::ripeness::h(x)
-                };
-                self.ripeness.insert(page, f, info.drain, now);
+            let coverage = info.coverage as f64;
+            if live && info.coverage > 0 && coverage < packed && info.epoch < now {
+                let (key, floor) = crate::ripeness::keys(&info.drain, coverage, packed, fill);
+                self.ripeness.insert(page, key, floor, now);
             } else {
                 self.ripeness.remove(page);
             }
@@ -448,6 +449,11 @@ impl State {
         if self.natural {
             let e = self.losses.entry(page).or_insert((0, info.coverage));
             e.0 += n;
+        } else if info.coverage > n {
+            // Content moved out: the estimate shrinks with the page. A page
+            // emptied keeps its estimate, which its survivors carry along.
+            let keep = (info.coverage - n) as f64 / info.coverage as f64;
+            info.drain.shrink(keep);
         }
         info.coverage -= n;
         self.dropped_candidates.insert(page);

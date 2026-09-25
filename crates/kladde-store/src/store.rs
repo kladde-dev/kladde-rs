@@ -516,7 +516,7 @@ impl Store {
                 let live = matches!(info.state, PageState::Data | PageState::Table);
                 (live && info.coverage > 0 && (info.coverage as f64) < packed).then_some((
                     p as u32,
-                    info.drain.rho,
+                    info.drain.rate,
                     info.drain.at,
                 ))
             })
