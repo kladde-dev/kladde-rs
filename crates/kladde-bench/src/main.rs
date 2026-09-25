@@ -9,9 +9,9 @@
 //! cargo run --release -p kladde-bench -- <output directory> [scenario ...]
 //! ```
 //!
-//! Scenarios: `uniform`, `skewed`, `append`, `churn`, `shrink`, `typed`, and
-//! `quick`, which runs small versions of all of them. Without a scenario, all
-//! but `quick` run.
+//! Scenarios: `uniform`, `skewed`, `append`, `churn`, `shrink`, `typed`,
+//! `tuning`, which runs three of them with variants of the default options,
+//! and `quick`, which makes whatever runs small. Without a scenario, all run.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -213,20 +213,24 @@ fn opts(consolidate: bool) -> Options {
     }
 }
 
+/// The label and options of the default policy, or of none.
+fn on_off(consolidate: bool) -> (&'static str, Options) {
+    (if consolidate { "on" } else { "off" }, opts(consolidate))
+}
+
 /// Overwrites random ranges of fixed-size allocations -- uniformly, or with
 /// 90 % of the writes going to 10 % of the allocations -- until eight times
 /// the live size has been written.
 fn overwrite(
     dir: &Path,
     scenario: &'static str,
+    (variant, options): (&str, Options),
     size: u64,
-    consolidate: bool,
     skewed: bool,
 ) -> Vec<String> {
     const ALLOC: u64 = 16 * KIB;
     const AVG_WRITE: u64 = 256;
-    let variant = if consolidate { "on" } else { "off" };
-    let mut run = Run::new(dir, scenario, variant, size, opts(consolidate));
+    let mut run = Run::new(dir, scenario, variant, size, options);
     let mut rng = Rng::new(size ^ skewed as u64);
     let n = (size / ALLOC).max(1);
     let mut model: Vec<Vec<u8>> = Vec::new();
@@ -263,10 +267,9 @@ fn overwrite(
 
 /// Many logs, each appended to with small records and rotated -- truncated
 /// to nothing -- once it reaches 64 KiB.
-fn append(dir: &Path, size: u64, consolidate: bool) -> Vec<String> {
+fn append(dir: &Path, (variant, options): (&str, Options), size: u64) -> Vec<String> {
     const ROTATE: u64 = 64 * KIB;
-    let variant = if consolidate { "on" } else { "off" };
-    let mut run = Run::new(dir, "append", variant, size, opts(consolidate));
+    let mut run = Run::new(dir, "append", variant, size, options);
     let mut rng = Rng::new(size ^ 7);
     let n = (size / (ROTATE / 2)).max(1);
     let mut logs: Vec<(UniquePointer, Vec<u8>)> = Vec::new();
@@ -524,16 +527,60 @@ fn typed(dir: &Path, size: u64) -> Vec<String> {
     rows
 }
 
-fn save(out: &Path, name: &str, rows: &[String]) {
+/// Writes `rows` to `<name>.csv`, and reports how long they took since `t`.
+fn save(out: &Path, name: &str, rows: &[String], t: Instant) {
     let mut f = BufWriter::new(File::create(out.join(format!("{name}.csv"))).expect("create csv"));
     writeln!(f, "{COLUMNS}").unwrap();
     for r in rows {
         writeln!(f, "{r}").unwrap();
     }
+    eprintln!(
+        "{name}: {} rows in {:.1} s",
+        rows.len(),
+        t.elapsed().as_secs_f64()
+    );
+}
+
+/// Variants of the default options, one table per workload so that its
+/// variants compare directly: `tuning-uniform.csv` and `tuning-skewed.csv`
+/// vary the churn floor and the target fill, `tuning-append.csv` the pages
+/// reserved for description defragmentation.
+fn tuning(out: &Path, work: &Path, quick: bool) {
+    let with = |f: &dyn Fn(&mut Options)| {
+        let mut o = Options::default();
+        f(&mut o);
+        o
+    };
+    let size = if quick { MIB } else { 8 * MIB };
+    for (name, skewed) in [("uniform", false), ("skewed", true)] {
+        let t = Instant::now();
+        let mut rows = Vec::new();
+        for (variant, options) in [
+            ("lambda=0.5", with(&|o| o.churn_floor = 0.5)),
+            ("lambda=1", Options::default()),
+            ("lambda=2", with(&|o| o.churn_floor = 2.0)),
+            ("tau=0.6", with(&|o| o.target_fill = 0.6)),
+            ("tau=0.5", with(&|o| o.target_fill = 0.5)),
+        ] {
+            rows.extend(overwrite(work, name, (variant, options), size, skewed));
+        }
+        save(out, &format!("tuning-{name}"), &rows, t);
+    }
+    let t = Instant::now();
+    let size = if quick { MIB } else { 16 * MIB };
+    let mut rows = Vec::new();
+    for share in [1, 4, 16] {
+        let options = with(&|o| o.defrag_share = share);
+        rows.extend(append(work, (&format!("share={share}"), options), size));
+    }
+    save(out, "tuning-append", &rows, t);
 }
 
 fn scenario(out: &Path, work: &Path, name: &str, quick: bool) {
     let t = Instant::now();
+    if name == "tuning" {
+        return tuning(out, work, quick);
+    }
     let sizes: &[u64] = if quick {
         &[MIB]
     } else {
@@ -549,17 +596,17 @@ fn scenario(out: &Path, work: &Path, name: &str, quick: bool) {
             };
             let mut rows = Vec::new();
             for &size in sizes {
-                rows.extend(overwrite(work, label, size, true, skewed));
+                rows.extend(overwrite(work, label, on_off(true), size, skewed));
             }
             for &size in small {
-                rows.extend(overwrite(work, label, size, false, skewed));
+                rows.extend(overwrite(work, label, on_off(false), size, skewed));
             }
             rows
         }
         "append" => {
             let size = if quick { MIB } else { 16 * MIB };
-            let mut rows = append(work, size, true);
-            rows.extend(append(work, size, false));
+            let mut rows = append(work, on_off(true), size);
+            rows.extend(append(work, on_off(false), size));
             rows
         }
         "churn" => {
@@ -579,12 +626,7 @@ fn scenario(out: &Path, work: &Path, name: &str, quick: bool) {
         "typed" => typed(work, if quick { MIB } else { 16 * MIB }),
         other => panic!("unknown scenario {other:?}"),
     };
-    save(out, name, &rows);
-    eprintln!(
-        "{name}: {} rows in {:.1} s",
-        rows.len(),
-        t.elapsed().as_secs_f64()
-    );
+    save(out, name, &rows, t);
 }
 
 fn main() {
@@ -600,9 +642,11 @@ fn main() {
     let quick = names.iter().any(|n| n == "quick");
     names.retain(|n| n != "quick");
     if names.is_empty() {
-        names = ["uniform", "skewed", "append", "churn", "shrink", "typed"]
-            .map(String::from)
-            .to_vec();
+        names = [
+            "uniform", "skewed", "append", "churn", "shrink", "typed", "tuning",
+        ]
+        .map(String::from)
+        .to_vec();
     }
     for name in &names {
         scenario(&out, &work, name, quick);
