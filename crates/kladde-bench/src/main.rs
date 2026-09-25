@@ -9,9 +9,10 @@
 //! cargo run --release -p kladde-bench -- <output directory> [scenario ...]
 //! ```
 //!
-//! Scenarios: `uniform`, `skewed`, `append`, `churn`, `shrink`, `typed`,
-//! `tuning`, which runs three of them with variants of the default options,
-//! and `quick`, which makes whatever runs small. Without a scenario, all run.
+//! Scenarios: `uniform`, `skewed`, `mixed`, `append`, `churn`, `shrink`,
+//! `typed`, `tuning`, which runs three of them with variants of the default
+//! options, and `quick`, which makes whatever runs small. Without a scenario,
+//! all run.
 //!
 //! Two variables in the environment change the options of every scenario but
 //! `typed`. With `KLADDE_BENCH_NO_STATE` set, the stores keep no consolidator
@@ -19,6 +20,7 @@
 //! difference. With `KLADDE_BENCH_MYOPIC` set, they rank pages by the myopic
 //! rule, as the ripeness draft's ablation does.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -67,7 +69,13 @@ const COLUMNS: &str =
 free_pages,live_data,live_table,alloc_bytes,allocations,statements,fragments,budget,\
 data_written,table_written,headers_written,journal_bytes,fresh_bytes,evacuated_pages,\
 evacuated_bytes,free_filled,budget_pages,table_rewrites,window_restated,defrag_rewrites,\
-defrag_bytes,compaction_flushes,truncations,flush_us,ops_us,kappa,static_pages,static_bytes";
+defrag_bytes,compaction_flushes,truncations,flush_us,ops_us,kappa,static_pages,static_bytes,\
+mixed_pages,mixed_bytes,cold_bytes,cold_mixed_bytes";
+
+/// The classes of allocation `mixed` assigns, as indexes of per-class sums.
+const HOT: usize = 0;
+const COOL: usize = 1;
+const COLD: usize = 2;
 
 /// One scenario run: a store on a file, the workload's counters, and the rows
 /// recorded so far.
@@ -84,6 +92,9 @@ struct Run {
     base: Stats,
     ops_start: Instant,
     rows: Vec<String>,
+    /// Allocation id -> class, where the scenario assigns classes: each row
+    /// then records how the classes share data pages.
+    classes: Option<HashMap<u32, usize>>,
 }
 
 impl Run {
@@ -103,6 +114,7 @@ impl Run {
             base: Stats::default(),
             ops_start: Instant::now(),
             rows: Vec::new(),
+            classes: None,
         }
     }
 
@@ -149,9 +161,13 @@ impl Run {
         let flush_us = t.elapsed().as_micros();
         self.flushes += 1;
         let s = self.store.stats();
+        let mix = self
+            .classes
+            .as_ref()
+            .map_or([0; 4], |c| mixing(&self.store, c));
         let b = &self.base;
         self.rows.push(format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.scenario,
             self.variant,
             self.size,
@@ -189,6 +205,10 @@ impl Run {
             s.kappa,
             s.static_pages,
             s.static_bytes,
+            mix[0],
+            mix[1],
+            mix[2],
+            mix[3],
         ));
         self.ops_start = Instant::now();
     }
@@ -271,6 +291,90 @@ fn overwrite(
         } else {
             rng.below(n)
         } as usize;
+        let len = rng.range(1, 2 * AVG_WRITE) as usize;
+        let off = rng.below(ALLOC - len as u64 + 1) as usize;
+        let bytes = rng.bytes(len);
+        model[i][off..off + len].copy_from_slice(&bytes);
+        run.write(ptrs[i].raw(), off as u32, &bytes);
+        run.tick();
+    }
+    run.flush();
+    let check: Vec<(Pointer, Vec<u8>)> = ptrs.iter().map(|p| p.raw()).zip(model).collect();
+    run.finish(&check)
+}
+
+/// How the classes of `classes` share the store's data pages: the pages that
+/// hold more than one class, the live bytes on those pages, the cold bytes on
+/// all data pages, and the cold bytes on those pages, which share a page with
+/// content that still changes. A few cold bytes can live in leaves, where
+/// description defragmentation states short runs inline.
+fn mixing(store: &Store, classes: &HashMap<u32, usize>) -> [u64; 4] {
+    let mut pages: HashMap<u32, [u64; 3]> = HashMap::new();
+    for (page, id, bytes) in store.describe_data_pages() {
+        if let Some(&class) = classes.get(&id) {
+            pages.entry(page).or_default()[class] += bytes as u64;
+        }
+    }
+    let mut out = [0; 4];
+    for held in pages.values() {
+        out[2] += held[COLD];
+        if held.iter().filter(|&&b| b > 0).count() > 1 {
+            out[0] += 1;
+            out[1] += held.iter().sum::<u64>();
+            out[3] += held[COLD];
+        }
+    }
+    out
+}
+
+/// Skewed overwrites, as in `overwrite`, of allocations that are each hot,
+/// cool, or cold at random, so that the three share pages: a tenth are hot and
+/// take nine tenths of the writes, and the other writes go to any allocation
+/// alike, except that cold ones never change, so writes drawn for them are not
+/// made. The allocations are 1 KiB, four to a page, since cold content is only
+/// ever written at the start, and an allocation of four pages would fill them
+/// alone. Each row records how the three share data pages.
+fn mixed(dir: &Path, (variant, options): (&str, Options), size: u64) -> Vec<String> {
+    const ALLOC: u64 = KIB;
+    const AVG_WRITE: u64 = 256;
+    let mut run = Run::new(dir, "mixed", variant, size, options);
+    let mut rng = Rng::new(size ^ 19);
+    let n = (size / ALLOC).max(1);
+    let mut model: Vec<Vec<u8>> = Vec::new();
+    let mut ptrs = Vec::new();
+    let mut class = Vec::new();
+    let mut classes = HashMap::new();
+    for _ in 0..n {
+        let c = if rng.chance(0.1) {
+            HOT
+        } else if rng.chance(0.5) {
+            COOL
+        } else {
+            COLD
+        };
+        let p = run.alloc(ALLOC as u32);
+        let bytes = rng.bytes(ALLOC as usize);
+        run.store.write(p.raw(), 0, &bytes).expect("fill");
+        classes.insert(p.raw().raw(), c);
+        class.push(c);
+        model.push(bytes);
+        ptrs.push(p);
+        if ptrs.len() % 1024 == 0 {
+            run.store.flush().expect("flush");
+        }
+    }
+    let hot: Vec<usize> = (0..n as usize).filter(|&i| class[i] == HOT).collect();
+    run.classes = Some(classes);
+    run.begin();
+    while run.app_bytes < 8 * size {
+        let i = if !hot.is_empty() && rng.chance(0.9) {
+            hot[rng.below(hot.len() as u64) as usize]
+        } else {
+            rng.below(n) as usize
+        };
+        if class[i] == COLD {
+            continue;
+        }
         let len = rng.range(1, 2 * AVG_WRITE) as usize;
         let off = rng.below(ALLOC - len as u64 + 1) as usize;
         let bytes = rng.bytes(len);
@@ -499,7 +603,7 @@ fn typed(dir: &Path, size: u64) -> Vec<String> {
             flushes += 1;
             let s = book.stats();
             rows.push(format!(
-                "typed,on,{size},{flushes},{ops},{app_bytes},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{flush_us},{ops_us},{},{},{}",
+                "typed,on,{size},{flushes},{ops},{app_bytes},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{flush_us},{ops_us},{},{},{},0,0,0,0",
                 s.file_pages,
                 s.data_pages,
                 s.table_pages,
@@ -624,6 +728,16 @@ fn scenario(out: &Path, work: &Path, name: &str, quick: bool) {
             }
             rows
         }
+        "mixed" => {
+            let mut rows = Vec::new();
+            for &size in sizes {
+                rows.extend(mixed(work, on_off(true), size));
+            }
+            for &size in small {
+                rows.extend(mixed(work, on_off(false), size));
+            }
+            rows
+        }
         "append" => {
             let size = if quick { MIB } else { 16 * MIB };
             let mut rows = append(work, on_off(true), size);
@@ -664,7 +778,7 @@ fn main() {
     names.retain(|n| n != "quick");
     if names.is_empty() {
         names = [
-            "uniform", "skewed", "append", "churn", "shrink", "typed", "tuning",
+            "uniform", "skewed", "mixed", "append", "churn", "shrink", "typed", "tuning",
         ]
         .map(String::from)
         .to_vec();
