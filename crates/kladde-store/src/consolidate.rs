@@ -87,12 +87,7 @@ impl Inner {
         self.cons.tail = self.file_pages.saturating_sub(1);
         let holes = match self.tail() {
             Some(t) => (2..t)
-                .filter(|&p| {
-                    matches!(
-                        self.state.pages[p as usize].state,
-                        PageState::Free | PageState::Retiring
-                    )
-                })
+                .filter(|&p| self.state.pages[p as usize].state == PageState::Free)
                 .count(),
             None => 0,
         };

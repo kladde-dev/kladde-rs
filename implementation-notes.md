@@ -152,6 +152,8 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
   Right after a mass free, the freed pages are in quarantine for two commits, and the ready pool may be empty although holes abound.
   Moving the tail then opens pages at the end of the file, which become the next tail, and the same content moves again: a test that frees three quarters of its file grew it by another 96 pages over 30 flushes and truncated twice rather than ten times.
   For the same reason, free filling moves the tail only into a page below it.
-- **Compaction mode counts holes by scanning the page table once per flush**, reusable and retiring pages below the highest live page alike.
+- **Compaction mode counts holes by scanning the page table once per flush.**
   `impl/consolidation.md#compaction-mode` keeps a cached index of the highest live page instead; the scan costs `O(pages)` per flush, which is small next to what a flush writes, but is not the `O(1)` amortised the design promises.
   Interior pages are passed over like journal pages, since every cut that needs them writes them afresh.
+- **A hole is a page that is reusable now, not one in quarantine.**
+  Counting quarantined pages too kept the mode on in 30 of 33 flushes of a 1 MiB file whose flushes rewrite a quarter of it: the pages the last commit released are working space, which the next flushes reuse by themselves, and moving the tail meanwhile only cost table rewrites and a file 6 % larger.
