@@ -74,6 +74,7 @@ dependencies = [
  "kladde-derive",
  "kladde-persist",
  "kladde-store",
+ "kladde-types",
 ]
 
 [[package]]
@@ -82,6 +83,7 @@ version = "0.1.0"
 dependencies = [
  "kladde",
  "kladde-persist",
+ "kladde-store",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -115,6 +117,7 @@ version = "0.1.0"
 dependencies = [
  "kladde",
  "kladde-persist",
+ "kladde-store",
  "postcard",
  "serde",
 ]

@@ -10,6 +10,10 @@ kladde-store = { workspace = true }
 kladde-persist = { workspace = true }
 kladde-derive = { workspace = true, optional = true }
 
+[dev-dependencies]
+# The examples show the facade with the containers an application uses it with.
+kladde-types = { workspace = true }
+
 [features]
 # On by default -- unlike `serde`, whose default is only `std`. Serde is
 # depended on by half the ecosystem, much of which only wants the traits, so

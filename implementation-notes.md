@@ -73,6 +73,23 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
   Ending a transaction that is not open is a caller's bug rather than a damaged file, and deserves an error variant of its own.
   The typed layers pair the calls through guards, so only direct users of `Store` can hit it.
 
+## Typed layers
+
+- **Every guard mutation is one transaction.**
+  `rust/tutorial/durability.md` promises that "a partial mutation is never visible", but a mutation is often several records: a `push` of a string allocates, writes the string's bytes, and writes its pointer into the vector's new slot.
+  The guards wrap every mutation in `WriteBackend::atomically`, which appends it as one transaction and discards it cleanly if it fails midway, so no ordering discipline between the records is needed for crash consistency any more; the containers keep "publish, then free" all the same.
+  A consequence for `rust/containers.md`: a push is a transaction of a `Resize` and the element's writes, not the single `Write` it describes, since growing first keeps it correct for an element whose `store` writes fewer bytes than its inline size.
+- **Guards dereference to their value but not mutably.**
+  `rust/derive-macro.md` lists `Deref` *and* `DerefMut` on generated guards, but `DerefMut` lets `guard.field = value` compile and persist nothing, which is exactly what guards exist to prevent.
+  The guards implement `Deref` only; `Guard::as_persistable_mut` remains as an explicit, documented escape hatch for container implementations.
+- **A derived enum writes zeros where a smaller variant leaves bytes unused**, so that `store` always writes exactly `INLINE_SIZE` bytes and a value's bytes do not depend on what the slot held before.
+- **Loading reads sizes as of the last flush**, through a `ReadBackend::read_size` added for it: `Backend::size` includes operations not yet flushed, and a vector loaded between a write and the next flush would otherwise count elements its reads cannot see.
+- **`PersistableVec` reads through `Deref<Target = [T]>`**, so a slice's whole read API works on it; the whole-value `set` takes a `PersistableVec`, and the byte-level replacement `PersistableString` uses is `PersistableVecGuard<u8>::set_bytes`.
+- **Removing an entry from a `PersistableHashMap` frees its key**, and an `insert` that replaces a value frees the key passed in, since the map keeps its own; `rust/freeing.md` discusses values only, but a `PersistableString` key owns an allocation too.
+- **`PersistableBlob`'s in-place edit is a closure, `update(|value| ...)`**, rather than a handle that persists when dropped, since `Drop` cannot report the error that recording now returns.
+- **`Kladde::create_in` and `Kladde::open_in` take any `Storage` and `Options`**; `Kladde::new` is `create_in` with a `MemoryStorage`, and cannot fail.
+  The root's allocation and the descriptor table's are ordinary allocations, and count in `Kladde::stats`.
+
 ## Consolidation
 
 - **Free filling moves part of at most one victim per page, and the victim stays eligible.**
