@@ -82,9 +82,14 @@ pub struct Stats {
     /// The price of space the controller has reached: the page writes that
     /// one page of garbage, kept for one flush, is worth.
     pub kappa: f64,
-    /// Pages ranked by ripeness: live data pages and leaves no fuller than
-    /// a page may close.
+    /// Pages ranked by ripeness: live data pages and leaves emptier than the
+    /// fill that consolidation packs pages to.
     pub ripe_ranked: u64,
+    /// Live data pages and leaves estimated to hold a share of content that
+    /// no longer dies.
+    pub static_pages: u64,
+    /// The live bytes of those shares.
+    pub static_bytes: u64,
 }
 
 impl Stats {

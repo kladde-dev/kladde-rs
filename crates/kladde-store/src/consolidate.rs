@@ -865,6 +865,10 @@ impl Inner {
             if p < 2 {
                 continue;
             }
+            if matches!(info.state, PageState::Data | PageState::Table) && info.drain.share < 1.0 {
+                s.static_pages += 1;
+                s.static_bytes += ((1.0 - info.drain.share as f64) * info.coverage as f64) as u64;
+            }
             match info.state {
                 PageState::Data => {
                     s.data_pages += 1;

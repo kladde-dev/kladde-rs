@@ -67,7 +67,7 @@ const COLUMNS: &str =
 free_pages,live_data,live_table,alloc_bytes,allocations,statements,fragments,budget,\
 data_written,table_written,headers_written,journal_bytes,fresh_bytes,evacuated_pages,\
 evacuated_bytes,free_filled,budget_pages,table_rewrites,window_restated,defrag_rewrites,\
-defrag_bytes,compaction_flushes,truncations,flush_us,ops_us,kappa";
+defrag_bytes,compaction_flushes,truncations,flush_us,ops_us,kappa,static_pages,static_bytes";
 
 /// One scenario run: a store on a file, the workload's counters, and the rows
 /// recorded so far.
@@ -151,7 +151,7 @@ impl Run {
         let s = self.store.stats();
         let b = &self.base;
         self.rows.push(format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.scenario,
             self.variant,
             self.size,
@@ -187,6 +187,8 @@ impl Run {
             flush_us,
             ops_us,
             s.kappa,
+            s.static_pages,
+            s.static_bytes,
         ));
         self.ops_start = Instant::now();
     }
@@ -497,7 +499,7 @@ fn typed(dir: &Path, size: u64) -> Vec<String> {
             flushes += 1;
             let s = book.stats();
             rows.push(format!(
-                "typed,on,{size},{flushes},{ops},{app_bytes},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{flush_us},{ops_us},{}",
+                "typed,on,{size},{flushes},{ops},{app_bytes},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{flush_us},{ops_us},{},{},{}",
                 s.file_pages,
                 s.data_pages,
                 s.table_pages,
@@ -525,6 +527,8 @@ fn typed(dir: &Path, size: u64) -> Vec<String> {
                 s.compaction_flushes - base.compaction_flushes,
                 s.truncations - base.truncations,
                 s.kappa,
+                s.static_pages,
+                s.static_bytes,
             ));
             t = Instant::now();
         }

@@ -202,3 +202,4 @@ Each page fits a draining share and its rate to its own discounted losses, and k
 - **A description defragmentation's rewrite is static in its new page**, as the single-rate branch starts it at the floor: it is cold by selection, and its source pages are unknown when it is placed.
 - **The seed's past runs to the governing header's epoch**, the epochs a page has been watched by the time the session starts, while its rate counts the epochs until the session's first flush, as the draft says.
 - **In memory, `Drain` is 24 bytes**, its epoch a `u64`; in the consolidator state, an entry holds the two sums, the rate, and the share as `f32`s, and the layout is tagged `kladrip3`.
+- **`Stats` counts the pages that hold a static share, and its bytes**, and kladde-bench records both, to show how often real pages earn one.
