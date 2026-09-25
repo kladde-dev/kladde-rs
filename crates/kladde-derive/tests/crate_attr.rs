@@ -9,7 +9,7 @@ mod support;
 
 use kladde_derive::Persistable;
 use kladde_persist::Persistable;
-use support::{root_location, MockBackend, Number};
+use support::{Fixture, Number};
 
 #[derive(Persistable)]
 #[kladde(crate = "kladde_persist")]
@@ -20,16 +20,13 @@ struct Redirected {
 
 #[test]
 fn a_type_rooted_at_kladde_persist_round_trips() {
-    let mut backend = MockBackend::default();
-    let location = root_location(&backend, <Redirected as Persistable>::INLINE_SIZE);
-
+    let mut f = Fixture::new(<Redirected as Persistable>::INLINE_SIZE);
     let mut value = Redirected {
         x: Number(7),
         y: Number(9),
     };
-    value.store(&backend, location);
-
-    let loaded = Redirected::load(&mut backend, location);
+    value.store(&f.store, f.location).unwrap();
+    let loaded: Redirected = f.reload();
     assert_eq!(loaded.x, Number(7));
     assert_eq!(loaded.y, Number(9));
 }

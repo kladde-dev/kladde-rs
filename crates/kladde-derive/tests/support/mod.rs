@@ -1,29 +1,45 @@
-//! Shared test fixtures for exercising `#[derive(Persistable)]`-generated code:
-//! a minimal hand-written "leaf" `Persistable` type (standing in for what
-//! `kladde-persist`'s primitive blanket impls provide) over the real
-//! `kladde_persist::MockBackend`.
+//! Shared fixtures for exercising `#[derive(Persistable)]`-generated code: a
+//! store in memory with a root allocation, and a minimal hand-written leaf
+//! type standing in for what the scalar impls provide.
 //!
-//! Not every item here is used by every test binary that includes this module
-//! (each `tests/*.rs` file compiles as its own crate) -- allowed rather than
-//! split further, since it's `#[cfg(test)]`-only fixture code.
+//! Not every item is used by every test binary that includes this module
+//! (each `tests/*.rs` file compiles as its own crate).
 #![allow(dead_code)]
 
 use kladde_persist::{
-    Backend, Guard, Location, Persistable, PointerRepr, ReadBackend, Word, WriteBackend,
+    Error, Guard, Location, Persistable, Pointer, PointerRepr, ReadBackend, WriteBackend,
 };
+use kladde_store::{MemoryStorage, Store};
 use std::io::Read;
 
-pub use kladde_persist::MockBackend;
+/// A store whose root allocation holds the value under test.
+pub struct Fixture {
+    pub store: Store,
+    pub location: Location<Pointer, u32>,
+}
 
-/// The pointer/size types the mock backend works in, so tests can name a
-/// `Location` without spelling out associated types.
-pub type MockLocation = Location<<MockBackend as Backend>::Pointer, <MockBackend as Backend>::Size>;
+impl Fixture {
+    pub fn new(size: usize) -> Fixture {
+        let store = Store::create(Box::new(MemoryStorage::new()), Default::default()).unwrap();
+        let root = store.alloc(size as u32).unwrap();
+        Fixture {
+            store,
+            location: Location::new(root.raw(), 0),
+        }
+    }
 
-/// Hands out a location backed by a real allocation, sized for whatever root
-/// type a test uses.
-pub fn root_location(backend: &MockBackend, size: usize) -> MockLocation {
-    let pointer = backend.alloc_fixed_size(Word::from_usize(size));
-    Location::new(pointer.raw(), 0)
+    /// Flushes, then loads a `T` from the root allocation.
+    pub fn reload<T: Persistable>(&mut self) -> T {
+        self.store.flush().unwrap();
+        self.store.check();
+        T::load(&mut self.store, self.location).unwrap()
+    }
+
+    /// Flushes, then returns the root allocation's bytes.
+    pub fn bytes(&mut self) -> Vec<u8> {
+        self.store.flush().unwrap();
+        self.store.read_all(self.location.anchor).unwrap()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -50,17 +66,23 @@ impl<P: PointerRepr> Persistable<P> for Number {
         }
     }
 
-    fn store<B: WriteBackend<Pointer = P>>(&mut self, backend: &B, location: Location<P, B::Size>) {
-        backend.write(location.anchor, location.offset, &self.0.to_le_bytes());
+    fn store<B: WriteBackend<Pointer = P>>(
+        &mut self,
+        backend: &B,
+        location: Location<P, B::Size>,
+    ) -> Result<(), Error> {
+        backend.write(location.anchor, location.offset, &self.0.to_le_bytes())
     }
 
-    fn load<B: ReadBackend<Pointer = P>>(backend: &mut B, location: Location<P, B::Size>) -> Self {
+    fn load<B: ReadBackend<Pointer = P>>(
+        backend: &mut B,
+        location: Location<P, B::Size>,
+    ) -> Result<Self, Error> {
         let mut bytes = [0u8; 4];
         backend
-            .read_at(location.anchor, location.offset)
-            .read_exact(&mut bytes)
-            .expect("read Number");
-        Number(i32::from_le_bytes(bytes))
+            .read_at(location.anchor, location.offset)?
+            .read_exact(&mut bytes)?;
+        Ok(Number(i32::from_le_bytes(bytes)))
     }
 
     fn describe_local(
@@ -77,13 +99,14 @@ pub struct NumberGuard<'s, B: WriteBackend> {
 }
 
 impl<'s, B: WriteBackend> NumberGuard<'s, B> {
-    pub fn set(&mut self, value: i32) {
+    pub fn set(&mut self, value: i32) -> Result<(), Error> {
         self.backend.write(
             self.location.anchor,
             self.location.offset,
             &value.to_le_bytes(),
-        );
+        )?;
         self.inner.0 = value;
+        Ok(())
     }
 }
 

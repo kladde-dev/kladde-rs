@@ -1,73 +1,57 @@
-//! composed from already-`Persistable` fields. See `spec.md`'s "The Trait
-//! Layer" and "Workspace Layout" for the pattern this generates:
+//! `#[derive(Persistable)]`: turns a struct or enum composed of
+//! `Persistable` fields into a backed type. Applications reach it through the
+//! `kladde` crate, which re-exports it.
 //!
-//! - Both named structs (`struct S { x: T }`) and tuple structs
-//!   (`struct S(T, U)`) are supported, laid out identically. Every field is
-//!   treated uniformly (including primitives, via blanket `Persistable`
-//!   impls in `kladde-persist`) -- no special-cased scalar setters, just a
-//!   `{field}_mut()` accessor per field (`field_{i}_mut()` for a tuple
-//!   struct's positional fields). Tuples of `Persistable` types, `(T, U)`,
-//!   are `Persistable` too (see `kladde-persist`), laid out the same way.
-//! - A derived struct's own `INLINE_SIZE` is the sum of its fields'
-//!   (each field's offset within it is therefore static, computable at
-//!   compile time), and it never owns an allocation of its own -- it just
-//!   threads the `Location` it's given down to its fields, extended by
-//!   each field's static offset.
-//! - An `enum`'s own `INLINE_SIZE` is a 4-byte discriminant plus whichever
-//!   variant's fields are largest -- each variant is laid out like a
-//!   struct in its own right (the same per-field offset computation,
-//!   based at offset 4 instead of 0), so an enum never owns an allocation
-//!   of its own either and needs no `serde`/`postcard` at all. Only
-//!   whole-value replacement is supported for now (`guard.set(new_value)`)
-//!   -- mutating a field within the current variant in place, and/or
-//!   matching directly on a generated `Guard`, is deferred (see
-//!   `spec.md`'s Future Work).
-//! - A single-field struct (tuple `struct S(T)` or braced `struct S { x: T }`)
-//!   marked `#[kladde(transparent)]` is persisted *exactly* as its one
-//!   field `T`, analogous to `#[serde(transparent)]`: same bytes, and the
-//!   same fingerprint (it reuses `T`'s schema descriptor instead of
-//!   registering its own).
-//! - **Generic types** are supported for type parameters: `#[derive(Persistable)]`
-//!   adds a `T: Persistable` bound to each type parameter (the same
-//!   heuristic `#[derive(Debug)]` uses), so a `struct List<T> { inner:
-//!   PersistableVec<T> }` derives an `impl<T: Persistable> Persistable for
-//!   List<T>`. Lifetime and const-generic parameters are not supported yet.
+//! For a type `T`, it generates
 //!
-//! **Field requirements:** every field of a derived `struct`/`enum` has
-//! to be a type that itself implements `Persistable`. Plain `String`
-//! doesn't (use `kladde_types::PersistableString` instead), but scalars
-//! (`i32`, `bool`, ...), `kladde-types` containers (`PersistableVec`,
-//! `PersistableHashMap`, `PersistableString`), and other
-//! `#[derive(Persistable)]` types all do. There's no special error
-//! message for this -- an unsuitable field type just fails to compile
-//! with an ordinary `` `Foo` doesn't implement `Persistable` `` error
-//! pointing at the field:
+//! - a `Persistable` implementation: `INLINE_SIZE`, `store`, `load`, `free`,
+//!   and the schema descriptor;
+//! - a guard type `TGuard`, with a `{field}_mut()` accessor per field
+//!   (`field_{i}_mut()` for a tuple struct's positional fields), a `parts()`
+//!   method handing out a guard for every field at once, and a whole-value
+//!   `set` that stores the new value and then frees the old one, in one
+//!   transaction;
+//! - `Deref` on the guard, so read-only methods stay available.
+//!
+//! Layout:
+//!
+//! - A struct's `INLINE_SIZE` is the sum of its fields', each field at the
+//!   static offset of the fields before it. It owns no allocation of its own.
+//! - An enum's `INLINE_SIZE` is a 4-byte discriminant plus its largest
+//!   variant, each variant laid out like a struct based past the
+//!   discriminant, and the bytes a smaller variant leaves unused written as
+//!   zeros. Only whole-value replacement is supported (`guard.set(value)`).
+//! - A single-field struct marked `#[kladde(transparent)]` is persisted exactly
+//!   as its field: same bytes and same fingerprint. Its guard has a `get_mut()`
+//!   returning the field's guard.
+//! - Type parameters get a `Persistable` bound, as `#[derive(Debug)]` does;
+//!   lifetime and const parameters are rejected.
+//!
+//! **Every field must be `Persistable`.** Plain `String` is not, and the
+//! compile error is the point: a field that would silently persist nothing
+//! does not compile.
 //!
 //! ```compile_fail
-//! #[derive(kladde_derive::Persistable)]
+//! #[derive(kladde::Persistable)]
 //! struct Contact {
 //!     name: String, // error[E0277]: the trait bound `String: Persistable` is not satisfied
 //! }
 //! ```
 //!
-//! Swapping in any type that *does* implement `Persistable` compiles the
-//! same way -- a scalar like `i32` here, or in a real application a
-//! `kladde-types` container, another `#[derive(Persistable)]` type, or
-//! (for a `String`-like field specifically) `kladde_types::PersistableString`:
+//! A type that does implement it, such as a scalar or a container of
+//! `kladde-types`, compiles:
 //!
 //! ```
-//! #[derive(kladde_derive::Persistable)]
+//! #[derive(kladde::Persistable)]
 //! struct Contact {
-//!     name: i32, // more realistically, kladde_types::PersistableString in this case
+//!     age: u16,
 //! }
 //! ```
 //!
-//! **Transparent newtypes:** `#[kladde(transparent)]` requires exactly one
-//! field, so a multi-field struct is a compile error (as it is for
-//! `#[serde(transparent)]`):
+//! `#[kladde(transparent)]` requires exactly one field:
 //!
 //! ```compile_fail
-//! #[derive(kladde_derive::Persistable)]
+//! #[derive(kladde::Persistable)]
 //! #[kladde(transparent)]
 //! struct TwoFields {
 //!     a: i32,
@@ -75,20 +59,15 @@
 //! }
 //! ```
 //!
-//! A one-field version compiles, and is persisted exactly as that field:
-//!
 //! ```
-//! #[derive(kladde_derive::Persistable)]
+//! #[derive(kladde::Persistable)]
 //! #[kladde(transparent)]
 //! struct Meters(i32);
 //! ```
 //!
-//! **Dependency note:** generated code references `::kladde_persist::...`
-//! paths directly, so any crate using this macro needs `kladde-persist` as
-//! a *direct* dependency too -- re-exports (e.g. via `kladde-types`)
-//! aren't enough to make `::kladde_persist` resolve. The same reason
-//! `#[derive(serde::Serialize)]` requires a direct `serde` dependency,
-//! not just `serde_derive`.
+//! **Paths.** Generated code names everything through `::kladde`, which
+//! re-exports what it needs. A library built on `kladde-persist` without the
+//! facade redirects it with `#[kladde(crate = "kladde_persist")]`.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -125,45 +104,36 @@ pub fn derive_persistable(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-/// The generics plumbing every derive path shares, precomputed once from
-/// the input type's own generic parameters. The generated code has to
-/// name three related-but-distinct generic lists, so they're built here
-/// rather than re-derived in each `derive_*` function:
+/// The generics plumbing every derive path shares, precomputed once from the
+/// input type's own generic parameters:
 ///
-/// - the *type*'s own `impl`/type/where fragments (`impl_generics`,
-///   `type_generics`, `where_clause`), with a `T: Persistable` bound
+/// - the *type*'s own `impl`/type/where fragments, with a `Persistable` bound
 ///   added to each type parameter (the `#[derive(Debug)]` heuristic); and
 /// - the generated *guard*'s generic lists, which extend the type's own
-///   parameters with a fresh lifetime `'__s`, pointer type `::kladde_persist::Pointer`, and backend
-///   `__B`. The last three
-///   are given deliberately underscore-prefixed, collision-proof names so
-///   a user type like `struct Foo<B> { .. }` (its own `B`) doesn't clash
-///   with the guard's backend parameter -- the same hygiene trick serde's
-///   derive uses.
+///   parameters with a fresh lifetime `'__s` and backend `__B`, given
+///   underscore-prefixed names so that a user type like `struct Foo<B>` does
+///   not clash with them -- the same hygiene trick serde's derive uses.
 ///
 /// Only type parameters are supported; lifetime and const parameters are
 /// rejected in [`build`](Ctx::build).
 struct Ctx {
-    /// The `impl` generics of the `Persistable` impl: the pointer type `::kladde_persist::Pointer`
-    /// followed by the type's own parameters, each given a
-    /// `Persistable<::kladde_persist::Pointer>` bound, e.g. `<::kladde_persist::Pointer: PointerRepr, T: Persistable<::kladde_persist::Pointer>>`.
+    /// The `impl` generics of the `Persistable` impl: the type's own
+    /// parameters, each bounded by `Persistable<Pointer>`.
     impl_generics: proc_macro2::TokenStream,
     /// The type's type generics, e.g. `<T>` (empty for a non-generic type).
     type_generics: proc_macro2::TokenStream,
     /// The type's own `where`-clause, verbatim (empty if none).
     where_clause: proc_macro2::TokenStream,
-    /// Generic list for *declaring* the guard struct and for every `impl` block
-    /// on it: `<'__s, T: Persistable<::kladde_persist::Pointer>, ::kladde_persist::Pointer: PointerRepr,
-    /// __B: WriteBackend<Pointer = ::kladde_persist::Pointer>>`.
+    /// Generic list for *declaring* the guard struct and for every `impl`
+    /// block on it.
     guard_impl_generics: proc_macro2::TokenStream,
-    /// Generic list for *naming* the guard type (bare parameter names, no
-    /// bounds): `<'__s, T, ::kladde_persist::Pointer, __B>`.
+    /// Generic list for *naming* the guard type (bare parameter names).
     guard_use_generics: proc_macro2::TokenStream,
-    /// The type's type parameters rendered with their bounds (`T: ... +
-    /// Persistable`), for building further generic lists (e.g. the `Parts`
-    /// struct) that need a different bracketing lifetime than the guard's.
+    /// The type's type parameters rendered with their bounds, for building
+    /// further generic lists (the `Parts` struct) that need a different
+    /// lifetime than the guard's.
     bounded_params: Vec<proc_macro2::TokenStream>,
-    /// The type's type parameters as bare idents (`T`), for naming.
+    /// The type's type parameters as bare idents.
     param_idents: Vec<syn::Ident>,
     /// The crate every generated path is rooted at -- `::kladde` unless
     /// `#[kladde(crate = "...")]` says otherwise.
@@ -184,16 +154,12 @@ impl Ctx {
                 GenericParam::Const(c) => {
                     return Err(syn::Error::new_spanned(
                         c,
-                        "#[derive(Persistable)] does not support const generic parameters yet",
+                        "#[derive(Persistable)] does not support const generic parameters",
                     ));
                 }
             }
         }
 
-        // Add a `T: Persistable` bound to every type parameter -- the same
-        // (slightly conservative) rule `#[derive(Debug)]` uses. A future
-        // `#[kladde(bound = "...")]` escape hatch could override this; see
-        // `later.md`.
         let mut bounded = input.generics.clone();
         for tp in bounded.type_params_mut() {
             tp.bounds.push(parse_quote!(
@@ -202,10 +168,6 @@ impl Ctx {
         }
         let (_, type_generics, where_clause) = bounded.split_for_impl();
 
-        // The guard's own generic lists: the type's (bounded) parameters,
-        // bracketed by a fresh lifetime and backend with collision-proof
-        // names. `bounded_params` render with their bounds
-        // (`T: ... + Persistable`); `param_idents` are the bare names.
         let bounded_params: Vec<proc_macro2::TokenStream> =
             bounded.type_params().map(|tp| quote!(#tp)).collect();
         let param_idents: Vec<syn::Ident> = input
@@ -214,12 +176,6 @@ impl Ctx {
             .map(|tp| tp.ident.clone())
             .collect();
 
-        // `::kladde_persist::Pointer` (the pointer type) leads every generic list: `Persistable` is
-        // generic over it, so the type parameters' own bounds mention it. It is
-        // *redundant* on the guard lists -- `__B::Pointer` already determines it
-        // -- but carrying it explicitly means every generated body can spell the
-        // bound as plain `Persistable<::kladde_persist::Pointer>`, whether it sits inside the
-        // `Persistable` impl or inside a guard impl.
         Ok(Ctx {
             impl_generics: quote! { <#(#bounded_params,)*> },
             type_generics: quote!(#type_generics),
@@ -235,14 +191,11 @@ impl Ctx {
     }
 }
 
-/// Whether the type carries `#[kladde(transparent)]`. Errors on any other
-/// `#[kladde(...)]` contents, so a typo is a compile error rather than a
-/// silent no-op.
+/// Parses the type's `#[kladde(...)]` attributes: whether it is
+/// `transparent`, and the `crate` generated paths are rooted at. Errors on
+/// anything else, so that a typo is a compile error rather than a no-op.
 fn kladde_attrs(attrs: &[syn::Attribute]) -> syn::Result<(bool, syn::Path)> {
     let mut transparent = false;
-    // Generated code is written in terms of the *facade*, so an application
-    // needs `kladde` and nothing else. A library built on `kladde-persist`
-    // without the facade overrides this with `#[kladde(crate = "kladde_persist")]`.
     let mut krate: syn::Path = syn::parse_quote!(::kladde);
     for attr in attrs {
         if !attr.path().is_ident("kladde") {
@@ -266,20 +219,9 @@ fn kladde_attrs(attrs: &[syn::Attribute]) -> syn::Result<(bool, syn::Path)> {
     Ok((transparent, krate))
 }
 
-/// For a list of field types meant to be laid out contiguously, back to
-/// back (a struct's fields, or one `enum` variant's fields, based at some
-/// offset the caller adds separately), computes each field's own static
-/// byte offset within that layout: the sum of every *earlier* field's
-/// `INLINE_SIZE`. Purely a function of the field *types*, not how the
-/// caller's generated code actually accesses each field (`self.foo`,
-/// `self.0`, a `match`-bound local, ...) -- shared by struct-derive and
-/// (per-variant) enum-derive.
-/// `base` is where the whole run starts within the value's own inline bytes: `0`
-/// for a struct, `4` for an enum variant (past the discriminant).
-///
-/// The result is typed as the *backend's* `Size`, not `u32`, because that is
-/// what `Location<P, S>`'s `Add` takes -- so every use site must have `__B` in
-/// scope, which every generated use site does.
+/// For fields laid out back to back starting at `base` bytes into the value
+/// (0 for a struct, 4 for an enum variant), each field's static offset: the
+/// sum of every earlier field's `INLINE_SIZE`, as the backend's `Size`.
 fn field_offsets(
     field_ty: &[syn::Type],
     base: usize,
@@ -297,22 +239,16 @@ fn field_offsets(
         .collect()
 }
 
-/// The total inline size of a list of field types laid out contiguously,
-/// back to back -- the sum of each field's own `INLINE_SIZE`.
+/// The total inline size of fields laid out back to back.
 fn total_size(field_ty: &[syn::Type], krate: &syn::Path) -> proc_macro2::TokenStream {
     quote! {
         0usize #( + <#field_ty as #krate::Persistable<#krate::Pointer>>::INLINE_SIZE )*
     }
 }
 
-/// The guard type shared by *every* derived `Persistable`: a
-/// `{ inner, backend, location }` struct plus its `Guard`/`Deref`/
-/// `DerefMut` impls. These are structurally identical across the struct,
-/// unit, enum, and transparent derives -- each of those differs only in the
-/// *accessor* `impl` block it adds on top (per-field `_mut()`, an enum's
-/// whole-value `set`, a transparent newtype's `get_mut`, ...) and in its
-/// `Persistable` body. Paired with [`guard_assoc`], which emits the
-/// matching items *inside* the `Persistable` impl.
+/// The guard type every derive kind shares: a `{ inner, backend, location }`
+/// struct, its `Guard` and `Deref` impls, and the whole-value `set`. Each kind
+/// adds accessors of its own on top.
 fn guard_scaffold(
     ctx: &Ctx,
     ident: &syn::Ident,
@@ -327,13 +263,27 @@ fn guard_scaffold(
         guard_use_generics,
         ..
     } = ctx;
+    let doc =
+        format!("The guard of [`{ident}`]: records and applies mutations of a backed `{ident}`.");
 
     quote! {
-        #[doc(hidden)]
+        #[doc = #doc]
         #vis struct #guard_ident #guard_impl_generics #where_clause {
             inner: &'__s mut #ident #type_generics,
             backend: &'__s __B,
             location: #krate::Location<#krate::Pointer, <__B as #krate::Backend>::Size>,
+        }
+
+        impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
+            /// Replaces the whole value: stores `value`, which publishes it,
+            /// then frees what the old value owned, in one transaction. If
+            /// anything fails, the value is left as it was.
+            #vis fn set(
+                &mut self,
+                value: #ident #type_generics,
+            ) -> ::std::result::Result<(), #krate::Error> {
+                #krate::replace(&mut *self.inner, value, self.backend, self.location)
+            }
         }
 
         impl #guard_impl_generics #krate::Guard
@@ -361,21 +311,11 @@ fn guard_scaffold(
                 self.inner
             }
         }
-
-        impl #guard_impl_generics ::std::ops::DerefMut
-            for #guard_ident #guard_use_generics #where_clause
-        {
-            fn deref_mut(&mut self) -> &mut #ident #type_generics {
-                self.inner
-            }
-        }
     }
 }
 
-/// The `Guard` associated type and `guard()` constructor shared by every
-/// derived `Persistable` impl -- the in-impl counterpart of
-/// [`guard_scaffold`]'s out-of-impl items. Every derive kind builds the
-/// same `{ inner, backend, location }` guard the same way.
+/// The `Guard` associated type and `guard()` constructor every derived
+/// `Persistable` impl shares.
 fn guard_assoc(ctx: &Ctx, guard_ident: &syn::Ident) -> proc_macro2::TokenStream {
     let krate = &ctx.krate;
     let Ctx {
@@ -403,19 +343,42 @@ fn guard_assoc(ctx: &Ctx, guard_ident: &syn::Ident) -> proc_macro2::TokenStream 
     }
 }
 
+/// The `store`/`load`/`free` signatures, which every derive kind spells the
+/// same way.
+fn store_sig(krate: &syn::Path) -> proc_macro2::TokenStream {
+    quote! {
+        fn store<__B: #krate::WriteBackend<Pointer = #krate::Pointer>>(
+            &mut self,
+            backend: &__B,
+            location: #krate::Location<#krate::Pointer, <__B as #krate::Backend>::Size>,
+        ) -> ::std::result::Result<(), #krate::Error>
+    }
+}
+
+fn load_sig(krate: &syn::Path) -> proc_macro2::TokenStream {
+    quote! {
+        fn load<__B: #krate::ReadBackend<Pointer = #krate::Pointer>>(
+            backend: &mut __B,
+            location: #krate::Location<#krate::Pointer, <__B as #krate::Backend>::Size>,
+        ) -> ::std::result::Result<Self, #krate::Error>
+    }
+}
+
+fn free_sig(krate: &syn::Path) -> proc_macro2::TokenStream {
+    quote! {
+        fn free<__B: #krate::WriteBackend<Pointer = #krate::Pointer>>(
+            &mut self,
+            backend: &__B,
+        ) -> ::std::result::Result<(), #krate::Error>
+    }
+}
+
 /// `#[kladde(transparent)]`, analogous to `#[serde(transparent)]`: a
-/// single-field newtype (tuple `struct S(T)` or braced `struct S { x: T }`)
-/// that is persisted *exactly* as its one field. The generated
-/// [`Persistable`](::kladde_persist::Persistable) impl delegates its whole
-/// representation to `T` -- same `INLINE_SIZE`, same bytes at the same
-/// location -- and, crucially, is **schema-transparent**: it overrides
-/// `describe` to reuse `T`'s descriptor rather than registering a node of
-/// its own (leaving `describe_local` at its panicking default), so `S` and
-/// `T` share one fingerprint. This is the derive-level front door to the
-/// escape hatch documented on `Persistable::describe`.
-///
-/// The wrapper's guard exposes a single `get_mut()` returning the inner
-/// type's own guard, so `T`'s full mutation API is reachable through it.
+/// single-field newtype persisted *exactly* as its one field. The impl
+/// delegates everything to the field at the wrapper's own location, and is
+/// **schema-transparent**: it overrides `describe` to reuse the field's
+/// descriptor rather than registering a node of its own, so the two share one
+/// fingerprint.
 fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> proc_macro2::TokenStream {
     let krate = &ctx.krate;
     let ident = &input.ident;
@@ -461,9 +424,6 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> proc_macro2::TokenStrea
     };
 
     let field_ty = &field.ty;
-    // How the single field is named on `self` (`.0` for a tuple newtype,
-    // the field ident for a braced one) and how the value is reassembled
-    // in `load`.
     let (member, construct): (syn::Member, proc_macro2::TokenStream) = match &field.ident {
         Some(name) => (
             syn::Member::Named(name.clone()),
@@ -477,15 +437,14 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> proc_macro2::TokenStrea
 
     let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident);
     let guard_assoc = guard_assoc(ctx, &guard_ident);
+    let (store_sig, load_sig, free_sig) = (store_sig(krate), load_sig(krate), free_sig(krate));
 
     quote! {
         #scaffold
 
         impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
-            /// A mutable guard over the wrapped value. Since this is a
-            /// `#[kladde(transparent)]` newtype, the inner value lives at
-            /// the wrapper's own location, so this is a direct pass-through
-            /// to the inner type's full mutation API.
+            /// The guard of the wrapped value, which lives at the wrapper's
+            /// own location: its whole mutation API, passed through.
             #[inline]
             #vis fn get_mut(
                 &mut self,
@@ -499,31 +458,29 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> proc_macro2::TokenStrea
         }
 
         impl #impl_generics #krate::Persistable<#krate::Pointer> for #ident #type_generics #where_clause {
-            // Transparent: the wrapper *is* its one field, so it owns no
-            // storage of its own and forwards everything at offset 0.
             const INLINE_SIZE: usize =
                 <#field_ty as #krate::Persistable<#krate::Pointer>>::INLINE_SIZE;
 
             #guard_assoc
 
-            fn store<__B: #krate::WriteBackend<Pointer = #krate::Pointer>>(&mut self, backend: &__B, location: #krate::Location<#krate::Pointer, <__B as #krate::Backend>::Size>) {
+            #store_sig {
                 <#field_ty as #krate::Persistable<#krate::Pointer>>::store(
                     &mut self.#member,
                     backend,
                     location,
-                );
+                )
             }
 
-            fn load<__B: #krate::ReadBackend<Pointer = #krate::Pointer>>(backend: &mut __B, location: #krate::Location<#krate::Pointer, <__B as #krate::Backend>::Size>) -> Self {
-                let __value = <#field_ty as #krate::Persistable<#krate::Pointer>>::load(backend, location);
-                #construct
+            #load_sig {
+                let __value =
+                    <#field_ty as #krate::Persistable<#krate::Pointer>>::load(backend, location)?;
+                ::std::result::Result::Ok(#construct)
             }
 
-            // Schema-transparent: reuse the inner type's descriptor instead
-            // of registering our own node, so `Self` and the field type
-            // share one fingerprint. Overriding `describe` (and leaving
-            // `describe_local` at its default) is exactly the transparency
-            // escape hatch documented on `Persistable::describe`.
+            #free_sig {
+                <#field_ty as #krate::Persistable<#krate::Pointer>>::free(&mut self.#member, backend)
+            }
+
             fn describe(builder: &mut #krate::SchemaBuilder) -> #krate::TypeRef
             where
                 Self: 'static,
@@ -552,10 +509,8 @@ fn derive_struct(
         ..
     } = ctx;
 
-    // Both named (`struct S { x: T }`) and tuple (`struct S(T)`) structs
-    // are laid out identically -- fields back to back -- so they share
-    // this code path; only how each field is *named* differs (see
-    // `StructField`).
+    // Named and tuple structs are laid out identically; only how each field
+    // is *named* differs.
     let fields: Vec<&syn::Field> = match &data.fields {
         Fields::Named(fields) => fields.named.iter().collect(),
         Fields::Unnamed(fields) => fields.unnamed.iter().collect(),
@@ -565,8 +520,6 @@ fn derive_struct(
     };
 
     let field_ty: Vec<syn::Type> = fields.iter().map(|f| f.ty.clone()).collect();
-    // Per field: how it's accessed on `self` (`.name` or `.0`), the
-    // `_mut()` accessor name, and its schema field name.
     let member: Vec<syn::Member> = fields
         .iter()
         .enumerate()
@@ -583,6 +536,14 @@ fn derive_struct(
             None => format_ident!("field_{}_mut", i),
         })
         .collect();
+    let accessor_doc: Vec<String> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| match &f.ident {
+            Some(name) => format!("The guard of field `{name}`."),
+            None => format!("The guard of field `{i}`."),
+        })
+        .collect();
     let schema_name: Vec<String> = fields
         .iter()
         .enumerate()
@@ -595,8 +556,6 @@ fn derive_struct(
     let field_offset = field_offsets(&field_ty, 0, krate);
     let total_size = total_size(&field_ty, krate);
 
-    // `load` reconstructs the value; the syntax differs between a braced
-    // struct (`S { name: .. }`) and a tuple struct (`S(..)`).
     let is_tuple = matches!(&data.fields, Fields::Unnamed(_));
     let load_body = if is_tuple {
         quote! {
@@ -605,7 +564,7 @@ fn derive_struct(
                     <#field_ty as #krate::Persistable<#krate::Pointer>>::load(
                         backend,
                         location + #field_offset,
-                    ),
+                    )?,
                 )*
             )
         }
@@ -618,19 +577,15 @@ fn derive_struct(
                     #field_ident: <#field_ty as #krate::Persistable<#krate::Pointer>>::load(
                         backend,
                         location + #field_offset,
-                    ),
+                    )?,
                 )*
             }
         }
     };
 
-    // A `{Ident}Parts` struct plus a `parts()` method that hands out a
-    // guard for *every* field at once. Each field guard borrows a disjoint
-    // part of `self.inner`, so all fields can be mutated simultaneously --
-    // the guard analog of splitting `&mut Pair` into `&mut pair.a` and
-    // `&mut pair.b` (which per-field `_mut()` accessors, each borrowing the
-    // whole guard, can't do). Mirrors the struct's own shape: a braced
-    // struct for a named struct, a tuple struct for a tuple struct.
+    // A `{Ident}Parts` struct plus a `parts()` method handing out a guard for
+    // *every* field at once, each borrowing a disjoint part of `self.inner`,
+    // so that all fields can be mutated simultaneously.
     let parts_ident = format_ident!("{}Parts", ident);
     let bounded_params = &ctx.bounded_params;
     let param_idents = &ctx.param_idents;
@@ -638,10 +593,8 @@ fn derive_struct(
         <'__f, #(#bounded_params,)* __B: #krate::WriteBackend<Pointer = #krate::Pointer>>
     };
     let parts_ret_generics = quote! { <'_, #(#param_idents,)* __B> };
-    // The `Parts` struct holds `Guard<'__f, __B>` associated types, whose
-    // GAT bound (`where Self: 's, B: 's`) means each needs `Param: '__f` and
-    // `__B: '__f`. Combine those outlives bounds with the user's own
-    // `where`-clause predicates.
+    // The `Parts` struct holds `Guard<'__f, __B>` associated types, whose GAT
+    // bounds need `Param: '__f` and `__B: '__f`.
     let user_where_preds = input.generics.where_clause.as_ref().map(|w| {
         let preds = &w.predicates;
         quote!(#preds,)
@@ -649,9 +602,10 @@ fn derive_struct(
     let parts_where = quote! {
         where #user_where_preds #(#param_idents: '__f,)* __B: '__f
     };
+    let parts_doc = format!("The guards of every field of [`{ident}`] at once.");
     let (parts_struct, parts_ctor) = if is_tuple {
         let struct_def = quote! {
-            #[doc(hidden)]
+            #[doc = #parts_doc]
             #vis struct #parts_ident #parts_decl_generics (
                 #(
                     #vis <#field_ty as #krate::Persistable<#krate::Pointer>>::Guard<'__f, __B>,
@@ -674,9 +628,10 @@ fn derive_struct(
         let field_ident: Vec<&syn::Ident> =
             fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
         let struct_def = quote! {
-            #[doc(hidden)]
+            #[doc = #parts_doc]
             #vis struct #parts_ident #parts_decl_generics #parts_where {
                 #(
+                    #[doc = #accessor_doc]
                     #vis #field_ident:
                         <#field_ty as #krate::Persistable<#krate::Pointer>>::Guard<'__f, __B>,
                 )*
@@ -698,6 +653,7 @@ fn derive_struct(
 
     let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident);
     let guard_assoc = guard_assoc(ctx, &guard_ident);
+    let (store_sig, load_sig, free_sig) = (store_sig(krate), load_sig(krate), free_sig(krate));
 
     quote! {
         #scaffold
@@ -706,6 +662,7 @@ fn derive_struct(
 
         impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
             #(
+                #[doc = #accessor_doc]
                 #[inline]
                 #vis fn #accessor_ident(
                     &mut self,
@@ -718,9 +675,8 @@ fn derive_struct(
                 }
             )*
 
-            /// Returns a guard for every field at once, so all fields can be
-            /// mutated simultaneously. Destructure the returned struct:
-            /// `let #parts_ident { .. } = guard.parts();`.
+            /// A guard for every field at once, so that all fields can be
+            /// mutated simultaneously.
             #[inline]
             #vis fn parts(&mut self) -> #parts_ident #parts_ret_generics {
                 #parts_ctor
@@ -728,25 +684,33 @@ fn derive_struct(
         }
 
         impl #impl_generics #krate::Persistable<#krate::Pointer> for #ident #type_generics #where_clause {
-            // A struct never owns an allocation of its own -- it's just
-            // the sum of its fields' inline representations, threaded
-            // through at static offsets.
             const INLINE_SIZE: usize = #total_size;
 
             #guard_assoc
 
-            fn store<__B: #krate::WriteBackend<Pointer = #krate::Pointer>>(&mut self, backend: &__B, location: #krate::Location<#krate::Pointer, <__B as #krate::Backend>::Size>) {
+            #store_sig {
                 #(
                     <#field_ty as #krate::Persistable<#krate::Pointer>>::store(
                         &mut self.#member,
                         backend,
                         location + #field_offset,
-                    );
+                    )?;
                 )*
+                ::std::result::Result::Ok(())
             }
 
-            fn load<__B: #krate::ReadBackend<Pointer = #krate::Pointer>>(backend: &mut __B, location: #krate::Location<#krate::Pointer, <__B as #krate::Backend>::Size>) -> Self {
-                #load_body
+            #load_sig {
+                ::std::result::Result::Ok(#load_body)
+            }
+
+            #free_sig {
+                #(
+                    <#field_ty as #krate::Persistable<#krate::Pointer>>::free(
+                        &mut self.#member,
+                        backend,
+                    )?;
+                )*
+                ::std::result::Result::Ok(())
             }
 
             fn describe_local(
@@ -773,9 +737,7 @@ fn derive_struct(
     }
 }
 
-/// A unit struct (`struct Foo;`) has no fields to mutate, load, or store
-/// at all -- same shape as the struct case but with empty bodies
-/// everywhere and `INLINE_SIZE = 0`.
+/// A unit struct (`struct Foo;`): no fields, `INLINE_SIZE = 0`.
 fn derive_unit_like_struct(
     ctx: &Ctx,
     ident: &syn::Ident,
@@ -791,6 +753,7 @@ fn derive_unit_like_struct(
     } = ctx;
     let scaffold = guard_scaffold(ctx, ident, vis, guard_ident);
     let guard_assoc = guard_assoc(ctx, guard_ident);
+    let (store_sig, load_sig) = (store_sig(krate), load_sig(krate));
 
     quote! {
         #scaffold
@@ -800,10 +763,14 @@ fn derive_unit_like_struct(
 
             #guard_assoc
 
-            fn store<__B: #krate::WriteBackend<Pointer = #krate::Pointer>>(&mut self, _backend: &__B, _location: #krate::Location<#krate::Pointer, <__B as #krate::Backend>::Size>) {}
+            #[allow(unused_variables)]
+            #store_sig {
+                ::std::result::Result::Ok(())
+            }
 
-            fn load<__B: #krate::ReadBackend<Pointer = #krate::Pointer>>(_backend: &mut __B, _location: #krate::Location<#krate::Pointer, <__B as #krate::Backend>::Size>) -> Self {
-                #ident
+            #[allow(unused_variables)]
+            #load_sig {
+                ::std::result::Result::Ok(#ident)
             }
 
             fn describe_local(
@@ -821,25 +788,17 @@ fn derive_unit_like_struct(
     }
 }
 
-/// Inline layout: a 4-byte discriminant followed by whichever variant's
-/// own fields, laid out exactly like a struct's (see
-/// `field_offsets`/`total_size`) but based at offset 4 instead of 0. Sized
-/// to fit the *largest* variant, since the same bytes have to be able to
-/// hold any of them -- unused tail bytes for a smaller variant are simply
-/// never read, the same way a `union`'s would be.
+/// Inline layout: a 4-byte discriminant followed by the variant's fields,
+/// laid out like a struct's but based at offset 4, and zeros up to the size
+/// of the largest variant, so that `store` always writes exactly
+/// `INLINE_SIZE` bytes.
 ///
-/// The discriminant value follows Rust's own rule: the explicit value where
-/// the author wrote one (`A = 42`), otherwise `predecessor + 1`. So the
-/// value stored on disk (and reported in the schema) equals the enum's real
-/// Rust discriminant, an author's pinned values stay stable, and uniqueness
-/// is inherited from Rust's own discriminant check -- a colliding enum never
-/// compiles. `store`, `load`, and `describe` all read it from one generated
-/// `const` chain.
-///
-/// Supports unit, tuple (`Fields::Unnamed`), and named-field variants,
-/// all in the same enum. Positional (tuple) fields get synthetic
-/// `field_0`, `field_1`, ... bindings in generated match patterns, since
-/// they have no identifier of their own to reuse.
+/// The discriminant follows Rust's own rule: the explicit value where the
+/// author wrote one (`A = 42`), otherwise `predecessor + 1`. So the value
+/// stored on disk, and reported in the schema, equals the enum's real Rust
+/// discriminant, pinned values stay stable, and uniqueness is inherited from
+/// Rust's own check. `store`, `load`, and `describe` read it from one
+/// generated `const` chain.
 fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_macro2::TokenStream {
     let krate = &ctx.krate;
     let ident = &input.ident;
@@ -849,8 +808,6 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
         impl_generics,
         type_generics,
         where_clause,
-        guard_impl_generics,
-        guard_use_generics,
         ..
     } = ctx;
 
@@ -866,11 +823,6 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
     let variant_count = data.variants.len();
     let variant_index: Vec<usize> = (0..variant_count).collect();
 
-    // Per-variant discriminant, emitted as a `const` chain: the explicit
-    // Rust discriminant where the author wrote one, otherwise
-    // `predecessor + 1` (Rust's own rule, so the values coincide with the
-    // enum's real discriminants and inherit its uniqueness check). Reused
-    // verbatim by `store`, `load`, and `describe`.
     let disc_assign: Vec<proc_macro2::TokenStream> = data
         .variants
         .iter()
@@ -895,11 +847,6 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
         };
     };
 
-    // Each variant's own field types (for its own offset/size
-    // computation) and the binding names generated code uses to refer to
-    // them in a match pattern -- the variant's own field idents for a
-    // named variant, synthetic `field_N` for a tuple variant, none for a
-    // unit variant.
     let variant_field_ty: Vec<Vec<syn::Type>> = data
         .variants
         .iter()
@@ -928,10 +875,6 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
         .iter()
         .map(|tys| total_size(tys, krate))
         .collect();
-
-    // The *schema* field names (as opposed to the match-binding idents):
-    // a named variant's field idents, a tuple variant's decimal positions,
-    // none for a unit variant.
     let variant_field_name: Vec<Vec<String>> = data
         .variants
         .iter()
@@ -946,9 +889,8 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
         })
         .collect();
 
-    // A match pattern binding a variant's own fields (if any) -- shared
-    // by `store` (matched against `&mut Self`, so bindings come out as
-    // `&mut FieldTy` via match ergonomics).
+    // A match pattern binding a variant's fields, matched against `&mut Self`
+    // so that bindings come out as `&mut FieldTy`.
     let variant_pattern: Vec<proc_macro2::TokenStream> = data
         .variants
         .iter()
@@ -963,16 +905,15 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
         })
         .collect();
 
-    // `store`'s per-variant match arm: write the discriminant, then each
-    // field at its static offset (base 4). Recurses into
-    // `Persistable::store` on each field's `&mut` binding, same as
-    // `derive_struct`'s `store`.
-    let variant_store_arm: Vec<proc_macro2::TokenStream> = (0..data.variants.len())
+    // `store`: the discriminant, each field at its static offset, and zeros
+    // for what the largest variant has beyond this one.
+    let variant_store_arm: Vec<proc_macro2::TokenStream> = (0..variant_count)
         .map(|i| {
             let pattern = &variant_pattern[i];
             let bindings = &variant_binding[i];
             let field_offset = &variant_field_offset[i];
             let field_ty = &variant_field_ty[i];
+            let size = &variant_size[i];
             quote! {
                 #pattern => {
                     #krate::WriteBackend::write(
@@ -980,22 +921,47 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
                         location.anchor,
                         location.offset,
                         &DISC[#i].to_le_bytes(),
-                    );
+                    )?;
                     #(
                         <#field_ty as #krate::Persistable<#krate::Pointer>>::store(
                             #bindings,
                             backend,
                             location + #field_offset,
-                        );
+                        )?;
+                    )*
+                    let __used = 4 + #size;
+                    let __padding = <Self as #krate::Persistable<#krate::Pointer>>::INLINE_SIZE - __used;
+                    if __padding > 0 {
+                        let __at = location
+                            + <<__B as #krate::Backend>::Size as #krate::Word>::from_usize(__used);
+                        #krate::WriteBackend::write(
+                            backend,
+                            __at.anchor,
+                            __at.offset,
+                            &::std::vec![0u8; __padding],
+                        )?;
+                    }
+                }
+            }
+        })
+        .collect();
+
+    let variant_free_arm: Vec<proc_macro2::TokenStream> = (0..variant_count)
+        .map(|i| {
+            let pattern = &variant_pattern[i];
+            let bindings = &variant_binding[i];
+            let field_ty = &variant_field_ty[i];
+            quote! {
+                #pattern => {
+                    #(
+                        <#field_ty as #krate::Persistable<#krate::Pointer>>::free(#bindings, backend)?;
                     )*
                 }
             }
         })
         .collect();
 
-    // `load`'s per-discriminant reconstruction expression: read each
-    // field back from its static offset and rebuild the variant.
-    let variant_load_expr: Vec<proc_macro2::TokenStream> = (0..data.variants.len())
+    let variant_load_expr: Vec<proc_macro2::TokenStream> = (0..variant_count)
         .map(|i| {
             let v_ident = &variant_ident[i];
             let field_ty = &variant_field_ty[i];
@@ -1010,7 +976,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
                                 #field_ident: <#field_ty as #krate::Persistable<#krate::Pointer>>::load(
                                     backend,
                                     location + #field_offset,
-                                ),
+                                )?,
                             )*
                         }
                     }
@@ -1021,7 +987,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
                             <#field_ty as #krate::Persistable<#krate::Pointer>>::load(
                                 backend,
                                 location + #field_offset,
-                            ),
+                            )?,
                         )*
                     )
                 },
@@ -1030,8 +996,6 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
         })
         .collect();
 
-    // Each variant's `Vec<Field>` expression for `describe`: a field's
-    // schema name paired with a recursive `describe` of its type.
     let variant_describe: Vec<proc_macro2::TokenStream> = (0..variant_count)
         .map(|i| {
             let v_ident = &variant_ident[i];
@@ -1058,20 +1022,10 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
 
     let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident);
     let guard_assoc = guard_assoc(ctx, &guard_ident);
+    let (store_sig, load_sig, free_sig) = (store_sig(krate), load_sig(krate), free_sig(krate));
 
     quote! {
         #scaffold
-
-        impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
-            /// Replaces the whole value with `value`. See `spec.md`'s
-            /// Future Work for the deferred fine-grained alternative
-            /// (mutating a field within the current variant in place,
-            /// and/or matching directly on this guard).
-            #vis fn set(&mut self, mut value: #ident #type_generics) {
-                <#ident #type_generics as #krate::Persistable<#krate::Pointer>>::store(&mut value, self.backend, self.location);
-                *self.inner = value;
-            }
-        }
 
         impl #impl_generics #krate::Persistable<#krate::Pointer> for #ident #type_generics #where_clause {
             const INLINE_SIZE: usize = 4 + {
@@ -1089,14 +1043,15 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
 
             #guard_assoc
 
-            fn store<__B: #krate::WriteBackend<Pointer = #krate::Pointer>>(&mut self, backend: &__B, location: #krate::Location<#krate::Pointer, <__B as #krate::Backend>::Size>) {
+            #store_sig {
                 #discriminants
                 match self {
                     #(#variant_store_arm)*
                 }
+                ::std::result::Result::Ok(())
             }
 
-            fn load<__B: #krate::ReadBackend<Pointer = #krate::Pointer>>(backend: &mut __B, location: #krate::Location<#krate::Pointer, <__B as #krate::Backend>::Size>) -> Self {
+            #load_sig {
                 #discriminants
                 let discriminant = {
                     let mut __buf = [0u8; 4];
@@ -1104,21 +1059,27 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
                         backend,
                         location.anchor,
                         location.offset,
-                    );
-                    ::std::io::Read::read_exact(&mut __cursor, &mut __buf)
-                        .expect("read enum discriminant");
+                    )?;
+                    ::std::io::Read::read_exact(&mut __cursor, &mut __buf)?;
                     u32::from_le_bytes(__buf)
                 };
                 #(
                     if discriminant == DISC[#variant_index] {
-                        return #variant_load_expr;
+                        return ::std::result::Result::Ok(#variant_load_expr);
                     }
                 )*
-                panic!(
-                    "corrupt persisted {}: unknown discriminant {}",
-                    ::std::stringify!(#ident),
+                ::std::result::Result::Err(#krate::Error::Corrupt(::std::format!(
+                    "unknown discriminant {} of {}",
                     discriminant,
-                );
+                    ::std::stringify!(#ident),
+                )))
+            }
+
+            #free_sig {
+                match self {
+                    #(#variant_free_arm)*
+                }
+                ::std::result::Result::Ok(())
             }
 
             fn describe_local(
