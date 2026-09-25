@@ -82,6 +82,19 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 - **The budget loop never continues the last page of `pack`.**
   The design lets that page cut a victim's survivor whenever the loop opens another page, so that only the flush's very last data page can close short.
   Here, `pack`'s last page is filled by free filling alone, and can close short even when the loop goes on.
+- **The cut's fillers state only ids the flush has not touched otherwise — a gap in `impl/`.**
+  `impl/consolidation.md#one-dirty-set-and-why-statements-are-derived-last` fills the last page's room with table victims and the rotating window once the flush's own statements are laid out, and merges what they add into that page.
+  But a victim can hold the anchor of an id whose size statements are laid out already: if the flush emitted a `Grow` for it, replacing the anchor needs a `Shrink`, and one epoch may not hold both.
+  The implementation avoids the conflict: the cut takes a table victim only if the flush touched none of the ids it names, and the window restates an anchor or grow witness only for such ids, while restating content, which cannot conflict, for any id.
+  A victim excluded this way remains a candidate for later flushes.
+- **A table victim's restatements are estimated at 1.25 times its coverage.**
+  Fragments split by shadowing need a statement each, and restated statements lose the delta encoding of their old neighbours; `impl/consolidation.md#the-page-rewrite` prices the rewrite by coverage alone.
+  If the estimate is too low for a filler, what does not fit the last page spills into another leaf.
+- **A budgeted page rewrite opens no page of its own.**
+  It takes its victims before the cut, whose layout then needs about one more leaf per offer; the budget counts it as a page all the same.
+- **The header keeps its hottest statements one by one, not the coldest key-contiguous run.**
+  `impl/flush.md#the-header-as-write-buffer` recommends evicting the coldest run in key order, so that leaves cover coherent id ranges.
+  The cut fills the header with the hottest statements that fit and cuts the rest into leaves in key order, which gets the leaves' key order but not the runs.
 - **The controller moves the budget multiplicatively.**
   After each commit it measures the live fraction of data and table pages and multiplies the budget by `exp(4 · (τ − fill))`, within `budget_min` and `budget_max`.
   `impl/consolidation.md#constants-still-to-be-chosen` leaves the rule open.

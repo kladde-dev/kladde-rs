@@ -701,6 +701,13 @@ impl Inner {
             }
         }
         for p in out.dropped_tables {
+            if cfg!(debug_assertions) && self.state.pages[p as usize].state == PageState::Table {
+                let live = self.live_statements_in(p);
+                assert!(
+                    live.is_empty(),
+                    "unlinked leaf {p} still holds live statements: {live:?}"
+                );
+            }
             self.state.unbucket(p);
             self.state.pages[p as usize].state = PageState::Retiring;
             self.table_pages.remove(&p);

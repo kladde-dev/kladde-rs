@@ -1,10 +1,14 @@
 //! The cut (`impl/consolidation.md#one-dirty-set-and-why-statements-are-derived-last`):
 //! derive every statement from the dirty set, lay them out — the hottest in
-//! the header, the rest in leaves in key order — and bind them.
+//! the header, the rest in leaves in key order — give the room the last page
+//! has left to the fillers, and bind.
+
+use std::collections::BTreeMap;
 
 use crate::consts::*;
 use crate::error::{corrupt, Error};
 use crate::flush::Output;
+use crate::hash::IdMap;
 use crate::page::decode_page;
 use crate::state::*;
 use crate::statement::{Kind, Stmt, TableReader, TableWriter};
@@ -23,35 +27,194 @@ pub(crate) struct Derived {
 /// How many child references the header keeps before an interior layer
 /// takes them over.
 const HEADER_CHILD_LIMIT: usize = 600;
+/// Children per interior page.
+const INTERIOR_FANOUT: usize = 800;
+/// Header bytes the first layout keeps back, for leaves the fillers may add.
+const HEADER_RESERVE: usize = 16;
+
+/// Which page each derived statement goes to, by index into the statements.
+struct Layout {
+    header: Vec<usize>,
+    leaves: Vec<Vec<usize>>,
+}
+
+/// The size statements a set of records calls for, and the ids whose old
+/// grow witness they make redundant.
+struct Sizes {
+    stmts: Vec<Derived>,
+    retire: Vec<u32>,
+}
+
+/// The encoded length of the statements `set`, without a child list.
+fn statements_len(set: &[usize], derived: &[Derived]) -> usize {
+    let mut w = TableWriter::new();
+    w.end_children();
+    for &i in set {
+        w.push(&derived[i].stmt, &derived[i].payload);
+    }
+    w.len() - 1
+}
+
+/// A bound on the header's child list, with its delimiter, for the `kept`
+/// leaves and `new` more.
+fn children_len(kept: &[u32], new: usize) -> usize {
+    let n = kept.len() + new;
+    if n > HEADER_CHILD_LIMIT {
+        5 * n.div_ceil(INTERIOR_FANOUT) + 1
+    } else {
+        TableWriter::children_len(kept) + 5 * new
+    }
+}
+
+fn header_len(set: &[usize], derived: &[Derived], kept: &[u32], new_leaves: usize) -> usize {
+    children_len(kept, new_leaves) + statements_len(set, derived)
+}
+
+fn sort_by_key(set: &mut [usize], derived: &[Derived]) {
+    set.sort_by_key(|&i| derived[i].stmt.sort_key());
+}
+
+/// Cuts `order`, sorted by key, into leaves, each closed when the next
+/// statement does not fit.
+fn split_leaves(order: &[usize], derived: &[Derived]) -> Vec<Vec<usize>> {
+    let mut out = Vec::new();
+    let mut w = TableWriter::new();
+    w.end_children();
+    let mut cur: Vec<usize> = Vec::new();
+    for &i in order {
+        let l = w.statement_len(&derived[i].stmt);
+        if w.len() + l > MAX_PAGE_CONTENT && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            w = TableWriter::new();
+            w.end_children();
+        }
+        w.push(&derived[i].stmt, &derived[i].payload);
+        cur.push(i);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The header first, with the hottest statements it can hold; the rest in
+/// leaves, in key order. `derived` is sorted by key.
+fn layout(derived: &[Derived], kept: &[u32]) -> Layout {
+    let all: Vec<usize> = (0..derived.len()).collect();
+    if kept.len() <= HEADER_CHILD_LIMIT
+        && header_len(&all, derived, kept, 0) + HEADER_RESERVE <= MAX_HEADER_CONTENT
+    {
+        return Layout {
+            header: all,
+            leaves: Vec::new(),
+        };
+    }
+    let mut order = all.clone();
+    order.sort_by_key(|&i| (derived[i].heat, derived[i].stmt.sort_key()));
+    let total: usize = derived
+        .iter()
+        .map(|d| TableWriter::standalone_len(&d.stmt))
+        .sum();
+    let mut slack = 64usize;
+    loop {
+        let estimate = total / MAX_PAGE_CONTENT + 2;
+        let cap = MAX_HEADER_CONTENT
+            .saturating_sub(children_len(kept, estimate) + HEADER_RESERVE + slack);
+        let mut used = 0usize;
+        let mut chosen = vec![false; derived.len()];
+        for &i in &order {
+            let l = TableWriter::standalone_len(&derived[i].stmt);
+            if used + l <= cap {
+                used += l;
+                chosen[i] = true;
+            }
+        }
+        let header: Vec<usize> = all.iter().copied().filter(|&i| chosen[i]).collect();
+        let rest: Vec<usize> = all.iter().copied().filter(|&i| !chosen[i]).collect();
+        let leaves = split_leaves(&rest, derived);
+        if header_len(&header, derived, kept, leaves.len()) + HEADER_RESERVE <= MAX_HEADER_CONTENT {
+            return Layout { header, leaves };
+        }
+        slack += 256;
+    }
+}
+
+/// Moves the header's coldest statements into leaves until it fits.
+fn fit_header(lay: &mut Layout, derived: &[Derived], kept: &[u32]) {
+    let mut spill: Vec<usize> = Vec::new();
+    loop {
+        let mut sorted = spill.clone();
+        sort_by_key(&mut sorted, derived);
+        let spill_leaves = split_leaves(&sorted, derived).len();
+        let len = header_len(&lay.header, derived, kept, lay.leaves.len() + spill_leaves);
+        if len <= MAX_HEADER_CONTENT || lay.header.is_empty() {
+            break;
+        }
+        let coldest = (0..lay.header.len())
+            .max_by_key(|&j| {
+                (
+                    derived[lay.header[j]].heat,
+                    derived[lay.header[j]].stmt.sort_key(),
+                )
+            })
+            .unwrap();
+        spill.push(lay.header.remove(coldest));
+    }
+    if !spill.is_empty() {
+        sort_by_key(&mut spill, derived);
+        lay.leaves.extend(split_leaves(&spill, derived));
+    }
+}
+
+/// Puts `extra` into the last page of `lay`: the last leaf, or the header if
+/// there is none. What does not fit there spills into more leaves.
+fn add_to_last(lay: &mut Layout, extra: Vec<usize>, derived: &[Derived], kept: &[u32]) {
+    if extra.is_empty() {
+        return;
+    }
+    match lay.leaves.pop() {
+        Some(mut last) => {
+            last.extend(extra);
+            sort_by_key(&mut last, derived);
+            lay.leaves.extend(split_leaves(&last, derived));
+        }
+        None => {
+            lay.header.extend(extra);
+            sort_by_key(&mut lay.header, derived);
+        }
+    }
+    fit_header(lay, derived, kept);
+}
 
 impl Inner {
-    /// Unlinks table pages that nothing in them keeps alive. Their
-    /// statements are dead, but still physically present until now.
-    fn unlink_empty(&mut self, out: &mut Output) -> Result<Vec<u32>, Error> {
+    /// Unlinks the leaves this flush rewrote, and those nothing keeps alive
+    /// any more, whose statements are dead but still physically present
+    /// until now. Returns the leaves that stay.
+    fn unlink_leaves(&mut self, out: &mut Output) -> Result<Vec<u32>, Error> {
         let leaves = self.all_leaves();
         let mut kept = Vec::with_capacity(leaves.len());
         for p in leaves {
-            let info = self.state.pages[p as usize];
-            if info.state == PageState::Table && info.coverage == 0 {
-                if !self.flush_rewritten.contains(&p) {
-                    self.drop_page_statements(p)?;
-                }
+            if self.flush_rewritten.contains(&p) {
+                out.dropped_tables.push(p);
+            } else if self.state.pages[p as usize].state == PageState::Table
+                && self.state.pages[p as usize].coverage == 0
+            {
+                self.drop_page_statements(p)?;
                 out.dropped_tables.push(p);
             } else {
                 kept.push(p);
             }
         }
         // The interior layer is rebuilt by every cut that needs one.
-        let interiors: Vec<u32> = self
+        let header_children = self
             .children
             .get(&self.header_slot)
             .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|&c| self.state.pages[c as usize].state == PageState::Interior)
-            .collect();
-        for p in interiors {
-            out.dropped_tables.push(p);
+            .unwrap_or_default();
+        for p in header_children {
+            if self.state.pages[p as usize].state == PageState::Interior {
+                out.dropped_tables.push(p);
+            }
         }
         Ok(kept)
     }
@@ -76,36 +239,38 @@ impl Inner {
         out
     }
 
-    /// Drops every statement of table page `p` physically.
-    pub(crate) fn drop_page_statements(&mut self, p: u32) -> Result<(), Error> {
+    /// The ids the statements of table page `p` name, in page order.
+    pub(crate) fn page_ids(&self, p: u32) -> Result<Vec<u32>, Error> {
         let buf = self
             .table_pages
             .get(&p)
-            .ok_or_else(|| corrupt("a table page is not resident"))?
-            .clone();
-        let d = decode_page(&buf, p < 2)
+            .ok_or_else(|| corrupt("a table page is not resident"))?;
+        let d = decode_page(buf, p < 2)
             .map_err(|_| corrupt("a resident table page does not decode"))?;
         let (_, mut r) = TableReader::open(&buf[..], d.content)?;
+        let mut ids = Vec::new();
         while let Some(dec) = r.next_stmt()? {
-            self.state.drop_physically(dec.stmt.id);
+            ids.push(dec.stmt.id);
+        }
+        Ok(ids)
+    }
+
+    /// Drops every statement of table page `p` physically.
+    pub(crate) fn drop_page_statements(&mut self, p: u32) -> Result<(), Error> {
+        for id in self.page_ids(p)? {
+            self.state.drop_physically(id);
         }
         Ok(())
     }
 
     /// Derives the content statements stating the pending fragments in
-    /// `dirty`: one per maximal run that states alike.
-    pub(crate) fn derive(
-        &mut self,
-        dirty: &Dirty,
-        from: Option<&std::collections::BTreeMap<Key, u32>>,
-    ) -> Result<Vec<Derived>, Error> {
-        let threshold = self.opts.inline_threshold.max(1).min(MAX_INLINE as u32);
+    /// `ranges`: one per maximal run that states alike.
+    fn derive(&mut self, ranges: &BTreeMap<Key, u32>) -> Result<Vec<Derived>, Error> {
+        let threshold = self.opts.inline_threshold.clamp(1, MAX_INLINE as u32);
         let mut out: Vec<Derived> = Vec::new();
-        let ranges = from.unwrap_or(&dirty.ranges);
         for (&k, &end) in ranges {
             let id = kid(k);
-            let size = self.state.size_of(id);
-            let end = end.min(size);
+            let end = end.min(self.state.size_of(id));
             if koff(k) >= end {
                 continue;
             }
@@ -123,13 +288,23 @@ impl Inner {
                 let off = koff(fk);
                 let len = fend - off;
                 let Fragment::Pending(p) = f else {
-                    if let Some(r) = run.take() {
-                        out.push(r);
-                    }
+                    out.extend(run.take());
                     continue;
                 };
                 let pe = self.state.pending[p as usize];
                 let continues = |r: &Derived| r.stmt.offset + r.stmt.size == off;
+                let start = |stmt: Stmt,
+                             payload: Vec<u8>,
+                             run: &mut Option<Derived>,
+                             out: &mut Vec<Derived>| {
+                    out.extend(run.take());
+                    *run = Some(Derived {
+                        stmt,
+                        keys: vec![fk],
+                        payload,
+                        heat: pe.heat,
+                    });
+                };
                 match pe.place {
                     Place::Zero => match &mut run {
                         Some(r) if r.stmt.kind == Kind::Zero && continues(r) => {
@@ -137,17 +312,7 @@ impl Inner {
                             r.keys.push(fk);
                             r.heat = r.heat.min(pe.heat);
                         }
-                        _ => {
-                            if let Some(r) = run.take() {
-                                out.push(r);
-                            }
-                            run = Some(Derived {
-                                stmt: Stmt::zero(id, off, len),
-                                keys: vec![fk],
-                                payload: vec![],
-                                heat: pe.heat,
-                            });
-                        }
+                        _ => start(Stmt::zero(id, off, len), Vec::new(), &mut run, &mut out),
                     },
                     Place::Data(a) => match &mut run {
                         Some(r)
@@ -160,17 +325,12 @@ impl Inner {
                             r.keys.push(fk);
                             r.heat = r.heat.min(pe.heat);
                         }
-                        _ => {
-                            if let Some(r) = run.take() {
-                                out.push(r);
-                            }
-                            run = Some(Derived {
-                                stmt: Stmt::reference(id, off, len, a),
-                                keys: vec![fk],
-                                payload: vec![],
-                                heat: pe.heat,
-                            });
-                        }
+                        _ => start(
+                            Stmt::reference(id, off, len, a),
+                            Vec::new(),
+                            &mut run,
+                            &mut out,
+                        ),
                     },
                     Place::Inline => {
                         let mut bytes = vec![0u8; len as usize];
@@ -187,20 +347,12 @@ impl Inner {
                                 r.heat = r.heat.min(pe.heat);
                             }
                             _ => {
-                                if let Some(r) = run.take() {
-                                    out.push(r);
-                                }
                                 if len as usize > MAX_INLINE {
                                     return Err(corrupt(
                                         "an inline run longer than the format allows",
                                     ));
                                 }
-                                run = Some(Derived {
-                                    stmt: Stmt::inline(id, off, len),
-                                    keys: vec![fk],
-                                    payload: bytes,
-                                    heat: pe.heat,
-                                });
+                                start(Stmt::inline(id, off, len), bytes, &mut run, &mut out);
                             }
                         }
                     }
@@ -209,37 +361,40 @@ impl Inner {
                     }
                 }
             }
-            if let Some(r) = run.take() {
-                out.push(r);
-            }
+            out.extend(run.take());
         }
         Ok(out)
     }
 
-    /// The statements a touched id's size and existence call for
-    /// (`impl/address-table-operations.md#what-the-cut-states-for-a-touched-id`).
-    fn size_statements(&mut self, dirty: &Dirty, derived: &[Derived]) -> Vec<Derived> {
-        let mut reach: crate::hash::IdMap<u32> = Default::default();
-        for d in derived {
-            let e = reach.entry(d.stmt.id).or_default();
-            *e = (*e).max(d.stmt.offset + d.stmt.size);
+    /// The statements the touched ids in `records` need for their size and
+    /// existence (`impl/address-table-operations.md#what-the-cut-states-for-a-touched-id`).
+    /// `content` holds every content statement of the flush.
+    fn size_statements(&self, records: &IdMap<IdRecord>, content: &[&[Derived]]) -> Sizes {
+        let mut reach: IdMap<u32> = IdMap::default();
+        for d in content.iter().flat_map(|c| c.iter()) {
+            if d.stmt.kind.is_content() {
+                let e = reach.entry(d.stmt.id).or_default();
+                *e = (*e).max(d.stmt.offset + d.stmt.size);
+            }
         }
-        let mut ids: Vec<u32> = dirty.records.keys().copied().collect();
+        let mut ids: Vec<u32> = records.keys().copied().collect();
         ids.sort_unstable();
-        let mut out = Vec::new();
-        let mut retire = Vec::new();
+        let mut sizes = Sizes {
+            stmts: Vec::new(),
+            retire: Vec::new(),
+        };
         for id in ids {
-            let rec = dirty.records[&id];
+            let rec = records[&id];
             let heat = if rec.written { 0 } else { self.heat_of(id) };
             let mk = |stmt| Derived {
                 stmt,
-                keys: vec![],
-                payload: vec![],
+                keys: Vec::new(),
+                payload: Vec::new(),
                 heat,
             };
             let Some(m) = self.state.allocs.get(&id) else {
                 if (rec.freed || rec.replace_anchor) && self.state.mentions(id) > 0 {
-                    out.push(mk(Stmt::tombstone(id)));
+                    sizes.stmts.push(mk(Stmt::tombstone(id)));
                 }
                 continue;
             };
@@ -248,129 +403,74 @@ impl Inner {
             let mut anchored = false;
             let mut grown = false;
             if rec.shrank {
-                out.push(mk(Stmt::shrink(id, size)));
+                sizes.stmts.push(mk(Stmt::shrink(id, size)));
                 anchored = true;
             } else if (rec.allocated || size > rec.size_before) && !reaches {
-                out.push(mk(Stmt::grow(id, size)));
+                sizes.stmts.push(mk(Stmt::grow(id, size)));
                 grown = true;
             }
             if rec.replace_anchor && !anchored && m.anchor.is_some() {
-                out.push(mk(Stmt::shrink(id, size)));
+                sizes.stmts.push(mk(Stmt::shrink(id, size)));
                 anchored = true;
             }
             if rec.replace_grow && m.grow.is_some() {
                 if !anchored && !grown && !reaches {
-                    out.push(mk(Stmt::grow(id, size)));
+                    sizes.stmts.push(mk(Stmt::grow(id, size)));
                 } else {
                     // Something else witnesses the size now; the old witness
-                    // lives in a page this flush retires, so it goes.
-                    retire.push(id);
+                    // lives in a page the flush retires or restates, so it goes.
+                    sizes.retire.push(id);
                 }
             }
         }
-        for id in retire {
-            if let Some(g) = self.state.allocs.get_mut(&id).and_then(|m| m.grow.take()) {
-                self.state.unpin(g);
-            }
+        sizes
+    }
+
+    /// The room the last page of `lay` has left, in encoded bytes.
+    fn last_room(&self, lay: &Layout, derived: &[Derived], kept: &[u32]) -> usize {
+        match lay.leaves.last() {
+            Some(last) => MAX_PAGE_CONTENT.saturating_sub(statements_len(last, derived) + 1),
+            None => MAX_HEADER_CONTENT
+                .saturating_sub(header_len(&lay.header, derived, kept, 0) + HEADER_RESERVE),
         }
-        out
     }
 
     /// Lays out and binds everything the flush states.
     pub(crate) fn cut(&mut self, dirty: &mut Dirty, out: &mut Output) -> Result<(), Error> {
-        let kept = self.unlink_empty(out)?;
-        let mut derived = self.derive(dirty, None)?;
-        let sizes = self.size_statements(dirty, &derived);
-        derived.extend(sizes);
+        let mut kept = self.unlink_leaves(out)?;
+        let mut derived = self.derive(&dirty.ranges)?;
+        let sizes = self.size_statements(&dirty.records, &[&derived]);
+        derived.extend(sizes.stmts);
+        let mut retire = sizes.retire;
         derived.sort_by_key(|d| d.stmt.sort_key());
+        let mut lay = layout(&derived, &kept);
 
-        // Header first: everything, if it fits.
-        let new_slot = ((self.epoch + 1) % 2) as u32;
-        let exact = |set: &[usize], derived: &[Derived], children: &[u32]| -> usize {
-            let mut w = TableWriter::new();
-            for &c in children {
-                w.child(c);
+        // The fillers: whole table victims that fit the last page's room,
+        // then the rotating window. They state only ids the flush has not
+        // touched otherwise, so their statements merge into the last page
+        // without conflicting with anything laid out already.
+        if self.opts.consolidate {
+            let room = self.last_room(&lay, &derived, &kept);
+            let mut fillers = Dirty::default();
+            let victims = self.cut_fillers(room, dirty, &mut fillers)?;
+            if !victims.is_empty() {
+                kept.retain(|p| !victims.contains(p));
+                out.dropped_tables.extend(victims);
             }
-            w.end_children();
-            for &i in set {
-                w.push(&derived[i].stmt, &derived[i].payload);
-            }
-            w.len()
-        };
-        let all: Vec<usize> = (0..derived.len()).collect();
-        let mut header_set: Vec<usize>;
-        let mut leaf_sets: Vec<Vec<usize>> = Vec::new();
-        if kept.len() <= HEADER_CHILD_LIMIT && exact(&all, &derived, &kept) <= MAX_HEADER_CONTENT {
-            header_set = all;
-        } else {
-            // The hottest statements stay in the header; the rest go to leaves
-            // in key order.
-            let total: usize = derived
-                .iter()
-                .map(|d| TableWriter::standalone_len(&d.stmt))
-                .sum();
-            let mut reserve = 64usize;
-            loop {
-                let est_leaves = total / MAX_PAGE_CONTENT + 2;
-                let child_budget = if kept.len() + est_leaves > HEADER_CHILD_LIMIT {
-                    5 * ((kept.len() + est_leaves) / 800 + 2)
-                } else {
-                    TableWriter::children_len(&kept) + 5 * est_leaves
-                };
-                let cap = MAX_HEADER_CONTENT.saturating_sub(child_budget + reserve);
-                let mut order: Vec<usize> = (0..derived.len()).collect();
-                order.sort_by_key(|&i| (derived[i].heat, derived[i].stmt.sort_key()));
-                let mut used = 0usize;
-                let mut chosen = vec![false; derived.len()];
-                for &i in &order {
-                    let l = TableWriter::standalone_len(&derived[i].stmt);
-                    if used + l <= cap {
-                        used += l;
-                        chosen[i] = true;
-                    }
-                }
-                header_set = (0..derived.len()).filter(|&i| chosen[i]).collect();
-                let rest: Vec<usize> = (0..derived.len()).filter(|&i| !chosen[i]).collect();
-                leaf_sets.clear();
-                let mut w = TableWriter::new();
-                w.end_children();
-                let mut cur: Vec<usize> = Vec::new();
-                for i in rest {
-                    let l = w.statement_len(&derived[i].stmt);
-                    if w.len() + l > MAX_PAGE_CONTENT && !cur.is_empty() {
-                        leaf_sets.push(std::mem::take(&mut cur));
-                        w = TableWriter::new();
-                        w.end_children();
-                    }
-                    w.push(&derived[i].stmt, &derived[i].payload);
-                    cur.push(i);
-                }
-                if !cur.is_empty() {
-                    leaf_sets.push(cur);
-                }
-                let leaves = kept.len() + leaf_sets.len();
-                let children_len = if leaves > HEADER_CHILD_LIMIT {
-                    5 * (leaves / 800 + 2)
-                } else {
-                    TableWriter::children_len(&kept) + 5 * leaf_sets.len()
-                };
-                if children_len + exact(&header_set, &derived, &[]) <= MAX_HEADER_CONTENT {
-                    break;
-                }
-                reserve += 256;
-            }
+            let mut extra = self.derive(&fillers.ranges)?;
+            let sizes = self.size_statements(&fillers.records, &[&derived, &extra]);
+            extra.extend(sizes.stmts);
+            retire.extend(sizes.retire);
+            dirty.records.extend(fillers.records);
+            let base = derived.len();
+            derived.extend(extra);
+            add_to_last(&mut lay, (base..derived.len()).collect(), &derived, &kept);
         }
 
         // Pages for the leaves, then the tree above them.
-        let mut leaf_pages = Vec::with_capacity(leaf_sets.len());
-        for _ in &leaf_sets {
-            leaf_pages.push(take_page(
-                &mut self.ready,
-                &mut self.state,
-                &mut self.file_pages,
-                &mut *self.storage,
-                &mut self.stats,
-            )?);
+        let mut leaf_pages = Vec::with_capacity(lay.leaves.len());
+        for _ in &lay.leaves {
+            leaf_pages.push(self.take_table_page()?);
         }
         let mut all_leaves: Vec<u32> = kept
             .iter()
@@ -382,14 +482,8 @@ impl Inner {
         let mut interiors: Vec<(u32, Vec<u32>)> = Vec::new();
         if all_leaves.len() > HEADER_CHILD_LIMIT {
             header_children.clear();
-            for group in all_leaves.chunks(800) {
-                let p = take_page(
-                    &mut self.ready,
-                    &mut self.state,
-                    &mut self.file_pages,
-                    &mut *self.storage,
-                    &mut self.stats,
-                )?;
+            for group in all_leaves.chunks(INTERIOR_FANOUT) {
+                let p = self.take_table_page()?;
                 interiors.push((p, group.to_vec()));
                 header_children.push(p);
             }
@@ -397,13 +491,9 @@ impl Inner {
         }
 
         // Encode every page, noting where each statement landed.
+        let new_slot = ((self.epoch + 1) % 2) as u32;
         let mut placed: Vec<(u32, u8, usize)> = vec![(0, 0, 0); derived.len()];
-        let mut encode = |page: u32,
-                          children: &[u32],
-                          set: &[usize],
-                          base: usize,
-                          derived: &[Derived]|
-         -> Vec<u8> {
+        let mut encode = |page: u32, children: &[u32], set: &[usize], base: usize| -> Vec<u8> {
             let mut w = TableWriter::new();
             for &c in children {
                 w.child(c);
@@ -416,18 +506,17 @@ impl Inner {
             w.into_content()
         };
         let mut contents: Vec<(u32, Vec<u8>, bool)> = Vec::new();
-        for (set, &p) in leaf_sets.iter().zip(&leaf_pages) {
-            contents.push((p, encode(p, &[], set, CONTENT_OFFSET, &derived), false));
+        for (set, &p) in lay.leaves.iter().zip(&leaf_pages) {
+            contents.push((p, encode(p, &[], set, CONTENT_OFFSET), false));
         }
         for (p, kids) in &interiors {
-            contents.push((*p, encode(*p, kids, &[], CONTENT_OFFSET, &derived), true));
+            contents.push((*p, encode(*p, kids, &[], CONTENT_OFFSET), true));
         }
         let header_content = encode(
             new_slot,
             &header_children,
-            &header_set,
+            &lay.header,
             HEADER_CONTENT_OFFSET,
-            &derived,
         );
         if header_content.len() > MAX_HEADER_CONTENT {
             return Err(corrupt("the header overflowed its page"));
@@ -446,26 +535,18 @@ impl Inner {
             self.state.pages[*p as usize].coverage = TableWriter::children_len(kids) as u32;
         }
         if cfg!(debug_assertions) && self.state.pages[new_slot as usize].coverage != 0 {
-            let live: Vec<String> = (1..self.state.slab.pins.len())
-                .filter(|&s| {
-                    self.state.slab.pins[s] > 0 && self.state.slab.page_or_next[s] == new_slot
-                })
-                .map(|s| {
-                    let id = self.state.slab.ids[s];
-                    format!(
-                        "{:?} id {} pins {} meta {:?} rec {:?}",
-                        self.state.slab.kinds[s],
-                        id,
-                        self.state.slab.pins[s],
-                        self.state.allocs.get(&id),
-                        dirty.records.get(&id)
-                    )
-                })
-                .collect();
-            panic!("the header slot being overwritten still holds live statements: {live:#?}");
+            panic!(
+                "the header slot being overwritten still holds live statements: {:?}",
+                self.live_statements_in(new_slot)
+            );
         }
 
         // Bind: every statement gets its slot, its fragments, and its pins.
+        for id in retire {
+            if let Some(g) = self.state.allocs.get_mut(&id).and_then(|m| m.grow.take()) {
+                self.state.unpin(g);
+            }
+        }
         for (i, d) in derived.iter().enumerate() {
             let (page, framing, payload_pos) = placed[i];
             self.bind(d, page, framing, payload_pos);
@@ -473,6 +554,32 @@ impl Inner {
         out.tables.extend(contents);
         out.header_content = header_content;
         Ok(())
+    }
+
+    fn take_table_page(&mut self) -> Result<u32, Error> {
+        take_page(
+            &mut self.ready,
+            &mut self.state,
+            &mut self.file_pages,
+            &mut *self.storage,
+            &mut self.stats,
+        )
+    }
+
+    /// A description of the live statements in page `p`, for diagnostics.
+    pub(crate) fn live_statements_in(&self, p: u32) -> Vec<String> {
+        (1..self.state.slab.pins.len())
+            .filter(|&s| self.state.slab.pins[s] > 0 && self.state.slab.page_or_next[s] == p)
+            .map(|s| {
+                let id = self.state.slab.ids[s];
+                format!(
+                    "{:?} of id {id} with {} pins: {:?}",
+                    self.state.slab.kinds[s],
+                    self.state.slab.pins[s],
+                    self.state.allocs.get(&id)
+                )
+            })
+            .collect()
     }
 
     /// Gives `d` its slab slot, fragments, pins, and coverage.

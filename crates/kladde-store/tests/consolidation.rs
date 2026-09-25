@@ -87,3 +87,21 @@ fn evacuation_keeps_data_pages_full() {
     assert!(data_fill(&with) > 0.6, "data fill {}", data_fill(&with));
     assert!(with.data_pages * 3 < without.data_pages);
 }
+
+#[test]
+fn page_rewrites_keep_leaves_full() {
+    let off = Options {
+        consolidate: false,
+        ..Default::default()
+    };
+    let without = overwrite(off, 64, 8192, 600, 32, 300);
+    let with = overwrite(Options::default(), 64, 8192, 600, 32, 300);
+    println!("without {without:#?}\nwith {with:#?}");
+    assert!(with.table_rewrites > 0 && with.window_restated > 0);
+    assert!(
+        with.live_fraction() > 0.6,
+        "live fraction {}",
+        with.live_fraction()
+    );
+    assert!(with.table_pages * 3 < without.table_pages);
+}
