@@ -473,6 +473,29 @@ impl Store {
         s
     }
 
+    /// A description of how allocation `p` resolves, fragment by fragment:
+    /// for debugging.
+    #[doc(hidden)]
+    pub fn describe(&self, p: Pointer) -> String {
+        let i = self.inner.borrow();
+        let id = p.raw();
+        let mut out = format!("id {id}: {:?}\n", i.state.allocs.get(&id));
+        for (&k, f) in i.state.frags.range(key(id, 0)..=key(id, u32::MAX)) {
+            let stmt = f.stmt().map(|s| {
+                let page = i.state.slab.page(s);
+                format!(
+                    "{:?} in page {page} ({:?}, epoch {}), pins {}",
+                    i.state.slab.kinds[s.idx()],
+                    i.state.pages[page as usize].state,
+                    i.state.pages[page as usize].epoch,
+                    i.state.slab.pins[s.idx()]
+                )
+            });
+            out += &format!("  {} {:?} {}\n", koff(k), f, stmt.unwrap_or_default());
+        }
+        out
+    }
+
     /// Checks the in-memory invariants, panicking at the first violation.
     ///
     /// Takes time linear in the size of the in-memory state; meant for

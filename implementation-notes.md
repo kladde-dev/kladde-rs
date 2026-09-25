@@ -66,6 +66,12 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 - **`Store::open` folds a recovered journal before it returns.**
   `spec/journal.md#the-start-of-a-session` asks only that a non-empty recovered journal be folded before anything is appended.
   Folding at open is simpler, and it lets reads, which see flushed state only, see every recovered transaction at once.
+- **The last-tombstone rule must not fire when the tombstone itself is what leaves — a gap in `impl/`.**
+  `drop_physically` in `impl/address-table-operations.md#drop_physicallystmt` releases a non-existent id's tombstone once the id's mentions fall to 1, assuming the one mention left is the tombstone.
+  When the statement dropped *is* the tombstone -- the header's take, or a page rewrite, drops every statement of its page -- the mention left is a dead statement of the id's previous incarnation, which the tombstone was denying.
+  If the id is then re-allocated in the same flush, which recycling makes likely, `allocate` finds no tombstone to anchor the new incarnation on, the cut states no replacement, and after reopening the old incarnation's content resurfaces past the new size.
+  The rule is skipped when the tombstone lives in the page being dropped: the cut restates it, or, for a re-allocated id, replaces it as the anchor with a `Shrink`; and it is released at the cut if nothing names the id any more.
+  The randomized oracle never hit it; a benchmark replacing values in a key-value population did within two flushes, and `tests/churn.rs` now does too.
 - **Ids a recovered journal allocates must be withheld from the id allocator.**
   The allocator is rebuilt at open from the loaded state, which knows nothing of the ids the unfolded journal brings into existence; before the fix, the first `alloc` after a recovery could hand one of them out again.
   `impl/id-recycling.md` should say that recovery counts the journal's ids as used; the consolidator state, whose allocation the recovery flush creates, exposed it.

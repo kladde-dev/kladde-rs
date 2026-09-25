@@ -39,7 +39,7 @@ struct Layout {
 }
 
 /// The size statements a set of records calls for, and the ids whose old
-/// grow witness they make redundant.
+/// grow witness, or tombstone, they make redundant.
 struct Sizes {
     stmts: Vec<Derived>,
     retire: Vec<u32>,
@@ -258,7 +258,7 @@ impl Inner {
     /// Drops every statement of table page `p` physically.
     pub(crate) fn drop_page_statements(&mut self, p: u32) -> Result<(), Error> {
         for id in self.page_ids(p)? {
-            self.state.drop_physically(id);
+            self.state.drop_physically(id, p);
         }
         Ok(())
     }
@@ -395,6 +395,10 @@ impl Inner {
             let Some(m) = self.state.allocs.get(&id) else {
                 if (rec.freed || rec.replace_anchor) && self.state.mentions(id) > 0 {
                     sizes.stmts.push(mk(Stmt::tombstone(id)));
+                } else if rec.replace_anchor {
+                    // Nothing names the id any more, so its tombstone, which
+                    // leaves with its page, has nothing left to deny.
+                    sizes.retire.push(id);
                 }
                 continue;
             };
@@ -545,6 +549,13 @@ impl Inner {
         for id in retire {
             if let Some(g) = self.state.allocs.get_mut(&id).and_then(|m| m.grow.take()) {
                 self.state.unpin(g);
+            } else if let Some(t) = self
+                .state
+                .recyclable
+                .get_mut(&id)
+                .and_then(|r| r.tombstone.take())
+            {
+                self.state.unpin(t);
             }
         }
         for (i, d) in derived.iter().enumerate() {

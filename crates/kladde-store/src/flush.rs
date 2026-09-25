@@ -243,7 +243,7 @@ impl Inner {
                     rec.replace_anchor = true;
                 }
             }
-            self.state.drop_physically(id);
+            self.state.drop_physically(id, page);
         }
         Ok(())
     }

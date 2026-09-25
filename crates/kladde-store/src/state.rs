@@ -810,8 +810,15 @@ impl State {
         dirty.add(id, start, end);
     }
 
-    /// A statement naming `id` stopped being physically present.
-    pub fn drop_physically(&mut self, id: u32) {
+    /// A statement naming `id`, in table page `page`, stopped being
+    /// physically present.
+    ///
+    /// When only the tombstone is left naming a non-existent id, nothing is
+    /// left for it to deny, so it is released. But when the statement leaving
+    /// *is* the tombstone -- its page is being rewritten -- what remains are
+    /// the statements it denies, and it stays, for the cut to restate: an id
+    /// re-allocated in the same flush anchors on it.
+    pub fn drop_physically(&mut self, id: u32, page: u32) {
         if let Some(m) = self.allocs.get_mut(&id) {
             m.mentions = m.mentions.saturating_sub(1);
             return;
@@ -820,7 +827,8 @@ impl State {
             return;
         };
         r.mentions = r.mentions.saturating_sub(1);
-        if r.mentions <= 1 {
+        let leaving = r.tombstone.is_some_and(|t| self.slab.page(t) == page);
+        if r.mentions <= 1 && !leaving {
             if let Some(t) = r.tombstone.take() {
                 self.unpin(t);
             }
