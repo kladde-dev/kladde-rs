@@ -123,6 +123,35 @@ pub trait WriteBackend: Backend {
         dst: Self::Pointer,
         dst_offset: Self::Size,
     ) -> Result<(), Error>;
+    /// Runs `f` as one transaction: the operations it records reach the
+    /// journal together once it returns `Ok`, and a crash keeps all of them
+    /// or none.
+    ///
+    /// If `f` fails, what it recorded is discarded and the error returned,
+    /// as if `f` had never run; if the append at the end fails, the store is
+    /// poisoned. Nests inside other transactions and batches.
+    ///
+    /// ```
+    /// use kladde_store::{Error, MemoryStorage, Store, WriteBackend};
+    ///
+    /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
+    /// let p = store.alloc(2)?;
+    /// store.atomically(|| {
+    ///     store.write(p.raw(), 0, b"a")?;
+    ///     store.write(p.raw(), 1, b"b")
+    /// })?;
+    /// // A failure inside discards the whole transaction.
+    /// let failed = store.atomically(|| {
+    ///     store.write(p.raw(), 0, b"x")?;
+    ///     Err::<(), _>(Error::OutOfBounds)
+    /// });
+    /// assert!(failed.is_err());
+    /// store.flush()?;
+    /// assert_eq!(store.read_all(p.raw())?, b"ab");
+    /// # Ok::<(), kladde_store::Error>(())
+    /// ```
+    fn atomically<R>(&self, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error>;
+
     /// Copies like [`copy`](WriteBackend::copy), then zeroes what the
     /// destination left of the source range. See
     /// [`copy`](WriteBackend::copy) for an example.

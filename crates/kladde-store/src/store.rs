@@ -801,13 +801,17 @@ impl Inner {
     }
 
     /// Recomputes the write-phase geometry from the operations still buffered.
+    /// Recomputes the write-phase geometry from the operations recorded since
+    /// the last flush: those appended already, then those still buffered.
     pub fn repopulate_geometry(&mut self) {
         self.geometry.clear();
-        let recs = std::mem::take(&mut self.ops.records);
-        for r in &recs {
+        let appended = std::mem::take(&mut self.segment_records.records);
+        let buffered = std::mem::take(&mut self.ops.records);
+        for r in appended.iter().chain(&buffered) {
             self.apply_geometry(r);
         }
-        self.ops.records = recs;
+        self.segment_records.records = appended;
+        self.ops.records = buffered;
     }
 
     // ------------------------------------------------------------ recording
@@ -1145,6 +1149,29 @@ impl WriteBackend for Store {
                 dst_offset,
             })
         })
+    }
+
+    fn atomically<R>(&self, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
+        let (mark, tx) = self.with(|i| Ok((i.ops.len(), i.tx)))?;
+        self.begin_transaction()?;
+        match f() {
+            Ok(r) => {
+                self.end_transaction()?;
+                Ok(r)
+            }
+            Err(e) => {
+                // Inside a transaction nothing is appended, so what `f`
+                // recorded is still buffered past `mark`, and dropping it
+                // undoes `f` as far as the file is concerned.
+                let mut i = self.inner.borrow_mut();
+                if !i.poisoned {
+                    i.ops.records.truncate(mark);
+                    i.tx = tx;
+                    i.repopulate_geometry();
+                }
+                Err(e)
+            }
+        }
     }
 
     fn move_range(
