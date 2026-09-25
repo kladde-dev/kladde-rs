@@ -40,6 +40,9 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
   The implementation keeps 64 bits and relies on the journal budget to keep the arena small; a single transaction is still capped at `2^32 - 1` bytes by the journal's length prefix.
 - **A page whose coverage reaches zero leaves its bucket at once.**
   It is retired at the next commit either way, and keeping it would waste the samples that victim selection draws from the sparsest bucket, which is exactly where such pages collect.
+- **The statement slab also keeps each statement's id and kind: 14 bytes per slot, where `rust/store.md#the-statement-slab` has 9.**
+  Releasing a statement charges its framing to its allocation's `statement_bytes`, the page rewrite and the window ask which ids a page names, and several paths ask whether a statement is an `Inline` or a `Shrink`.
+  Without the two arrays, each of those would decode the statement from its page again.
 
 ## Flush
 
