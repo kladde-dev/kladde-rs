@@ -13,8 +13,10 @@ mod error;
 mod fold;
 mod hash;
 mod journal;
+mod load;
 mod page;
 mod pointer;
+mod state;
 mod statement;
 mod storage;
 
