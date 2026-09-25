@@ -10,6 +10,7 @@
 //! | 8 | [`TAG`]: this implementation, and the layout's version |
 //! | 8 | `up_to_date`: the epoch of the flush that last wrote the state, little-endian |
 //! | 4 | the price of space `κ`, as an `f32`'s little-endian bits |
+//! | 8 | the rates fresh content starts from, in data pages and in leaves, each as an `f32`'s little-endian bits, negative before the first estimate |
 //! | 8 | the window: the id and offset at which the latest walk began, little-endian |
 //! | 4 | the length of the snapshot that starts the records, little-endian |
 //! | .. | records: the snapshot, then those of every flush since |
@@ -33,9 +34,9 @@ use crate::state::*;
 use crate::store::Inner;
 
 /// Names this implementation and the layout's version.
-pub(crate) const TAG: [u8; 8] = *b"kladdrsr";
+pub(crate) const TAG: [u8; 8] = *b"kladrip2";
 /// The bytes before the records.
-const FIXED: usize = 32;
+const FIXED: usize = 40;
 
 const AGE: u8 = 0;
 const DRAIN: u8 = 1;
@@ -53,6 +54,7 @@ struct DrainEntry {
 struct Parsed {
     up_to_date: u64,
     kappa: f32,
+    fresh: [f32; 2],
     window: Key,
     snapshot_len: u32,
     ages: Vec<(u64, Vec<u32>)>,
@@ -98,8 +100,9 @@ fn parse(bytes: &[u8]) -> Option<Parsed> {
     let u32_at = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
     let up_to_date = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
     let kappa = f32::from_bits(u32_at(16));
-    let window = key(u32_at(20), u32_at(24));
-    let snapshot_len = u32_at(28);
+    let fresh = [f32::from_bits(u32_at(20)), f32::from_bits(u32_at(24))];
+    let window = key(u32_at(28), u32_at(32));
+    let snapshot_len = u32_at(36);
     let mut rest = &bytes[FIXED..];
     let get = |rest: &mut &[u8]| -> Option<u64> {
         let (v, r) = kladde_varint::decode(rest).ok()?;
@@ -149,6 +152,7 @@ fn parse(bytes: &[u8]) -> Option<Parsed> {
     Some(Parsed {
         up_to_date,
         kappa,
+        fresh,
         window,
         snapshot_len,
         ages,
@@ -233,9 +237,10 @@ impl Inner {
 
     /// Seeds consolidation after a load: content ages and page estimates
     /// from the consolidator state where they are current, and from the
-    /// pages elsewhere; the price of space and the window from the state;
-    /// the cursor's pages from the governing header's epoch; and then a
-    /// read-only walk that finds again the candidates the latest walk found.
+    /// pages elsewhere; the price of space, the rates fresh content starts
+    /// from, and the window from the state; the cursor's pages from the
+    /// governing header's epoch; and then a read-only walk that finds again
+    /// the candidates the latest walk found.
     pub(crate) fn seed_after_load(&mut self) -> Result<(), Error> {
         self.cons.kappa = self.opts.kappa;
         self.seed_drains();
@@ -303,6 +308,11 @@ impl Inner {
                 }
                 if p.kappa.is_finite() && p.kappa > 0.0 {
                     self.cons.kappa = p.kappa as f64;
+                }
+                // So that the session's first flush does not start its pages
+                // from nothing, which would make them look frozen.
+                for (fresh, rate) in self.cons.fresh.iter_mut().zip(p.fresh) {
+                    *fresh = (rate.is_finite() && rate >= 0.0).then_some(rate as f64);
                 }
                 window = Some(p.window);
                 self.cons.kept = Kept {
@@ -396,6 +406,10 @@ impl Inner {
         fixed.extend_from_slice(&TAG);
         fixed.extend_from_slice(&e.to_le_bytes());
         fixed.extend_from_slice(&(self.cons.kappa as f32).to_bits().to_le_bytes());
+        for fresh in self.cons.fresh {
+            let rate = fresh.map_or(-1.0, |f| f as f32);
+            fixed.extend_from_slice(&rate.to_bits().to_le_bytes());
+        }
         fixed.extend_from_slice(&kid(self.cons.cursor).to_le_bytes());
         fixed.extend_from_slice(&koff(self.cons.cursor).to_le_bytes());
         if snapshot {

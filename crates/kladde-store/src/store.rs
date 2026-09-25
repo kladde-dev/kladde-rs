@@ -496,6 +496,13 @@ impl Store {
         out
     }
 
+    /// The rates fresh content starts from, in data pages and in leaves,
+    /// once estimated. For tests.
+    #[doc(hidden)]
+    pub fn describe_fresh_rates(&self) -> [Option<f64>; 2] {
+        self.inner.borrow().cons.fresh
+    }
+
     /// Every live data page and leaf emptier than the fill survivors are
     /// packed at, with its estimate: `(page, rate at the estimate's epoch,
     /// that epoch)`. For tests.

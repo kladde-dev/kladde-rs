@@ -171,13 +171,14 @@ The notes below say what the draft leaves open, and where the implementation dep
   The kind of the highest ripe page decides which offer goes first.
 - **Natural losses are what the fold and the consolidator state's own rewrite release**, recorded per page with its coverage before the first of them and applied once per flush.
 - **What fresh pages lose is estimated per kind**, data pages and leaves: the share of their coverage the pages of the previous flush lose in the next fold, averaged over flushes with weight `1 − e^(−β)`.
-  Before the first observation it is 0, so fresh content starts at the floor.
+  The consolidator state carries both estimates from one session to the next, which the draft does not ask for: without them, a session's first flush would start its pages from nothing, and they would look frozen, which the draft rules out for per-page estimates.
+  Only a new file has no estimate yet, and its first pages start at the floor.
 - **A new leaf starts from the leaves' fresh rate**, not from the rates of the statements it restates, whose sources the cut does not track.
 - **A description defragmentation's rewrite starts at the floor**, as content cold by selection: its bytes pass through the arena, so its source pages are unknown when it is placed.
 - **Free filling no longer takes spare defragmentation candidates**, following the draft's two sources, small ripe victims and the cursor; on the main branch they added nothing measurable, since the reserved share takes nearly all candidates.
 - **The ranking is refreshed lazily**: a page whose coverage, state, or estimate changes is marked, and marked pages are ranked again before the next query, once however many of its fragments changed.
-- **The consolidator state's layout here is tagged `kladdrsr`**: the price takes the budget's place, and its records are typed, age records and drain records.
-  A flush records the estimates it changed and those of the pages the previous flush wrote; the snapshot holds every page no fuller than `1 − θ`, as the draft says, so a fuller page's estimate is seeded again at open once a snapshot has dropped it.
+- **The consolidator state's layout here is tagged `kladrip2`**: the price takes the budget's place, the rates fresh content starts from follow it, and its records are typed, age records and drain records.
+  A flush records the estimates it changed and those of the pages the previous flush wrote; the snapshot holds every page emptier than `u₀ = 1 − θ`, which is every page that could be ripe, so a fuller page's estimate is seeded again at open once a snapshot has dropped it.
   The records are written right after the fold, so content consolidation moves out of a page later in the same flush looks, at a reopen, like a natural loss in the gap, which the draft's rule for a gap then counts.
 - **A page's estimate is seeded at open from its content size, its coverage, and its age**, as the draft says, with the estimate's epoch at the governing header's.
 - **`Options::myopic_ripeness` runs the draft's ablation**: pages are ranked by `(1 − x)/x` over their rate, in place of `h(x)`, and nothing else changes.

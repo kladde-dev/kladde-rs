@@ -262,8 +262,14 @@ fn estimates_survive_a_reopen() {
     }
     let now = store.stats().flushes + 1;
     let before = store.describe_drains();
+    let fresh = store.describe_fresh_rates();
+    assert!(fresh[0].is_some(), "{fresh:?}");
     drop(store);
     let store = Store::open(Box::new(storage), opts).unwrap();
+    // Kept as `f32`s, so that the next session's first pages do not start
+    // from nothing.
+    let rounded = fresh.map(|f| f.map(|r| r as f32 as f64));
+    assert_eq!(store.describe_fresh_rates(), rounded);
     let after = store.describe_drains();
     let same = before
         .iter()
