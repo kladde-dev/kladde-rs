@@ -1,0 +1,15 @@
+[package]
+name = "kladde-store"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The storage layer: a file of fixed-size pages holding byte allocations,
+# described by an address table of statements and mutated through a journal of
+# byte-level records, with copy-on-write flushes and consolidation. See
+# kladde-docs' `spec/` for the format and `impl/` for the algorithms.
+# Type-agnostic: it knows nothing about `Persistable` or schemas.
+
+[dependencies]
+kladde-varint = { workspace = true }

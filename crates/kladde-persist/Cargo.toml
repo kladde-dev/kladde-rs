@@ -5,11 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Kladde's serialization layer on top of the standalone `kladde-heap`: the
-# on-file pointer byte encoding (`PointerRepr`), `Location`, the `Persistable`
-# trait, the typed `WriteBackendExt` conveniences, and the container(s) built on
-# them. Everything here is kladde-specific; the reusable heap knows none of it.
+# Kladde's serialization layer on top of `kladde-store`: `Location`, the
+# `Persistable` trait and its guards, the scalar and tuple implementations, and
+# the schema binding. Everything here is kladde-specific; the store knows none
+# of it.
 
 [dependencies]
-kladde-heap = { workspace = true }
+kladde-store = { workspace = true }
 kladde-schema = { workspace = true }

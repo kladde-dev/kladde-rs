@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-kladde-heap = { workspace = true }
+kladde-store = { workspace = true }
 kladde-persist = { workspace = true }
 kladde-derive = { workspace = true, optional = true }
 
