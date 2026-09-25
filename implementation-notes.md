@@ -152,7 +152,7 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 
 ## Cleaning by ripeness (branch `ripeness`)
 
-This branch implements `drafts/ripeness.md` in place of data-page scoring, the churn floor, and the budget controller, so the notes above about buckets, sampling, offers within the churn floor, and the budget controller describe the main branch.
+This branch implements `drafts/ripeness.md`, as of kladde-docs commit `b33a836`, in place of data-page scoring, the churn floor, and the budget controller, so the notes above about buckets, sampling, offers within the churn floor, and the budget controller describe the main branch.
 The notes below say what the draft leaves open, and where the implementation departs from it.
 
 - **The constants the draft leaves open**: `β = 0.1` per epoch, `R_MIN = 10⁻⁴` and a starting `κ = 0.01` (the draft's own examples), `W = 8` epochs for the cursor, `κ` within `[10⁻⁶, 1]`, and at most 64 ripe pages considered per offer.
@@ -180,3 +180,5 @@ The notes below say what the draft leaves open, and where the implementation dep
   A flush records the estimates it changed and those of the pages the previous flush wrote; the snapshot holds every page no fuller than `1 − θ`, as the draft says, so a fuller page's estimate is seeded again at open once a snapshot has dropped it.
   The records are written right after the fold, so content consolidation moves out of a page later in the same flush looks, at a reopen, like a natural loss in the gap, which the draft's rule for a gap then counts.
 - **A page's estimate is seeded at open from its content size, its coverage, and its age**, as the draft says, with the estimate's epoch at the governing header's.
+- **`Options::myopic_ripeness` runs the draft's ablation**: pages are ranked by `(1 − x)/x` over their rate, in place of `h(x)`, and nothing else changes.
+  `KLADDE_BENCH_MYOPIC` sets it in kladde-bench.

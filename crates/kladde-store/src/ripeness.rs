@@ -3,14 +3,17 @@
 //! of space at which cleaning them starts to pay.
 //!
 //! A page of fill `u` whose content dies at rate `r` is ripe at price `κ`
-//! once `h(u) ≥ r / κ`, with `h(u) = (1 − u)/u − ln(1/u)`; its ripeness
-//! index `h(u) / r` is the `1/κ` at which that happens. Every estimate decays
-//! by the same factor per epoch, so every index grows by the same factor,
-//! and the order of pages changes only when a page's own content does.
+//! once `h(x) ≥ r / κ`, with `x = u/u₀` its fill relative to the fill `u₀`
+//! that survivors are packed at, and `h(x) = (1 − x)/x − ln(1/x)`; its
+//! ripeness index `h(x) / r` is the `1/κ` at which that happens. No page at
+//! or above `u₀` is ripe. Every estimate decays by the same factor per
+//! epoch, so every index grows by the same factor, and the order of pages
+//! changes only when a page's own content does.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, BinaryHeap};
 
+use crate::consts::MAX_PAGE_CONTENT;
 use crate::hash::{IdMap, IdSet};
 
 /// How fast a page's estimate forgets old losses, per epoch.
@@ -51,10 +54,25 @@ fn decay(now: u64, at: u64) -> f64 {
     (-BETA * now.saturating_sub(at) as f64).exp()
 }
 
-/// What keeping a page of fill `u` waiting costs, relative to what its
-/// draining saves: the threshold `h(u*) = r / κ` of the draft.
-pub fn h(u: f64) -> f64 {
-    (1.0 - u) / u + u.ln()
+/// The fill survivors are packed at, in bytes: `u₀ = 1 − θ` of a page's
+/// capacity, which packing promises for every page but a flush's last. A
+/// page's fill counts relative to it, and no page at or above it is ripe,
+/// since its survivors would take a whole page or more.
+pub fn packed_fill(theta: f64) -> f64 {
+    (1.0 - theta) * MAX_PAGE_CONTENT as f64
+}
+
+/// What keeping a page at relative fill `x` waiting costs, relative to what
+/// its draining saves: the threshold `h(x*) = r / κ` of the draft.
+pub fn h(x: f64) -> f64 {
+    (1.0 - x) / x + x.ln()
+}
+
+/// The myopic rule's `g(x) = (1 − x)/x`, which the draft's ablation puts in
+/// place of `h`: the space a cleaning frees per byte it writes, blind to
+/// survivors that go on dying after they are moved.
+pub fn g(x: f64) -> f64 {
+    (1.0 - x) / x
 }
 
 /// A log-index, totally ordered.
@@ -78,14 +96,14 @@ impl Ord for Ln {
     }
 }
 
-/// The pages that could be ripe -- live data pages and leaves no fuller than
-/// the cap -- ordered by their ripeness index.
+/// The pages that could be ripe -- live data pages and leaves emptier than
+/// `u₀` -- ordered by their ripeness index.
 #[derive(Debug, Default)]
 pub struct Ripeness {
-    /// `K = ln h(u) − ln rho − β·at`: the page's log-index is `K + β·now`
+    /// `K = ln h(x) − ln rho − β·at`: the page's log-index is `K + β·now`
     /// while its estimate stays above the floor.
     draining: BTreeSet<(Ln, u32)>,
-    /// `ln h(u) − ln R_MIN`: the log-index of a page at the floor, constant.
+    /// `ln h(x) − ln R_MIN`: the log-index of a page at the floor, constant.
     settled: BTreeSet<(Ln, u32)>,
     /// Where each ranked page is: whether settled, and its key.
     at: IdMap<(bool, Ln)>,
@@ -104,10 +122,11 @@ impl Ripeness {
         }
     }
 
-    /// Ranks `page` at fill `u` with estimate `d`, as of `now`.
-    pub fn insert(&mut self, page: u32, u: f64, d: Drain, now: u64) {
+    /// Ranks `page` by its fill term `f`, `h(x)` for its relative fill `x`,
+    /// and its estimate `d`, as of `now`.
+    pub fn insert(&mut self, page: u32, f: f64, d: Drain, now: u64) {
         self.remove(page);
-        let lh = h(u).ln();
+        let lh = f.ln();
         if d.rho as f64 * decay(now, d.at) > R_MIN {
             let k = Ln(lh - (d.rho as f64).ln() - BETA * d.at as f64);
             self.draining.insert((k, page));
@@ -212,20 +231,34 @@ mod tests {
         assert_eq!(d.rate(1000), R_MIN);
     }
 
-    #[test]
-    fn the_threshold_matches_the_drafts_table() {
-        // `u*` for `r / κ`, from `drafts/ripeness.md`.
-        for (ratio, u) in [(0.001, 0.96), (0.01, 0.87), (0.1, 0.66), (1.0, 0.32)] {
-            let (mut lo, mut hi) = (1e-9, 1.0 - 1e-9);
-            for _ in 0..100 {
-                let mid = (lo + hi) / 2.0;
-                if h(mid) > ratio {
-                    lo = mid;
-                } else {
-                    hi = mid;
-                }
+    /// The `x` at which `f(x)` falls to `ratio`, for a decreasing `f`.
+    fn threshold(f: fn(f64) -> f64, ratio: f64) -> f64 {
+        let (mut lo, mut hi) = (1e-9, 1.0 - 1e-9);
+        for _ in 0..100 {
+            let mid = (lo + hi) / 2.0;
+            if f(mid) > ratio {
+                lo = mid;
+            } else {
+                hi = mid;
             }
-            assert!((lo - u).abs() < 0.01, "r/κ = {ratio}: u* = {lo}");
+        }
+        lo
+    }
+
+    #[test]
+    fn the_thresholds_match_the_drafts_table() {
+        // `x*` for `r / κ`, and where the myopic rule would clean instead,
+        // from `drafts/ripeness.md`.
+        for (ratio, x, myopic) in [
+            (0.001, 0.96, 0.999),
+            (0.01, 0.87, 0.99),
+            (0.1, 0.66, 0.91),
+            (1.0, 0.32, 0.5),
+            (10.0, 0.07, 0.09),
+        ] {
+            let (xh, xg) = (threshold(h, ratio), threshold(g, ratio));
+            assert!((xh - x).abs() < 0.01, "r/κ = {ratio}: x* = {xh}");
+            assert!((xg - myopic).abs() < 0.005, "r/κ = {ratio}: myopic {xg}");
         }
     }
 
@@ -239,9 +272,9 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        r.insert(1, 0.3, drains[&1], 10);
-        r.insert(2, 0.8, drains[&2], 10);
-        r.insert(3, 0.9, drains[&3], 10);
+        r.insert(1, h(0.3), drains[&1], 10);
+        r.insert(2, h(0.8), drains[&2], 10);
+        r.insert(3, h(0.9), drains[&3], 10);
         let ripe = r.ripe(10, 0.01, &|p| drains[&p], &mut |_| true, 10);
         // Frozen at 0.8: h = 0.027, index 270. Hot at 0.3: h = 1.13,
         // index 11. Hot at 0.9: h = 0.006, index 0.06, not ripe at 1/κ = 100.
@@ -254,7 +287,7 @@ mod tests {
     fn a_decayed_page_is_settled_and_still_found() {
         let mut r = Ripeness::default();
         let d = Drain { rho: 0.01, at: 0 };
-        r.insert(7, 0.5, d, 0);
+        r.insert(7, h(0.5), d, 0);
         // Much later the estimate is at the floor: index h(0.5) / R_MIN.
         let ripe = r.ripe(500, 0.01, &|_| d, &mut |_| true, 10);
         assert_eq!(ripe, vec![7]);

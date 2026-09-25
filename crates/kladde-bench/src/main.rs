@@ -13,9 +13,11 @@
 //! `tuning`, which runs three of them with variants of the default options,
 //! and `quick`, which makes whatever runs small. Without a scenario, all run.
 //!
-//! With `KLADDE_BENCH_NO_STATE` set in the environment, the stores of
-//! `uniform`, `skewed`, `append`, and `churn` keep no consolidator state, which
-//! a single session only writes: what it costs is the difference.
+//! Two variables in the environment change the options of every scenario but
+//! `typed`. With `KLADDE_BENCH_NO_STATE` set, the stores keep no consolidator
+//! state, which a single session only writes: what it costs is the
+//! difference. With `KLADDE_BENCH_MYOPIC` set, they rank pages by the myopic
+//! rule, as the ripeness draft's ablation does.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -211,11 +213,19 @@ impl Run {
     }
 }
 
+/// The default options, as the environment varies them.
+fn defaults() -> Options {
+    Options {
+        consolidator_state: std::env::var_os("KLADDE_BENCH_NO_STATE").is_none(),
+        myopic_ripeness: std::env::var_os("KLADDE_BENCH_MYOPIC").is_some(),
+        ..Default::default()
+    }
+}
+
 fn opts(consolidate: bool) -> Options {
     Options {
         consolidate,
-        consolidator_state: std::env::var_os("KLADDE_BENCH_NO_STATE").is_none(),
-        ..Default::default()
+        ..defaults()
     }
 }
 
@@ -371,9 +381,9 @@ fn shrink(dir: &Path, size: u64, variant: &str) -> Vec<String> {
         "off" => opts(false),
         "no-compaction" => Options {
             hole_share: 1.0,
-            ..Default::default()
+            ..defaults()
         },
-        _ => Options::default(),
+        _ => defaults(),
     };
     let mut run = Run::new(dir, "shrink", variant, size, options);
     let mut rng = Rng::new(size ^ 13);
@@ -554,7 +564,7 @@ fn save(out: &Path, name: &str, rows: &[String], t: Instant) {
 /// `tuning-append.csv` the pages reserved for description defragmentation.
 fn tuning(out: &Path, work: &Path, quick: bool) {
     let with = |f: &dyn Fn(&mut Options)| {
-        let mut o = Options::default();
+        let mut o = defaults();
         f(&mut o);
         o
     };
@@ -565,7 +575,7 @@ fn tuning(out: &Path, work: &Path, quick: bool) {
         for (variant, options) in [
             ("tau=0.65", with(&|o| o.target_fill = 0.65)),
             ("tau=0.7", with(&|o| o.target_fill = 0.7)),
-            ("tau=0.75", Options::default()),
+            ("tau=0.75", defaults()),
             ("tau=0.8", with(&|o| o.target_fill = 0.8)),
             ("tau=0.85", with(&|o| o.target_fill = 0.85)),
         ] {

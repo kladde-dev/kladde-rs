@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
-use crate::consts::{MAX_PAGE_CONTENT, PAGE_SIZE};
+use crate::consts::PAGE_SIZE;
 use crate::hash::{IdMap, IdSet};
 pub use crate::ripeness::{Drain, Ripeness};
 use crate::statement::Kind;
@@ -404,18 +404,25 @@ impl State {
     }
 
     /// Ranks every stale page again as of `now`: a live data page or leaf
-    /// with coverage at most `cap`, written before the flush in progress;
-    /// anything else leaves the ranking.
-    pub fn refresh_ranking(&mut self, now: u64, cap: u32) {
+    /// with coverage below `packed` bytes, the fill survivors are packed at,
+    /// written before the flush in progress; anything else leaves the
+    /// ranking. Its fill counts relative to `packed`, in `h`, or in the
+    /// myopic `g` if `myopic`.
+    pub fn refresh_ranking(&mut self, now: u64, packed: f64, myopic: bool) {
         for page in std::mem::take(&mut self.ripeness.stale) {
             let Some(info) = self.pages.get(page as usize) else {
                 self.ripeness.remove(page);
                 continue;
             };
             let live = matches!(info.state, PageState::Data | PageState::Table);
-            if live && info.coverage > 0 && info.coverage <= cap && info.epoch < now {
-                let u = info.coverage as f64 / MAX_PAGE_CONTENT as f64;
-                self.ripeness.insert(page, u, info.drain, now);
+            let x = info.coverage as f64 / packed;
+            if live && info.coverage > 0 && x < 1.0 && info.epoch < now {
+                let f = if myopic {
+                    crate::ripeness::g(x)
+                } else {
+                    crate::ripeness::h(x)
+                };
+                self.ripeness.insert(page, f, info.drain, now);
             } else {
                 self.ripeness.remove(page);
             }

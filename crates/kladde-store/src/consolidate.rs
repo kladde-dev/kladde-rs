@@ -183,8 +183,9 @@ impl Inner {
         limit: usize,
     ) -> Vec<u32> {
         let now = self.state.flush_epoch;
-        let cap = ((1.0 - self.opts.theta) * C as f64) as u32;
-        self.state.refresh_ranking(now, cap);
+        let packed = crate::ripeness::packed_fill(self.opts.theta);
+        self.state
+            .refresh_ranking(now, packed, self.opts.myopic_ripeness);
         let pages = &self.state.pages;
         let (skip, rewritten) = (&self.cons.skip, &self.flush_rewritten);
         let drain = |p: u32| pages[p as usize].drain;

@@ -23,7 +23,7 @@
 //!   page delta, ascending from 0, the page's epoch and coverage as varints,
 //!   its estimate's rate as an `f32`'s little-endian bits, and the estimate's
 //!   epoch as a varint. A flush records the pages whose estimate it changed;
-//!   the snapshot, every page no fuller than a page may close.
+//!   the snapshot, every page emptier than the fill survivors are packed at.
 
 use std::collections::BTreeMap;
 
@@ -438,7 +438,8 @@ impl Inner {
 
     /// The snapshot: one age record per epoch, naming every allocation whose
     /// `last_written` the pages holding it after this flush would not give;
-    /// then one drain record, of every page no fuller than a page may close.
+    /// then one drain record, of every page emptier than the fill survivors
+    /// are packed at.
     fn snapshot(&self, own: u32) -> Vec<u8> {
         let e = self.state.flush_epoch;
         let mut fallback: IdMap<u64> = IdMap::default();
@@ -469,10 +470,10 @@ impl Inner {
             ids.sort_unstable();
             age_record(&mut out, epoch, &ids);
         }
-        let cap = ((1.0 - self.opts.theta) * crate::consts::MAX_PAGE_CONTENT as f64) as u32;
+        let packed = crate::ripeness::packed_fill(self.opts.theta);
         let below = (2..self.file_pages).filter(|&p| {
             let c = self.state.pages[p as usize].coverage;
-            c > 0 && c <= cap
+            c > 0 && (c as f64) < packed
         });
         let entries = self.drain_entries(below);
         if !entries.is_empty() {

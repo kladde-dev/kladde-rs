@@ -39,6 +39,14 @@ pub struct Options {
     /// The largest share of a page a flush's pages may close empty with; no
     /// page fuller than the rest is ever cleaned.
     pub theta: f64,
+    /// Whether to rank pages for cleaning by the myopic rule, for experiments.
+    ///
+    /// The myopic rule ranks a page by the space its cleaning frees per byte
+    /// it writes, over how fast its content dies, as if what survives a
+    /// cleaning never died afterwards. It cleans pages whose content dies
+    /// slowly too early; it exists to measure what counting on later deaths
+    /// gains.
+    pub myopic_ripeness: bool,
     /// How far `pack` looks ahead for a chunk that fits.
     pub lookahead: usize,
     /// Fragments the rotating window walks per flush.
@@ -67,6 +75,7 @@ impl Default for Options {
             kappa: 0.01,
             kappa_gain: 2.0,
             theta: 0.05,
+            myopic_ripeness: false,
             lookahead: 16,
             walk: 512,
             defrag_share: 1,
