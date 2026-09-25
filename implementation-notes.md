@@ -40,3 +40,32 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
   The implementation keeps 64 bits and relies on the journal budget to keep the arena small; a single transaction is still capped at `2^32 - 1` bytes by the journal's length prefix.
 - **A page whose coverage reaches zero leaves its bucket at once.**
   It is retired at the next commit either way, and keeping it would waste the samples that victim selection draws from the sparsest bucket, which is exactly where such pages collect.
+
+## Flush
+
+- **A growth in the fold must not resolve through an anchor that the header's take retires — a gap in `impl/`.**
+  The flush takes the header's content before the fold, and marks the anchors it held for replacement.
+  When the fold then grows such an id, `grow_size_to` resolves the exposed range through the old anchor, and the replacement `Shrink(id, size)` the cut states anchors at the new size, so it covers none of that range.
+  After the commit, the old anchor is gone from the governing world, and the exposed range resolves through whatever older statement matches it, which can be stale bytes the old anchor had denied.
+  The flush therefore takes the exposed range as a pending zero whenever the id's anchor is being replaced, and the cut states it as a `Zero`.
+  `impl/address-table-operations.md#grow_size_ton-and-shrink_size_ton` should say so; the differential oracle found it within a few hundred random operations.
+- **A grow witness in a retired page must be released when another statement now witnesses the size — a gap in `impl/`.**
+  `impl/address-table-operations.md#what-the-cut-states-for-a-touched-id` restates a retired page's grow witness "unless a row above already states one", and says nothing about the old witness in that case.
+  It then stays pinned in a page that is no longer in the governing world, and in the header's case, in the slot the flush after next overwrites.
+  The cut unpins it.
+- **Every piece the fold sources from elsewhere is read and written afresh.**
+  That covers `Copy` and `Move` sources and the tail a `Splice` shifts, which the flush writes as new bytes rather than restating existing ones at new offsets.
+  So the flush has no ordering phase (`impl/flush.md#phase-c--ordering`) and no content-blind fast path; the fold's output is only ever new bytes or bytes left where they are.
+  It keeps every data byte referenced at most once and the reverse index valid without any splice rule, at the price of rewriting a spliced tail, which makes a `remove(0)` on a large vector cost the vector's size.
+- **The header's eviction ranks by allocation, not by fragment.**
+  A pending fragment's heat is the number of flushes since its allocation's `last_written`, where `impl/flush.md#the-header-as-write-buffer` keeps an eviction clock per fragment.
+  All statements of one allocation therefore stay in the header or leave it together, which is coarser for a large allocation with a hot tail and a cold head, but needs no clock at all, and `impl/consolidator-state.md#what-stays-out` seeds the clock from the same content ages anyway.
+- **The interior layer is rebuilt by every cut that needs one.**
+  `impl/flush.md#the-shape-of-the-tree` path-copies from the changed leaves up.
+  With the header naming up to 600 leaves directly, a file needs an interior layer only past that, and rebuilding it costs one page per 800 leaves per flush.
+- **`Store::open` folds a recovered journal before it returns.**
+  `spec/journal.md#the-start-of-a-session` asks only that a non-empty recovered journal be folded before anything is appended.
+  Folding at open is simpler, and it lets reads, which see flushed state only, see every recovered transaction at once.
+- **Misusing the transaction and batch calls reports `Error::Corrupt`.**
+  Ending a transaction that is not open is a caller's bug rather than a damaged file, and deserves an error variant of its own.
+  The typed layers pair the calls through guards, so only direct users of `Store` can hit it.
