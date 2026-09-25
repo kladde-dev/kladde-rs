@@ -61,7 +61,7 @@ const COLUMNS: &str =
 free_pages,live_data,live_table,alloc_bytes,allocations,statements,fragments,budget,\
 data_written,table_written,headers_written,journal_bytes,fresh_bytes,evacuated_pages,\
 evacuated_bytes,free_filled,budget_pages,table_rewrites,window_restated,defrag_rewrites,\
-defrag_bytes,compaction_flushes,truncations,flush_us,ops_us";
+defrag_bytes,compaction_flushes,truncations,flush_us,ops_us,kappa";
 
 /// One scenario run: a store on a file, the workload's counters, and the rows
 /// recorded so far.
@@ -145,7 +145,7 @@ impl Run {
         let s = self.store.stats();
         let b = &self.base;
         self.rows.push(format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.scenario,
             self.variant,
             self.size,
@@ -180,6 +180,7 @@ impl Run {
             s.truncations - b.truncations,
             flush_us,
             ops_us,
+            s.kappa,
         ));
         self.ops_start = Instant::now();
     }
@@ -481,7 +482,7 @@ fn typed(dir: &Path, size: u64) -> Vec<String> {
             flushes += 1;
             let s = book.stats();
             rows.push(format!(
-                "typed,on,{size},{flushes},{ops},{app_bytes},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{flush_us},{ops_us}",
+                "typed,on,{size},{flushes},{ops},{app_bytes},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{flush_us},{ops_us},{}",
                 s.file_pages,
                 s.data_pages,
                 s.table_pages,
@@ -508,6 +509,7 @@ fn typed(dir: &Path, size: u64) -> Vec<String> {
                 s.defrag_bytes - base.defrag_bytes,
                 s.compaction_flushes - base.compaction_flushes,
                 s.truncations - base.truncations,
+                s.kappa,
             ));
             t = Instant::now();
         }
@@ -543,8 +545,8 @@ fn save(out: &Path, name: &str, rows: &[String], t: Instant) {
 
 /// Variants of the default options, one table per workload so that its
 /// variants compare directly: `tuning-uniform.csv` and `tuning-skewed.csv`
-/// vary the churn floor and the target fill, `tuning-append.csv` the pages
-/// reserved for description defragmentation.
+/// vary the target fill, which the price of space follows,
+/// `tuning-append.csv` the pages reserved for description defragmentation.
 fn tuning(out: &Path, work: &Path, quick: bool) {
     let with = |f: &dyn Fn(&mut Options)| {
         let mut o = Options::default();
@@ -556,11 +558,11 @@ fn tuning(out: &Path, work: &Path, quick: bool) {
         let t = Instant::now();
         let mut rows = Vec::new();
         for (variant, options) in [
-            ("lambda=0.5", with(&|o| o.churn_floor = 0.5)),
-            ("lambda=1", Options::default()),
-            ("lambda=2", with(&|o| o.churn_floor = 2.0)),
-            ("tau=0.6", with(&|o| o.target_fill = 0.6)),
-            ("tau=0.5", with(&|o| o.target_fill = 0.5)),
+            ("tau=0.65", with(&|o| o.target_fill = 0.65)),
+            ("tau=0.7", with(&|o| o.target_fill = 0.7)),
+            ("tau=0.75", Options::default()),
+            ("tau=0.8", with(&|o| o.target_fill = 0.8)),
+            ("tau=0.85", with(&|o| o.target_fill = 0.85)),
         ] {
             rows.extend(overwrite(work, name, (variant, options), size, skewed));
         }
