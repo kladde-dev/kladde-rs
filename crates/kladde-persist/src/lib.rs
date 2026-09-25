@@ -24,7 +24,6 @@
 //! `kladde-alloc` mock behind it) was deleted rather than ported, since
 //! `kladde-heap` subsumes it.
 
-mod chunked_vec;
 mod ext;
 mod guard;
 mod location;
@@ -34,7 +33,6 @@ mod scalar;
 mod schema;
 mod tuple;
 
-pub use chunked_vec::{ChunkedVec, ChunkedVecGuard};
 pub use ext::WriteBackendExt;
 pub use guard::Guard;
 pub use location::Location;

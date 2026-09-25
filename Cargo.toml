@@ -6,7 +6,6 @@ members = [
     "crates/kladde-types",
     "crates/kladde-varint",
     "crates/kladde-schema",
-    "crates/kladde-heap",
     "crates/kladde-persist",
 ]
 
@@ -21,7 +20,6 @@ kladde-derive = { path = "crates/kladde-derive" }
 kladde-types = { path = "crates/kladde-types" }
 kladde-varint = { path = "crates/kladde-varint" }
 kladde-schema = { path = "crates/kladde-schema" }
-kladde-heap = { path = "crates/kladde-heap" }
 kladde-persist = { path = "crates/kladde-persist" }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
