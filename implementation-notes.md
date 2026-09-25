@@ -146,17 +146,6 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
   `impl/consolidator-state.md#checking-it` asks about every statement naming it; statements that are physically present but dead are not in memory after a load.
   A dead statement newer than every live one is rare (a `Grow` below the size, from another writer), and the cost of missing it is an age that errs toward old.
 - **The consolidator state's allocation is hidden from `Store::allocations` and the statistics**, since the application never allocated it.
-- **An offer holding compaction mode's tail passes the churn floor and the fill floor unconditionally — a gap in `impl/`.**
-  `impl/consolidation.md#compaction-mode` argues that a tail victim at fill `u` returns a whole page for `u · C` written, a ratio of `1 / u` that passes a floor near 1 even for a full page, "so it is the budget that paces the mode".
-  With restatements estimated at 1.25 times coverage, a table page more than 80 % full fails `λ = 1`, and at first it did not even fit one leaf's offer.
-  In the 64 MiB `shrink` benchmark, a leaf full of `Inline` patches at the end of the file stopped compaction for 180 flushes, until the rotating window had drained it statement by statement.
-  The tail is now offered whatever its size, and the budget alone paces the mode, as the design intends.
-- **Compaction takes the tail only while a page that is reusable now lies below it — a gap in `impl/`.**
-  Right after a mass free, the freed pages are in quarantine for two commits, and the ready pool may be empty although holes abound.
-  Moving the tail then opens pages at the end of the file, which become the next tail, and the same content moves again: a test that frees three quarters of its file grew it by another 96 pages over 30 flushes and truncated twice rather than ten times.
-  For the same reason, free filling moves the tail only into a page below it.
 - **Compaction mode counts holes by scanning the page table once per flush.**
   `impl/consolidation.md#compaction-mode` keeps a cached index of the highest live page instead; the scan costs `O(pages)` per flush, which is small next to what a flush writes, but is not the `O(1)` amortised the design promises.
   Interior pages are passed over like journal pages, since every cut that needs them writes them afresh.
-- **A hole is a page that is reusable now, not one in quarantine.**
-  Counting quarantined pages too kept the mode on in 30 of 33 flushes of a 1 MiB file whose flushes rewrite a quarter of it: the pages the last commit released are working space, which the next flushes reuse by themselves, and moving the tail meanwhile only cost table rewrites and a file 6 % larger.
