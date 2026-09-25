@@ -2,11 +2,9 @@
 //! [`Persistable`](crate::Persistable) and the language-neutral `kladde-schema`
 //! model.
 //!
-//! Moved here from the old `kladde-traits` when `Persistable` did. The one shape
-//! change is that both entry points now carry the **pointer type** `P` as an
-//! explicit parameter, because `Persistable` is generic over it and a
-//! pointer-holding type's `INLINE_SIZE` (hence its descriptor) genuinely depends
-//! on the pointer width.
+//! Both entry points carry the **pointer type** `P` as an explicit parameter,
+//! because `Persistable` is generic over it and a pointer-holding type's
+//! `INLINE_SIZE`, hence its descriptor, depends on the pointer width.
 
 use crate::{Persistable, PointerRepr};
 use kladde_schema::{TypeDescriptor, TypeRef, TypeTable};
@@ -32,6 +30,16 @@ use std::collections::HashMap;
 ///   only for something the generic form can't express -- e.g. a
 ///   schema-transparent wrapper, or two Rust types sharing one node.
 ///
+/// ```
+/// use kladde_persist::{Pointer, SchemaBuilder, TypeRef};
+///
+/// let mut builder = SchemaBuilder::new();
+/// let root = builder.describe::<Pointer, (u8, u8)>();
+/// assert_eq!(root, TypeRef(0));
+/// let table = builder.finish(root);
+/// assert_eq!(table.descriptors().len(), 2); // the tuple, and `u8` once
+/// ```
+///
 /// [`Persistable::schema`]: crate::Persistable::schema
 /// [`Persistable::fingerprint`]: crate::Persistable::fingerprint
 /// [`Persistable::describe`]: crate::Persistable::describe
@@ -47,7 +55,7 @@ pub struct SchemaBuilder {
 }
 
 impl SchemaBuilder {
-    /// A fresh, empty builder.
+    /// A fresh, empty builder. See [`SchemaBuilder`] for an example.
     pub fn new() -> Self {
         SchemaBuilder::default()
     }
@@ -62,7 +70,7 @@ impl SchemaBuilder {
     /// Keying on `T` alone is sound because a type whose layout depends on the
     /// pointer width carries `P` as one of its own type parameters (so it is
     /// part of the `TypeId`), while one that does not has the same descriptor at
-    /// every width.
+    /// every width. See [`SchemaBuilder`] for an example.
     ///
     /// [`Persistable::describe_local`]: crate::Persistable::describe_local
     pub fn describe<P: PointerRepr, T: Persistable<P> + 'static>(&mut self) -> TypeRef {
@@ -82,6 +90,19 @@ impl SchemaBuilder {
     /// express: keying a node under an identity other than a single Rust type's
     /// (sharing one node across types, a schema-transparent wrapper that returns
     /// another type's reference instead of building its own, ...).
+    ///
+    /// ```
+    /// use kladde_persist::{Primitive, SchemaBuilder, TypeDescriptor};
+    /// use std::any::TypeId;
+    ///
+    /// struct Celsius;
+    /// let mut builder = SchemaBuilder::new();
+    /// let a = builder.describe_with(TypeId::of::<Celsius>(), |_| {
+    ///     TypeDescriptor::Primitive(Primitive::F64)
+    /// });
+    /// let b = builder.describe_with(TypeId::of::<Celsius>(), |_| unreachable!());
+    /// assert_eq!(a, b);
+    /// ```
     pub fn describe_with(
         &mut self,
         type_id: TypeId,
@@ -100,7 +121,8 @@ impl SchemaBuilder {
 
     /// Finalizes the accumulated descriptors into a [`TypeTable`] rooted at
     /// `root`. `root` must be the first type described (index 0), which is
-    /// automatically the case when [`Persistable::schema`] drives the builder.
+    /// automatically the case when [`Persistable::schema`] drives the builder,
+    /// and panics otherwise. See [`SchemaBuilder`] for an example.
     ///
     /// [`Persistable::schema`]: crate::Persistable::schema
     pub fn finish(self, root: TypeRef) -> TypeTable {
