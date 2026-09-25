@@ -8,6 +8,7 @@ members = [
     "crates/kladde-schema",
     "crates/kladde-store",
     "crates/kladde-persist",
+    "crates/kladde-bench",
 ]
 
 [workspace.package]
