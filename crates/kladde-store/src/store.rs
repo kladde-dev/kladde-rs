@@ -496,6 +496,29 @@ impl Store {
         out
     }
 
+    /// The live bytes of each allocation in each data page, as `(page, id,
+    /// bytes)` per fragment: for measuring how allocations share pages.
+    #[doc(hidden)]
+    pub fn describe_data_pages(&self) -> Vec<(u32, u32, u32)> {
+        let i = self.inner.borrow();
+        let mut out = Vec::new();
+        let mut frags = i.state.frags.iter().peekable();
+        while let Some((&k, &f)) = frags.next() {
+            let Fragment::Bytes { page, .. } = f else {
+                continue;
+            };
+            if i.state.pages.get(page as usize).map(|p| p.state) != Some(PageState::Data) {
+                continue;
+            }
+            let end = match frags.peek() {
+                Some((&n, _)) if kid(n) == kid(k) => koff(n),
+                _ => i.state.size_of(kid(k)),
+            };
+            out.push((page, kid(k), end - koff(k)));
+        }
+        out
+    }
+
     /// Checks the in-memory invariants, panicking at the first violation.
     ///
     /// Takes time linear in the size of the in-memory state; meant for
