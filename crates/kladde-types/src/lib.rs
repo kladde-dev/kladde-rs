@@ -1,20 +1,37 @@
-//! The built-in backed container types (`PersistableVec`, `PersistableHashMap`,
-//! `PersistableString` -- a rope is deferred, see `spec.md`).
+//! The built-in backed containers: [`PersistableVec`], [`PersistableString`],
+//! [`PersistableHashMap`], and, with the `serde` feature, `PersistableBlob`.
 //!
-//! Per `spec.md`'s "Workspace Layout": most of what lives here is
-//! hand-implemented directly against `Persistable`/`Guard`/`UniquePointer`
-//! rather than derive-macro output, the same way `std`'s own collections
-//! hand-write unsafe raw-pointer manipulation internally.
+//! They are hand-implemented against the same public `Persistable` and `Guard`
+//! surface any crate can use, the way `std`'s collections hand-write their raw
+//! pointer manipulation. This crate is a default library, not a layer of the
+//! system: nothing depends on it, and third-party libraries of backed types can
+//! stand beside it on equal terms.
 //!
-//! This crate is a *default* library, not a layer of the system: nothing
-//! depends on it, and everything in it is written against the same public
-//! `Persistable`/`Guard` surface any third-party crate can use. The derive
-//! macro is not re-exported here -- it comes from `kladde`, which is where
-//! generated code is rooted.
+//! ```
+//! use kladde::{Kladde, Persistable};
+//! use kladde_types::{PersistableHashMap, PersistableString, PersistableVec};
+//!
+//! #[derive(Persistable)]
+//! struct Library {
+//!     titles: PersistableVec<PersistableString>,
+//!     loans: PersistableHashMap<PersistableString, u32>,
+//! }
+//!
+//! let mut lib = Kladde::new(Library {
+//!     titles: PersistableVec::new(),
+//!     loans: PersistableHashMap::new(),
+//! });
+//! let mut guard = lib.guard();
+//! guard.titles_mut().push(PersistableString::from("Emma"))?;
+//! guard.loans_mut().insert(PersistableString::from("Emma"), 3)?;
+//! assert_eq!(lib.get().titles.len(), 1);
+//! # Ok::<(), kladde::Error>(())
+//! ```
 
 #[cfg(feature = "serde")]
 mod blob;
 mod map;
+mod slot;
 mod string;
 mod vec;
 
@@ -22,14 +39,13 @@ mod vec;
 mod test_support;
 
 #[cfg(feature = "serde")]
-pub use blob::{PersistableBlob, PersistableBlobEdit, PersistableBlobGuard};
+pub use blob::{PersistableBlob, PersistableBlobGuard};
 pub use map::{PersistableHashMap, PersistableHashMapGuard};
 pub use string::{PersistableString, PersistableStringGuard};
 pub use vec::{PersistableVec, PersistableVecGuard};
 
-/// This crate's own version, used as the `Opaque` descriptor version for every
-/// built-in container (`type-descriptors.md` §2.4). Kept in sync with
-/// `Cargo.toml` automatically via the `CARGO_PKG_VERSION_*` environment.
+/// This crate's own version, the `Opaque` descriptor version of every
+/// built-in container.
 pub(crate) fn library_version() -> kladde_persist::Version {
     kladde_persist::Version {
         major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
@@ -37,20 +53,3 @@ pub(crate) fn library_version() -> kladde_persist::Version {
         patch: env!("CARGO_PKG_VERSION_PATCH").parse().unwrap(),
     }
 }
-
-pub use kladde_persist::{
-    Backend, Guard, Location, Persistable, Pointer, ReadBackend, UniquePointer,
-    UniquePointerFixedSize, UniquePointerResizable, WriteBackend, WriteBackendExt,
-};
-pub use kladde_persist::{
-    BoolGuard, CharGuard, F32Guard, F64Guard, I16Guard, I32Guard, I64Guard, I8Guard, TupleGuard,
-    U16Guard, U32Guard, U64Guard, U8Guard,
-};
-
-// Schema/fingerprint surface (originally from `kladde-schema`, re-exported
-// through `kladde-persist`), so application code that builds or inspects a
-// type's schema needs only this crate.
-pub use kladde_persist::{
-    Field, Fingerprint, Primitive, SchemaBuilder, TypeDescriptor, TypeRef, TypeTable, Variant,
-    Version,
-};

@@ -12,9 +12,10 @@ postcard = { workspace = true, optional = true }
 
 [dev-dependencies]
 kladde = { workspace = true }
+kladde-store = { workspace = true }
 
 [features]
-# Gates `PersistableBlob<T>` -- the generic wrapper for foreign types that
-# can't otherwise satisfy `Persistable` without leaking (see `blob.rs`'s
-# module doc comment). Nothing else in this crate needs `serde`/`postcard`.
+# Gates `PersistableBlob<T>`, the wrapper for foreign types that can get
+# neither a derive nor a hand-written `Persistable`. Nothing else in this crate
+# needs `serde`/`postcard`.
 serde = ["dep:serde", "dep:postcard"]

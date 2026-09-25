@@ -1,20 +1,29 @@
-//! Shared test fixtures for this crate's container tests.
-//!
-//! The vehicle is `kladde-heap`'s public [`MockBackend`], which applies every
-//! operation immediately -- so a test can write and read back without a flush
-//! step -- and counts live allocations, which is what the leak-checking
-//! assertions here rely on.
+//! Shared fixtures for this crate's container tests: a store in memory, and a
+//! root allocation to put the value under test in.
 
-pub use kladde_persist::MockBackend;
+use kladde_persist::{Location, Persistable, Pointer, WriteBackend};
+use kladde_store::{MemoryStorage, Store};
 
-use kladde_persist::{Backend, Location, Word, WriteBackend};
+pub struct Fixture {
+    pub store: Store,
+    pub location: Location<Pointer, u32>,
+}
 
-/// A location backed by a real allocation, sized for whatever root type a test
-/// uses.
-pub fn root_location(
-    backend: &MockBackend,
-    size: usize,
-) -> Location<<MockBackend as Backend>::Pointer, <MockBackend as Backend>::Size> {
-    let pointer = backend.alloc_fixed_size(Word::from_usize(size));
-    Location::new(pointer.raw(), 0)
+impl Fixture {
+    /// A store whose root allocation holds `size` bytes.
+    pub fn new(size: usize) -> Fixture {
+        let store = Store::create(Box::new(MemoryStorage::new()), Default::default()).unwrap();
+        let root = store.alloc(size as u32).unwrap();
+        Fixture {
+            store,
+            location: Location::new(root.raw(), 0),
+        }
+    }
+
+    /// Flushes, then loads a `T` from the root allocation.
+    pub fn reload<T: Persistable>(&mut self) -> T {
+        self.store.flush().unwrap();
+        self.store.check();
+        T::load(&mut self.store, self.location).unwrap()
+    }
 }

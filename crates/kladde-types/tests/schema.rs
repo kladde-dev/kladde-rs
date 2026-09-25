@@ -102,7 +102,7 @@ fn explicit_enum_discriminants_are_honored() {
 
     // The schema reports the pinned values.
     let table = Explicit::schema();
-    if let kladde_types::TypeDescriptor::Enum { variants, .. } = &table.descriptors()[0] {
+    if let kladde::TypeDescriptor::Enum { variants, .. } = &table.descriptors()[0] {
         let mut discriminants: Vec<u64> = variants.iter().map(|v| v.discriminant).collect();
         discriminants.sort_unstable();
         assert_eq!(discriminants, vec![10, 20]);

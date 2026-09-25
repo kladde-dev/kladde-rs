@@ -4,8 +4,8 @@
 //! eyeballing what `#[derive(Persistable)]` produces and for reading off
 //! golden-vector fingerprints.
 
-use kladde::Persistable;
-use kladde_types::{PersistableString, PersistableVec, TypeDescriptor};
+use kladde::{Persistable, TypeDescriptor};
+use kladde_types::{PersistableString, PersistableVec};
 
 #[derive(kladde::Persistable)]
 enum PhoneKind {
