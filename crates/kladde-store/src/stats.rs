@@ -42,6 +42,9 @@ pub struct Stats {
     pub free_filled_pages: u64,
     /// Data pages opened only to take victims.
     pub budget_pages: u64,
+    /// Flushes that ran in compaction mode, moving content off the end of
+    /// the file.
+    pub compaction_flushes: u64,
     /// Address-table pages the page rewrite drained.
     pub table_rewrites: u64,
     /// Fragments the rotating window restated.

@@ -103,6 +103,11 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
   The re-check therefore refuses any range holding a chunk not placed yet or bytes placed in a page of this flush.
 - **The reserved share counts every rewritten byte, `Inline`s included**, although an `Inline` takes no data page.
   Free filling uses only candidates too long for an `Inline`, since a page's room is what it offers.
-- **The controller moves the budget multiplicatively.**
-  After each commit it measures the live fraction of data and table pages and multiplies the budget by `exp(4 · (τ − fill))`, within `budget_min` and `budget_max`.
-  `impl/consolidation.md#constants-still-to-be-chosen` leaves the rule open.
+- **The controller moves the budget multiplicatively, and measures fill against the whole file.**
+  After each commit it divides the live bytes by the capacity of every page but the headers, and multiplies the budget by `exp(4 · (τ − fill))`, within `budget_min` and `budget_max`; `impl/consolidation.md#constants-still-to-be-chosen` leaves the rule open.
+  `impl/consolidation.md#the-churn-floor-is-a-parameter-not-an-identity` says "`live_bytes / (pages · C)`" without saying which pages.
+  Counting only live pages would let holes go unnoticed: in a test that frees three quarters of a file, the fill of the live pages stayed near 1, the budget fell to its minimum, and compaction mode moved one page per flush.
+  Counting every page makes holes raise the budget like sparse pages do, which also matches the bound the budget is meant to buy, a file of `live_size / τ`.
+- **Compaction mode counts holes by scanning the page table once per flush**, reusable and retiring pages below the highest live page alike.
+  `impl/consolidation.md#compaction-mode` keeps a cached index of the highest live page instead; the scan costs `O(pages)` per flush, which is small next to what a flush writes, but is not the `O(1)` amortised the design promises.
+  Interior pages are passed over like journal pages, since every cut that needs them writes them afresh.

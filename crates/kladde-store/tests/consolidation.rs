@@ -134,6 +134,59 @@ fn page_rewrites_keep_leaves_full() {
     assert!(with.table_pages * 3 < without.table_pages);
 }
 
+/// Writes `n` allocations of a page each, frees all but every fourth, then
+/// runs `flushes` small flushes. Returns the file's length in pages before
+/// and after.
+fn shrink(opts: Options, n: usize, flushes: usize) -> (u64, u64) {
+    use kladde_store::Storage;
+    let storage = MemoryStorage::new();
+    let store = Store::create(Box::new(storage.clone()), opts.clone()).unwrap();
+    let fill = |i: usize| (i % 251) as u8 + 1;
+    let mut owned: Vec<_> = (0..n)
+        .map(|i| {
+            let p = store.alloc(4000).unwrap();
+            store.write(p.raw(), 0, &[fill(i); 4000]).unwrap();
+            p
+        })
+        .collect();
+    store.flush().unwrap();
+    let before = storage.len().unwrap() / 4096;
+    let mut kept = Vec::new();
+    for (i, p) in owned.drain(..).enumerate() {
+        if i % 4 == 0 {
+            kept.push((i, p));
+        } else {
+            store.free(p).unwrap();
+        }
+    }
+    let note = store.alloc(8).unwrap();
+    for f in 0..flushes {
+        store
+            .write(note.raw(), 0, &(f as u64).to_le_bytes())
+            .unwrap();
+        store.flush().unwrap();
+    }
+    store.close().unwrap();
+    store.check();
+    for (i, p) in &kept {
+        assert_eq!(store.read_all(p.raw()).unwrap(), vec![fill(*i); 4000]);
+    }
+    (before, storage.len().unwrap() / 4096)
+}
+
+#[test]
+fn compaction_moves_content_off_the_end() {
+    let off = Options {
+        hole_share: 1.0,
+        ..Default::default()
+    };
+    let (before, without) = shrink(off, 400, 60);
+    let (_, with) = shrink(Options::default(), 400, 60);
+    println!("before {before}, without compaction {without}, with {with}");
+    assert!(without * 10 > before * 9, "{without} of {before} pages");
+    assert!(with * 2 < before, "{with} of {before} pages");
+}
+
 #[test]
 fn defragmentation_merges_appended_pieces() {
     let off = Options {

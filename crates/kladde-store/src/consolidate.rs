@@ -36,6 +36,10 @@ pub struct ConsState {
     pub candidates: Vec<Candidate>,
     /// This flush's candidates beyond its share, for free filling.
     pub spare: Vec<Candidate>,
+    /// Whether this flush runs in compaction mode.
+    pub compaction: bool,
+    /// Where the search for the highest live page resumes.
+    pub tail: u32,
 }
 
 /// A live fragment in a data page being evacuated.
@@ -92,6 +96,59 @@ impl Inner {
     /// Resets what consolidation keeps for one flush only.
     pub(crate) fn begin_consolidation(&mut self) {
         self.cons.skip.clear();
+        // Compaction mode: while holes below the highest live page exceed a
+        // share of the file, that page is every mechanism's first victim.
+        self.cons.tail = self.file_pages.saturating_sub(1);
+        let holes = match self.tail() {
+            Some(t) => (2..t)
+                .filter(|&p| {
+                    matches!(
+                        self.state.pages[p as usize].state,
+                        PageState::Free | PageState::Retiring
+                    )
+                })
+                .count(),
+            None => 0,
+        };
+        self.cons.compaction =
+            self.opts.consolidate && holes as f64 > self.opts.hole_share * self.file_pages as f64;
+        if self.cons.compaction {
+            self.stats.compaction_flushes += 1;
+        }
+    }
+
+    /// The highest page with live data or statements that is no victim of
+    /// this flush yet: where compaction mode works down from. Journal pages
+    /// are passed over, since the next flush moves the journal by itself.
+    fn tail(&mut self) -> Option<u32> {
+        let mut p = self.cons.tail;
+        while p >= 2 && (p as usize) < self.state.pages.len() {
+            let info = &self.state.pages[p as usize];
+            let live =
+                matches!(info.state, PageState::Data | PageState::Table) && info.coverage > 0;
+            if live && !self.cons.skip.contains(&p) && !self.flush_rewritten.contains(&p) {
+                self.cons.tail = p;
+                return Some(p);
+            }
+            p -= 1;
+        }
+        self.cons.tail = p.min(self.cons.tail);
+        None
+    }
+
+    /// The tail, if compaction mode is on and the tail is a page of the kind
+    /// asked for.
+    fn compaction_victim(&mut self, data: bool) -> Option<u32> {
+        if !self.cons.compaction {
+            return None;
+        }
+        let want = if data {
+            PageState::Data
+        } else {
+            PageState::Table
+        };
+        self.tail()
+            .filter(|&t| self.state.pages[t as usize].state == want)
     }
 
     // ------------------------------------------------------------ victims
@@ -314,7 +371,11 @@ impl Inner {
             if room == 0 {
                 return Ok(());
             }
-            let Some(v) = self.pick_victim(true, b, room, &|_, _| true) else {
+            // In compaction mode, the tail first whenever it fits.
+            let tail = self
+                .compaction_victim(true)
+                .filter(|&t| self.state.pages[t as usize].coverage <= room);
+            let Some(v) = tail.or_else(|| self.pick_victim(true, b, room, &|_, _| true)) else {
                 break;
             };
             if self.evacuate_into(v, open, dirty)? {
@@ -385,7 +446,31 @@ impl Inner {
             fill: 0.0,
         };
         let mut chosen = IdSet::default();
+        // In compaction mode, the tail first, whatever its fill: it returns a
+        // whole page to the file system, not only to the pool.
+        if let Some(t) = self.compaction_victim(true) {
+            let cov = self.state.pages[t as usize].coverage;
+            let taken = if cov <= room {
+                offer.whole.push(t);
+                room -= cov;
+                true
+            } else if may_cut {
+                offer.cut = Some(t);
+                room = 0;
+                true
+            } else {
+                false
+            };
+            if taken {
+                chosen.insert(t);
+                offer.reclaimed += C as f64;
+                offer.written += cov as f64;
+            }
+        }
         while let Some(b) = self.state.data_buckets.lowest_non_empty() {
+            if offer.cut.is_some() {
+                break;
+            }
             let not_chosen = |_: &Inner, p: u32| !chosen.contains(&p);
             let Some(v) = self.pick_victim(true, b, room.min(max), &not_chosen) else {
                 break;
@@ -484,6 +569,16 @@ impl Inner {
             fill: 0.0,
         };
         let mut chosen = IdSet::default();
+        if let Some(t) = self.compaction_victim(false) {
+            let cov = self.state.pages[t as usize].coverage;
+            if cov as f64 * RESTATE <= room {
+                chosen.insert(t);
+                offer.whole.push(t);
+                offer.reclaimed += C as f64;
+                offer.written += cov as f64 * RESTATE;
+                room -= cov as f64 * RESTATE;
+            }
+        }
         while let Some(b) = self.state.table_buckets.lowest_non_empty() {
             let fresh = |i: &Inner, p: u32| !chosen.contains(&p) && !i.flush_rewritten.contains(&p);
             let limit = ((room / RESTATE) as u32).min(max);
@@ -540,8 +635,11 @@ impl Inner {
         let mut victims = Vec::new();
         while let Some(b) = self.state.table_buckets.lowest_non_empty() {
             let limit = (room / RESTATE) as u32;
+            let tail = self.compaction_victim(false).filter(|&t| {
+                self.state.pages[t as usize].coverage <= limit && self.filler_eligible(t, main)
+            });
             let eligible = |i: &Inner, p: u32| i.filler_eligible(p, main);
-            let Some(v) = self.pick_victim(false, b, limit, &eligible) else {
+            let Some(v) = tail.or_else(|| self.pick_victim(false, b, limit, &eligible)) else {
                 break;
             };
             room -= self.state.pages[v as usize].coverage as f64 * RESTATE;
@@ -651,21 +749,23 @@ impl Inner {
         self.stats.window_restated += take.len() as u64;
     }
 
-    /// Moves the budget toward the target fill, after each commit.
+    /// Moves the budget toward the target fill, after each commit. The fill
+    /// is measured against the whole file, so that holes count against it as
+    /// much as sparse pages do.
     pub(crate) fn after_commit(&mut self) -> Result<(), Error> {
         if !self.opts.consolidate {
             return Ok(());
         }
-        let (mut live, mut pages) = (0u64, 0u64);
+        let mut live = 0u64;
         for info in self.state.pages.iter().skip(2) {
             if matches!(
                 info.state,
                 PageState::Data | PageState::Table | PageState::Interior
             ) {
                 live += info.coverage as u64;
-                pages += 1;
             }
         }
+        let pages = self.file_pages.saturating_sub(2) as u64;
         if pages == 0 {
             return Ok(());
         }
