@@ -14,3 +14,12 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 - **`MemoryStorage` models a power cut as any subset of the writes since the last sync, each write whole.**
   It does not model a write torn within a page.
   The page CRCs are meant to catch those, but no test exercises them yet.
+
+## Journal and fold
+
+- **The fold keeps one `BTreeMap` piece table per touched id.**
+  `impl/flush.md#representing-a-piece-table-cheaply` proposes a `Uniform` source per id that spills into one flush-wide map only on a second piece.
+  The simpler form costs a tree per touched id, which has not mattered at the sizes measured so far.
+- **`Move` is folded exactly like `Copy`, followed by zeroing the vacated range.**
+  The record is specified in `spec/journal.md#move`, and the fold implements its semantics.
+  What `drafts/move-op.md` sketches, handing the source's `Ref`s to the destination without copying bytes, is not implemented: the flush copies the moved bytes like any other read (see [Flush](#flush)).
