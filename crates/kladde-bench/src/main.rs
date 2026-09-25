@@ -12,6 +12,10 @@
 //! Scenarios: `uniform`, `skewed`, `append`, `churn`, `shrink`, `typed`,
 //! `tuning`, which runs three of them with variants of the default options,
 //! and `quick`, which makes whatever runs small. Without a scenario, all run.
+//!
+//! With `KLADDE_BENCH_NO_STATE` set in the environment, the stores of
+//! `uniform`, `skewed`, `append`, and `churn` keep no consolidator state, which
+//! a single session only writes: what it costs is the difference.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -210,6 +214,7 @@ impl Run {
 fn opts(consolidate: bool) -> Options {
     Options {
         consolidate,
+        consolidator_state: std::env::var_os("KLADDE_BENCH_NO_STATE").is_none(),
         ..Default::default()
     }
 }
