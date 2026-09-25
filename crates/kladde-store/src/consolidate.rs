@@ -3,6 +3,7 @@
 //! and the controller that paces it.
 
 use crate::consts::MAX_PAGE_CONTENT;
+use crate::defrag::{Candidate, Weighed};
 use crate::error::Error;
 use crate::flush::{DataPage, Output};
 use crate::hash::{IdMap, IdSet};
@@ -30,6 +31,11 @@ pub struct ConsState {
     pub rot: usize,
     /// Victims this flush found unusable, so that it does not pick them again.
     pub skip: IdSet,
+    /// Description defragmentation's candidates from the latest walk, for
+    /// the next flush.
+    pub candidates: Vec<Candidate>,
+    /// This flush's candidates beyond its share, for free filling.
+    pub spare: Vec<Candidate>,
 }
 
 /// A live fragment in a data page being evacuated.
@@ -303,22 +309,22 @@ impl Inner {
         open: &mut DataPage,
         dirty: &mut Dirty,
     ) -> Result<(), Error> {
-        loop {
+        while let Some(b) = self.state.data_buckets.lowest_non_empty() {
             let room = open.room() as u32;
-            let Some(b) = self.state.data_buckets.lowest_non_empty() else {
-                return Ok(());
-            };
             if room == 0 {
                 return Ok(());
             }
-            match self.pick_victim(true, b, room, &|_, _| true) {
-                Some(v) => {
-                    if self.evacuate_into(v, open, dirty)? {
-                        self.stats.free_filled_pages += 1;
-                    }
-                }
-                None => return self.fill_with_part(b, open, dirty),
+            let Some(v) = self.pick_victim(true, b, room, &|_, _| true) else {
+                break;
+            };
+            if self.evacuate_into(v, open, dirty)? {
+                self.stats.free_filled_pages += 1;
             }
+        }
+        self.fill_with_candidates(open, dirty)?;
+        match self.state.data_buckets.lowest_non_empty() {
+            Some(b) if open.room() > 0 => self.fill_with_part(b, open, dirty),
+            _ => Ok(()),
         }
     }
 
@@ -570,12 +576,28 @@ impl Inner {
         let mut prev: Option<Key> = None;
         let mut full = false;
         let mut take: Vec<(u32, u32, u32, Fragment)> = Vec::new();
+        // Description defragmentation rides along: Kadane's search over each
+        // id's walked fragments, reset at every id boundary.
+        let mut found = Vec::new();
+        let mut run: Vec<Weighed> = Vec::new();
         for &(k, f) in &items {
+            let (id, off, end) = (kid(k), koff(k), self.state.frag_end(k));
+            let wrapped = prev.is_some_and(|p| k < p);
+            if wrapped || prev.is_some_and(|p| kid(p) != id) {
+                self.candidates_of(prev.map_or(0, kid), &run, &mut found);
+                run.clear();
+            }
+            if wrapped {
+                // The encoding starts afresh.
+                w = crate::statement::TableWriter::new();
+                w.end_children();
+            }
+            prev = Some(k);
+            run.push(self.weigh(off, end, f));
             let Some(s) = f.stmt() else { continue };
             if full {
-                break;
+                continue;
             }
-            let (id, off, end) = (kid(k), koff(k), self.state.frag_end(k));
             let len = end - off;
             let inline = self.state.slab.kinds[s.idx()] == crate::statement::Kind::Inline;
             let stmt = match f {
@@ -585,12 +607,6 @@ impl Inner {
                 }
                 _ => crate::statement::Stmt::zero(id, off, len),
             };
-            if prev.is_some_and(|p| k < p) {
-                // The walk wrapped around: the encoding starts afresh.
-                w = crate::statement::TableWriter::new();
-                w.end_children();
-            }
-            prev = Some(k);
             if w.len() + w.statement_len(&stmt) > room {
                 full = true;
                 continue;
@@ -598,6 +614,8 @@ impl Inner {
             w.push(&stmt, &zeros[..if inline { len as usize } else { 0 }]);
             take.push((id, off, end, f));
         }
+        self.candidates_of(prev.map_or(0, kid), &run, &mut found);
+        self.cons.candidates = found;
         self.cons.cursor = items.last().map_or(start, |&(k, _)| k.wrapping_add(1));
         // The pages the window restates from, read before taking releases the
         // statements that name them.

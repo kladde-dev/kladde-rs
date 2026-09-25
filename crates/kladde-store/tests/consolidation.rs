@@ -66,6 +66,34 @@ fn overwrite(
     stats
 }
 
+/// Appends `piece` bytes to each of `n` allocations in every flush, and
+/// checks every byte at the end.
+fn append(opts: Options, n: usize, piece: usize, flushes: usize) -> Stats {
+    let storage = MemoryStorage::new();
+    let store = Store::create(Box::new(storage.clone()), opts.clone()).unwrap();
+    let ptrs: Vec<Pointer> = (0..n).map(|_| store.alloc(0).unwrap().raw()).collect();
+    let mut model: Vec<Vec<u8>> = vec![Vec::new(); n];
+    for f in 0..flushes {
+        for (i, p) in ptrs.iter().enumerate() {
+            let bytes: Vec<u8> = (0..piece).map(|j| (f * 7 + i * 3 + j) as u8).collect();
+            store.write(*p, model[i].len() as u32, &bytes).unwrap();
+            model[i].extend(bytes);
+        }
+        store.flush().unwrap();
+    }
+    store.check();
+    let stats = store.stats();
+    drop(store);
+    let store = Store::open(Box::new(MemoryStorage::from_image(storage.image())), opts).unwrap();
+    for (i, p) in ptrs.iter().enumerate() {
+        assert!(
+            store.read_all(*p).unwrap() == model[i],
+            "allocation {i} differs"
+        );
+    }
+    stats
+}
+
 fn data_fill(s: &Stats) -> f64 {
     s.live_data_bytes as f64 / (s.data_pages as f64 * kladde_store::MAX_PAGE_CONTENT as f64)
 }
@@ -104,4 +132,17 @@ fn page_rewrites_keep_leaves_full() {
         with.live_fraction()
     );
     assert!(with.table_pages * 3 < without.table_pages);
+}
+
+#[test]
+fn defragmentation_merges_appended_pieces() {
+    let off = Options {
+        mu: f64::INFINITY,
+        ..Default::default()
+    };
+    let without = append(off, 32, 16, 200);
+    let with = append(Options::default(), 32, 16, 200);
+    println!("without {without:#?}\nwith {with:#?}");
+    assert!(with.defrag_rewrites > 0);
+    assert!(with.statements * 2 < without.statements);
 }

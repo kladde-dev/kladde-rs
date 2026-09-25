@@ -90,6 +90,11 @@ impl Inner {
         });
         self.hoist(&mut f)?;
         self.apply_fold(f, &mut dirty)?;
+        if self.opts.consolidate {
+            // Description defragmentation's share: rewrites chosen now are
+            // written like the flush's own.
+            self.defrag_share(&mut dirty)?;
+        }
 
         // 3. Data pages, with victims riding along, then budgeted pages.
         let mut out = Output::default();

@@ -95,6 +95,14 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 - **The header keeps its hottest statements one by one, not the coldest key-contiguous run.**
   `impl/flush.md#the-header-as-write-buffer` recommends evicting the coldest run in key order, so that leaves cover coherent id ranges.
   The cut fills the header with the hottest statements that fit and cuts the rest into leaves in key order, which gets the leaves' key order but not the runs.
+- **Description defragmentation weighs a pending fragment as if it were stated alone**: 8 bytes of framing for bytes in a data page, 4 for an `Inline`, 5 for a `Zero`.
+  `impl/consolidation.md#the-envelope-is-a-maximum-subarray-problem` leaves the estimate open, and the re-check at execution corrects it either way.
+- **The re-check refuses a candidate holding bytes the flush is moving, not only bytes it wrote — a gap in `impl/`.**
+  `impl/consolidation.md#where-it-is-called-and-how-it-is-executed` relies on the age filter to keep rewrites off anything the flush is writing, since a fragment the fold took has age 0.
+  But free filling executes candidates while `pack` runs, and by then evacuation may have moved survivors of the candidate's range into this flush's pages; their allocation's age can be anything, so the filter lets them through, and the rewrite would leave dead bytes in pages the flush is about to write.
+  The re-check therefore refuses any range holding a chunk not placed yet or bytes placed in a page of this flush.
+- **The reserved share counts every rewritten byte, `Inline`s included**, although an `Inline` takes no data page.
+  Free filling uses only candidates too long for an `Inline`, since a page's room is what it offers.
 - **The controller moves the budget multiplicatively.**
   After each commit it measures the live fraction of data and table pages and multiplies the budget by `exp(4 · (τ − fill))`, within `budget_min` and `budget_max`.
   `impl/consolidation.md#constants-still-to-be-chosen` leaves the rule open.

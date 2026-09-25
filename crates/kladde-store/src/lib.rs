@@ -25,6 +25,7 @@ mod consolidate;
 mod consts;
 mod crc;
 mod cut;
+mod defrag;
 mod error;
 mod flush;
 mod fold;
