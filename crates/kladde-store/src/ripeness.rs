@@ -41,8 +41,10 @@ pub const NU_PI: f64 = 10.0;
 const A_MIN: f64 = 0.05;
 /// The range of `ln κ` an index is sought in.
 const LN_KAPPA: (f64, f64) = (-24.0, 12.0);
-/// Bisection steps for an index, which pin `ln κ` down to `36 / 2^32`.
-const STEPS: usize = 32;
+/// How closely an index's `ln κ` is pinned down, and the most steps that
+/// may take, enough to bisect `LN_KAPPA` down to it.
+const TOLERANCE: f64 = 1e-9;
+const STEPS: usize = 64;
 
 /// `e^(−β)`: what one epoch discounts evidence by.
 fn delta() -> f64 {
@@ -196,7 +198,8 @@ pub struct View {
 /// weight, and the draining share in bytes.
 struct Mixture {
     shape: f64,
-    scale: Vec<f64>,
+    /// `ln` of each component's scale.
+    ln_scale: Vec<f64>,
     weight: Vec<f64>,
     draining: Vec<f64>,
 }
@@ -310,22 +313,22 @@ impl Drain {
         let base = self.b as f64;
         let per = chunk * t / sigma;
         let drained = self.drained as f64;
-        let (p0, q0) = (self.p0 as f64, self.q0());
+        let (p, q) = (self.p0 as f64 + drained, self.q0());
         let nf = n as f64;
-        let ln_choose_n = ln_gamma(nf + 1.0);
         let mut ln_w = Vec::with_capacity(n as usize + 1);
-        let mut scale = Vec::with_capacity(n as usize + 1);
-        let mut draining = Vec::with_capacity(n as usize + 1);
+        let mut ln_scale = Vec::with_capacity(n as usize + 1);
+        // `ln C(n, j) + ln B(p + j, q + n − j)`, from one term to the next:
+        // `C(n, j + 1) = C(n, j)·(n − j)/(j + 1)`, and
+        // `B(x + 1, y − 1) = B(x, y)·x/(y − 1)`.
+        let mut ln_cb = ln_beta(p, q + nf);
         for j in 0..=n {
             let jf = j as f64;
-            let b = (base + jf * per).max(1e-300);
-            ln_w.push(
-                ln_choose_n - ln_gamma(jf + 1.0) - ln_gamma(nf - jf + 1.0)
-                    + ln_beta(p0 + drained + jf, q0 + nf - jf)
-                    - shape * b.ln(),
-            );
-            scale.push(b);
-            draining.push((known_live + jf * chunk).min(v.live));
+            let ln_b = (base + jf * per).max(1e-300).ln();
+            ln_w.push(ln_cb - shape * ln_b);
+            ln_scale.push(ln_b);
+            if j < n {
+                ln_cb += ((nf - jf) * (p + jf) / ((jf + 1.0) * (q + nf - jf - 1.0))).ln();
+            }
         }
         let top = ln_w.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let mut weight: Vec<f64> = ln_w.iter().map(|l| (l - top).exp()).collect();
@@ -337,9 +340,12 @@ impl Drain {
         let keep: Vec<usize> = (0..weight.len()).filter(|&i| weight[i] > 1e-9).collect();
         Mixture {
             shape,
-            scale: keep.iter().map(|&i| scale[i]).collect(),
+            ln_scale: keep.iter().map(|&i| ln_scale[i]).collect(),
             weight: keep.iter().map(|&i| weight[i]).collect(),
-            draining: keep.iter().map(|&i| draining[i]).collect(),
+            draining: keep
+                .iter()
+                .map(|&i| (known_live + i as f64 * chunk).min(v.live))
+                .collect(),
         }
     }
 
@@ -371,21 +377,22 @@ pub fn ln_index(d: &Drain, v: &View, packed: f64, sigma: f64, rule: Rule) -> (f6
     };
     let ln = match rule {
         Rule::ExpectedGain => {
+            // Cleaning now gains `κ·(1 − x)`; waiting saves what the page
+            // drains meanwhile, `κ·Σ w a Φ_A(B κ)`.
             let table = phi_table();
-            let gain = |lk: f64| {
-                let kappa = lk.exp();
-                let wait: f64 = (0..m.weight.len())
+            let row = Row::of(m.shape);
+            let wait = |lk: f64| {
+                (0..m.weight.len())
                     .map(|i| {
-                        m.weight[i] * m.draining[i] / packed * table.at(m.shape, m.scale[i] * kappa)
+                        m.weight[i] * m.draining[i] / packed * table.at_ln(row, m.ln_scale[i] + lk)
                     })
-                    .sum();
-                (1.0 - x) - wait
+                    .sum()
             };
-            -root(gain)
+            -root(1.0 - x, wait)
         }
         Rule::OptionToWait => {
             let rate: f64 = (0..m.weight.len())
-                .map(|i| m.weight[i] * m.shape / m.scale[i])
+                .map(|i| m.weight[i] * m.shape * (-m.ln_scale[i]).exp())
                 .sum();
             option_ln_index(m.shape, rate, mean_share / packed, x, sigma / packed)
         }
@@ -393,22 +400,54 @@ pub fn ln_index(d: &Drain, v: &View, packed: f64, sigma: f64, rule: Rule) -> (f6
     (ln, share)
 }
 
-/// The `ln κ` at which `f`, rising in `ln κ`, turns positive, within
-/// [`LN_KAPPA`].
-fn root(f: impl Fn(f64) -> f64) -> f64 {
+/// The `ln κ` within [`LN_KAPPA`] at which `wait`, what waiting a epoch saves
+/// over `κ`, positive and falling in `ln κ`, comes down to `gain`, what
+/// cleaning now gains over `κ`: where cleaning starts to pay.
+///
+/// `ln wait` falls with a slope between −1 and −1/2, and nearly straight, so
+/// regula falsi on the logarithms, in its Illinois variant, which keeps it
+/// from stalling at one end, pins `ln κ` down to [`TOLERANCE`] in a few
+/// steps; a step that leaves the bracket bisects instead.
+fn root(gain: f64, wait: impl Fn(f64) -> f64) -> f64 {
     let (mut lo, mut hi) = LN_KAPPA;
-    if f(lo) >= 0.0 {
-        return lo;
-    }
-    if f(hi) < 0.0 {
+    if gain.is_nan() || gain <= 0.0 {
         return hi;
     }
+    let f = |lk: f64| gain.ln() - wait(lk).ln();
+    let (mut f_lo, mut f_hi) = (f(lo), f(hi));
+    if f_lo >= 0.0 {
+        return lo;
+    }
+    if f_hi.is_nan() || f_hi < 0.0 {
+        return hi;
+    }
+    let mut side = 0;
     for _ in 0..STEPS {
-        let mid = (lo + hi) / 2.0;
-        if f(mid) >= 0.0 {
-            hi = mid;
+        if hi - lo <= TOLERANCE {
+            break;
+        }
+        let secant = (lo * f_hi - hi * f_lo) / (f_hi - f_lo);
+        let mid = if secant > lo && secant < hi {
+            secant
         } else {
-            lo = mid;
+            (lo + hi) / 2.0
+        };
+        let fm = f(mid);
+        if fm >= 0.0 {
+            (hi, f_hi) = (mid, fm);
+            if side == 1 {
+                f_lo /= 2.0;
+            }
+            side = 1;
+        } else {
+            (lo, f_lo) = (mid, fm);
+            if side == -1 {
+                f_hi /= 2.0;
+            }
+            side = -1;
+        }
+        if fm.abs() <= 1e-12 {
+            return mid;
         }
     }
     (lo + hi) / 2.0
@@ -450,18 +489,26 @@ fn option_ln_index(shape: f64, rate: f64, a: f64, x: f64, sigma: f64) -> f64 {
             *w /= sum;
         }
     }
+    // Draws of no weight cost time and nothing else; rates as logarithms.
+    let later: Vec<(f64, f64, f64, f64)> = weight
+        .iter()
+        .zip(&later)
+        .filter(|&(&w, _)| w > 1e-12)
+        .map(|(&w, &(aj, xj, rj))| (w, aj, 1.0 - xj, rj.max(1e-300).ln()))
+        .collect();
+    let ln_rate = rate.max(1e-300).ln();
     let table = phi_table();
-    let gain = |lk: f64| {
-        let kappa = lk.exp();
-        let now = (1.0 - x) - a * table.phi(rate / kappa);
-        let option: f64 = weight
+    let phi = |ln_y: f64| table.ln_phi_at(ln_y).exp();
+    // Cleaning now forgoes `a·φ(r/κ)` of draining, and the option to clean
+    // later, after the losses of `H` epochs, those gains it would still have.
+    let wait = |lk: f64| {
+        let option: f64 = later
             .iter()
-            .zip(&later)
-            .map(|(w, &(aj, xj, rj))| w * (-((1.0 - xj) - aj * table.phi(rj / kappa))).max(0.0))
+            .map(|&(w, aj, room, ln_rj)| w * (aj * phi(ln_rj - lk) - room).max(0.0))
             .sum();
-        now - option
+        a * phi(ln_rate - lk) + option
     };
-    -root(gain)
+    -root(1.0 - x, wait)
 }
 
 // ------------------------------------------------------------------ tables
@@ -567,6 +614,7 @@ impl PhiTable {
     }
 
     /// `φ(y)`, from the table, and from its asymptotes beyond it.
+    #[cfg(test)]
     fn phi(&self, y: f64) -> f64 {
         if y <= 0.0 {
             return 0.0;
@@ -589,21 +637,49 @@ impl PhiTable {
 
     /// `Φ_A(m) = E φ(G/m)`, `G ~ Gamma(A, 1)`: from the table, and from its
     /// asymptotes in `m` beyond it.
+    #[cfg(test)]
     fn at(&self, shape: f64, m: f64) -> f64 {
-        let (la, lm) = (shape.max(A_MIN).ln(), m.max(1e-300).ln());
-        if lm > LN_M.1 {
+        self.at_ln(Row::of(shape), m.max(1e-300).ln())
+    }
+
+    /// `Φ` at the shape of `row` and at `m = e^ln_m`.
+    fn at_ln(&self, row: Row, ln_m: f64) -> f64 {
+        if ln_m > LN_M.1 {
             // E √(2G/m)
-            return (2.0 / m).sqrt() * (ln_gamma(shape + 0.5) - ln_gamma(shape)).exp();
+            return (2.0 * (-ln_m).exp()).sqrt() * row.half;
         }
-        if lm < LN_M.0 {
-            return shape / m + (shape / m).ln_1p();
+        if ln_m < LN_M.0 {
+            let y = row.shape * (-ln_m).exp();
+            return y + y.ln_1p();
         }
-        let (ia, fa) = locate(LN_A, la);
-        let (im, fm) = locate(LN_M, lm);
+        let (im, fm) = locate(LN_M, ln_m);
         let v = |a: usize, b: usize| self.big[a * LN_M.2 + b];
+        let (ia, fa) = (row.ia, row.fa);
         let lo = v(ia, im) * (1.0 - fm) + v(ia, im + 1) * fm;
         let hi = v(ia + 1, im) * (1.0 - fm) + v(ia + 1, im + 1) * fm;
         lo * (1.0 - fa) + hi * fa
+    }
+}
+
+/// A shape's place in the table of `Φ`, found once for every lookup at it.
+#[derive(Clone, Copy, Debug)]
+struct Row {
+    shape: f64,
+    ia: usize,
+    fa: f64,
+    /// `Γ(A + 1/2)/Γ(A)`, for the asymptote at large `m`.
+    half: f64,
+}
+
+impl Row {
+    fn of(shape: f64) -> Row {
+        let (ia, fa) = locate(LN_A, shape.max(A_MIN).ln());
+        Row {
+            shape,
+            ia,
+            fa,
+            half: (ln_gamma(shape + 0.5) - ln_gamma(shape)).exp(),
+        }
     }
 }
 
@@ -1045,5 +1121,38 @@ mod tests {
         assert!(!r.at[&7].0, "draining");
         assert_eq!(r.ripe(500, 0.01, &mut |_| true, 10), vec![7]);
         assert!(r.at[&7].0, "settled");
+    }
+
+    #[test]
+    fn the_root_is_where_bisection_finds_it() {
+        // A leaf of 300 statements of 13 bytes, 20 of which died, and a data
+        // page of 20 chunks of 200 bytes, 4 of which lost bytes: what each
+        // rule's cost of waiting comes down to the gain at, by regula falsi
+        // and by bisection.
+        let prior = Prior { a: 0.8, b: 16.0 };
+        for (chunks, size, drain, sigma) in [(300, 13.0, 20, 13.0), (20, 200.0, 4, 60.0)] {
+            let (d, v) = watch(chunks, size, drain, 0.05, sigma, 30, prior, 1.0);
+            let m = d.mixture(&v, sigma);
+            let (table, row) = (phi_table(), Row::of(m.shape));
+            let wait = |lk: f64| {
+                (0..m.weight.len())
+                    .map(|i| {
+                        m.weight[i] * m.draining[i] / PAGE * table.at_ln(row, m.ln_scale[i] + lk)
+                    })
+                    .sum::<f64>()
+            };
+            let gain = 1.0 - v.live / PAGE;
+            let (mut lo, mut hi) = LN_KAPPA;
+            for _ in 0..60 {
+                let mid = (lo + hi) / 2.0;
+                if wait(mid) <= gain {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            let got = root(gain, wait);
+            assert!((got - hi).abs() < 1e-8, "{got} against bisection's {hi}");
+        }
     }
 }

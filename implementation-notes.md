@@ -230,7 +230,8 @@ The notes on `ripeness` above still hold, except for the estimate; of those on `
   The young pages are not kept across sessions; the sums are.
 - **Moved content brings its source's draining share into its new page's class prior**, as the `ripeness2` branch brought its fitted share: `π₀` is the page's bytes weighted by their sources' posterior mean shares, fresh content counting as draining and a description defragmentation's rewrite as static.
   A source's share is the one the ranking last found, so a page fuller than `u₀`, which the ranking passes over, passes on its prior's.
-- **The index is found by bisection on `ln κ`, within `[−24, 12]`, in 32 steps.**
+- **The index is found by regula falsi on logarithms**: both rules come down to where what waiting saves, which falls with `ln κ` at a slope between −1 and −1/2 in its logarithm, meets what cleaning gains, and the Illinois variant of regula falsi pins `ln κ` within `[−24, 12]` down to 10⁻⁹ in about 10 evaluations, where bisection takes 32 for 10⁻⁸.
+  Ranking took about 80 % of a flush's instructions with bisection, the logarithms of every table lookup, and six `ln Γ` per mixture component, and flushes took 10 to 20 times as long as on the other branches; with the mixture's weights by recurrence, the table's row found once per page, and regula falsi, it takes a third.
   Rule (a) interpolates `Φ_A(m) = E φ(G/m)` in a table of 147 shapes by 481 scales, spaced by 0.1 in their logarithms, built once per process, at the first ranking, in about 0.3 s in a release build; its integral over `ln G` uses 160 points in the bulk and 40 in the left tail, where a small shape spreads `ln G` over some `1/A`, and is within 0.4 % of the same with 25 times the points.
   Mixture components of weight below 10⁻⁹ are dropped.
   Rule (c′) sums the negative-binomial predictive of the losses of the posterior's memory, `H` flushes, over up to `a/σ` events, as the simulation does.
