@@ -14,12 +14,13 @@
 //! options, and `quick`, which makes whatever runs small. Without a scenario,
 //! all run.
 //!
-//! Two variables in the environment change the options of every scenario but
-//! `typed`. With `KLADDE_BENCH_NO_STATE` set, the stores keep no consolidator
-//! state, which a single session only writes: what it costs is the
-//! difference. With `KLADDE_BENCH_OPTION` set, they judge ripeness by the
+//! Three variables in the environment change the options of every scenario
+//! but `typed`. With `KLADDE_BENCH_NO_STATE` set, the stores keep no
+//! consolidator state, which a single session only writes: what it costs is
+//! the difference. With `KLADDE_BENCH_OPTION` set, they judge ripeness by the
 //! option to wait, [`RipenessRule::OptionToWait`], rather than by the
-//! expected gain.
+//! expected gain. With `KLADDE_BENCH_EXACT` set, they judge every page's
+//! ripeness afresh in every flush, `Options::exact_ranking`, which is slow.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -247,6 +248,7 @@ fn defaults() -> Options {
         } else {
             RipenessRule::ExpectedGain
         },
+        exact_ranking: std::env::var_os("KLADDE_BENCH_EXACT").is_some(),
         ..Default::default()
     }
 }

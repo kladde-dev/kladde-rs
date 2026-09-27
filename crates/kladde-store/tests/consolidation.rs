@@ -117,6 +117,17 @@ fn evacuation_keeps_data_pages_full() {
 }
 
 #[test]
+fn exact_ranking_keeps_data_pages_full_too() {
+    let exact = Options {
+        exact_ranking: true,
+        ..Default::default()
+    };
+    let with = overwrite(exact, 64, 8192, 600, 32, 300);
+    assert!(with.evacuated_pages > 0);
+    assert!(data_fill(&with) > 0.6, "data fill {}", data_fill(&with));
+}
+
+#[test]
 fn page_rewrites_keep_leaves_full() {
     let off = Options {
         consolidate: false,

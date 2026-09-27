@@ -42,6 +42,15 @@ pub struct Options {
     /// How consolidation judges, from what a page's losses say about it, when
     /// cleaning the page pays.
     pub ripeness_rule: RipenessRule,
+    /// Whether to judge every page afresh in every flush, for experiments.
+    ///
+    /// A page's ripeness changes with every flush, whether it loses content
+    /// or not; by default, it is worked out exactly only when the page
+    /// loses content, and follows a close approximation in between. With
+    /// this set, every flush works it out exactly for every page that could
+    /// be ripe, which costs far more; it exists to measure what the
+    /// approximation costs.
+    pub exact_ranking: bool,
     /// How far `pack` looks ahead for a chunk that fits.
     pub lookahead: usize,
     /// Fragments the rotating window walks per flush.
@@ -71,6 +80,7 @@ impl Default for Options {
             kappa_gain: 2.0,
             theta: 0.05,
             ripeness_rule: RipenessRule::default(),
+            exact_ranking: false,
             lookahead: 16,
             walk: 512,
             defrag_share: 1,

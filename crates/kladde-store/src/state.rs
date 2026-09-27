@@ -384,6 +384,9 @@ pub struct State {
     /// Per kind, data pages and leaves: the sizes of natural loss events,
     /// and of their squares, summed, and discounted once per flush.
     pub events: [(f64, f64); 2],
+    /// The epoch whose first ranking refresh last ranked every page again,
+    /// with the exact ranking of `Options::exact_ranking`.
+    pub exact_epoch: u64,
     /// Data page -> `(id, lo, hi)`: ids that may have bytes in it, and the
     /// window of offsets they may occupy. A superset, pruned on use.
     pub reverse: IdMap<Vec<(u32, u32, u32)>>,
@@ -408,6 +411,7 @@ impl Default for State {
             natural: false,
             losses: IdMap::default(),
             events: [(0.0, 0.0); 2],
+            exact_epoch: 0,
             reverse: IdMap::default(),
             pending: Vec::new(),
             dropped_candidates: IdSet::default(),
@@ -471,13 +475,24 @@ impl State {
     /// the dispersion `sigma` of its kind, and `rule` turns its posterior into
     /// its index. The posterior mean draining share it finds is kept in the
     /// page's estimate, for the content it passes on.
+    ///
+    /// With `exact`, the first refresh of each epoch ranks every ranked page
+    /// again, by its posterior aged to `now` rather than by its index at its
+    /// last loss aged at `β` per epoch; the estimates themselves stay as they
+    /// are. It costs an index per ranked page per flush, and exists to
+    /// measure what the aging costs.
     pub fn refresh_ranking(
         &mut self,
         now: u64,
         packed: f64,
         sigma: [f64; 2],
         rule: crate::ripeness::Rule,
+        exact: bool,
     ) {
+        if exact && self.exact_epoch != now {
+            self.exact_epoch = now;
+            self.ripeness.stale_all();
+        }
         for page in std::mem::take(&mut self.ripeness.stale) {
             let Some(info) = self.pages.get_mut(page as usize) else {
                 self.ripeness.remove(page);
@@ -487,8 +502,13 @@ impl State {
             let coverage = info.coverage as f64;
             if live && info.coverage > 0 && coverage < packed && info.epoch < now {
                 let s = sigma[usize::from(info.state != PageState::Data)];
+                let drain = if exact {
+                    info.drain.aged(now, info.known_live() as f64 / s)
+                } else {
+                    info.drain
+                };
                 let (key, floor, share) =
-                    crate::ripeness::keys(&info.drain, &info.view(), packed, s, rule);
+                    crate::ripeness::keys(&drain, &info.view(), packed, s, rule);
                 info.drain.share = share as f32;
                 self.ripeness.insert(page, key, floor, now);
             } else {

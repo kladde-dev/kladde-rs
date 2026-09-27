@@ -208,8 +208,13 @@ impl Inner {
         let now = self.state.flush_epoch;
         let packed = crate::ripeness::packed_fill(self.opts.theta);
         let sigma = self.state.sigma();
-        self.state
-            .refresh_ranking(now, packed, sigma, self.opts.ripeness_rule);
+        self.state.refresh_ranking(
+            now,
+            packed,
+            sigma,
+            self.opts.ripeness_rule,
+            self.opts.exact_ranking,
+        );
         let pages = &self.state.pages;
         let (skip, rewritten) = (&self.cons.skip, &self.flush_rewritten);
         let mut ok = |p: u32| {

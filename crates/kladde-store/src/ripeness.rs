@@ -263,6 +263,17 @@ impl Drain {
         }
     }
 
+    /// The estimate as of epoch `to`, which it reaches through epochs without
+    /// a loss, in which `known_live` events' worth of bytes known to drain
+    /// stayed live: the exact posterior between losses, where the ranking
+    /// ages the index instead. A copy; the estimate itself changes only with
+    /// losses.
+    pub fn aged(&self, to: u64, known_live: f64) -> Drain {
+        let mut d = *self;
+        d.quiet(to, known_live);
+        d
+    }
+
     /// Ages the sums to epoch `to` through epochs without a loss, in which
     /// `known_live` events' worth of bytes known to drain stayed live.
     fn quiet(&mut self, to: u64, known_live: f64) {
@@ -816,6 +827,12 @@ impl Ripeness {
         self.at.len()
     }
 
+    /// Marks every ranked page stale, so that the next refresh ranks all of
+    /// them again.
+    pub fn stale_all(&mut self) {
+        self.stale.extend(self.at.keys().copied());
+    }
+
     /// Up to `limit` pages that are ripe at price `kappa` and pass `ok`,
     /// highest index first. A draining page whose index has passed its floor
     /// is overstated by its key, so it can surface early but never hide
@@ -1091,6 +1108,33 @@ mod tests {
             "(c′) {c} against the mean's {mean}"
         );
         assert!((a - mean).abs() < 0.2, "(a) {a} against the mean's {mean}");
+    }
+
+    #[test]
+    fn an_aged_estimate_is_the_posterior_after_epochs_without_losses() {
+        let prior = Prior { a: 0.8, b: 16.0 };
+        let (d, v) = watch(20, 150.0, 4, 0.05, 30.0, 30, prior, 1.0);
+        let known = v.live - v.untouched_bytes;
+        assert_eq!(d.aged(d.at, known / 30.0), d, "aging to its own epoch");
+        // Five flushes that record a loss of nothing on the page.
+        let mut stepped = d;
+        for t in 1..=5 {
+            let nothing = Loss {
+                live: v.live as u32,
+                known_live: known as u32,
+                ..Default::default()
+            };
+            stepped.lose(&nothing, 0, 30.0, d.at + t);
+        }
+        let aged = d.aged(d.at + 5, known.floor() / 30.0);
+        for (x, y) in [
+            (aged.a, stepped.a),
+            (aged.b, stepped.b),
+            (aged.drained, stepped.drained),
+        ] {
+            assert!((x / y - 1.0).abs() < 1e-5, "{x} against {y}");
+        }
+        assert_eq!(aged.at, stepped.at);
     }
 
     #[test]
