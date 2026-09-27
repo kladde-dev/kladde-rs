@@ -176,6 +176,13 @@ impl Sink {
             .state
             .slab
             .alloc(it.page, it.framing, it.stmt.id, it.stmt.kind);
+        // A chunk of its table page; a `Ref`'s payload is counted among its
+        // data page's chunks once the fragments show whether it is whole.
+        let stated = match it.stmt.kind {
+            Kind::Ref | Kind::Inline => it.stmt.size,
+            _ => 0,
+        };
+        self.state.add_chunk(s, it.page, None, stated);
         self.state.cover(it.page, it.framing as u32);
         entries[idx].slot = Some(s);
         s
@@ -515,6 +522,27 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
         info.state = PageState::Data;
         info.epoch = d.epoch;
         info.written = (d.content.end - d.content.start) as u16;
+    }
+    // A `Ref` whose payload is whole is one of its data page's untouched
+    // chunks; one that has lost bytes is known to drain.
+    let mut refs: IdMap<(u32, u32)> = IdMap::default();
+    for (&k, &f) in &state.frags {
+        if let Fragment::Bytes { page, stmt, .. } = f {
+            if state.slab.kinds[stmt.idx()] == Kind::Ref {
+                let len = state.frag_end(k) - koff(k);
+                refs.entry(stmt.idx() as u32).or_insert((page, 0)).1 += len;
+            }
+        }
+    }
+    for (&s, &(page, live)) in &refs {
+        let size = state.slab.size[s as usize];
+        if live >= size {
+            let info = &mut state.pages[page as usize];
+            info.untouched += 1;
+            info.untouched_bytes += size;
+        } else {
+            state.slab.touched[s as usize] = true;
+        }
     }
     for p in 2..file_pages {
         state.rerank(p);

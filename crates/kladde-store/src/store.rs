@@ -519,29 +519,34 @@ impl Store {
         out
     }
 
-    /// The rates fresh content starts from, in data pages and in leaves,
-    /// once estimated. For tests.
+    /// The priors on the rate that new data pages and leaves start from, as
+    /// `(events, exposure)`. For tests.
     #[doc(hidden)]
-    pub fn describe_fresh_rates(&self) -> [Option<f64>; 2] {
-        self.inner.borrow().cons.fresh
+    pub fn describe_priors(&self) -> [(f64, f64); 2] {
+        self.inner.borrow().cons.prior.map(|p| (p.a, p.b))
     }
 
     /// Every live data page and leaf emptier than the fill survivors are
-    /// packed at, with its estimate: `(page, rate at the estimate's epoch,
-    /// that epoch)`. For tests.
+    /// packed at, with its estimate: `(page, the draining share's rate if
+    /// every untouched chunk drains, as of the estimate's epoch, that
+    /// epoch)`. For tests.
     #[doc(hidden)]
-    pub fn describe_drains(&self) -> Vec<(u32, f32, u64)> {
+    pub fn describe_drains(&self) -> Vec<(u32, f64, u64)> {
         let i = self.inner.borrow();
         let packed = crate::ripeness::packed_fill(i.opts.theta);
+        let sigma = i.state.sigma();
         (2..i.state.pages.len())
             .filter_map(|p| {
                 let info = &i.state.pages[p];
                 let live = matches!(info.state, PageState::Data | PageState::Table);
-                (live && info.coverage > 0 && (info.coverage as f64) < packed).then_some((
-                    p as u32,
-                    info.drain.rate,
-                    info.drain.at,
-                ))
+                let s = sigma[usize::from(info.state != PageState::Data)];
+                (live && info.coverage > 0 && (info.coverage as f64) < packed).then(|| {
+                    (
+                        p as u32,
+                        info.drain.mean_rate(&info.view(), s),
+                        info.drain.at,
+                    )
+                })
             })
             .collect()
     }
@@ -1105,7 +1110,11 @@ pub(crate) fn take_page(
     stats: &mut Stats,
 ) -> Result<u32, Error> {
     if let Some(p) = ready.pop_first() {
-        state.pages[p as usize].state = PageState::Claimed;
+        let info = &mut state.pages[p as usize];
+        info.state = PageState::Claimed;
+        // Its chunks are counted afresh as they are stated.
+        info.untouched = 0;
+        info.untouched_bytes = 0;
         return Ok(p);
     }
     let p = *file_pages;

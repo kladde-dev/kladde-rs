@@ -39,14 +39,9 @@ pub struct Options {
     /// The largest share of a page a flush's pages may close empty with; no
     /// page fuller than the rest is ever cleaned.
     pub theta: f64,
-    /// Whether to rank pages for cleaning by the myopic rule, for experiments.
-    ///
-    /// The myopic rule ranks a page by the space its cleaning frees per byte
-    /// it writes, over how fast its content dies, as if what survives a
-    /// cleaning never died afterwards. It cleans pages whose content dies
-    /// slowly too early; it exists to measure what counting on later deaths
-    /// gains.
-    pub myopic_ripeness: bool,
+    /// How consolidation judges, from what a page's losses say about it, when
+    /// cleaning the page pays.
+    pub ripeness_rule: RipenessRule,
     /// How far `pack` looks ahead for a chunk that fits.
     pub lookahead: usize,
     /// Fragments the rotating window walks per flush.
@@ -75,7 +70,7 @@ impl Default for Options {
             kappa: 0.01,
             kappa_gain: 2.0,
             theta: 0.05,
-            myopic_ripeness: false,
+            ripeness_rule: RipenessRule::default(),
             lookahead: 16,
             walk: 512,
             defrag_share: 1,
@@ -85,4 +80,30 @@ impl Default for Options {
             consolidator_state: true,
         }
     }
+}
+
+/// How consolidation judges when cleaning a page pays.
+///
+/// A page's losses tell the store how much of the page's content still dies,
+/// and how fast, but only so surely: a page that has lost little could drain
+/// slowly or not at all. Both rules clean a page once cleaning it now gains
+/// more than waiting; they differ in what they count waiting as worth.
+///
+/// ```
+/// use kladde_store::{MemoryStorage, Options, RipenessRule, Store};
+///
+/// let opts = Options { ripeness_rule: RipenessRule::OptionToWait, ..Default::default() };
+/// let store = Store::create(Box::new(MemoryStorage::new()), opts)?;
+/// # Ok::<(), kladde_store::Error>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RipenessRule {
+    /// Clean a page once cleaning it now gains more than cleaning it one
+    /// flush later, on average over what its content may yet do.
+    #[default]
+    ExpectedGain,
+    /// Clean a page once cleaning it now gains more than keeping the option
+    /// to decide later, after more of its losses are known, is worth. It
+    /// waits longer on pages of which little is known.
+    OptionToWait,
 }

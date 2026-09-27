@@ -203,3 +203,43 @@ Each page fits a draining share and its rate to its own discounted losses, and k
 - **The seed's past runs to the governing header's epoch**, the epochs a page has been watched by the time the session starts, while its rate counts the epochs until the session's first flush, as the draft says.
 - **In memory, `Drain` is 24 bytes**, its epoch a `u64`; in the consolidator state, an entry holds the two sums, the rate, and the share as `f32`s, and the layout is tagged `kladrip3`.
 - **`Stats` counts the pages that hold a static share, and its bytes**, and kladde-bench records both, to show how often real pages earn one.
+
+## Bayesian ripeness (branch `bayesian-ripeness`)
+
+This branch implements `drafts/bayesian-ripeness.md` as of kladde-docs commit `369ae0e`, on the kladde-docs branch `ripeness2`, on top of the branch `ripeness2`, whose fit it replaces.
+Each page keeps the cure model's posterior per chunk: a chunk that has lost bytes is known to drain, and a mixture over how many of the untouched chunks drain too, all evidence discounted by `e^(−β)` per flush, the class count included.
+Every page's rate starts from the file's empirical prior, and its chunks' class from what it holds, with `ν_π = 10` chunks.
+`Options::ripeness_rule` picks the decision: rule (a), the expected gain, by default, or rule (c′), the option to wait.
+The notes on `ripeness` above still hold, except for the estimate; of those on `ripeness2`, the draining share that moved content brings along, and the rewrite that is static, still hold.
+`tools/simulate-ripeness.py` served as the reference where the draft leaves things implicit.
+
+- **The prior is folded into the sums, as the draft's single-rate `Drain` folds it**: `a` counts loss events with the prior's `A₀`, and `b` the exposure of the bytes known to drain, in events, with the prior's `B₀`, both discounted.
+  The class prior is one number, since `p₀ + q₀ = ν_π + 1` on every page, rounded to halves.
+  In memory, `Drain` is 28 bytes: `a`, `b`, the discounted count of touched chunks, `p₀`, and the posterior mean draining share the ranking last found as `f32`s, and the epoch as a `u64`; the page table adds the untouched chunks' count and bytes, 8 bytes.
+- **A chunk's size is the payload its statement states**, which the slab keeps beside the bit for its first loss, as parallel arrays of `u32` and `bool`: 5 bytes a statement, where the draft asks for one bit and takes a chunk's bytes from its fragment's extent at its first loss.
+  The size is at hand when a statement is bound, and the extent is not once the fold has split the fragment.
+- **A restated `Ref` is a new, untouched chunk**, of the bytes it states, which are the live ones: when the cut or description defragmentation restates a `Ref` whose payload has lost bytes, the page forgets that the chunk is known to drain.
+  At open, a `Ref` is touched if its live fragments cover less than it states, as the draft says.
+- **On a leaf, a chunk is a statement, which dies whole**: a leaf's live bytes are all untouched, and its known exposure is that of the statements that died, framing and `Inline` payload.
+  A statement's death is two loss events where it states an `Inline` payload, its payload's range and its framing, where the draft counts one.
+- **The dispersion `σ` is kept per kind**, data pages and leaves, as sums of the natural loss events' sizes and of their squares, discounted by `e^(−β)` once per flush; an event is a range the fold releases from a page.
+  Before the first event, `σ` is 64 bytes.
+- **The empirical prior learns from every page a flush writes**, per kind, over its first `⌊H⌋ = 10` flushes, `H = 1/(1 − e^(−β))`, or until it is freed or rewritten sooner, into the draft's five sums, discounted once per flush.
+  Until two pages' worth have been watched that long, the losses so far of the pages still young stand in; before any, the prior is `A₀ = 0.05` events over an exposure of one, which a page's first losses outweigh.
+  The mean rate is floored at `R_MIN`, so that a file whose pages never lose a byte learns a prior of rates near it.
+  The young pages are not kept across sessions; the sums are.
+- **Moved content brings its source's draining share into its new page's class prior**, as the `ripeness2` branch brought its fitted share: `π₀` is the page's bytes weighted by their sources' posterior mean shares, fresh content counting as draining and a description defragmentation's rewrite as static.
+  A source's share is the one the ranking last found, so a page fuller than `u₀`, which the ranking passes over, passes on its prior's.
+- **The index is found by bisection on `ln κ`, within `[−24, 12]`, in 32 steps.**
+  Rule (a) interpolates `Φ_A(m) = E φ(G/m)` in a table of 147 shapes by 481 scales, spaced by 0.1 in their logarithms, built once per process, at the first ranking, in about 0.3 s in a release build; its integral over `ln G` uses 160 points in the bulk and 40 in the left tail, where a small shape spreads `ln G` over some `1/A`, and is within 0.4 % of the same with 25 times the points.
+  Mixture components of weight below 10⁻⁹ are dropped.
+  Rule (c′) sums the negative-binomial predictive of the losses of the posterior's memory, `H` flushes, over up to `a/σ` events, as the simulation does.
+- **A page's second loss record in one flush adds to its first without discounting again**: the consolidator state's own rewrite can release bytes from a page the fold released bytes from.
+- **The floor stays the cap it is on the other branches**, `ln h(x) − ln R_MIN`; the draft's background rate is not added to the posterior.
+- **A page's estimate is seeded at open as the draft says**: its past counts as watched, at the one rate that takes its written bytes to its live ones; on a data page, its touched `Ref`s are known to drain since its write, at their stated sizes.
+- **The consolidator state's layout is tagged `kladbay1`**: 88 bytes of fixed fields, with the dispersion's sums and the empirical prior's in place of the rates fresh content starts from, and entries of three `f32`s and a byte, 13 bytes against the `ripeness2` branch's 16.
+  The share the ranking found is not kept, since the ranking finds it again.
+  A flush writes the state from its start in two pieces, 32 bytes and the rest, so that the fixed fields, and a small state whole, stay under the inline threshold of 64 bytes, as the 40 bytes of `kladrip3` did: in one piece, a small file's state takes a data page, which can end the file and keep `Store::close` from truncating it.
+- **`Options::myopic_ripeness` is gone**, and `KLADDE_BENCH_MYOPIC` with it; `KLADDE_BENCH_OPTION` sets rule (c′) in kladde-bench.
+- **`Stats::static_pages` counts the pages expected to be at least a tenth static**, and `static_bytes` the expected static bytes of every live data page and leaf.
+- **`State::check` also checks the untouched chunks' counts**, against the live `Ref`s that have lost no byte and the live statements of each leaf.

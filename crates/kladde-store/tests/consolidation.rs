@@ -244,9 +244,7 @@ fn estimates_survive_a_reopen() {
         walk: 0,
         ..Default::default()
     };
-    let rate = |&(_, rho, at): &(u32, f32, u64), now: u64| {
-        rho as f64 * (-0.1 * now.saturating_sub(at) as f64).exp()
-    };
+    let close = |a: f64, b: f64| (a - b).abs() <= 0.01 * b.abs();
     let storage = MemoryStorage::new();
     let store = Store::create(Box::new(storage.clone()), opts.clone()).unwrap();
     let ptrs: Vec<_> = (0..64).map(|_| store.alloc(4000).unwrap()).collect();
@@ -260,24 +258,25 @@ fn estimates_survive_a_reopen() {
             .unwrap();
         store.flush().unwrap();
     }
-    let now = store.stats().flushes + 1;
     let before = store.describe_drains();
-    let fresh = store.describe_fresh_rates();
-    assert!(fresh[0].is_some(), "{fresh:?}");
+    let priors = store.describe_priors();
+    let fresh = Store::create(Box::new(MemoryStorage::new()), opts.clone()).unwrap();
+    assert_ne!(
+        priors[0],
+        fresh.describe_priors()[0],
+        "no prior was learned"
+    );
     drop(store);
     let store = Store::open(Box::new(storage), opts).unwrap();
     // Kept as `f32`s, so that the next session's first pages do not start
     // from nothing.
-    let rounded = fresh.map(|f| f.map(|r| r as f32 as f64));
-    assert_eq!(store.describe_fresh_rates(), rounded);
+    for (a, b) in store.describe_priors().into_iter().zip(priors) {
+        assert!(close(a.0, b.0) && close(a.1, b.1), "{a:?} against {b:?}");
+    }
     let after = store.describe_drains();
     let same = before
         .iter()
-        .filter(|b| {
-            after
-                .iter()
-                .any(|a| a.0 == b.0 && (rate(a, now) - rate(b, now)).abs() <= 0.01 * rate(b, now))
-        })
+        .filter(|b| after.iter().any(|a| a.0 == b.0 && close(a.1, b.1)))
         .count();
     assert!(before.len() >= 60, "{before:?}");
     assert!(

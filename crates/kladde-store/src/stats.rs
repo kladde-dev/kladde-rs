@@ -85,10 +85,10 @@ pub struct Stats {
     /// Pages ranked by ripeness: live data pages and leaves emptier than the
     /// fill that consolidation packs pages to.
     pub ripe_ranked: u64,
-    /// Live data pages and leaves estimated to hold a share of content that
-    /// no longer dies.
+    /// Live data pages and leaves whose content is expected to be at least a
+    /// tenth static: to hold content that no longer dies.
     pub static_pages: u64,
-    /// The live bytes of those shares.
+    /// The live bytes of data pages and leaves expected to be static.
     pub static_bytes: u64,
 }
 

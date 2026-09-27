@@ -129,6 +129,12 @@ pub struct Slab {
     pub framing: Vec<u8>,
     pub ids: Vec<u32>,
     pub kinds: Vec<Kind>,
+    /// The bytes a `Ref` or `Inline` states: its payload, a chunk of the page
+    /// holding it.
+    pub size: Vec<u32>,
+    /// Whether its payload has lost bytes, or left its page, since it was
+    /// stated: the chunk is known to drain, or gone.
+    pub touched: Vec<bool>,
     free_head: u32,
     pub live: u32,
 }
@@ -141,6 +147,8 @@ impl Default for Slab {
             framing: vec![0],
             ids: vec![0],
             kinds: vec![Kind::Tombstone],
+            size: vec![0],
+            touched: vec![false],
             free_head: 0,
             live: 0,
         }
@@ -159,6 +167,8 @@ impl Slab {
             self.framing[s] = framing;
             self.ids[s] = id;
             self.kinds[s] = kind;
+            self.size[s] = 0;
+            self.touched[s] = false;
             return StmtRef(NonZeroU32::new(s as u32).unwrap());
         }
         let s = self.page_or_next.len();
@@ -168,6 +178,8 @@ impl Slab {
         self.framing.push(framing);
         self.ids.push(id);
         self.kinds.push(kind);
+        self.size.push(0);
+        self.touched.push(false);
         StmtRef(NonZeroU32::new(s as u32).unwrap())
     }
 
@@ -241,6 +253,11 @@ pub struct PageInfo {
     pub written: u16,
     /// How fast its content still dies.
     pub drain: Drain,
+    /// Its chunks that have not lost a byte: on a data page, `Ref` payloads,
+    /// and their bytes; on a leaf, its live statements, all of whose bytes
+    /// count as untouched.
+    pub untouched: u32,
+    pub untouched_bytes: u32,
 }
 
 impl Default for PageInfo {
@@ -252,6 +269,35 @@ impl Default for PageInfo {
             parent: 0,
             written: 0,
             drain: Drain::default(),
+            untouched: 0,
+            untouched_bytes: 0,
+        }
+    }
+}
+
+impl PageInfo {
+    /// What the posterior needs of the page beside its estimate.
+    pub fn view(&self) -> crate::ripeness::View {
+        let live = self.coverage as f64;
+        let untouched_bytes = if self.state == PageState::Data {
+            (self.untouched_bytes as f64).min(live)
+        } else {
+            live
+        };
+        crate::ripeness::View {
+            live,
+            untouched: self.untouched,
+            untouched_bytes,
+            written: self.epoch,
+        }
+    }
+
+    /// The live bytes of its chunks known to drain.
+    pub fn known_live(&self) -> u32 {
+        if self.state == PageState::Data {
+            self.coverage.saturating_sub(self.untouched_bytes)
+        } else {
+            0
         }
     }
 }
@@ -333,9 +379,11 @@ pub struct State {
     /// application's writes, frees, and shrinks caused, as opposed to
     /// consolidation moving content.
     pub natural: bool,
-    /// Page -> `(lost, live)`: the natural losses of the flush in progress,
-    /// and the page's coverage before the first of them.
-    pub losses: IdMap<(u32, u32)>,
+    /// Page -> the natural losses of the flush in progress.
+    pub losses: IdMap<crate::ripeness::Loss>,
+    /// Per kind, data pages and leaves: the sizes of natural loss events,
+    /// and of their squares, summed, and discounted once per flush.
+    pub events: [(f64, f64); 2],
     /// Data page -> `(id, lo, hi)`: ids that may have bytes in it, and the
     /// window of offsets they may occupy. A superset, pruned on use.
     pub reverse: IdMap<Vec<(u32, u32, u32)>>,
@@ -359,6 +407,7 @@ impl Default for State {
             ripeness: Ripeness::default(),
             natural: false,
             losses: IdMap::default(),
+            events: [(0.0, 0.0); 2],
             reverse: IdMap::default(),
             pending: Vec::new(),
             dropped_candidates: IdSet::default(),
@@ -403,26 +452,44 @@ impl State {
         self.ripeness.stale.remove(&page);
     }
 
+    /// The dispersion of natural loss events, `E[s²]/E[s]`, on data pages and
+    /// on leaves, in bytes.
+    pub fn sigma(&self) -> [f64; 2] {
+        self.events.map(|(s, s2)| {
+            if s > 0.0 {
+                s2 / s
+            } else {
+                crate::ripeness::SIGMA0
+            }
+        })
+    }
+
     /// Ranks every stale page again as of `now`: a live data page or leaf
     /// with coverage below `packed` bytes, the fill survivors are packed at,
     /// written before the flush in progress; anything else leaves the
-    /// ranking. Its fill counts relative to `packed`, in `h`, or in the
-    /// myopic `g` if `myopic`.
-    pub fn refresh_ranking(&mut self, now: u64, packed: f64, myopic: bool) {
-        let fill = if myopic {
-            crate::ripeness::g
-        } else {
-            crate::ripeness::h
-        };
+    /// ranking. Its fill counts relative to `packed`, its loss events have
+    /// the dispersion `sigma` of its kind, and `rule` turns its posterior into
+    /// its index. The posterior mean draining share it finds is kept in the
+    /// page's estimate, for the content it passes on.
+    pub fn refresh_ranking(
+        &mut self,
+        now: u64,
+        packed: f64,
+        sigma: [f64; 2],
+        rule: crate::ripeness::Rule,
+    ) {
         for page in std::mem::take(&mut self.ripeness.stale) {
-            let Some(info) = self.pages.get(page as usize) else {
+            let Some(info) = self.pages.get_mut(page as usize) else {
                 self.ripeness.remove(page);
                 continue;
             };
             let live = matches!(info.state, PageState::Data | PageState::Table);
             let coverage = info.coverage as f64;
             if live && info.coverage > 0 && coverage < packed && info.epoch < now {
-                let (key, floor) = crate::ripeness::keys(&info.drain, coverage, packed, fill);
+                let s = sigma[usize::from(info.state != PageState::Data)];
+                let (key, floor, share) =
+                    crate::ripeness::keys(&info.drain, &info.view(), packed, s, rule);
+                info.drain.share = share as f32;
                 self.ripeness.insert(page, key, floor, now);
             } else {
                 self.ripeness.remove(page);
@@ -444,20 +511,80 @@ impl State {
         if n == 0 {
             return;
         }
-        let info = &mut self.pages[page as usize];
-        debug_assert!(info.coverage >= n, "coverage of page {page} underflows");
+        debug_assert!(
+            self.pages[page as usize].coverage >= n,
+            "coverage of page {page} underflows"
+        );
         if self.natural {
-            let e = self.losses.entry(page).or_insert((0, info.coverage));
-            e.0 += n;
-        } else if info.coverage > n {
-            // Content moved out: the estimate shrinks with the page. A page
-            // emptied keeps its estimate, which its survivors carry along.
-            let keep = (info.coverage - n) as f64 / info.coverage as f64;
-            info.drain.shrink(keep);
+            // A natural loss event, which the dispersion of its kind counts;
+            // content moved out is not one, and leaves the estimate alone.
+            match self.pages[page as usize].state {
+                PageState::Data => {
+                    self.events[0].0 += n as f64;
+                    self.events[0].1 += n as f64 * n as f64;
+                }
+                PageState::Table => {
+                    self.events[1].0 += n as f64;
+                    self.events[1].1 += n as f64 * n as f64;
+                }
+                _ => {}
+            }
+            self.loss_entry(page).lost += n;
         }
+        let info = &mut self.pages[page as usize];
         info.coverage -= n;
         self.dropped_candidates.insert(page);
         self.rerank(page);
+    }
+
+    /// The flush's record of `page`'s natural losses, begun with the page as
+    /// it stands before the first of them.
+    fn loss_entry(&mut self, page: u32) -> &mut crate::ripeness::Loss {
+        let info = &self.pages[page as usize];
+        let (live, known_live) = (info.coverage, info.known_live());
+        self.losses.entry(page).or_insert(crate::ripeness::Loss {
+            live,
+            known_live,
+            ..Default::default()
+        })
+    }
+
+    /// The payload of `s`, a chunk of data page `page`, loses bytes or moves
+    /// out. The first time, the chunk leaves the page's untouched ones: known
+    /// to drain, if the loss is natural, or gone.
+    fn touch(&mut self, page: u32, s: StmtRef) {
+        let i = s.idx();
+        if self.slab.touched[i]
+            || self.slab.kinds[i] != Kind::Ref
+            || self.pages[page as usize].state != PageState::Data
+        {
+            return;
+        }
+        let size = self.slab.size[i];
+        if self.natural {
+            let e = self.loss_entry(page);
+            e.new += 1;
+            e.new_bytes += size;
+        }
+        self.slab.touched[i] = true;
+        let info = &mut self.pages[page as usize];
+        info.untouched = info.untouched.saturating_sub(1);
+        info.untouched_bytes = info.untouched_bytes.saturating_sub(size);
+    }
+
+    /// Statement `s`, just stated in table page `page`, is one of its chunks,
+    /// and a `Ref`'s payload of `size` bytes is one of data page `data`'s.
+    pub fn add_chunk(&mut self, s: StmtRef, page: u32, data: Option<u32>, size: u32) {
+        self.slab.size[s.idx()] = size;
+        self.slab.touched[s.idx()] = false;
+        if let Some(info) = self.pages.get_mut(page as usize) {
+            info.untouched += 1;
+        }
+        if let Some(dp) = data {
+            let info = &mut self.pages[dp as usize];
+            info.untouched += 1;
+            info.untouched_bytes += size;
+        }
     }
 
     // ------------------------------------------------------------ allocations
@@ -503,6 +630,21 @@ impl State {
             let page = self.slab.page_or_next[i];
             let framing = self.slab.framing[i] as u32;
             let id = self.slab.ids[i];
+            // A leaf's chunk dies whole: known to drain, if naturally.
+            if self.pages.get(page as usize).map(|p| p.state) == Some(PageState::Table) {
+                if self.natural {
+                    let inline = if self.slab.kinds[i] == Kind::Inline {
+                        self.slab.size[i]
+                    } else {
+                        0
+                    };
+                    let e = self.loss_entry(page);
+                    e.new += 1;
+                    e.new_bytes += framing + inline;
+                }
+                let info = &mut self.pages[page as usize];
+                info.untouched = info.untouched.saturating_sub(1);
+            }
             self.uncover(page, framing);
             if let Some(m) = self.allocs.get_mut(&id) {
                 m.statement_bytes -= framing;
@@ -514,6 +656,7 @@ impl State {
     fn release_fragment(&mut self, f: Fragment, len: u32) {
         match f {
             Fragment::Bytes { page, stmt, .. } => {
+                self.touch(page, stmt);
                 self.uncover(page, len);
                 self.unpin(stmt);
             }
@@ -898,12 +1041,30 @@ impl State {
                 pins[t.idx()] += 1;
             }
         }
+        // A data page's untouched chunks are the live `Ref` payloads in it
+        // that have lost no byte, and a leaf's its live statements.
+        let mut untouched: IdMap<(u32, u32)> = IdMap::default();
+        let mut seen = IdSet::default();
+        for &(_, f) in &keys {
+            if let Fragment::Bytes { page, stmt, .. } = f {
+                let i = stmt.idx();
+                if self.slab.kinds[i] == Kind::Ref && !self.slab.touched[i] && seen.insert(i as u32)
+                {
+                    let u = untouched.entry(page).or_default();
+                    u.0 += 1;
+                    u.1 += self.slab.size[i];
+                }
+            }
+        }
         for s in 1..pins.len() {
             let live = self.slab.pins[s] > 0;
             if live {
                 assert_eq!(pins[s], self.slab.pins[s], "pins of statement {s}");
-                *coverage.entry(self.slab.page_or_next[s]).or_default() +=
-                    self.slab.framing[s] as u32;
+                let page = self.slab.page_or_next[s];
+                *coverage.entry(page).or_default() += self.slab.framing[s] as u32;
+                if self.pages[page as usize].state == PageState::Table {
+                    untouched.entry(page).or_default().0 += 1;
+                }
             } else {
                 assert_eq!(pins[s], 0, "a dead statement {s} is referenced");
             }
@@ -920,6 +1081,16 @@ impl State {
                     "coverage of page {p} ({:?})",
                     info.state
                 );
+            }
+            let (n, bytes) = untouched.get(&(p as u32)).copied().unwrap_or_default();
+            match info.state {
+                PageState::Data => assert_eq!(
+                    (info.untouched, info.untouched_bytes),
+                    (n, bytes),
+                    "untouched chunks of data page {p}"
+                ),
+                PageState::Table => assert_eq!(info.untouched, n, "statements of leaf {p}"),
+                _ => {}
             }
         }
         let _: BTreeSet<u32> = BTreeSet::new();

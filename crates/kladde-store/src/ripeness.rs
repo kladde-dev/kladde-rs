@@ -1,264 +1,651 @@
-//! Cleaning by ripeness (`drafts/ripeness.md`, as of kladde-docs commit
-//! `7c343b7`): how much of each page still drains and how fast, fitted to
-//! the page's own losses, and the pages ranked by the price of space at
-//! which cleaning them starts to pay.
+//! Cleaning by ripeness, Bayesian (`drafts/bayesian-ripeness.md`, as of
+//! kladde-docs commit `369ae0e`, on its branch `ripeness2`): a posterior over
+//! how much of each page still drains and how fast, and the pages ranked by
+//! the price of space at which cleaning them starts to pay.
 //!
-//! A page's live content is a share `a` that drains at rate `r` over a share
-//! `s` that does not drain at all, both measured relative to the fill `u₀`
-//! that survivors are packed at. The page is ripe at price `κ` once
-//! `h(z) ≥ r / κ`, with `z = a/(1 − s)` and `h(x) = (1 − x)/x − ln(1/x)`.
-//! Its ripeness index, `min(h(z)/r, h(x)/R_MIN)` with `x = a + s`, is the
-//! `1/κ` at which that happens, and no page at or above `u₀` is ripe.
-//! Between a page's losses its rate decays by the same factor per epoch as
-//! every other page's, so the order of pages changes only when a page's own
-//! content does.
+//! A page's *chunks* are what it holds of its statements: each `Ref`'s
+//! payload on a data page, each statement on a leaf. A chunk drains with
+//! probability `π`, else it is static; a draining chunk loses its bytes at
+//! the rate `r`, in loss events whose sizes have the dispersion
+//! `σ = E[s²]/E[s]`. A chunk that has lost bytes is known to drain, and the
+//! posterior is a mixture over `j`, how many of the `n` untouched chunks drain
+//! too, each component with a Gamma posterior on the rate. All evidence is
+//! discounted by `e^(−β)` per epoch, the prior's drift.
+//!
+//! Fills count relative to the fill `u₀` survivors are packed at. Cleaning a
+//! page of fill `x` whose draining share `a` drains at `r` now rather than one
+//! epoch later gains `κ·[(1 − x) − a·φ(r/κ)]` per epoch, with `φ` solving
+//! `φ − ln(1 + φ) = y`; a page's index is the `1/κ` at which its expected
+//! gain turns positive, rule (a), or its gain net of what the option to wait
+//! is worth, rule (c′). Between a page's losses its index grows by the same
+//! factor per epoch as every other page's, so the order of pages changes only
+//! when a page's own content does.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, BinaryHeap};
+use std::sync::OnceLock;
 
 use crate::consts::MAX_PAGE_CONTENT;
 use crate::hash::{IdMap, IdSet};
+pub use crate::options::RipenessRule as Rule;
 
-/// How fast a page's fit forgets old losses, per epoch.
+/// The prior's drift: how fast a page's posterior forgets its evidence, per
+/// epoch.
 pub const BETA: f64 = 0.1;
 /// The slowest rate content is assumed to drain at, per epoch: no page is
 /// riper than it would be if all of its live content drained at this rate.
 pub const R_MIN: f64 = 1e-4;
-/// The weight of a page's starting estimate, in epochs of its losses.
-pub const N0: u64 = 10;
-/// How much better, in statements' worth of log-likelihood, a static share
-/// must explain a page's losses than one share draining alone.
-pub const STATIC_EVIDENCE: f64 = 3.0;
-/// The fastest rate a fit considers, per epoch.
-const R_MAX: f64 = 3.0;
-/// Bisection steps per fit, which pin a rate down to `R_MAX / 2^50`.
-const STEPS: usize = 50;
+/// The weight of the prior on a chunk's class, in chunks.
+pub const NU_PI: f64 = 10.0;
+/// The least shape a posterior is taken at.
+const A_MIN: f64 = 0.05;
+/// The range of `ln κ` an index is sought in.
+const LN_KAPPA: (f64, f64) = (-24.0, 12.0);
+/// Bisection steps for an index, which pin `ln κ` down to `36 / 2^32`.
+const STEPS: usize = 32;
 
-/// What a page's losses say about it: the discounted sums that a draining
-/// share is fitted to, and the fit.
+/// `e^(−β)`: what one epoch discounts evidence by.
+fn delta() -> f64 {
+    (-BETA).exp()
+}
+
+/// The discounted age of a byte live for `t` epochs: its exposure, as the
+/// posterior remembers it.
+pub fn remembered(t: f64) -> f64 {
+    let d = delta();
+    (1.0 - d.powf(t)) / (1.0 - d)
+}
+
+/// How many epochs the posterior remembers: `1/(1 − e^(−β))`.
+pub fn memory() -> f64 {
+    1.0 / (1.0 - delta())
+}
+
+/// The dispersion loss events are taken at before any has been seen, in
+/// bytes.
+pub const SIGMA0: f64 = 64.0;
+
+/// A Gamma prior on the rate, in loss events: `a` events over an exposure of
+/// `b`, which has mean `a/b`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Prior {
+    pub a: f64,
+    pub b: f64,
+}
+
+impl Default for Prior {
+    /// The prior before the file has any evidence: next to none, so that a
+    /// page's first losses decide.
+    fn default() -> Prior {
+        Prior { a: A_MIN, b: 1.0 }
+    }
+}
+
+/// The sums of the method of moments over pages' losses in their first
+/// epochs, discounted, from which the file's empirical prior follows: pages,
+/// their loss events `k`, their exposures `E` in events, and `E²` and `k²/E`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Moments {
+    pub n: f64,
+    pub k: f64,
+    pub e: f64,
+    pub e2: f64,
+    pub k2e: f64,
+}
+
+impl Moments {
+    /// Adds a page that lost `k` events over an exposure of `e`.
+    pub fn add(&mut self, k: f64, e: f64) {
+        if e > 0.0 {
+            self.n += 1.0;
+            self.k += k;
+            self.e += e;
+            self.e2 += e * e;
+            self.k2e += k * k / e;
+        }
+    }
+
+    pub fn discount(&mut self, by: f64) {
+        for v in [
+            &mut self.n,
+            &mut self.k,
+            &mut self.e,
+            &mut self.e2,
+            &mut self.k2e,
+        ] {
+            *v *= by;
+        }
+    }
+
+    /// The Gamma prior with the mean and the spread of the pages' rates, the
+    /// spread being what is left of their losses' scatter once the Poisson
+    /// noise is taken out, floored at a thousandth of the mean squared; once
+    /// two pages' worth are in.
+    pub fn prior(&self) -> Option<Prior> {
+        if self.n < 2.0 || self.e <= 0.0 {
+            return None;
+        }
+        let mean = (self.k / self.e).max(R_MIN);
+        let q = self.k2e - 2.0 * mean * self.k + mean * mean * self.e;
+        let over = self.e - self.e2 / self.e;
+        let spread = if over > 0.0 {
+            (q - (self.n - 1.0) * mean) / over
+        } else {
+            0.0
+        };
+        let spread = spread.max(mean * mean / 1000.0);
+        Some(Prior {
+            a: mean * mean / spread,
+            b: mean / spread,
+        })
+    }
+}
+
+/// What a page's losses say about it, as sums that the posterior follows
+/// from, and what the ranking last found.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Drain {
-    /// Natural losses, in bytes, each discounted by `e^(−β·lag)`, as of
-    /// epoch `at`.
-    pub s0: f32,
-    /// The same, each also weighted by its lag.
-    pub s1: f32,
-    /// The draining share's rate at epoch `at`, a fraction of it per epoch.
-    pub rate: f32,
-    /// The draining share, as a fraction of the page's coverage; the rest is
-    /// static.
+    /// The rate's shape: loss events, bytes lost over the dispersion, with
+    /// the prior's as pseudo-observations, discounted.
+    pub a: f32,
+    /// The rate's scale: the exposure of the bytes known to drain, those of
+    /// chunks that have lost bytes since the page was written, in events,
+    /// with the prior's, discounted.
+    pub b: f32,
+    /// Chunks known to drain, discounted.
+    pub drained: f32,
+    /// The prior on a chunk's class, in chunks, a multiple of one half: `p0`
+    /// draining, and `NU_PI + 1 − p0` static.
+    pub p0: f32,
+    /// The posterior mean draining share, as a fraction of the coverage, as
+    /// the ranking last found it; moved content brings it along.
     pub share: f32,
     /// The epoch the sums are as of: the page's last natural loss, its
     /// writing, or the open that seeded it.
     pub at: u64,
 }
 
+/// A page's natural losses in one flush, as the fold records them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Loss {
+    /// Bytes lost.
+    pub lost: u32,
+    /// The page's coverage before the first of them.
+    pub live: u32,
+    /// The live bytes of chunks touched before the flush: known to drain.
+    pub known_live: u32,
+    /// Chunks the flush touched first, and their bytes when written.
+    pub new: u32,
+    pub new_bytes: u32,
+}
+
+/// What the page table knows of a page's chunks, beside its estimate.
+#[derive(Clone, Copy, Debug)]
+pub struct View {
+    /// Live bytes.
+    pub live: f64,
+    /// Chunks that have not lost a byte, and their bytes.
+    pub untouched: u32,
+    pub untouched_bytes: f64,
+    /// The epoch the page was written.
+    pub written: u64,
+}
+
+/// A page's posterior, as of its estimate's epoch: the rate's shape, shared,
+/// and per number `j` of untouched chunks that drain, the rate's scale, the
+/// weight, and the draining share in bytes.
+struct Mixture {
+    shape: f64,
+    scale: Vec<f64>,
+    weight: Vec<f64>,
+    draining: Vec<f64>,
+}
+
 impl Drain {
-    /// A new page's estimate, written at epoch `at`: `fast` of its `live`
-    /// bytes draining at rate `r0`, and the rest static. The start enters the
-    /// sums as the losses it predicts for the page's first [`N0`] epochs,
-    /// which lie ahead.
-    pub fn start(fast: f64, r0: f64, live: f64, at: u64) -> Drain {
-        let (s0, s1) = predicted(fast, r0, -(N0 as i64), -1, 0);
+    /// A new page's estimate, written at epoch `at`: the rate's prior, and the
+    /// share `pi` of what it holds that drains.
+    pub fn start(prior: Prior, pi: f64, at: u64) -> Drain {
+        let pi = pi.clamp(0.0, 1.0);
         Drain {
-            s0: s0 as f32,
-            s1: s1 as f32,
-            rate: r0 as f32,
-            share: if live > 0.0 {
-                (fast / live).clamp(0.0, 1.0) as f32
-            } else {
-                0.0
-            },
+            a: prior.a as f32,
+            b: prior.b as f32,
+            p0: ((2.0 * NU_PI * pi).round() / 2.0 + 0.5) as f32,
+            share: pi as f32,
             at,
+            ..Drain::default()
         }
     }
 
+    /// The prior's count of static chunks.
+    pub fn q0(&self) -> f64 {
+        NU_PI + 1.0 - self.p0 as f64
+    }
+
     /// The estimate of a page of which nothing is known but that it was
-    /// written with `written` bytes, `past` epochs before `now`, and holds
-    /// `live` bytes: all of it draining, at the one rate that takes `written`
-    /// to `live` in `age` epochs. Its past enters the sums as watched, and
-    /// seen to lose what that rate predicts, and so does the start of a page
-    /// with all of `written` draining.
-    pub fn seed(written: f64, live: f64, past: u64, age: f64, now: u64) -> Drain {
+    /// written with `written` bytes, `past` epochs before `now`, holds `live`
+    /// bytes, and has `touched` chunks that have lost bytes, first
+    /// `touched_bytes` long, with loss events of dispersion `sigma`: its past
+    /// counts as watched, losing bytes at the one rate that takes `written`
+    /// to `live` in `age` epochs, and all of it drains.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed(
+        written: f64,
+        live: f64,
+        past: u64,
+        age: f64,
+        sigma: f64,
+        touched: u32,
+        touched_bytes: f64,
+        now: u64,
+    ) -> Drain {
         let r = if live > 0.0 && written > live {
             (written / live).ln() / age
         } else {
-            0.0
+            R_MIN
         };
-        let p = past as i64;
-        let (a0, a1) = predicted(written, r, 0, p - 1, p);
-        let (b0, b1) = predicted(written, r, p - N0 as i64, p - 1, p);
+        // The bytes it would have held k epochs ago, discounted by k.
+        let d = delta();
+        let b: f64 = (0..past.max(1))
+            .map(|k| d.powi(k as i32) * live * (r * k as f64).exp())
+            .sum::<f64>()
+            / sigma;
+        let t = remembered(past as f64);
         Drain {
-            s0: (a0 + b0) as f32,
-            s1: (a1 + b1) as f32,
-            rate: r as f32,
+            a: (r * b) as f32,
+            b: (b + touched_bytes * t / sigma) as f32,
+            drained: touched as f32,
+            p0: (NU_PI + 0.5) as f32,
             share: 1.0,
             at: now,
         }
     }
 
-    /// A flush's fold superseded `bytes` of the page's content at `now`,
-    /// leaving `live` bytes; the page was written `age` epochs ago, and the
-    /// file's statements state `statement` bytes each on average, which is
-    /// the unit its losses come in.
-    pub fn lose(&mut self, bytes: u32, live: u32, age: u64, now: u64, statement: f64) {
-        let d = now.saturating_sub(self.at) as f64;
-        let decay = (-BETA * d).exp();
-        let (s0, s1) = (self.s0 as f64, self.s1 as f64);
-        let s1 = decay * (s1 + d * s0);
-        let s0 = decay * s0 + bytes as f64;
-        self.s0 = s0 as f32;
-        self.s1 = s1 as f32;
-        self.at = now;
-        if live == 0 || s0 <= 0.0 {
+    /// Ages the sums to epoch `to` through epochs without a loss, in which
+    /// `known_live` events' worth of bytes known to drain stayed live.
+    fn quiet(&mut self, to: u64, known_live: f64) {
+        if to <= self.at {
             return;
         }
-        let (live, age) = (live as f64, age.max(1) as f64);
-        let (r, loss) = fit(s0, s1, age);
-        let fast = if r > 1e-9 {
-            loss / r.exp_m1()
+        let d = delta();
+        let decay = d.powf((to - self.at) as f64);
+        self.a = (decay * self.a as f64) as f32;
+        self.b = (decay * self.b as f64 + known_live * (1.0 - decay) / (1.0 - d)) as f32;
+        self.drained = (decay * self.drained as f64) as f32;
+        self.at = to;
+    }
+
+    /// The flush of epoch `now` recorded `loss` on the page, written at epoch
+    /// `written`; loss events on pages of its kind have the dispersion
+    /// `sigma`, in bytes. A second record of the same flush adds to the
+    /// first.
+    pub fn lose(&mut self, loss: &Loss, written: u64, sigma: f64, now: u64) {
+        let d = delta();
+        if self.at < now {
+            let known_live = loss.known_live as f64 / sigma;
+            self.quiet(now - 1, known_live);
+            self.a = (d * self.a as f64) as f32;
+            self.b = (d * self.b as f64 + known_live) as f32;
+            self.drained = (d * self.drained as f64) as f32;
+            self.at = now;
+        }
+        // Chunks touched first are known to drain since the page's writing.
+        let before = remembered(now.saturating_sub(1).saturating_sub(written) as f64);
+        let (lost, new) = (loss.lost as f64 / sigma, loss.new_bytes as f64 / sigma);
+        self.b = (self.b as f64 + new * (d * before + 1.0) - lost / 2.0).max(0.0) as f32;
+        self.a += lost as f32;
+        self.drained += loss.new as f32;
+    }
+
+    /// The posterior of a page `v`, as of the estimate's epoch.
+    fn mixture(&self, v: &View, sigma: f64) -> Mixture {
+        let n = v.untouched;
+        let chunk = if n > 0 {
+            v.untouched_bytes / n as f64
         } else {
-            f64::INFINITY
+            0.0
         };
-        // A static share must earn its place against one share draining
-        // alone, by what it adds to the log-likelihood.
-        let (one, one_likelihood) = fit_one(s0, s1, age, live);
-        let gain = s0 * loss.ln() + r * s1 - s0 - one_likelihood;
-        if fast < live && gain >= STATIC_EVIDENCE * statement.max(1.0) {
-            self.rate = r as f32;
-            self.share = (fast / live) as f32;
-        } else {
-            self.rate = one as f32;
-            self.share = 1.0;
+        let known_live = (v.live - v.untouched_bytes).max(0.0);
+        let t = remembered(self.at.saturating_sub(v.written) as f64);
+        let shape = (self.a as f64).max(A_MIN);
+        let base = self.b as f64;
+        let per = chunk * t / sigma;
+        let drained = self.drained as f64;
+        let (p0, q0) = (self.p0 as f64, self.q0());
+        let nf = n as f64;
+        let ln_choose_n = ln_gamma(nf + 1.0);
+        let mut ln_w = Vec::with_capacity(n as usize + 1);
+        let mut scale = Vec::with_capacity(n as usize + 1);
+        let mut draining = Vec::with_capacity(n as usize + 1);
+        for j in 0..=n {
+            let jf = j as f64;
+            let b = (base + jf * per).max(1e-300);
+            ln_w.push(
+                ln_choose_n - ln_gamma(jf + 1.0) - ln_gamma(nf - jf + 1.0)
+                    + ln_beta(p0 + drained + jf, q0 + nf - jf)
+                    - shape * b.ln(),
+            );
+            scale.push(b);
+            draining.push((known_live + jf * chunk).min(v.live));
+        }
+        let top = ln_w.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mut weight: Vec<f64> = ln_w.iter().map(|l| (l - top).exp()).collect();
+        let sum: f64 = weight.iter().sum();
+        for w in &mut weight {
+            *w /= sum;
+        }
+        // Components that carry no weight cost time and nothing else.
+        let keep: Vec<usize> = (0..weight.len()).filter(|&i| weight[i] > 1e-9).collect();
+        Mixture {
+            shape,
+            scale: keep.iter().map(|&i| scale[i]).collect(),
+            weight: keep.iter().map(|&i| weight[i]).collect(),
+            draining: keep.iter().map(|&i| draining[i]).collect(),
         }
     }
 
-    /// The draining share's rate at `now`: between losses, it decays as a
-    /// discounted average of the losses would.
-    pub fn rate(&self, now: u64) -> f64 {
-        self.rate as f64 * (-BETA * now.saturating_sub(self.at) as f64).exp()
-    }
-
-    /// Consolidation moved content out of the page, leaving `keep` of it.
-    /// Which share the content came from is unknown, so both shrink in
-    /// proportion, and the rate stays where it was.
-    pub fn shrink(&mut self, keep: f64) {
-        self.s0 = (self.s0 as f64 * keep) as f32;
-        self.s1 = (self.s1 as f64 * keep) as f32;
+    /// The draining share's rate, by the posterior mean of the component in
+    /// which every untouched chunk drains: what the single-rate posterior
+    /// would say. For tests and diagnostics.
+    pub fn mean_rate(&self, v: &View, sigma: f64) -> f64 {
+        let t = remembered(self.at.saturating_sub(v.written) as f64);
+        let b = self.b as f64 + v.untouched_bytes * t / sigma;
+        (self.a as f64).max(A_MIN) / b.max(1e-300)
     }
 }
 
-/// `ln Σ_{k<n} e^(w·k)`, for `n ≥ 1`.
-fn ln_geometric(w: f64, n: f64) -> f64 {
-    if w.abs() < 1e-12 {
-        n.ln()
-    } else if w < 0.0 {
-        (-(w * n).exp_m1()).ln() - (-w.exp_m1()).ln()
+/// The log-index of page `v` with estimate `d` by `rule`, fills relative to
+/// `packed` bytes, with loss events of dispersion `sigma` bytes, and the
+/// posterior mean draining share as a fraction of the page's live bytes.
+/// [`Rule::ExpectedGain`] is rule (a): the `1/κ` at which the expected gain of
+/// cleaning now turns positive; [`Rule::OptionToWait`] is rule (c′): the
+/// `1/κ` at which the gain of cleaning now, by the posterior means, covers
+/// what the option to wait is worth.
+pub fn ln_index(d: &Drain, v: &View, packed: f64, sigma: f64, rule: Rule) -> (f64, f64) {
+    let m = d.mixture(v, sigma);
+    let x = v.live / packed;
+    let mean_share: f64 = m.weight.iter().zip(&m.draining).map(|(w, a)| w * a).sum();
+    let share = if v.live > 0.0 {
+        (mean_share / v.live).clamp(0.0, 1.0)
     } else {
-        w * (n - 1.0) + (-(-w * n).exp_m1()).ln() - (-(-w).exp_m1()).ln()
+        0.0
+    };
+    let ln = match rule {
+        Rule::ExpectedGain => {
+            let table = phi_table();
+            let gain = |lk: f64| {
+                let kappa = lk.exp();
+                let wait: f64 = (0..m.weight.len())
+                    .map(|i| {
+                        m.weight[i] * m.draining[i] / packed * table.at(m.shape, m.scale[i] * kappa)
+                    })
+                    .sum();
+                (1.0 - x) - wait
+            };
+            -root(gain)
+        }
+        Rule::OptionToWait => {
+            let rate: f64 = (0..m.weight.len())
+                .map(|i| m.weight[i] * m.shape / m.scale[i])
+                .sum();
+            option_ln_index(m.shape, rate, mean_share / packed, x, sigma / packed)
+        }
+    };
+    (ln, share)
+}
+
+/// The `ln κ` at which `f`, rising in `ln κ`, turns positive, within
+/// [`LN_KAPPA`].
+fn root(f: impl Fn(f64) -> f64) -> f64 {
+    let (mut lo, mut hi) = LN_KAPPA;
+    if f(lo) >= 0.0 {
+        return lo;
     }
-}
-
-/// The mean of `k < n` under weights `e^(w·k)`.
-fn mean_geometric(w: f64, n: f64) -> f64 {
-    if (w * n).abs() < 1e-6 {
-        (n - 1.0) / 2.0 + w * (n * n - 1.0) / 12.0
-    } else {
-        n / -(-w * n).exp_m1() - 1.0 / -(-w).exp_m1()
+    if f(hi) < 0.0 {
+        return hi;
     }
+    for _ in 0..STEPS {
+        let mid = (lo + hi) / 2.0;
+        if f(mid) >= 0.0 {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    (lo + hi) / 2.0
 }
 
-/// The losses at each lag that a share draining at rate `r` predicts,
-/// relative to what it loses now, summed with the discount: `ln E(r)`, and
-/// the mean lag `E'(r)/E(r)`. The lags are those of the `age` epochs the page
-/// has been watched, and those of the [`N0`] epochs its start stands for,
-/// the page's first.
-fn exposure(r: f64, age: f64) -> (f64, f64) {
-    let w = r - BETA;
-    let n0 = N0 as f64;
-    let watched = ln_geometric(w, age);
-    let start = w * (age - n0) + ln_geometric(w, n0);
-    let top = watched.max(start);
-    let ln_e = top + ((watched - top).exp() + (start - top).exp()).ln();
-    let (p, q) = ((watched - ln_e).exp(), (start - ln_e).exp());
-    let mean = p * mean_geometric(w, age) + q * (age - n0 + mean_geometric(w, n0));
-    (ln_e, mean)
+/// Rule (c′): the log of the `1/κ` at which cleaning now gains, per epoch, at
+/// least what the option to wait is worth, all by the posterior means: the
+/// gain the page would forgo if the losses of the posterior's memory, drawn
+/// from the negative-binomial predictive, left it unripe. The draining share
+/// `a` drains at `rate` and a posterior resting on `shape` events; after `H`
+/// epochs and `J` events of `sigma` each, the posterior is discounted by
+/// `e^(−β·H)`, with the events and `H` epochs' exposure added. Fills
+/// relative to `u₀`.
+fn option_ln_index(shape: f64, rate: f64, a: f64, x: f64, sigma: f64) -> f64 {
+    let h = memory();
+    let d = delta();
+    let decay = d.powf(h);
+    let kept = (1.0 - decay) / (h * (1.0 - d));
+    let scale = shape / rate.max(1e-300);
+    let top = (a / sigma).floor().max(0.0) as usize;
+    let exposure = a / sigma * h;
+    let p = (scale / (scale + exposure)).min(1.0 - 1e-16);
+    let mut weight = Vec::with_capacity(top + 1);
+    let mut later = Vec::with_capacity(top + 1);
+    for j in 0..=top {
+        let jf = j as f64;
+        let ln_p = ln_gamma(shape + jf) - ln_gamma(shape) - ln_gamma(jf + 1.0)
+            + shape * p.ln()
+            + jf * (-p).ln_1p();
+        let aj = (a - jf * sigma).max(0.0);
+        let shape_j = decay * shape + jf * kept;
+        let scale_j = decay * scale + (a - jf * sigma / 2.0).max(0.0) * h * kept / sigma;
+        weight.push(ln_p.exp());
+        later.push((aj, x - (a - aj), shape_j / scale_j.max(1e-300)));
+    }
+    let sum: f64 = weight.iter().sum();
+    if sum > 0.0 {
+        for w in &mut weight {
+            *w /= sum;
+        }
+    }
+    let table = phi_table();
+    let gain = |lk: f64| {
+        let kappa = lk.exp();
+        let now = (1.0 - x) - a * table.phi(rate / kappa);
+        let option: f64 = weight
+            .iter()
+            .zip(&later)
+            .map(|(w, &(aj, xj, rj))| w * (-((1.0 - xj) - aj * table.phi(rj / kappa))).max(0.0))
+            .sum();
+        now - option
+    };
+    -root(gain)
 }
 
-/// The maximum-likelihood fit of a falling loss rate, `ℓ·e^(r·lag)`, to the
-/// sums: the rate at which the mean lag it predicts is the sums' own, and
-/// the current loss `ℓ` in bytes per epoch.
-fn fit(s0: f64, s1: f64, age: f64) -> (f64, f64) {
-    let mean = s1 / s0;
-    let (mut lo, mut hi) = (0.0, R_MAX);
-    let r = if mean <= exposure(lo, age).1 {
-        lo
-    } else if mean >= exposure(hi, age).1 {
-        hi
+// ------------------------------------------------------------------ tables
+
+/// `φ` and `Φ_A(m) = E φ(G/m)`, `G ~ Gamma(A, 1)`, tabulated once.
+struct PhiTable {
+    /// `ln φ` on a grid of `ln y`.
+    ln_phi: Vec<f64>,
+    /// `Φ`, by `ln A`, then `ln m`.
+    big: Vec<f64>,
+}
+
+const LN_Y: (f64, f64, usize) = (-30.0, 12.0, 4201);
+const LN_A: (f64, f64, usize) = (-3.0, 11.6, 147);
+const LN_M: (f64, f64, usize) = (-24.0, 24.0, 481);
+
+fn grid(g: (f64, f64, usize), i: usize) -> f64 {
+    g.0 + (g.1 - g.0) * i as f64 / (g.2 - 1) as f64
+}
+
+/// Where `v` falls on grid `g`: the cell and the fraction into it.
+fn locate(g: (f64, f64, usize), v: f64) -> (usize, f64) {
+    let f = ((v - g.0) / (g.1 - g.0) * (g.2 - 1) as f64).clamp(0.0, (g.2 - 1) as f64 - 1e-9);
+    (f as usize, f - f.floor())
+}
+
+/// `φ(y)`, solving `φ − ln(1 + φ) = y` by Newton's method.
+fn phi_exact(y: f64) -> f64 {
+    if y <= 0.0 {
+        return 0.0;
+    }
+    if y < 1e-10 {
+        return (2.0 * y).sqrt();
+    }
+    let mut p = if y < 1.0 {
+        (2.0 * y).sqrt() + 2.0 * y / 3.0
     } else {
-        for _ in 0..STEPS {
-            let mid = (lo + hi) / 2.0;
-            if exposure(mid, age).1 < mean {
-                lo = mid;
-            } else {
-                hi = mid;
+        y + (1.0 + y).ln()
+    };
+    for _ in 0..50 {
+        let f = p - p.ln_1p() - y;
+        let step = f * (1.0 + p) / p;
+        p = (p - step).max(p / 2.0);
+        if step.abs() <= 1e-14 * p {
+            break;
+        }
+    }
+    p
+}
+
+impl PhiTable {
+    /// Integrates over `ln G`, whose density is `e^(A·t − e^t)/Γ(A)`, with
+    /// 160 points where the integrand peaks and 40 to its left, where a
+    /// small shape spreads `ln G` over some `1/A`: to within 0.4 % of the
+    /// same with 25 times the points.
+    fn build() -> PhiTable {
+        let (tail, bulk) = (40, 160);
+        let ln_phi: Vec<f64> = (0..LN_Y.2)
+            .map(|i| phi_exact(grid(LN_Y, i).exp()).ln())
+            .collect();
+        let mut t = PhiTable {
+            ln_phi,
+            big: Vec::new(),
+        };
+        let mut big = vec![0.0; LN_A.2 * LN_M.2];
+        for ia in 0..LN_A.2 {
+            let shape = grid(LN_A, ia).exp();
+            let lo = shape.ln() - 10.0 / shape.sqrt() - 40.0 / shape;
+            let hi = (shape + 40.0 + 10.0 * shape.sqrt()).ln();
+            let cut = (shape.ln().min(0.0) - 8.0).clamp(lo, hi);
+            let mut ts: Vec<f64> = (0..tail)
+                .map(|k| lo + (cut - lo) * k as f64 / tail as f64)
+                .collect();
+            ts.extend((0..bulk).map(|k| cut + (hi - cut) * k as f64 / (bulk - 1) as f64));
+            let ln_density: Vec<f64> = ts
+                .iter()
+                .map(|&tk| shape * tk - tk.exp() - ln_gamma(shape))
+                .collect();
+            for im in 0..LN_M.2 {
+                let ln_m = grid(LN_M, im);
+                let f: Vec<f64> = ts
+                    .iter()
+                    .zip(&ln_density)
+                    .map(|(&tk, &ld)| ld + t.ln_phi_at(tk - ln_m))
+                    .collect();
+                // Exact where the integrand is exponential between points, as
+                // it nearly is in the tail; and beyond `lo`, where it falls as
+                // `e^((A + 1/2)·t)`.
+                let mut e = f[0].exp() / (shape + 0.5);
+                for k in 1..ts.len() {
+                    let (h, d) = (ts[k] - ts[k - 1], f[k] - f[k - 1]);
+                    e += if d.abs() < 1e-6 {
+                        h * (f[k].exp() + f[k - 1].exp()) / 2.0
+                    } else {
+                        h * (f[k].exp() - f[k - 1].exp()) / d
+                    };
+                }
+                big[ia * LN_M.2 + im] = e;
             }
         }
-        (lo + hi) / 2.0
-    };
-    (r, s0 * (-exposure(r, age).0).exp())
-}
-
-/// The fit of one share draining alone, all `live` bytes of it, which loses
-/// `live·(e^r − 1)` in the epoch just past: its rate, and its log-likelihood.
-fn fit_one(s0: f64, s1: f64, age: f64, live: f64) -> (f64, f64) {
-    // The log-likelihood is concave in the rate, so the sign of its slope
-    // brackets the maximum. The slope's two terms are compared in logs where
-    // both are positive, since the second can overflow.
-    let rising = |r: f64| {
-        let (ln_e, mean) = exposure(r, age);
-        let up = s0 / -(-r).exp_m1() + s1;
-        let bracket = r.exp() + r.exp_m1() * mean;
-        if up > 0.0 && bracket > 0.0 {
-            up.ln() > live.ln() + ln_e + bracket.ln()
-        } else {
-            up > live * ln_e.exp() * bracket
-        }
-    };
-    let (mut lo, mut hi) = (1e-9, R_MAX);
-    let r = if rising(hi) {
-        hi
-    } else {
-        for _ in 0..STEPS {
-            let mid = (lo + hi) / 2.0;
-            if rising(mid) {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        (lo + hi) / 2.0
-    };
-    let ln_loss = live.ln() + r.exp_m1().ln();
-    let likelihood = s0 * ln_loss + r * s1 - (ln_loss + exposure(r, age).0).exp();
-    (r, likelihood)
-}
-
-/// `(S0, S1)` of the losses that a share of `start` bytes draining at `r0`
-/// predicts for the epochs at lags `lo..=hi`, as of `past` epochs after the
-/// page was written: a lag of `k` is the page's epoch `past − k`.
-fn predicted(start: f64, r0: f64, lo: i64, hi: i64, past: i64) -> (f64, f64) {
-    if start <= 0.0 || r0 <= 0.0 || hi < lo {
-        return (0.0, 0.0);
+        t.big = big;
+        t
     }
-    let w = r0 - BETA;
-    let n = (hi - lo + 1) as f64;
-    let ln_s0 = start.ln() + (-(-r0).exp_m1()).ln() - r0 * (past - 1) as f64
-        + w * lo as f64
-        + ln_geometric(w, n);
-    let s0 = ln_s0.exp();
-    (s0, s0 * (lo as f64 + mean_geometric(w, n)))
+
+    /// `φ(y)`, from the table, and from its asymptotes beyond it.
+    fn phi(&self, y: f64) -> f64 {
+        if y <= 0.0 {
+            return 0.0;
+        }
+        self.ln_phi_at(y.ln()).exp()
+    }
+
+    /// `ln φ(e^ly)`, which stays finite where `e^ly` underflows.
+    fn ln_phi_at(&self, ly: f64) -> f64 {
+        if ly < LN_Y.0 {
+            return 0.5 * (std::f64::consts::LN_2 + ly);
+        }
+        if ly > LN_Y.1 {
+            let y = ly.exp();
+            return (y + y.ln_1p()).ln();
+        }
+        let (i, f) = locate(LN_Y, ly);
+        self.ln_phi[i] * (1.0 - f) + self.ln_phi[i + 1] * f
+    }
+
+    /// `Φ_A(m) = E φ(G/m)`, `G ~ Gamma(A, 1)`: from the table, and from its
+    /// asymptotes in `m` beyond it.
+    fn at(&self, shape: f64, m: f64) -> f64 {
+        let (la, lm) = (shape.max(A_MIN).ln(), m.max(1e-300).ln());
+        if lm > LN_M.1 {
+            // E √(2G/m)
+            return (2.0 / m).sqrt() * (ln_gamma(shape + 0.5) - ln_gamma(shape)).exp();
+        }
+        if lm < LN_M.0 {
+            return shape / m + (shape / m).ln_1p();
+        }
+        let (ia, fa) = locate(LN_A, la);
+        let (im, fm) = locate(LN_M, lm);
+        let v = |a: usize, b: usize| self.big[a * LN_M.2 + b];
+        let lo = v(ia, im) * (1.0 - fm) + v(ia, im + 1) * fm;
+        let hi = v(ia + 1, im) * (1.0 - fm) + v(ia + 1, im + 1) * fm;
+        lo * (1.0 - fa) + hi * fa
+    }
 }
+
+fn phi_table() -> &'static PhiTable {
+    static TABLE: OnceLock<PhiTable> = OnceLock::new();
+    TABLE.get_or_init(PhiTable::build)
+}
+
+/// `ln Γ(x)`, for `x > 0`, by Lanczos's approximation.
+pub fn ln_gamma(x: f64) -> f64 {
+    const G: f64 = 7.0;
+    const C: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    if x < 0.5 {
+        // Reflection: Γ(x) Γ(1 − x) = π / sin(πx).
+        let pi = std::f64::consts::PI;
+        return (pi / (pi * x).sin()).ln() - ln_gamma(1.0 - x);
+    }
+    let x = x - 1.0;
+    let mut sum = C[0];
+    for (i, &c) in C.iter().enumerate().skip(1) {
+        sum += c / (x + i as f64);
+    }
+    let t = x + G + 0.5;
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + sum.ln()
+}
+
+/// `ln B(p, q)`.
+fn ln_beta(p: f64, q: f64) -> f64 {
+    ln_gamma(p) + ln_gamma(q) - ln_gamma(p + q)
+}
+
+// ----------------------------------------------------------------- ranking
 
 /// The fill survivors are packed at, in bytes: `u₀ = 1 − θ` of a page's
 /// capacity, which packing promises for every page but a flush's last. A
@@ -269,29 +656,18 @@ pub fn packed_fill(theta: f64) -> f64 {
 }
 
 /// What keeping a page at relative fill `x` waiting costs, relative to what
-/// its draining saves: the threshold `h(x*) = r / κ` of the draft.
+/// its draining saves: the threshold `h(x*) = r / κ` of the drafts.
 pub fn h(x: f64) -> f64 {
     (1.0 - x) / x + x.ln()
 }
 
-/// The myopic rule's `g(x) = (1 − x)/x`, which the draft's ablation puts in
-/// place of `h`: the space a cleaning frees per byte it writes, blind to
-/// survivors that go on dying after they are moved.
-pub fn g(x: f64) -> f64 {
-    (1.0 - x) / x
-}
-
-/// The keys that rank a page of `live` bytes, fewer than `packed`, with
-/// estimate `d`, its fill measured by `fill`, `h` or `g`: its key while its
-/// index lies below its floor, if anything on it drains, and its floor's.
-pub fn keys(d: &Drain, live: f64, packed: f64, fill: fn(f64) -> f64) -> (Option<f64>, f64) {
-    let floor = fill(live / packed).ln() - R_MIN.ln();
-    let fast = d.share as f64 * live;
-    let key = (fast > 0.0 && d.rate > 0.0).then(|| {
-        let z = fast / (packed - (live - fast));
-        fill(z).ln() - (d.rate as f64).ln() - BETA * d.at as f64
-    });
-    (key, floor)
+/// The keys that rank page `v`, emptier than `packed` bytes, with estimate
+/// `d`: its key while its index lies below its floor, its floor's, and its
+/// posterior mean draining share.
+pub fn keys(d: &Drain, v: &View, packed: f64, sigma: f64, rule: Rule) -> (Option<f64>, f64, f64) {
+    let floor = h(v.live / packed).ln() - R_MIN.ln();
+    let (ln, share) = ln_index(d, v, packed, sigma, rule);
+    (Some(ln - BETA * d.at as f64), floor, share)
 }
 
 /// A log-index, totally ordered.
@@ -319,8 +695,9 @@ impl Ord for Ln {
 /// `u₀` -- ordered by their ripeness index.
 #[derive(Debug, Default)]
 pub struct Ripeness {
-    /// `K = ln h(z) − ln rate − β·at`: while the index lies below its floor,
-    /// the page's log-index is `K + β·now`.
+    /// `K = ln I − β·at`, with `I` the index as of the estimate's epoch
+    /// `at`: while the index lies below its floor, the page's log-index is
+    /// `K + β·now`.
     draining: BTreeSet<(Ln, u32)>,
     /// `ln h(x) − ln R_MIN`: the log-index of a page at its floor, constant.
     settled: BTreeSet<(Ln, u32)>,
@@ -433,172 +810,229 @@ mod tests {
 
     const PAGE: f64 = 4096.0;
 
-    /// The index of a page of `live` bytes with estimate `d` at `now`, fills
-    /// relative to `packed`.
-    fn index(d: &Drain, live: f64, packed: f64, now: u64) -> f64 {
-        let (key, floor) = keys(d, live, packed, h);
-        key.map_or(floor, |k| (k + BETA * now as f64).min(floor))
-            .exp()
-    }
-
-    /// A page holding `shares` of `(fill, rate)`, starting from `start`'s
-    /// `(fast, rate)`, that loses exactly what its shares predict each epoch;
-    /// its estimate and live bytes at each epoch up to `epochs`.
-    fn drain_exactly(
-        shares: &[(f64, f64)],
-        start: (f64, f64),
-        statement: f64,
-        epochs: u64,
-    ) -> Vec<(Drain, f64)> {
-        let live = |t: u64| {
-            shares
-                .iter()
-                .map(|&(a, r)| a * (-r * t as f64).exp())
-                .sum::<f64>()
-                * PAGE
-        };
-        let mut d = Drain::start(start.0 * PAGE, start.1, live(0), 0);
-        let mut out = vec![(d, live(0))];
-        for t in 1..=epochs {
-            let lost = (live(t - 1) - live(t)).round() as u32;
-            d.lose(lost, live(t).round() as u32, t, t, statement);
-            out.push((d, live(t)));
-        }
-        out
-    }
-
-    /// The `x` at which `f(x)` falls to `ratio`, for a decreasing `f`.
-    fn threshold(f: fn(f64) -> f64, ratio: f64) -> f64 {
-        let (mut lo, mut hi) = (1e-9, 1.0 - 1e-9);
-        for _ in 0..100 {
-            let mid = (lo + hi) / 2.0;
-            if f(mid) > ratio {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
-    }
-
     #[test]
-    fn the_thresholds_match_the_drafts_table() {
-        // `x*` for `r / κ`, and where the myopic rule would clean instead,
-        // from `drafts/ripeness.md`.
-        for (ratio, x, myopic) in [
-            (0.001, 0.96, 0.999),
-            (0.01, 0.87, 0.99),
-            (0.1, 0.66, 0.91),
-            (1.0, 0.32, 0.5),
-            (10.0, 0.07, 0.09),
-        ] {
-            let (xh, xg) = (threshold(h, ratio), threshold(g, ratio));
-            assert!((xh - x).abs() < 0.01, "r/κ = {ratio}: x* = {xh}");
-            assert!((xg - myopic).abs() < 0.005, "r/κ = {ratio}: myopic {xg}");
-        }
-    }
-
-    #[test]
-    fn the_fit_follows_the_drafts_example() {
-        // `drafts/ripeness.md`: 0.3 of the page dying at 0.5, 0.3 at 0.02,
-        // 0.4 static, from the draft's start of 0.6 at 0.26, with statements
-        // of 144 bytes. The draft's tested fit reads 40, 6, and 41, from a
-        // simulation that fits rates on a grid of steps of 0.001; solved
-        // exactly, the last is 43.
-        let shares = [(0.3, 0.5), (0.3, 0.02), (0.4, 0.0)];
-        let run = drain_exactly(&shares, (0.6, 0.26), 144.0, 50);
-        for (t, want) in [(10, 40.0), (20, 6.0), (50, 43.0)] {
-            let (d, live) = run[t];
-            let got = index(&d, live, PAGE, t as u64);
+    fn phi_solves_its_equation() {
+        let t = phi_table();
+        for y in [1e-8, 1e-4, 0.01, 0.3, 1.0, 10.0, 100.0, 1e4] {
+            let p = phi_exact(y);
             assert!(
-                (got / want).ln().abs() < 0.05,
-                "epoch {t}: {got}, not {want}"
+                (p - p.ln_1p() - y).abs() < 1e-9 * y.max(1.0),
+                "y = {y}: {p}"
+            );
+            assert!(
+                (t.phi(y) / p - 1.0).abs() < 1e-4,
+                "table at {y}: {} against {p}",
+                t.phi(y)
             );
         }
-        // While the fast share dies, the fit keeps most of the page static.
-        let (d, live) = run[10];
-        let stat = (1.0 - d.share as f64) * live / PAGE;
-        assert!((stat - 0.62).abs() < 0.01, "static share {stat}");
-        // Once it has died, the few losses cannot earn a static share.
-        assert_eq!(run[20].0.share, 1.0);
+        // The draft's table.
+        for (y, want) in [
+            (0.0001, 0.014),
+            (0.01, 0.15),
+            (1.0, 2.15),
+            (10.0, 12.6),
+            (100.0, 104.7),
+        ] {
+            assert!(
+                (phi_exact(y) - want).abs() < 0.006 * want.max(1.0),
+                "φ({y})"
+            );
+        }
     }
 
     #[test]
-    fn a_static_share_is_found_where_losses_are_plentiful() {
-        // 0.3 draining at 0.1 over 0.7 static: in small statements, the
-        // losses soon show the fall, and the fit finds both exactly.
-        let shares = [(0.3, 0.1), (0.7, 0.0)];
-        let (d, live) = drain_exactly(&shares, (0.3, 0.1), 4.0, 20)[20];
-        let stat = (1.0 - d.share as f64) * live / PAGE;
-        assert!((stat - 0.7).abs() < 0.005, "static share {stat}");
-        assert!((d.rate - 0.1).abs() < 0.002, "rate {}", d.rate);
-        // In statements of 144 bytes, the same losses do not earn it: the
-        // page is taken for one share draining slowly throughout.
-        let (d, _) = drain_exactly(&shares, (0.3, 0.1), 144.0, 20)[20];
-        assert_eq!(d.share, 1.0);
-        assert!(d.rate < 0.02, "rate {}", d.rate);
+    fn ln_gamma_matches_known_values() {
+        for (x, want) in [
+            (1.0, 0.0),
+            (2.0, 0.0),
+            (5.0, 24f64.ln()),
+            (0.5, std::f64::consts::PI.sqrt().ln()),
+            (0.05, 2.968_879_9),
+            (100.5, 361.435_540_5),
+        ] {
+            assert!(
+                (ln_gamma(x) - want).abs() < 1e-6,
+                "ln Γ({x}) = {}",
+                ln_gamma(x)
+            );
+        }
     }
 
     #[test]
-    fn a_page_losing_a_steady_share_fits_one_share_at_that_rate() {
-        // From a start at a fifth of the true rate, the fit converges.
-        let run = drain_exactly(&[(1.0, 0.05)], (1.0, 0.01), 144.0, 40);
-        let (d, _) = run[40];
-        assert_eq!(d.share, 1.0);
-        assert!((d.rate - 0.05).abs() < 0.005, "rate {}", d.rate);
+    fn the_expected_phi_matches_a_direct_integration() {
+        // G ~ Gamma(1, 1) is exponential: E φ(G/m) = ∫ φ(g/m) e^(−g) dg.
+        let t = phi_table();
+        for m in [0.01, 0.3, 1.0, 20.0, 500.0] {
+            let n = 200_000;
+            let top = 60.0;
+            let direct: f64 = (0..n)
+                .map(|k| {
+                    let g = (k as f64 + 0.5) * top / n as f64;
+                    phi_exact(g / m) * (-g).exp() * top / n as f64
+                })
+                .sum();
+            assert!(
+                (t.at(1.0, m) / direct - 1.0).abs() < 2e-3,
+                "m = {m}: {} against {direct}",
+                t.at(1.0, m)
+            );
+        }
+        // Many events: the posterior is sure, and Φ is φ at the mean.
+        let (a, m) = (5000.0, 400.0);
+        assert!((t.at(a, m) / phi_exact(a / m) - 1.0).abs() < 1e-3);
+        // Concave φ: an uncertain posterior expects less than φ at its mean.
+        assert!(t.at(1.0, 1.0) < phi_exact(1.0));
+        // Small shapes, which spread ln G over some 1/A, against adaptive
+        // quadrature (SciPy's `quad`, to 10⁻¹⁰), on grid points and off.
+        for (a, m, want) in [
+            (0.05, 1.0, 0.153_640_795),
+            (0.1, 0.01, 11.084_279_485),
+            (0.3, 100.0, 0.057_060_878),
+            (0.07, 1e-6, 70_004.816_133),
+            (3.0, 0.5, 8.122_593_478),
+        ] {
+            let got = t.at(a, m);
+            assert!(
+                (got / want - 1.0).abs() < 5e-3,
+                "Φ_{a}({m}) = {got}, not {want}"
+            );
+        }
+    }
+
+    /// A page of `chunks` chunks of `size` bytes each, `drain` of which lose
+    /// `per` of their bytes each epoch in events of `sigma` bytes, the rest
+    /// never: its estimate and view after `epochs` epochs, from the rate's
+    /// `prior` and the draining share `pi` of what it was written with.
+    #[allow(clippy::too_many_arguments)]
+    fn watch(
+        chunks: u32,
+        size: f64,
+        drain: u32,
+        per: f64,
+        sigma: f64,
+        epochs: u64,
+        prior: Prior,
+        pi: f64,
+    ) -> (Drain, View) {
+        let mut d = Drain::start(prior, pi, 0);
+        let mut live = chunks as f64 * size;
+        let mut untouched = chunks;
+        let mut untouched_bytes = live;
+        let mut left = drain as f64 * size;
+        for t in 1..=epochs {
+            let lost = left * per;
+            let new = if t == 1 { drain } else { 0 };
+            let loss = Loss {
+                lost: lost.round() as u32,
+                live: live as u32,
+                known_live: (live - untouched_bytes) as u32,
+                new,
+                new_bytes: (new as f64 * size) as u32,
+            };
+            d.lose(&loss, 0, sigma, t);
+            if t == 1 {
+                untouched -= drain;
+                untouched_bytes -= drain as f64 * size;
+            }
+            live -= lost;
+            left -= lost;
+        }
+        let v = View {
+            live,
+            untouched,
+            untouched_bytes,
+            written: 0,
+        };
+        (d, v)
     }
 
     #[test]
-    fn the_seed_starts_from_the_one_rate_of_the_pages_life() {
-        // Written full at epoch 71, half left at the open at epoch 100: all
-        // of it draining at ln 2 / 30, 30 epochs until the session's first
-        // flush, and a first loss at that rate keeps it there.
-        let rate = 2f64.ln() / 30.0;
-        let mut d = Drain::seed(PAGE, PAGE / 2.0, 29, 30.0, 100);
-        assert_eq!(d.share, 1.0);
-        assert!((d.rate as f64 - rate).abs() < 1e-6);
-        let lost = PAGE / 2.0 * -(-rate).exp_m1();
-        d.lose(lost as u32, (PAGE / 2.0 - lost) as u32, 30, 101, 144.0);
-        assert!((d.rate as f64 - rate).abs() < 0.1 * rate, "rate {}", d.rate);
-    }
-
-    #[test]
-    fn moving_content_out_leaves_the_fit_alone() {
-        let mut d = Drain::start(PAGE, 0.05, PAGE, 0);
-        d.lose(200, 3896, 1, 1, 144.0);
-        let mut moved = d;
-        moved.shrink(0.5);
-        let (mut a, mut b) = (d, moved);
-        a.lose(190, 3706, 2, 2, 144.0);
-        b.lose(95, 1853, 2, 2, 144.0);
+    fn untouched_chunks_that_outlive_the_draining_ones_are_found_static() {
+        // Twenty chunks of 150 bytes: four lose 5 % a epoch, sixteen never
+        // lose a byte. Written as half static, the page finds most of its
+        // untouched chunks static after 30 epochs, and all of them once its
+        // losses rest on many events, even written as fresh content.
+        let prior = Prior { a: 0.8, b: 16.0 };
+        let (d, v) = watch(20, 150.0, 4, 0.05, 30.0, 30, prior, 0.5);
+        let (_, share) = ln_index(&d, &v, PAGE, 30.0, Rule::ExpectedGain);
+        assert!(share < 0.25, "share {share}");
+        let (d, v) = watch(20, 150.0, 4, 0.05, 2.0, 30, prior, 1.0);
+        let (_, share) = ln_index(&d, &v, PAGE, 2.0, Rule::ExpectedGain);
+        let known = (v.live - v.untouched_bytes) / v.live;
         assert!(
-            (a.rate - b.rate).abs() < 1e-4,
-            "{} against {}",
-            a.rate,
-            b.rate
+            (share - known).abs() < 0.05,
+            "share {share}, known to drain {known}"
         );
-        assert_eq!(a.share, b.share);
+    }
+
+    #[test]
+    fn fresh_content_keeps_draining_on_little_evidence() {
+        // The same page as fresh content, whose losses rest on a few events:
+        // the prior that all of it drains outweighs the untouched chunks'
+        // survival.
+        let prior = Prior { a: 0.8, b: 16.0 };
+        let (d, v) = watch(20, 150.0, 4, 0.05, 30.0, 30, prior, 1.0);
+        let (_, share) = ln_index(&d, &v, PAGE, 30.0, Rule::ExpectedGain);
+        assert!(share > 0.5, "share {share}");
+    }
+
+    #[test]
+    fn a_page_that_drains_throughout_is_found_draining() {
+        // Every chunk loses a little every epoch: none is untouched, and the
+        // whole page drains at the rate of its losses.
+        let prior = Prior { a: 0.8, b: 16.0 };
+        let (d, v) = watch(20, 150.0, 20, 0.05, 30.0, 30, prior, 1.0);
+        assert_eq!(v.untouched, 0);
+        let (_, share) = ln_index(&d, &v, PAGE, 30.0, Rule::ExpectedGain);
+        assert!((share - 1.0).abs() < 1e-9, "share {share}");
+        let r = d.mean_rate(&v, 30.0);
+        assert!((r / 0.05 - 1.0).abs() < 0.15, "rate {r}");
+    }
+
+    #[test]
+    fn a_static_share_makes_a_page_riper() {
+        // The same losses, on a page written as mostly static content and
+        // on one written as fresh content.
+        let prior = Prior { a: 0.8, b: 16.0 };
+        let (d1, v1) = watch(20, 150.0, 4, 0.05, 30.0, 30, prior, 0.2);
+        let (d2, v2) = watch(20, 150.0, 4, 0.05, 30.0, 30, prior, 1.0);
+        let i1 = ln_index(&d1, &v1, PAGE, 30.0, Rule::ExpectedGain).0;
+        let i2 = ln_index(&d2, &v2, PAGE, 30.0, Rule::ExpectedGain).0;
+        assert!(i1 > i2, "{i1} against {i2}");
+    }
+
+    #[test]
+    fn the_option_to_wait_is_worth_little_once_losses_are_known() {
+        // With the posterior resting on many events, (c′) ranks a page as the
+        // posterior mean does, and (a) as nearly so.
+        let prior = Prior { a: 0.8, b: 16.0 };
+        let (d, v) = watch(20, 150.0, 20, 0.05, 30.0, 30, prior, 1.0);
+        let a = ln_index(&d, &v, PAGE, 30.0, Rule::ExpectedGain).0;
+        let c = ln_index(&d, &v, PAGE, 30.0, Rule::OptionToWait).0;
+        let mean = (h(v.live / PAGE) / d.mean_rate(&v, 30.0)).ln();
+        assert!(
+            (c - mean).abs() < 0.05,
+            "(c′) {c} against the mean's {mean}"
+        );
+        assert!((a - mean).abs() < 0.2, "(a) {a} against the mean's {mean}");
+    }
+
+    #[test]
+    fn a_seeded_page_starts_from_the_one_rate_of_its_life() {
+        // Written full 30 epochs ago, half left.
+        let rate = 2f64.ln() / 30.0;
+        let d = Drain::seed(PAGE, PAGE / 2.0, 30, 30.0, 100.0, 0, 0.0, 30);
+        assert!((d.a as f64 / d.b as f64 / rate - 1.0).abs() < 1e-3);
     }
 
     #[test]
     fn ripe_pages_come_highest_index_first() {
-        let packed = PAGE;
-        let rank = |r: &mut Ripeness, p: u32, d: Drain, fill: f64| {
-            let (key, floor) = keys(&d, fill * packed, packed, h);
-            r.insert(p, key, floor, 10);
-        };
         let mut r = Ripeness::default();
-        // Hot at 0.3: index h(0.3) / 0.1 = 11. Nothing draining at 0.8:
-        // at its floor, h(0.8) / R_MIN = 270. Hot at 0.9: 0.06.
-        let hot = Drain {
-            rate: 0.1,
-            share: 1.0,
-            at: 10,
-            ..Drain::default()
-        };
-        rank(&mut r, 1, hot, 0.3);
-        rank(&mut r, 2, Drain::default(), 0.8);
-        rank(&mut r, 3, hot, 0.9);
+        let floor = |x: f64| h(x).ln() - R_MIN.ln();
+        // Log-indexes at epoch 10: ln 11, ln 0.06; and a page at its floor.
+        r.insert(1, Some(11f64.ln() - BETA * 10.0), floor(0.3), 10);
+        r.insert(2, None, floor(0.8), 10);
+        r.insert(3, Some(0.06f64.ln() - BETA * 10.0), floor(0.9), 10);
         assert_eq!(r.ripe(10, 0.01, &mut |_| true, 10), vec![2]);
         assert_eq!(r.ripe(10, 0.2, &mut |_| true, 10), vec![2, 1]);
     }
@@ -606,42 +1040,10 @@ mod tests {
     #[test]
     fn a_page_whose_index_passes_its_floor_is_settled_and_still_found() {
         let mut r = Ripeness::default();
-        let d = Drain {
-            rate: 0.01,
-            share: 1.0,
-            at: 0,
-            ..Drain::default()
-        };
-        let (key, floor) = keys(&d, PAGE / 2.0, PAGE, h);
-        r.insert(7, key, floor, 0);
+        let floor = h(0.5).ln() - R_MIN.ln();
+        r.insert(7, Some(floor - 20.0), floor, 0);
         assert!(!r.at[&7].0, "draining");
-        // Much later its index would pass the floor, h(0.5) / R_MIN.
         assert_eq!(r.ripe(500, 0.01, &mut |_| true, 10), vec![7]);
         assert!(r.at[&7].0, "settled");
-    }
-
-    #[test]
-    fn a_static_share_ranks_its_page_riper() {
-        // Two pages at 0.8 that lose alike: 0.1 draining at r over 0.7
-        // static, and all of it draining at r/8. The draft ranks the first
-        // about four times higher: h(1/3) / (8 h(0.8)) = 4.2.
-        let r = 0.02;
-        let first = Drain {
-            rate: r as f32,
-            share: 0.125,
-            at: 0,
-            ..Drain::default()
-        };
-        let second = Drain {
-            rate: (r / 8.0) as f32,
-            share: 1.0,
-            at: 0,
-            ..Drain::default()
-        };
-        let (a, b) = (
-            index(&first, 0.8 * PAGE, PAGE, 0),
-            index(&second, 0.8 * PAGE, PAGE, 0),
-        );
-        assert!((a / b - 4.2).abs() < 0.01, "{a} against {b}");
     }
 }

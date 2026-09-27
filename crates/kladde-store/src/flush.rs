@@ -17,10 +17,9 @@ pub(crate) struct DataPage {
     pub page: u32,
     pub buf: Box<PageBuf>,
     pub used: usize,
-    /// The bytes of its content that drain, and their drain rates summed
-    /// over those bytes: what its estimate starts from.
+    /// The bytes of its content expected to drain: what the prior on its
+    /// chunks' class starts from.
     pub fast: f64,
-    pub rate: f64,
 }
 
 impl DataPage {
@@ -537,30 +536,23 @@ impl Inner {
             buf: new_page(),
             used: 0,
             fast: 0.0,
-            rate: 0.0,
         })
     }
 
     /// Places the chunk at `key` into `dp`, copying its bytes. Moved content
-    /// brings its source page's split along, draining at the source's rate;
-    /// fresh content drains at the rate fresh pages have been losing at; a
-    /// description defragmentation's rewrite, cold by selection, is static.
+    /// brings its source page's draining share along; fresh content drains;
+    /// a description defragmentation's rewrite, cold by selection, is static.
     pub(crate) fn place(&mut self, dp: &mut DataPage, key: Key, len: u32) -> Result<(), Error> {
         let Some(Fragment::Pending(p)) = self.state.frags.get(&key).copied() else {
             return Err(corrupt("placing a chunk that is not pending"));
         };
         let pending = self.state.pending[p as usize];
-        let (share, rate) = match pending.origin {
-            _ if pending.rewrite => (0.0, 0.0),
-            Origin::File(a) => {
-                let src = &self.state.pages[split_address(a).0 as usize].drain;
-                (src.share as f64, src.rate(self.state.flush_epoch))
-            }
-            _ => (1.0, self.fresh_rate(true)),
+        let share = match pending.origin {
+            _ if pending.rewrite => 0.0,
+            Origin::File(a) => self.state.pages[split_address(a).0 as usize].drain.share as f64,
+            _ => 1.0,
         };
-        let fast = share * len as f64;
-        dp.fast += fast;
-        dp.rate += rate * fast;
+        dp.fast += share * len as f64;
         let at = CONTENT_OFFSET + dp.used;
         let mut bytes = vec![0u8; len as usize];
         self.read_fragment(Fragment::Pending(p), 0, &mut bytes)?;
@@ -678,17 +670,13 @@ impl Inner {
             info.state = PageState::Data;
             info.epoch = e;
             info.written = dp.used as u16;
-            let r0 = if dp.fast > 0.0 {
-                dp.rate / dp.fast
-            } else {
-                0.0
-            };
-            info.drain = Drain::start(dp.fast, r0, dp.used as f64, e);
+            let pi = dp.fast / (dp.used as f64).max(1.0);
+            info.drain = Drain::start(self.cons.prior[0], pi, e);
             self.stats.data_pages_written += 1;
             self.state.rerank(dp.page);
             written.push((dp.page, true));
         }
-        let leaf_rate = self.fresh_rate(false);
+        let leaf_prior = self.cons.prior[1];
         for (p, content, interior) in &out.tables {
             let mut buf = new_page();
             crate::page::encode_page(&mut buf, None, KIND_ADDRESS_TABLE, e, content);
@@ -702,8 +690,7 @@ impl Inner {
             };
             info.epoch = e;
             info.written = content.len() as u16;
-            let len = content.len() as f64;
-            info.drain = Drain::start(len, leaf_rate, len, e);
+            info.drain = Drain::start(leaf_prior, 1.0, e);
             self.table_pages.insert(*p, buf);
             self.stats.table_pages_written += 1;
             self.state.rerank(*p);
@@ -800,12 +787,21 @@ impl Inner {
             }
         }
         self.stats.flushes += 1;
-        // What the next flush's fold takes from these pages is what fresh
-        // pages lose; the cursor looks for its next page among the data pages.
-        self.cons.just_written = written
-            .iter()
-            .map(|&(p, data)| (p, data, self.state.pages[p as usize].coverage))
-            .collect();
+        // What these pages lose in their first epochs teaches the file's
+        // empirical prior; the cursor looks for its next page among the data
+        // pages.
+        self.cons.just_written = written.iter().map(|&(p, _)| p).collect();
+        self.cons.young.extend(
+            written
+                .iter()
+                .map(|&(page, data)| crate::consolidate::Young {
+                    page,
+                    epoch: e,
+                    data,
+                    events: 0.0,
+                    exposure: 0.0,
+                }),
+        );
         let data_pages: Vec<u32> = written
             .iter()
             .filter(|&&(_, data)| data)

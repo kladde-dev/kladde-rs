@@ -1,19 +1,26 @@
 //! The consolidator state (`impl/consolidator-state.md`, with what
-//! `drafts/ripeness.md` adds): what consolidation learned, kept in an
-//! ordinary allocation that the header names, so that a session resumes
+//! `drafts/bayesian-ripeness.md` adds): what consolidation learned, kept in
+//! an ordinary allocation that the header names, so that a session resumes
 //! where the last one left off.
 //!
-//! The allocation's content, in this order:
+//! The allocation's content, in this order, with every `f32` as its
+//! little-endian bits:
 //!
 //! | bytes | what |
 //! | --- | --- |
 //! | 8 | [`TAG`]: this implementation, and the layout's version |
 //! | 8 | `up_to_date`: the epoch of the flush that last wrote the state, little-endian |
-//! | 4 | the price of space `κ`, as an `f32`'s little-endian bits |
-//! | 8 | the rates fresh content starts from, in data pages and in leaves, each as an `f32`'s little-endian bits, negative before the first estimate |
+//! | 4 | the price of space `κ`, an `f32` |
 //! | 8 | the window: the id and offset at which the latest walk began, little-endian |
 //! | 4 | the length of the snapshot that starts the records, little-endian |
+//! | 16 | for data pages, then leaves: the sizes of natural loss events and their squares, summed and discounted, two `f32`s each |
+//! | 40 | for data pages, then leaves: the five sums of the method of moments over pages' early losses ([`Moments`]), five `f32`s each |
 //! | .. | records: the snapshot, then those of every flush since |
+//!
+//! A flush writes the state from its start in two pieces, the first 32 bytes
+//! and the rest, so that the fixed fields, and a small state whole, are short
+//! enough to be stated inline with the default options, in the address table
+//! rather than in a data page.
 //!
 //! A record starts with its kind:
 //!
@@ -22,22 +29,28 @@
 //!   snapshot, the ids last written at that epoch.
 //! - `1`, a drain record: a varint count, and that many entries of a varint
 //!   page delta, ascending from 0, the page's epoch and coverage as varints,
-//!   its estimate's two sums, rate, and draining share, each as an `f32`'s
-//!   little-endian bits, and the estimate's epoch as a varint. A flush
-//!   records the pages whose estimate it changed; the snapshot, every page
-//!   emptier than the fill survivors are packed at.
+//!   its estimate's sums ([`Drain`]'s `a`, `b`, and `drained`) as `f32`s,
+//!   its prior's count of draining chunks in halves, `2·p0`, as a byte, and
+//!   the estimate's epoch as a varint. A flush records the pages whose
+//!   estimate it changed; the snapshot, every page emptier than the fill
+//!   survivors are packed at. The draining share the ranking last found is
+//!   not kept: the ranking finds it again, and a page it does not rank
+//!   starts from its prior's.
 
 use std::collections::BTreeMap;
 
 use crate::error::Error;
-use crate::hash::IdMap;
+use crate::hash::{IdMap, IdSet};
+use crate::ripeness::{Loss, Moments, NU_PI};
 use crate::state::*;
 use crate::store::Inner;
 
 /// Names this implementation and the layout's version.
-pub(crate) const TAG: [u8; 8] = *b"kladrip3";
+pub(crate) const TAG: [u8; 8] = *b"kladbay1";
 /// The bytes before the records.
-const FIXED: usize = 40;
+const FIXED: usize = 88;
+/// Where the second piece of the fixed fields starts.
+const SPLIT: usize = 32;
 
 const AGE: u8 = 0;
 const DRAIN: u8 = 1;
@@ -55,7 +68,8 @@ struct DrainEntry {
 struct Parsed {
     up_to_date: u64,
     kappa: f32,
-    fresh: [f32; 2],
+    events: [(f64, f64); 2],
+    moments: [Moments; 2],
     window: Key,
     snapshot_len: u32,
     ages: Vec<(u64, Vec<u32>)>,
@@ -90,9 +104,10 @@ fn drain_record(out: &mut Vec<u8>, entries: &[DrainEntry]) {
         put_varint(out, e.epoch);
         put_varint(out, e.coverage as u64);
         let d = &e.drain;
-        for v in [d.s0, d.s1, d.rate, d.share] {
+        for v in [d.a, d.b, d.drained] {
             out.extend_from_slice(&v.to_bits().to_le_bytes());
         }
+        out.push((2.0 * d.p0).round() as u8);
         put_varint(out, d.at);
     }
 }
@@ -103,10 +118,21 @@ fn parse(bytes: &[u8]) -> Option<Parsed> {
     }
     let u32_at = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
     let up_to_date = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let f32_at = |i: usize| f32::from_bits(u32_at(i)) as f64;
     let kappa = f32::from_bits(u32_at(16));
-    let fresh = [f32::from_bits(u32_at(20)), f32::from_bits(u32_at(24))];
-    let window = key(u32_at(28), u32_at(32));
-    let snapshot_len = u32_at(36);
+    let window = key(u32_at(20), u32_at(24));
+    let snapshot_len = u32_at(28);
+    let events = [0, 1].map(|k| (f32_at(SPLIT + 8 * k), f32_at(SPLIT + 4 + 8 * k)));
+    let moments = [0, 1].map(|k| {
+        let at = |j: usize| f32_at(SPLIT + 16 + 20 * k + 4 * j);
+        Moments {
+            n: at(0),
+            k: at(1),
+            e: at(2),
+            e2: at(3),
+            k2e: at(4),
+        }
+    });
     let mut rest = &bytes[FIXED..];
     let get = |rest: &mut &[u8]| -> Option<u64> {
         let (v, r) = kladde_varint::decode(rest).ok()?;
@@ -135,23 +161,27 @@ fn parse(bytes: &[u8]) -> Option<Parsed> {
                     page += get(&mut rest)?;
                     let epoch = get(&mut rest)?;
                     let coverage = u32::try_from(get(&mut rest)?).ok()?;
-                    let mut f = [0f32; 4];
+                    let mut f = [0f32; 3];
                     for v in &mut f {
                         let (bits, r) = rest.split_first_chunk::<4>()?;
                         rest = r;
                         *v = f32::from_bits(u32::from_le_bytes(*bits));
                     }
+                    let (&halves, r) = rest.split_first()?;
+                    rest = r;
                     let at = get(&mut rest)?;
-                    let [s0, s1, rate, share] = f;
+                    let [a, b, drained] = f;
+                    let p0 = (halves as f32 / 2.0).clamp(0.5, NU_PI as f32 + 0.5);
                     drains.push(DrainEntry {
                         page: u32::try_from(page).ok()?,
                         epoch,
                         coverage,
                         drain: Drain {
-                            s0,
-                            s1,
-                            rate,
-                            share,
+                            a,
+                            b,
+                            drained,
+                            p0,
+                            share: ((p0 as f64 - 0.5) / NU_PI) as f32,
                             at,
                         },
                     });
@@ -164,7 +194,8 @@ fn parse(bytes: &[u8]) -> Option<Parsed> {
     Some(Parsed {
         up_to_date,
         kappa,
-        fresh,
+        events,
+        moments,
         window,
         snapshot_len,
         ages,
@@ -226,30 +257,44 @@ impl Inner {
     /// Seeds each page's estimate from its fill and its age, assuming that
     /// all of it has drained at one rate since it was written: from its
     /// content size then to its coverage now, over the epochs until the
-    /// session's first flush. Its past counts as watched.
+    /// session's first flush. Its past counts as watched, and a data page's
+    /// `Ref` payloads that have lost bytes as draining since then.
     fn seed_drains(&mut self) {
         let first = self.epoch + 1;
-        for info in self.state.pages.iter_mut().skip(2) {
+        let sigma = self.state.sigma();
+        let mut touched: IdMap<(u32, f64)> = IdMap::default();
+        let mut seen = IdSet::default();
+        for &f in self.state.frags.values() {
+            if let Fragment::Bytes { page, stmt, .. } = f {
+                let i = stmt.idx();
+                if self.state.slab.touched[i] && seen.insert(i as u32) {
+                    let t = touched.entry(page).or_default();
+                    t.0 += 1;
+                    t.1 += self.state.slab.size[i] as f64;
+                }
+            }
+        }
+        for (p, info) in self.state.pages.iter_mut().enumerate().skip(2) {
             if !matches!(info.state, PageState::Data | PageState::Table) {
                 continue;
             }
             let (written, live) = (info.written as f64, info.coverage as f64);
             let past = self.epoch.saturating_sub(info.epoch);
             let age = first.saturating_sub(info.epoch).max(1) as f64;
-            info.drain = Drain::seed(written, live, past, age, self.epoch);
+            let s = sigma[usize::from(info.state != PageState::Data)];
+            let (n, bytes) = touched.get(&(p as u32)).copied().unwrap_or_default();
+            info.drain = Drain::seed(written, live, past, age, s, n, bytes, self.epoch);
         }
     }
 
     /// Seeds consolidation after a load: content ages and page estimates
     /// from the consolidator state where they are current, and from the
-    /// pages elsewhere; the price of space, the rates fresh content starts
-    /// from, and the window from the state; the cursor's pages from the
-    /// governing header's epoch; and then a read-only walk that finds again
-    /// the candidates the latest walk found.
+    /// pages elsewhere; the price of space, what loss events and pages' early
+    /// losses have shown, and the window from the state; the cursor's pages
+    /// from the governing header's epoch; and then a read-only walk that
+    /// finds again the candidates the latest walk found.
     pub(crate) fn seed_after_load(&mut self) -> Result<(), Error> {
         self.cons.kappa = self.opts.kappa;
-        self.measure_statements();
-        self.seed_drains();
         self.cons.prev_data_pages = (2..self.file_pages)
             .filter(|&p| {
                 let info = &self.state.pages[p as usize];
@@ -270,6 +315,26 @@ impl Inner {
             }
             _ => None,
         };
+        // So that the session's first flush does not start its pages from
+        // nothing, and the seeds weigh their pasts in the right events.
+        if let Some(Some(p)) = &parsed {
+            let finite = |v: f64| v.is_finite() && v >= 0.0;
+            for (kind, &(s, s2)) in p.events.iter().enumerate() {
+                if finite(s) && finite(s2) {
+                    self.state.events[kind] = (s, s2);
+                }
+            }
+            for (kind, m) in p.moments.iter().enumerate() {
+                if [m.n, m.k, m.e, m.e2, m.k2e].into_iter().all(finite) {
+                    self.cons.moments[kind] = *m;
+                    if let Some(prior) = m.prior() {
+                        self.cons.prior[kind] = prior;
+                    }
+                }
+            }
+        }
+        self.seed_drains();
+        let sigma = self.state.sigma();
         let mut window = None;
         match parsed {
             None => {}
@@ -298,7 +363,6 @@ impl Inner {
                 for e in p.drains {
                     latest.insert(e.page, e);
                 }
-                let statement = self.cons.statement;
                 for e in latest.into_values() {
                     let Some(info) = self.state.pages.get_mut(e.page as usize) else {
                         continue;
@@ -309,19 +373,18 @@ impl Inner {
                     }
                     info.drain = e.drain;
                     if info.coverage < e.coverage {
-                        let age = self.epoch.saturating_sub(info.epoch);
-                        let unit = statement[usize::from(info.state != PageState::Data)];
-                        let lost = e.coverage - info.coverage;
-                        info.drain.lose(lost, info.coverage, age, self.epoch, unit);
+                        let loss = Loss {
+                            lost: e.coverage - info.coverage,
+                            live: e.coverage,
+                            known_live: info.known_live(),
+                            ..Default::default()
+                        };
+                        let s = sigma[usize::from(info.state != PageState::Data)];
+                        info.drain.lose(&loss, info.epoch, s, self.epoch);
                     }
                 }
                 if p.kappa.is_finite() && p.kappa > 0.0 {
                     self.cons.kappa = p.kappa as f64;
-                }
-                // So that the session's first flush does not start its pages
-                // from nothing, which would make them look frozen.
-                for (fresh, rate) in self.cons.fresh.iter_mut().zip(p.fresh) {
-                    *fresh = (rate.is_finite() && rate >= 0.0).then_some(rate as f64);
                 }
                 window = Some(p.window);
                 self.cons.kept = Kept {
@@ -415,15 +478,21 @@ impl Inner {
         fixed.extend_from_slice(&TAG);
         fixed.extend_from_slice(&e.to_le_bytes());
         fixed.extend_from_slice(&(self.cons.kappa as f32).to_bits().to_le_bytes());
-        for fresh in self.cons.fresh {
-            let rate = fresh.map_or(-1.0, |f| f as f32);
-            fixed.extend_from_slice(&rate.to_bits().to_le_bytes());
-        }
         fixed.extend_from_slice(&kid(self.cons.cursor).to_le_bytes());
         fixed.extend_from_slice(&koff(self.cons.cursor).to_le_bytes());
-        if snapshot {
-            let snap = self.snapshot(id);
-            fixed.extend_from_slice(&(snap.len() as u32).to_le_bytes());
+        let snap = snapshot.then(|| self.snapshot(id));
+        let snapshot_len = snap.as_ref().map_or(kept.snapshot_len, |s| s.len() as u32);
+        fixed.extend_from_slice(&snapshot_len.to_le_bytes());
+        let events = self.state.events.iter().flat_map(|&(s, s2)| [s, s2]);
+        let moments = self
+            .cons
+            .moments
+            .iter()
+            .flat_map(|m| [m.n, m.k, m.e, m.e2, m.k2e]);
+        for v in events.chain(moments) {
+            fixed.extend_from_slice(&(v as f32).to_bits().to_le_bytes());
+        }
+        if let Some(snap) = snap {
             fixed.extend_from_slice(&snap);
             if !exists {
                 self.allocate(id, 0, dirty);
@@ -436,18 +505,19 @@ impl Inner {
                     dirty.records.get_mut(&id).unwrap().shrank = true;
                 }
             }
-            self.put_bytes(id, 0, &fixed, dirty);
+            self.put_bytes(id, 0, &fixed[..SPLIT], dirty);
+            self.put_bytes(id, SPLIT as u32, &fixed[SPLIT..], dirty);
             self.cons.kept = Kept {
                 id,
                 fresh: false,
-                snapshot_len: snap.len() as u32,
+                snapshot_len,
                 appended_len: 0,
             };
         } else {
-            fixed.extend_from_slice(&kept.snapshot_len.to_le_bytes());
             self.touch(id, true, dirty);
             let end = self.state.size_of(id);
-            self.put_bytes(id, 0, &fixed, dirty);
+            self.put_bytes(id, 0, &fixed[..SPLIT], dirty);
+            self.put_bytes(id, SPLIT as u32, &fixed[SPLIT..], dirty);
             if !rec.is_empty() {
                 self.put_bytes(id, end, &rec, dirty);
             }

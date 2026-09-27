@@ -17,8 +17,9 @@
 //! Two variables in the environment change the options of every scenario but
 //! `typed`. With `KLADDE_BENCH_NO_STATE` set, the stores keep no consolidator
 //! state, which a single session only writes: what it costs is the
-//! difference. With `KLADDE_BENCH_MYOPIC` set, they rank pages by the myopic
-//! rule, as the ripeness draft's ablation does.
+//! difference. With `KLADDE_BENCH_OPTION` set, they judge ripeness by the
+//! option to wait, [`RipenessRule::OptionToWait`], rather than by the
+//! expected gain.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -26,7 +27,9 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use kladde_store::{FileStorage, Options, Pointer, Stats, Store, UniquePointer, WriteBackend};
+use kladde_store::{
+    FileStorage, Options, Pointer, RipenessRule, Stats, Store, UniquePointer, WriteBackend,
+};
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
@@ -239,7 +242,11 @@ impl Run {
 fn defaults() -> Options {
     Options {
         consolidator_state: std::env::var_os("KLADDE_BENCH_NO_STATE").is_none(),
-        myopic_ripeness: std::env::var_os("KLADDE_BENCH_MYOPIC").is_some(),
+        ripeness_rule: if std::env::var_os("KLADDE_BENCH_OPTION").is_some() {
+            RipenessRule::OptionToWait
+        } else {
+            RipenessRule::ExpectedGain
+        },
         ..Default::default()
     }
 }

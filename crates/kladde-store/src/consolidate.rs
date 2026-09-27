@@ -8,7 +8,7 @@ use crate::defrag::{Candidate, Weighed};
 use crate::error::Error;
 use crate::flush::{DataPage, Output};
 use crate::hash::{IdMap, IdSet};
-use crate::ripeness::BETA;
+use crate::ripeness::{Moments, Prior, BETA};
 use crate::state::*;
 use crate::stats::Stats;
 use crate::store::Inner;
@@ -27,6 +27,10 @@ const CANDIDATES: usize = 64;
 /// The cursor gives up a page older than this many epochs, and leaves the
 /// rest of it to ripeness.
 const W: u64 = 8;
+
+/// The expected static share at which a page counts, in the statistics, as
+/// holding one.
+const STATIC_SHARE: f64 = 0.1;
 
 /// The bounds of the price of space.
 const KAPPA_MIN: f64 = 1e-6;
@@ -56,21 +60,37 @@ pub struct ConsState {
     /// The data pages of the latest flush that wrote any, where the cursor
     /// finds its next page.
     pub prev_data_pages: Vec<u32>,
-    /// The pages the latest flush wrote, whether data, and their coverage
-    /// then: what they lose next is what fresh pages lose.
-    pub just_written: Vec<(u32, bool, u32)>,
-    /// What pages lose in the flush after they are written, for data pages
-    /// and for leaves: the rate fresh content starts from.
-    pub fresh: [Option<f64>; 2],
-    /// The bytes each live statement states on average, in data pages and
-    /// in leaves: the units in which those pages lose content.
-    pub statement: [f64; 2],
+    /// The pages the latest flush wrote, whose starting estimates the next
+    /// flush records.
+    pub just_written: Vec<u32>,
+    /// Pages in their first [`memory`](crate::ripeness::memory) epochs,
+    /// whose losses so far the file's empirical prior takes in once they are
+    /// that old, or gone.
+    pub young: Vec<Young>,
+    /// Per kind, data pages and leaves: the method of moments' sums over the
+    /// early losses of the pages the file has written.
+    pub moments: [Moments; 2],
+    /// Per kind: the prior on the rate that the pages a flush writes start
+    /// from, the file's empirical prior once it has one.
+    pub prior: [Prior; 2],
     /// Pages whose estimate this flush changed, for the consolidator state.
     pub drained: Vec<u32>,
     /// Victims this flush took, anywhere.
     pub cleaned: u32,
     /// Whether this flush spent its whole budget.
     pub exhausted: bool,
+}
+
+/// A page in its first epochs, and what it has lost in them.
+#[derive(Clone, Copy, Debug)]
+pub struct Young {
+    pub page: u32,
+    /// The epoch it was written, which tells it from a later page in its slot.
+    pub epoch: u64,
+    pub data: bool,
+    /// Loss events, and their exposure, in events.
+    pub events: f64,
+    pub exposure: f64,
 }
 
 /// A live fragment in a data page being evacuated.
@@ -187,8 +207,9 @@ impl Inner {
     ) -> Vec<u32> {
         let now = self.state.flush_epoch;
         let packed = crate::ripeness::packed_fill(self.opts.theta);
+        let sigma = self.state.sigma();
         self.state
-            .refresh_ranking(now, packed, self.opts.myopic_ripeness);
+            .refresh_ranking(now, packed, sigma, self.opts.ripeness_rule);
         let pages = &self.state.pages;
         let (skip, rewritten) = (&self.cons.skip, &self.flush_rewritten);
         let mut ok = |p: u32| {
@@ -778,7 +799,6 @@ impl Inner {
         if !self.opts.consolidate {
             return Ok(());
         }
-        self.measure_statements();
         let (mut live, mut pages) = (0u64, 0u64);
         for info in self.state.pages.iter().skip(2) {
             if matches!(info.state, PageState::Data | PageState::Table) {
@@ -799,64 +819,82 @@ impl Inner {
         Ok(())
     }
 
-    /// Measures the bytes each live statement states on average, in data
-    /// pages and in leaves, for the fit's test of a static share.
-    pub(crate) fn measure_statements(&mut self) {
-        let (mut data, mut leaves) = (0u64, 0u64);
-        for info in self.state.pages.iter().skip(2) {
-            match info.state {
-                PageState::Data => data += info.coverage as u64,
-                PageState::Table => leaves += info.coverage as u64,
-                _ => {}
-            }
-        }
-        let statements = self.state.slab.live.max(1) as f64;
-        self.cons.statement = [data as f64 / statements, leaves as f64 / statements];
-    }
-
-    /// Fits the natural losses the flush has recorded since the last call
-    /// into the estimates of the pages that lost them. On the flush's first
-    /// call, what the pages the previous flush wrote have lost also updates
-    /// the rate that fresh content starts from.
+    /// Adds the natural losses the flush has recorded since the last call to
+    /// the estimates of the pages that lost them. On the flush's first call,
+    /// what young pages have lost also goes into the file's empirical prior,
+    /// and the evidence of loss events' sizes and of early losses is
+    /// discounted, as a page's is, once per flush.
     pub(crate) fn apply_losses(&mut self, first: bool) {
         let now = self.state.flush_epoch;
-        let statement = self.cons.statement;
+        let sigma = self.state.sigma();
         let losses = std::mem::take(&mut self.state.losses);
         if first {
-            let mut sums = [(0u64, 0u64); 2];
-            for &(p, data, coverage) in &self.cons.just_written {
-                let lost = losses.get(&p).map_or(0, |l| l.0);
-                let s = &mut sums[usize::from(!data)];
-                s.0 += lost as u64;
-                s.1 += coverage as u64;
-            }
-            let alpha = 1.0 - (-BETA).exp();
-            for (fresh, (lost, live)) in self.cons.fresh.iter_mut().zip(sums) {
-                if live > 0 {
-                    let seen = lost as f64 / live as f64;
-                    *fresh = Some(fresh.map_or(seen, |f| f + alpha * (seen - f)));
-                }
-            }
-            // The estimates those pages started from are recorded too.
-            let just_written = std::mem::take(&mut self.cons.just_written);
-            self.cons.drained = just_written.into_iter().map(|(p, ..)| p).collect();
+            self.learn_prior(&losses, sigma);
+            // The estimates the pages of the previous flush started from are
+            // recorded too.
+            self.cons.drained = std::mem::take(&mut self.cons.just_written);
         }
-        for (p, (lost, _)) in losses {
+        for (p, loss) in losses {
             let info = &mut self.state.pages[p as usize];
             if !matches!(info.state, PageState::Data | PageState::Table) {
                 continue;
             }
-            let age = now.saturating_sub(info.epoch);
-            let unit = statement[usize::from(info.state != PageState::Data)];
-            info.drain.lose(lost, info.coverage, age, now, unit);
+            let s = sigma[usize::from(info.state != PageState::Data)];
+            info.drain.lose(&loss, info.epoch, s, now);
             self.state.rerank(p);
             self.cons.drained.push(p);
         }
     }
 
-    /// The rate fresh content of a data page (`data`) or a leaf starts from.
-    pub(crate) fn fresh_rate(&self, data: bool) -> f64 {
-        self.cons.fresh[usize::from(!data)].unwrap_or(0.0)
+    /// Adds this flush's `losses` of young pages to what they have lost, and
+    /// a page that has been watched for the posterior's memory, or is gone,
+    /// to the sums the file's empirical prior follows from; then sets the
+    /// priors that the pages this flush writes start from.
+    fn learn_prior(&mut self, losses: &IdMap<crate::ripeness::Loss>, sigma: [f64; 2]) {
+        let now = self.state.flush_epoch;
+        let delta = (-BETA).exp();
+        for m in &mut self.cons.moments {
+            m.discount(delta);
+        }
+        for e in &mut self.state.events {
+            e.0 *= delta;
+            e.1 *= delta;
+        }
+        let memory = crate::ripeness::memory() as u64;
+        let mut young = std::mem::take(&mut self.cons.young);
+        young.retain_mut(|y| {
+            let kind = usize::from(!y.data);
+            let info = self.state.pages.get(y.page as usize);
+            let alive = info.is_some_and(|i| {
+                i.epoch == y.epoch && matches!(i.state, PageState::Data | PageState::Table)
+            });
+            if let Some(info) = info.filter(|_| alive) {
+                let (lost, live) = losses
+                    .get(&y.page)
+                    .map_or((0, info.coverage), |l| (l.lost, l.live));
+                y.events += lost as f64 / sigma[kind];
+                y.exposure += (live as f64 - lost as f64 / 2.0) / sigma[kind];
+            }
+            let done = !alive || now.saturating_sub(y.epoch) >= memory;
+            if done {
+                self.cons.moments[kind].add(y.events, y.exposure);
+            }
+            !done
+        });
+        for kind in 0..2 {
+            // Until pages have been watched long enough, the young ones'
+            // losses so far stand in.
+            let mut m = self.cons.moments[kind];
+            if m.prior().is_none() {
+                for y in young.iter().filter(|y| usize::from(!y.data) == kind) {
+                    m.add(y.events, y.exposure);
+                }
+            }
+            if let Some(p) = m.prior() {
+                self.cons.prior[kind] = p;
+            }
+        }
+        self.cons.young = young;
     }
 
     pub(crate) fn fill_stats(&self, s: &mut Stats) {
@@ -865,9 +903,12 @@ impl Inner {
             if p < 2 {
                 continue;
             }
-            if matches!(info.state, PageState::Data | PageState::Table) && info.drain.share < 1.0 {
-                s.static_pages += 1;
-                s.static_bytes += ((1.0 - info.drain.share as f64) * info.coverage as f64) as u64;
+            if matches!(info.state, PageState::Data | PageState::Table) {
+                let fixed = 1.0 - info.drain.share as f64;
+                if fixed >= STATIC_SHARE {
+                    s.static_pages += 1;
+                }
+                s.static_bytes += (fixed * info.coverage as f64) as u64;
             }
             match info.state {
                 PageState::Data => {
