@@ -18,6 +18,8 @@
     - Probably requires the `paste` crate. Could also be done by making `kladde-traits` depend on `kladde-derive`, but I don't want that.
     - Guards for tuple structs already have `field_{i}_mut` methods, but do they also have a `set` method to replace the whole tuple struct?
 - Rename `Edit::commit` to `Edit::apply` to avoid confusion with transactions.
+- Rename the `Persistable` trait to `Durable`, to match the docs, which now call kladde's values *durable data structures*.
+  The derive macro becomes `#[derive(Durable)]`; decide whether the containers and guards follow (`PersistableVec` to `DurableVec`, and so on), and update kladde-docs' `rust/` pages with them.
 
 ## Miscellaneous ideas
 
