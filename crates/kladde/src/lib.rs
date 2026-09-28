@@ -1,5 +1,5 @@
-//! Backed data structures: plain Rust values whose every mutation is recorded
-//! durably as it happens.
+//! Durable data structures: plain Rust values whose every mutation is
+//! recorded durably as it happens.
 //!
 //! A [`Kladde<T>`] pairs a root value with the file that backs it. Reading is
 //! ordinary reading, through [`get`](Kladde::get). Mutating goes through
