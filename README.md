@@ -48,9 +48,10 @@ cargo test --workspace
 cargo run --release -p kladde-bench -- <output directory> [scenario ...]
 ```
 
-## Documentation
+## Documentation and tutorial
 
-The [kladde-rs section](https://kladde-dev.github.io/rust/) of the documentation covers this implementation, with a tutorial for application authors.
+To use kladde-rs in an application, start with the **[tutorial](https://kladde-dev.github.io/rust/tutorial/)**.
+The [kladde-rs section](https://kladde-dev.github.io/rust/) of the documentation covers the rest of this implementation.
 It builds on the language-independent [specification](https://kladde-dev.github.io/spec/) and [reference algorithms](https://kladde-dev.github.io/impl/).
 
 [`implementation-notes.md`](implementation-notes.md) records where this implementation departs from the documentation, what the documentation leaves unclear, and what went wrong along the way.
