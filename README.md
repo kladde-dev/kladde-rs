@@ -1,3 +1,5 @@
+<img src="https://kladde-dev.github.io/static/logo.svg" alt="kladde logo" width="80" align="right">
+
 # kladde-rs
 
 The Rust implementation of [kladde](https://kladde-dev.github.io/): durable data structures that you mutate in memory, and it's on disk.
