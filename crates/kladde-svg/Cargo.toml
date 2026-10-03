@@ -1,0 +1,29 @@
+[package]
+name = "kladde-svg"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A realistic workload for kladde: SVG drawings as durable data structures.
+# The library converts SVG to `#[derive(Persistable)]` types and back; the
+# binaries convert files, check round trips over a corpus, and benchmark a
+# drawing editor's edits. Run the binaries in release mode:
+#
+#     cargo run --release -p kladde-svg --bin svg-roundtrip -- <files or directories>
+#     cargo run --release -p kladde-svg --bin svg-bench -- <drawing.svg> <output directory>
+
+[features]
+# Store every decimal as `f64` instead of `f32`, to measure what `f32` costs.
+f64 = []
+# Render original and round-tripped SVG with resvg and compare the pixels.
+render = ["dep:resvg"]
+
+[dependencies]
+kladde = { workspace = true }
+kladde-types = { workspace = true }
+kladde-bench = { workspace = true }
+roxmltree = "0.21"
+svgtypes = "0.16"
+flate2 = "1"
+resvg = { version = "0.48", optional = true, default-features = false }

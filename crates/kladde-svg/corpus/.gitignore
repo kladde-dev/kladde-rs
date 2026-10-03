@@ -1,0 +1,4 @@
+# Everything fetch.sh downloads stays local; see fetch.sh for the licenses.
+*
+!.gitignore
+!fetch.sh
