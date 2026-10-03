@@ -17,10 +17,14 @@
 //!
 //! - A struct's `INLINE_SIZE` is the sum of its fields', each field at the
 //!   static offset of the fields before it. It owns no allocation of its own.
-//! - An enum's `INLINE_SIZE` is a 4-byte discriminant plus its largest
-//!   variant, each variant laid out like a struct based past the
-//!   discriminant, and the bytes a smaller variant leaves unused written as
-//!   zeros. Only whole-value replacement is supported (`guard.set(value)`).
+//! - An enum's `INLINE_SIZE` is its discriminant plus its largest variant,
+//!   each variant laid out like a struct based past the discriminant, and the
+//!   bytes a smaller variant leaves unused written as zeros. The discriminant
+//!   is as wide as an integer `#[repr(u8 | u16 | u32 | u64)]` says, or else
+//!   the smallest of 1, 2, 4 and 8 bytes that holds the largest discriminant
+//!   value. Its guard's `parts()` returns a generated `{Enum}Parts` enum
+//!   holding the guards of the current variant's fields, for mutating them in
+//!   place; `set` replaces the whole value, which is how the variant changes.
 //! - A single-field struct marked `#[kladde(transparent)]` is persisted exactly
 //!   as its field: same bytes and same fingerprint. Its guard has a `get_mut()`
 //!   returning the field's guard.
@@ -63,6 +67,80 @@
 //! #[derive(kladde::Persistable)]
 //! #[kladde(transparent)]
 //! struct Meters(i32);
+//! ```
+//!
+//! **Enums.** `parts()` reaches into the current variant:
+//!
+//! ```
+//! use kladde::{Kladde, Persistable};
+//!
+//! #[derive(Persistable)]
+//! enum Shape {
+//!     Origin,
+//!     Circle(i32),
+//!     Rectangle { width: i32, height: i32 },
+//! }
+//!
+//! let mut shape = Kladde::new(Shape::Rectangle { width: 1, height: 2 });
+//! match shape.guard().parts() {
+//!     ShapeParts::Rectangle { mut width, .. } => width.set(3).unwrap(),
+//!     ShapeParts::Circle(mut radius) => radius.set(3).unwrap(),
+//!     ShapeParts::Origin => {}
+//! }
+//! assert!(matches!(shape.get(), Shape::Rectangle { width: 3, height: 2 }));
+//!
+//! // Three variants fit a one-byte discriminant.
+//! assert_eq!(<Shape as kladde::Persistable>::INLINE_SIZE, 1 + 8);
+//! ```
+//!
+//! The variant cannot be switched while a field's guard is alive:
+//!
+//! ```compile_fail
+//! use kladde::{Kladde, Persistable};
+//!
+//! #[derive(Persistable)]
+//! enum Shape {
+//!     Origin,
+//!     Circle(i32),
+//! }
+//!
+//! let mut shape = Kladde::new(Shape::Circle(1));
+//! let mut guard = shape.guard();
+//! if let ShapeParts::Circle(mut radius) = guard.parts() {
+//!     guard.set(Shape::Origin).unwrap(); // error[E0499]: cannot borrow `guard` as mutable more than once
+//!     radius.set(2).unwrap();
+//! }
+//! ```
+//!
+//! An integer `#[repr]` fixes the discriminant's width, and only unsigned
+//! ones of up to 64 bits are accepted, since discriminants are stored
+//! unsigned:
+//!
+//! ```
+//! #[derive(kladde::Persistable)]
+//! #[repr(u32)]
+//! enum Pinned {
+//!     A,
+//!     B,
+//! }
+//! assert_eq!(<Pinned as kladde::Persistable>::INLINE_SIZE, 4);
+//! ```
+//!
+//! ```compile_fail
+//! #[derive(kladde::Persistable)]
+//! #[repr(i8)] // error: #[derive(Persistable)] supports only the integer reprs `u8`, ...
+//! enum Signed {
+//!     A,
+//!     B,
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! #[derive(kladde::Persistable)]
+//! enum Negative {
+//!     A = -1, // error: #[derive(Persistable)] does not support negative discriminants
+//!     B,
+//! }
 //! ```
 //!
 //! **Paths.** Generated code names everything through `::kladde`, which
@@ -220,11 +298,12 @@ fn kladde_attrs(attrs: &[syn::Attribute]) -> syn::Result<(bool, syn::Path)> {
 }
 
 /// For fields laid out back to back starting at `base` bytes into the value
-/// (0 for a struct, 4 for an enum variant), each field's static offset: the
-/// sum of every earlier field's `INLINE_SIZE`, as the backend's `Size`.
+/// (0 for a struct, the discriminant's width for an enum variant), each
+/// field's static offset: the sum of every earlier field's `INLINE_SIZE`, as
+/// the backend's `Size`. `base` is a `usize` constant expression.
 fn field_offsets(
     field_ty: &[syn::Type],
-    base: usize,
+    base: &proc_macro2::TokenStream,
     krate: &syn::Path,
 ) -> Vec<proc_macro2::TokenStream> {
     (0..field_ty.len())
@@ -553,7 +632,7 @@ fn derive_struct(
         })
         .collect();
 
-    let field_offset = field_offsets(&field_ty, 0, krate);
+    let field_offset = field_offsets(&field_ty, &quote!(0usize), krate);
     let total_size = total_size(&field_ty, krate);
 
     let is_tuple = matches!(&data.fields, Fields::Unnamed(_));
@@ -819,19 +898,32 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
         .to_compile_error();
     }
 
+    let repr = match enum_repr(&input.attrs) {
+        Ok(repr) => repr,
+        Err(err) => return err.to_compile_error(),
+    };
+
     let variant_ident: Vec<_> = data.variants.iter().map(|v| v.ident.clone()).collect();
     let variant_count = data.variants.len();
     let variant_index: Vec<usize> = (0..variant_count).collect();
 
+    // The discriminant values, evaluated as Rust evaluates them: an explicit
+    // expression at the `repr` type (`isize` without one), otherwise one more
+    // than the previous variant's. Widened to `i128` so that a negative value
+    // can be detected rather than wrapping.
+    let disc_ty = match &repr {
+        Some((ty, _)) => quote!(#ty),
+        None => quote!(isize),
+    };
     let disc_assign: Vec<proc_macro2::TokenStream> = data
         .variants
         .iter()
         .enumerate()
         .map(|(i, variant)| {
             let value = if let Some((_, expr)) = &variant.discriminant {
-                quote! { (#expr) as u32 }
+                quote! { { const __V: #disc_ty = #expr; __V as i128 } }
             } else if i == 0 {
-                quote! { 0u32 }
+                quote! { 0i128 }
             } else {
                 let prev = i - 1;
                 quote! { d[#prev] + 1 }
@@ -839,13 +931,44 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
             quote! { d[#i] = #value; }
         })
         .collect();
-    let discriminants = quote! {
-        const DISC: [u32; #variant_count] = {
-            let mut d = [0u32; #variant_count];
+    let disc_values = quote! {
+        {
+            let mut d = [0i128; #variant_count];
             #(#disc_assign)*
             d
-        };
+        }
     };
+    let negative_msg = format!(
+        "#[derive(Persistable)] does not support negative discriminants (in enum `{ident}`)"
+    );
+    let width_expr = match &repr {
+        Some((_, width)) => quote!(#width),
+        None => quote! {
+            {
+                let d = Self::__KLADDE_DISCRIMINANTS;
+                let mut max = 0u64;
+                let mut i = 0usize;
+                while i < d.len() {
+                    if d[i] > max {
+                        max = d[i];
+                    }
+                    i += 1;
+                }
+                if max <= 0xFF {
+                    1
+                } else if max <= 0xFFFF {
+                    2
+                } else if max <= 0xFFFF_FFFF {
+                    4
+                } else {
+                    8
+                }
+            }
+        },
+    };
+    // Where every generated item names the discriminants and their width.
+    let discriminants = quote!(<#ident #type_generics>::__KLADDE_DISCRIMINANTS);
+    let disc_width = quote!(<#ident #type_generics>::__KLADDE_DISCRIMINANT_WIDTH);
 
     let variant_field_ty: Vec<Vec<syn::Type>> = data
         .variants
@@ -856,20 +979,27 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
             Fields::Unit => Vec::new(),
         })
         .collect();
+    // Bindings for a variant's fields in match patterns, prefixed so that a
+    // field named like a parameter of the generated code (`backend`,
+    // `location`) does not shadow it.
     let variant_binding: Vec<Vec<syn::Ident>> = data
         .variants
         .iter()
         .map(|variant| match &variant.fields {
-            Fields::Named(f) => f.named.iter().map(|f| f.ident.clone().unwrap()).collect(),
+            Fields::Named(f) => f
+                .named
+                .iter()
+                .map(|f| format_ident!("__field_{}", f.ident.as_ref().unwrap()))
+                .collect(),
             Fields::Unnamed(f) => (0..f.unnamed.len())
-                .map(|i| format_ident!("field_{}", i))
+                .map(|i| format_ident!("__field_{}", i))
                 .collect(),
             Fields::Unit => Vec::new(),
         })
         .collect();
     let variant_field_offset: Vec<Vec<proc_macro2::TokenStream>> = variant_field_ty
         .iter()
-        .map(|tys| field_offsets(tys, 4, krate))
+        .map(|tys| field_offsets(tys, &disc_width, krate))
         .collect();
     let variant_size: Vec<proc_macro2::TokenStream> = variant_field_ty
         .iter()
@@ -898,7 +1028,10 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
         .map(|(variant, bindings)| {
             let v_ident = &variant.ident;
             match &variant.fields {
-                Fields::Named(_) => quote! { #ident::#v_ident { #(#bindings),* } },
+                Fields::Named(f) => {
+                    let names = f.named.iter().map(|f| f.ident.as_ref().unwrap());
+                    quote! { #ident::#v_ident { #(#names: #bindings),* } }
+                }
                 Fields::Unnamed(_) => quote! { #ident::#v_ident(#(#bindings),*) },
                 Fields::Unit => quote! { #ident::#v_ident },
             }
@@ -920,7 +1053,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
                         backend,
                         location.anchor,
                         location.offset,
-                        &DISC[#i].to_le_bytes(),
+                        &#discriminants[#i].to_le_bytes()[..#disc_width],
                     )?;
                     #(
                         <#field_ty as #krate::Persistable<#krate::Pointer>>::store(
@@ -929,7 +1062,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
                             location + #field_offset,
                         )?;
                     )*
-                    let __used = 4 + #size;
+                    let __used = #disc_width + #size;
                     let __padding = <Self as #krate::Persistable<#krate::Pointer>>::INLINE_SIZE - __used;
                     if __padding > 0 {
                         let __at = location
@@ -1003,7 +1136,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
             let field_ty = &variant_field_ty[i];
             quote! {
                 #krate::Variant {
-                    discriminant: DISC[#i] as u64,
+                    discriminant: #discriminants[#i],
                     name: ::std::string::ToString::to_string(::std::stringify!(#v_ident)),
                     fields: ::std::vec![
                         #(
@@ -1020,6 +1153,17 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
         })
         .collect();
 
+    let parts = enum_parts(
+        input,
+        data,
+        ctx,
+        &guard_ident,
+        &variant_pattern,
+        &variant_binding,
+        &variant_field_ty,
+        &variant_field_offset,
+    );
+
     let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident);
     let guard_assoc = guard_assoc(ctx, &guard_ident);
     let (store_sig, load_sig, free_sig) = (store_sig(krate), load_sig(krate), free_sig(krate));
@@ -1027,8 +1171,42 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
     quote! {
         #scaffold
 
+        #parts
+
+        // Rejected here rather than wrapped: a descriptor stores discriminants
+        // unsigned. A free constant is evaluated even where nothing uses the
+        // type, so the error cannot hide behind a generic that is never
+        // instantiated.
+        const _: () = {
+            let d: [i128; #variant_count] = #disc_values;
+            let mut i = 0usize;
+            while i < d.len() {
+                if d[i] < 0 {
+                    ::std::panic!(#negative_msg);
+                }
+                i += 1;
+            }
+        };
+
+        impl #impl_generics #ident #type_generics #where_clause {
+            /// Each variant's discriminant, in declaration order.
+            const __KLADDE_DISCRIMINANTS: [u64; #variant_count] = {
+                let d: [i128; #variant_count] = #disc_values;
+                let mut out = [0u64; #variant_count];
+                let mut i = 0usize;
+                while i < d.len() {
+                    out[i] = d[i] as u64;
+                    i += 1;
+                }
+                out
+            };
+            /// The discriminant's width in bytes: the integer `repr`'s, or
+            /// else the smallest of 1, 2, 4 and 8 that holds every value.
+            const __KLADDE_DISCRIMINANT_WIDTH: usize = #width_expr;
+        }
+
         impl #impl_generics #krate::Persistable<#krate::Pointer> for #ident #type_generics #where_clause {
-            const INLINE_SIZE: usize = 4 + {
+            const INLINE_SIZE: usize = #disc_width + {
                 let variant_sizes = [#(#variant_size),*];
                 let mut max = 0usize;
                 let mut i = 0usize;
@@ -1044,7 +1222,6 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
             #guard_assoc
 
             #store_sig {
-                #discriminants
                 match self {
                     #(#variant_store_arm)*
                 }
@@ -1052,19 +1229,18 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
             }
 
             #load_sig {
-                #discriminants
                 let discriminant = {
-                    let mut __buf = [0u8; 4];
+                    let mut __buf = [0u8; 8];
                     let mut __cursor = #krate::ReadBackend::read_at(
                         backend,
                         location.anchor,
                         location.offset,
                     )?;
-                    ::std::io::Read::read_exact(&mut __cursor, &mut __buf)?;
-                    u32::from_le_bytes(__buf)
+                    ::std::io::Read::read_exact(&mut __cursor, &mut __buf[..#disc_width])?;
+                    u64::from_le_bytes(__buf)
                 };
                 #(
-                    if discriminant == DISC[#variant_index] {
+                    if discriminant == #discriminants[#variant_index] {
                         return ::std::result::Result::Ok(#variant_load_expr);
                     }
                 )*
@@ -1088,13 +1264,193 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> proc_mac
             where
                 Self: 'static,
             {
-                #discriminants
                 #krate::TypeDescriptor::Enum {
                     name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
-                    discriminant_width: 4,
+                    discriminant_width: #disc_width as u8,
                     variants: ::std::vec![
                         #(#variant_describe),*
                     ],
+                }
+            }
+        }
+    }
+}
+
+/// An enum's integer `#[repr]`, if it has one: the discriminant's type and
+/// its width in bytes. Other `repr` options (`C`, `align(..)`, ...) are
+/// ignored; a signed, pointer-sized or 128-bit integer `repr` is an error,
+/// because descriptors store discriminants unsigned in 1, 2, 4 or 8 bytes.
+fn enum_repr(attrs: &[syn::Attribute]) -> syn::Result<Option<(syn::Ident, usize)>> {
+    let mut repr = None;
+    for attr in attrs {
+        if !attr.path().is_ident("repr") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if let Some(ty) = meta.path.get_ident() {
+                let width = match ty.to_string().as_str() {
+                    "u8" => Some(1usize),
+                    "u16" => Some(2),
+                    "u32" => Some(4),
+                    "u64" => Some(8),
+                    "i8" | "i16" | "i32" | "i64" | "i128" | "u128" | "isize" | "usize" => {
+                        return Err(meta.error(
+                            "#[derive(Persistable)] supports only the integer reprs `u8`, `u16`, \
+                             `u32` and `u64` on enums, since discriminants are stored unsigned \
+                             and at a fixed width",
+                        ));
+                    }
+                    _ => None,
+                };
+                if let Some(width) = width {
+                    repr = Some((ty.clone(), width));
+                }
+            }
+            // Skip the argument of options such as `align(8)`.
+            if meta.input.peek(syn::token::Paren) {
+                let content;
+                syn::parenthesized!(content in meta.input);
+                content.parse::<proc_macro2::TokenStream>()?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(repr)
+}
+
+/// An enum guard's `parts()`: a generated `{Enum}Parts` enum with the same
+/// variants, each carrying the guards of its fields, and the method that
+/// matches on the current variant to hand them out. Each field guard is
+/// anchored at the field's static offset past the discriminant, exactly where
+/// `store` wrote it, so it can only ever write inside its field and never the
+/// discriminant; `parts()` borrows the guard mutably, so `set` cannot switch
+/// the variant while a field guard is alive.
+///
+/// An enum without any fields gets neither: there is nothing to mutate in
+/// place, and the `Parts` enum would not use its lifetime or backend
+/// parameters.
+#[allow(clippy::too_many_arguments)]
+fn enum_parts(
+    input: &DeriveInput,
+    data: &syn::DataEnum,
+    ctx: &Ctx,
+    guard_ident: &syn::Ident,
+    variant_pattern: &[proc_macro2::TokenStream],
+    variant_binding: &[Vec<syn::Ident>],
+    variant_field_ty: &[Vec<syn::Type>],
+    variant_field_offset: &[Vec<proc_macro2::TokenStream>],
+) -> proc_macro2::TokenStream {
+    if variant_field_ty.iter().all(|tys| tys.is_empty()) {
+        return proc_macro2::TokenStream::new();
+    }
+    let krate = &ctx.krate;
+    let ident = &input.ident;
+    let vis = &input.vis;
+    let Ctx {
+        where_clause,
+        guard_impl_generics,
+        guard_use_generics,
+        bounded_params,
+        param_idents,
+        ..
+    } = ctx;
+
+    let parts_ident = format_ident!("{}Parts", ident);
+    let parts_decl_generics = quote! {
+        <'__f, #(#bounded_params,)* __B: #krate::WriteBackend<Pointer = #krate::Pointer>>
+    };
+    let parts_ret_generics = quote! { <'_, #(#param_idents,)* __B> };
+    let user_where_preds = input.generics.where_clause.as_ref().map(|w| {
+        let preds = &w.predicates;
+        quote!(#preds,)
+    });
+    let parts_where = quote! {
+        where #user_where_preds #(#param_idents: '__f,)* __B: '__f
+    };
+
+    let mut parts_variants = Vec::new();
+    let mut parts_arms = Vec::new();
+    for (i, variant) in data.variants.iter().enumerate() {
+        let v_ident = &variant.ident;
+        let field_ty = &variant_field_ty[i];
+        let binding = &variant_binding[i];
+        let offset = &variant_field_offset[i];
+        let pattern = &variant_pattern[i];
+        let doc = format!("The guards of the fields of [`{ident}::{v_ident}`].");
+        let guards: Vec<proc_macro2::TokenStream> = field_ty
+            .iter()
+            .zip(binding)
+            .zip(offset)
+            .map(|((ty, binding), offset)| {
+                quote! {
+                    <#ty as #krate::Persistable<#krate::Pointer>>::guard(
+                        #binding,
+                        self.backend,
+                        self.location + #offset,
+                    )
+                }
+            })
+            .collect();
+        match &variant.fields {
+            Fields::Named(f) => {
+                let names: Vec<&syn::Ident> =
+                    f.named.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+                let field_docs = names
+                    .iter()
+                    .map(|name| format!("The guard of field `{name}`."));
+                parts_variants.push(quote! {
+                    #[doc = #doc]
+                    #v_ident {
+                        #(
+                            #[doc = #field_docs]
+                            #names: <#field_ty as #krate::Persistable<#krate::Pointer>>::Guard<'__f, __B>,
+                        )*
+                    }
+                });
+                parts_arms.push(quote! {
+                    #pattern => #parts_ident::#v_ident { #(#names: #guards,)* }
+                });
+            }
+            Fields::Unnamed(_) => {
+                parts_variants.push(quote! {
+                    #[doc = #doc]
+                    #v_ident(
+                        #(<#field_ty as #krate::Persistable<#krate::Pointer>>::Guard<'__f, __B>,)*
+                    )
+                });
+                parts_arms.push(quote! {
+                    #pattern => #parts_ident::#v_ident(#(#guards,)*)
+                });
+            }
+            Fields::Unit => {
+                let doc = format!("[`{ident}::{v_ident}`], which has no fields.");
+                parts_variants.push(quote! {
+                    #[doc = #doc]
+                    #v_ident
+                });
+                parts_arms.push(quote! { #pattern => #parts_ident::#v_ident });
+            }
+        }
+    }
+
+    let parts_doc = format!(
+        "The guards of the fields of the current variant of a backed [`{ident}`], \
+         handed out by its guard's `parts()`."
+    );
+    quote! {
+        #[doc = #parts_doc]
+        #vis enum #parts_ident #parts_decl_generics #parts_where {
+            #(#parts_variants,)*
+        }
+
+        impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
+            /// The guards of the current variant's fields, for mutating them
+            /// in place; match on the result to reach them. To switch to
+            /// another variant, use `set`.
+            #[inline]
+            #vis fn parts(&mut self) -> #parts_ident #parts_ret_generics {
+                match &mut *self.inner {
+                    #(#parts_arms,)*
                 }
             }
         }
