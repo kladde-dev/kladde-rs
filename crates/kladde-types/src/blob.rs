@@ -9,7 +9,7 @@
 use crate::vec::PersistableVec;
 use kladde_persist::{
     replace, Encoding, Error, Guard, Input, Persistable, Place, Pointer, PointerRepr, ReadBackend,
-    Slotted, WriteBackend,
+    Slottable, Slotted, WriteBackend,
 };
 use std::ops::Deref;
 
@@ -84,6 +84,11 @@ impl<T, P> Deref for PersistableBlob<T, P> {
     }
 }
 
+impl<T, P: PointerRepr> Slottable<P> for PersistableBlob<T, P> where
+    T: serde::Serialize + serde::de::DeserializeOwned + Default
+{
+}
+
 impl<T, P: PointerRepr> Persistable<P> for PersistableBlob<T, P>
 where
     T: serde::Serialize + serde::de::DeserializeOwned + Default,
@@ -93,6 +98,8 @@ where
     /// place too.
     const SLOTTED_SIZE: Option<usize> = Some(P::BYTE_LEN);
     const PACKED_SIZE: Option<usize> = Some(P::BYTE_LEN);
+
+    type RootEncoding = Slotted;
 
     type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
         = PersistableBlobGuard<'s, T, B, E>

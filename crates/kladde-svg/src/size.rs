@@ -40,7 +40,7 @@ impl Payload for PersistableString {
     }
 }
 
-impl<T: Payload> Payload for PersistableVec<T> {
+impl<T: Payload + kladde::Slottable> Payload for PersistableVec<T> {
     fn owned_bytes(&self) -> u64 {
         self.iter().map(Payload::payload_bytes).sum()
     }

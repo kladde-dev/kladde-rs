@@ -26,7 +26,7 @@ use kladde_store::{Error, PointerRepr, ReadBackend, WriteBackend};
 use crate::encoding::{Encoding, Slotted};
 use crate::guard::Guard;
 use crate::input::Input;
-use crate::persistable::Persistable;
+use crate::persistable::{Persistable, Slottable};
 use crate::place::{write_encoded, Place};
 use crate::schema::SchemaBuilder;
 
@@ -102,9 +102,13 @@ macro_rules! scalar_persistable {
         encode: |$ev:ident, $ep:ident, $out:ident| $encode:expr,
         decode: |$dp:ident, $input:ident| $decode:expr $(,)?
     ) => {
+        impl<P: PointerRepr> Slottable<P> for $ty {}
+
         impl<P: PointerRepr> Persistable<P> for $ty {
             const SLOTTED_SIZE: Option<usize> = Some($slotted);
             const PACKED_SIZE: Option<usize> = $packed;
+
+            type RootEncoding = Slotted;
 
             type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
                 = $guard<'s, B, E>

@@ -63,5 +63,12 @@ fn describe_one(descriptor: &TypeDescriptor) -> String {
             let params: Vec<String> = parameters.iter().map(|p| format!("#{}", p.0)).collect();
             format!("Opaque {library_name}::{type_name}<{}>", params.join(", "))
         }
+        TypeDescriptor::Pointer(target) => format!("Pointer(#{})", target.0),
+        TypeDescriptor::Sequence(element) => format!("Sequence(#{})", element.0),
+        TypeDescriptor::Packed(target) => format!("Packed(#{})", target.0),
+        TypeDescriptor::Slotted(target) => format!("Slotted(#{})", target.0),
+        TypeDescriptor::Small { content, spilled } => {
+            format!("Small(#{}, #{})", content.0, spilled.0)
+        }
     }
 }

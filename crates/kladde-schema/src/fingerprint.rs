@@ -145,6 +145,16 @@ impl<'a> Traversal<'a> {
                     self.emit_reference(*parameter, depth, hasher);
                 }
             }
+            TypeDescriptor::Pointer(_)
+            | TypeDescriptor::Sequence(_)
+            | TypeDescriptor::Packed(_)
+            | TypeDescriptor::Slotted(_)
+            | TypeDescriptor::Small { .. } => {
+                hasher.update([descriptor.wrapper_tag().expect("a wrapper kind")]);
+                for reference in descriptor.references() {
+                    self.emit_reference(reference, depth, hasher);
+                }
+            }
         }
     }
 

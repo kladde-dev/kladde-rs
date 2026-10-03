@@ -95,6 +95,18 @@ pub trait Persistable<P: PointerRepr = Pointer>: Sized {
     /// ```
     const PACKED_SIZE: Option<usize>;
 
+    /// The encoding of a place that leaves the choice to the type, such as
+    /// a root: [`Slotted`](crate::Slotted) if the type has a fixed encoding,
+    /// [`Packed`](crate::Packed) if it does not. A composite type joins its
+    /// fields' with [`Encoding::Join`].
+    ///
+    /// ```
+    /// use kladde_persist::{Persistable, Slotted};
+    ///
+    /// let _: <u32 as Persistable>::RootEncoding = Slotted;
+    /// ```
+    type RootEncoding: Encoding;
+
     /// The mutation-capable view onto this type, for a value in a place of
     /// encoding `E`. See [`Guard`].
     type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>: Guard<
@@ -355,6 +367,40 @@ pub trait Persistable<P: PointerRepr = Pointer>: Sized {
     {
         <Self as Persistable<P>>::schema().fingerprint()
     }
+}
+
+/// A type with a fixed encoding, which may therefore stand in a slotted
+/// place: what a slotted container such as `PersistableVec` requires of its
+/// elements, and a field declared `#[kladde(slotted)]` of its type.
+///
+/// Every scalar, tuple of slottable types, and container of `kladde-types`
+/// but the small ones implements it, and `#[derive(Persistable)]` implements
+/// it for a struct or enum whose fields all do, unless the type is marked
+/// `#[kladde(packed_only)]`. A type without it can stand only in packed
+/// places, such as the elements of a `PackedPersistableVec`.
+///
+/// ```
+/// use kladde_persist::Slottable;
+///
+/// fn slot_of<T: Slottable>() -> usize {
+///     T::SLOT_SIZE
+/// }
+/// assert_eq!(slot_of::<(u8, u32)>(), 5);
+/// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` has no fixed encoding, so it cannot stand in a slotted place",
+    label = "this type can stand only in packed places",
+    note = "slotted containers such as `PersistableVec` and fields declared \
+            `#[kladde(slotted)]` need a fixed encoding: use `PackedPersistableVec`, or \
+            mark a struct or enum that holds a packed-only field `#[kladde(packed_only)]`"
+)]
+pub trait Slottable<P: PointerRepr = Pointer>: Persistable<P> {
+    /// How many bytes the fixed encoding takes: the slot a slotted place
+    /// reserves.
+    const SLOT_SIZE: usize = match <Self as Persistable<P>>::SLOTTED_SIZE {
+        Some(size) => size,
+        None => panic!("a Slottable type has a fixed encoding"),
+    };
 }
 
 /// The slot size of `T`, for code that has made sure `T` stands in a slotted

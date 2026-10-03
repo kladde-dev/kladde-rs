@@ -181,9 +181,13 @@ impl<'s, B: WriteBackend> kladde_persist::Guard for BoxedGuard<'s, B> {
     }
 }
 
+impl kladde_persist::Slottable for Boxed {}
+
 impl Persistable for Boxed {
     const SLOTTED_SIZE: Option<usize> = Some(4);
     const PACKED_SIZE: Option<usize> = Some(4);
+
+    type RootEncoding = Slotted;
 
     type Guard<'s, B: WriteBackend<Pointer = kladde_store::Pointer>, E: Encoding>
         = BoxedGuard<'s, B>

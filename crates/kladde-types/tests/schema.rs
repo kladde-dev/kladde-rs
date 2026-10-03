@@ -51,9 +51,30 @@ struct WithContainers {
 #[test]
 fn containers_fingerprint_stably() {
     assert_eq!(WithContainers::fingerprint(), WithContainers::fingerprint());
-    // Its schema has the root struct plus one descriptor per distinct
-    // container/scalar type reached: PersistableString, PersistableVec, i32.
-    assert_eq!(WithContainers::schema().descriptors().len(), 4);
+    // The root struct; the string's `Pointer`, `Packed`, `Sequence` and
+    // `char`; the vector's `Pointer`, `Sequence`, and `i32`.
+    let table = WithContainers::schema();
+    assert_eq!(table.descriptors().len(), 8);
+    assert_eq!(table.validate(), Ok(()));
+}
+
+#[test]
+fn containers_describe_their_structure() {
+    use kladde::{Primitive, TypeDescriptor as D, TypeRef};
+    let string = PersistableString::<kladde::Pointer>::schema();
+    assert_eq!(string.get(TypeRef(0)), &D::Pointer(TypeRef(1)));
+    assert_eq!(string.get(TypeRef(1)), &D::Packed(TypeRef(2)));
+    assert_eq!(string.get(TypeRef(2)), &D::Sequence(TypeRef(3)));
+    assert_eq!(string.get(TypeRef(3)), &D::Primitive(Primitive::Char));
+    // The same layout as a packed vector of chars, so the same fingerprint.
+    assert_eq!(
+        PersistableString::<kladde::Pointer>::fingerprint(),
+        kladde_types::PackedPersistableVec::<char>::fingerprint()
+    );
+    assert_ne!(
+        PersistableVec::<u8>::fingerprint(),
+        PersistableString::<kladde::Pointer>::fingerprint()
+    );
 }
 
 #[derive(kladde::Persistable)]
@@ -82,6 +103,7 @@ fn recursive_type_fingerprints_reproducibly() {
     assert_eq!(Tree::fingerprint(), Tree::fingerprint());
     // A recursive type and a non-recursive one are different types.
     assert_ne!(Tree::fingerprint(), Point::fingerprint());
+    assert_eq!(Tree::schema().validate(), Ok(()));
 }
 
 #[test]

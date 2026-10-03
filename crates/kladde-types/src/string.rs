@@ -9,7 +9,7 @@
 use crate::vec::PersistableVec;
 use kladde_persist::{
     replace, Encoding, Error, Guard, Input, Persistable, Place, Pointer, PointerRepr, ReadBackend,
-    Slotted, WriteBackend,
+    Slottable, Slotted, TypeDescriptor, WriteBackend,
 };
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
@@ -151,9 +151,13 @@ impl<P> PartialEq<PersistableString<P>> for &str {
     }
 }
 
+impl<P: PointerRepr> Slottable<P> for PersistableString<P> {}
+
 impl<P: PointerRepr> Persistable<P> for PersistableString<P> {
     const SLOTTED_SIZE: Option<usize> = <PersistableVec<u8, P> as Persistable<P>>::SLOTTED_SIZE;
     const PACKED_SIZE: Option<usize> = <PersistableVec<u8, P> as Persistable<P>>::PACKED_SIZE;
+
+    type RootEncoding = Slotted;
 
     type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
         = PersistableStringGuard<'s, B, E>
@@ -203,16 +207,10 @@ impl<P: PointerRepr> Persistable<P> for PersistableString<P> {
         self.0.free(backend)
     }
 
-    fn describe_local(
-        _builder: &mut kladde_persist::SchemaBuilder,
-    ) -> kladde_persist::TypeDescriptor {
-        kladde_persist::TypeDescriptor::Opaque {
-            library_name: "kladde-types".into(),
-            type_name: "PersistableString".into(),
-            version: crate::library_version(),
-            inline_size: P::BYTE_LEN as u64,
-            parameters: vec![],
-        }
+    /// `Pointer(Packed(Sequence(char)))`: an allocation of text, whose packed
+    /// `char`s are its UTF-8 bytes.
+    fn describe_local(builder: &mut kladde_persist::SchemaBuilder) -> TypeDescriptor {
+        TypeDescriptor::Pointer(builder.packed_sequence::<P, char>())
     }
 }
 

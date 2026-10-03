@@ -32,6 +32,19 @@ pub trait Encoding:
 {
     /// Whether places of this encoding hold the packed encoding.
     const PACKED: bool;
+
+    /// The encoding of a value whose parts' encodings are `Self` and
+    /// `Other`: [`Slotted`] if both are, [`Packed`] otherwise. This is how a
+    /// composite type works out its
+    /// [`RootEncoding`](crate::Persistable::RootEncoding) from its fields'.
+    ///
+    /// ```
+    /// use kladde_persist::{Encoding, Packed, Slotted};
+    ///
+    /// let _: <Slotted as Encoding>::Join<Slotted> = Slotted;
+    /// let _: <Slotted as Encoding>::Join<Packed> = Packed;
+    /// ```
+    type Join<Other: Encoding>: Encoding;
 }
 
 /// The encoding of slotted places: a type's fixed encoding, the same number
@@ -64,8 +77,10 @@ pub struct Packed;
 
 impl Encoding for Slotted {
     const PACKED: bool = false;
+    type Join<Other: Encoding> = Other;
 }
 
 impl Encoding for Packed {
     const PACKED: bool = true;
+    type Join<Other: Encoding> = Packed;
 }
