@@ -191,6 +191,7 @@ dependencies = [
  "kladde",
  "kladde-persist",
  "kladde-store",
+ "kladde-types",
  "proc-macro2",
  "quote",
  "syn 2.0.119",

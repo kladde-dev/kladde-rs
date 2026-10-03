@@ -145,6 +145,20 @@ pub enum TypeDescriptor {
         inline_size: u64,
         parameters: Vec<TypeRef>,
     },
+    /// An owning pointer to an allocation whose content is the referenced
+    /// type: a `varint` id in a packed place, a fixed-width id in a slotted
+    /// one, `0` for none.
+    Pointer(TypeRef),
+    /// The referenced type's values back to back, as many as fill the range
+    /// that holds them: a pointer's allocation, or a small value's content.
+    Sequence(TypeRef),
+    /// What a pointer points to, laid out packed.
+    Packed(TypeRef),
+    /// A place declared slotted inside a packed value.
+    Slotted(TypeRef),
+    /// A size tag, then a `content` of that many bytes if the tag is below
+    /// 255, or a `spilled` value if it is 255.
+    Small { content: TypeRef, spilled: TypeRef },
 }
 
 /// Kind-tag byte for [`TypeDescriptor::Struct`] (`type-descriptors.md` §3.2).
@@ -155,15 +169,24 @@ pub const TAG_ENUM: u8 = 129;
 pub const TAG_OPAQUE: u8 = 130;
 /// Reserved kind-tag byte for the not-yet-implemented Array kind.
 pub const TAG_ARRAY: u8 = 131;
-/// Reserved kind-tag byte for the not-yet-defined Pointer kind.
+/// Kind-tag byte for [`TypeDescriptor::Pointer`].
 pub const TAG_POINTER: u8 = 132;
+/// Kind-tag byte for [`TypeDescriptor::Sequence`].
+pub const TAG_SEQUENCE: u8 = 133;
+/// Kind-tag byte for [`TypeDescriptor::Packed`].
+pub const TAG_PACKED: u8 = 134;
+/// Kind-tag byte for [`TypeDescriptor::Slotted`].
+pub const TAG_SLOTTED: u8 = 135;
+/// Kind-tag byte for [`TypeDescriptor::Small`].
+pub const TAG_SMALL: u8 = 136;
 
 impl TypeDescriptor {
     /// This descriptor's outgoing references, in canonical
     /// (`type-descriptors.md` §3.2) order — struct/variant fields in
     /// declaration order, enum variants in ascending discriminant order,
-    /// Opaque parameters as given. Used by both serialization and
-    /// fingerprinting so they always agree on traversal order.
+    /// Opaque parameters as given, a small value's content before its
+    /// spilled form. Used by both serialization and fingerprinting so they
+    /// always agree on traversal order.
     pub(crate) fn references(&self) -> Vec<TypeRef> {
         match self {
             TypeDescriptor::Primitive(_) => Vec::new(),
@@ -173,6 +196,24 @@ impl TypeDescriptor {
                 .flat_map(|v| v.fields.iter().map(|f| f.ty))
                 .collect(),
             TypeDescriptor::Opaque { parameters, .. } => parameters.clone(),
+            TypeDescriptor::Pointer(target)
+            | TypeDescriptor::Sequence(target)
+            | TypeDescriptor::Packed(target)
+            | TypeDescriptor::Slotted(target) => vec![*target],
+            TypeDescriptor::Small { content, spilled } => vec![*content, *spilled],
+        }
+    }
+
+    /// The kind-tag byte this descriptor's [`encode`](TypeTable::encode)
+    /// starts with, for every kind but Primitive, whose code is its tag.
+    pub(crate) fn wrapper_tag(&self) -> Option<u8> {
+        match self {
+            TypeDescriptor::Pointer(_) => Some(TAG_POINTER),
+            TypeDescriptor::Sequence(_) => Some(TAG_SEQUENCE),
+            TypeDescriptor::Packed(_) => Some(TAG_PACKED),
+            TypeDescriptor::Slotted(_) => Some(TAG_SLOTTED),
+            TypeDescriptor::Small { .. } => Some(TAG_SMALL),
+            _ => None,
         }
     }
 }

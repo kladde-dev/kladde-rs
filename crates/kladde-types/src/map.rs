@@ -10,11 +10,14 @@
 //! entries, not a live count.
 
 use kladde_persist::{
-    read_allocation, replace, slot_size, Encoding, Error, Guard, Input, Location, Persistable,
-    Place, Pointer, PointerRepr, ReadBackend, Slotted, UniquePointer, WriteBackend,
+    read_allocation, replace, slot_size, Encoding, Error, Field, Guard, Input, Location,
+    Persistable, Place, Pointer, PointerRepr, ReadBackend, Slottable, Slotted, TypeDescriptor,
+    UniquePointer, WriteBackend,
 };
+use std::any::TypeId;
 use std::collections::{hash_map, BTreeSet, HashMap};
 use std::hash::Hash;
+use std::marker::PhantomData;
 use std::ops::Deref;
 
 use crate::slot::{decode_pointer, encode_pointer, pointer_size, publish_pointer, size};
@@ -161,16 +164,30 @@ fn entry_size<K: Persistable<P>, V: Persistable<P>, P: PointerRepr>() -> usize {
     1 + slot_size::<K, P>() + slot_size::<V, P>()
 }
 
+impl<K, V, P> Slottable<P> for PersistableHashMap<K, V, P>
+where
+    K: Eq + Hash + Slottable<P>,
+    V: Slottable<P>,
+    P: PointerRepr,
+{
+}
+
+/// The identity under which a map's slot type is described.
+struct SlotOf<K, V, P>(PhantomData<(K, V, P)>);
+
 impl<K, V, P> Persistable<P> for PersistableHashMap<K, V, P>
 where
-    K: Eq + Hash + Persistable<P>,
-    V: Persistable<P>,
+    K: Eq + Hash + Slottable<P>,
+    V: Slottable<P>,
     P: PointerRepr,
 {
     /// Just the slot array's pointer: its slot count is its size over the slot
     /// size.
     const SLOTTED_SIZE: Option<usize> = Some(P::BYTE_LEN);
-    const PACKED_SIZE: Option<usize> = Some(P::BYTE_LEN);
+    /// None: packed, the pointer is a varint.
+    const PACKED_SIZE: Option<usize> = None;
+
+    type RootEncoding = Slotted;
 
     type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
         = PersistableHashMapGuard<'s, K, V, B, E>
@@ -248,20 +265,36 @@ where
         Ok(())
     }
 
-    fn describe_local(builder: &mut kladde_persist::SchemaBuilder) -> kladde_persist::TypeDescriptor
+    /// `Pointer(Sequence(Slot))`, where `Slot` is a struct of a liveness
+    /// flag, a key and a value: an allocation of slots, of which those whose
+    /// flag is clear hold no entry.
+    fn describe_local(builder: &mut kladde_persist::SchemaBuilder) -> TypeDescriptor
     where
         Self: 'static,
     {
-        kladde_persist::TypeDescriptor::Opaque {
-            library_name: "kladde-types".into(),
-            type_name: "PersistableHashMap".into(),
-            version: crate::library_version(),
-            inline_size: P::BYTE_LEN as u64,
-            parameters: vec![
-                <K as Persistable<P>>::describe(builder),
-                <V as Persistable<P>>::describe(builder),
-            ],
-        }
+        let slot = builder.describe_with(TypeId::of::<SlotOf<K, V, P>>(), |builder| {
+            TypeDescriptor::Struct {
+                name: "Slot".into(),
+                fields: vec![
+                    Field {
+                        name: "live".into(),
+                        ty: <bool as Persistable<P>>::describe(builder),
+                    },
+                    Field {
+                        name: "key".into(),
+                        ty: <K as Persistable<P>>::describe(builder),
+                    },
+                    Field {
+                        name: "value".into(),
+                        ty: <V as Persistable<P>>::describe(builder),
+                    },
+                ],
+            }
+        });
+        let sequence = builder.describe_with(TypeId::of::<Vec<SlotOf<K, V, P>>>(), |_| {
+            TypeDescriptor::Sequence(slot)
+        });
+        TypeDescriptor::Pointer(sequence)
     }
 }
 
@@ -293,8 +326,8 @@ pub struct PersistableHashMapGuard<'s, K, V, B: WriteBackend, E: Encoding = Slot
 
 impl<'s, K, V, B, E> PersistableHashMapGuard<'s, K, V, B, E>
 where
-    K: Eq + Hash + Persistable<B::Pointer>,
-    V: Persistable<B::Pointer>,
+    K: Eq + Hash + Slottable<B::Pointer>,
+    V: Slottable<B::Pointer>,
     B: WriteBackend,
     E: Encoding,
 {

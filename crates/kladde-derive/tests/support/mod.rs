@@ -8,7 +8,7 @@
 
 use kladde_persist::{
     slot_size, write_encoded, Encoding, Error, Guard, Input, Location, Packed, Persistable, Place,
-    Pointer, PointerRepr, ReadBackend, Slotted, WriteBackend,
+    Pointer, PointerRepr, ReadBackend, Slottable, Slotted, WriteBackend,
 };
 use kladde_store::{MemoryStorage, Store};
 
@@ -66,9 +66,13 @@ impl Fixture {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Number(pub i32);
 
+impl<P: PointerRepr> Slottable<P> for Number {}
+
 impl<P: PointerRepr> Persistable<P> for Number {
     const SLOTTED_SIZE: Option<usize> = Some(4);
     const PACKED_SIZE: Option<usize> = Some(4);
+
+    type RootEncoding = Slotted;
 
     type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
         = NumberGuard<'s, B, E>

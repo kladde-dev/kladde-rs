@@ -47,8 +47,8 @@ pub use kladde_persist::{
     read_allocation, replace, slot_size, splice_at, sum_sizes, varint_len, write_encoded,
     write_varint, Backend, BoolGuard, CharGuard, Encoding, Error, F32Guard, F64Guard, FieldOffsets,
     Guard, I16Guard, I32Guard, I64Guard, I8Guard, Input, Link, Location, Node, Packed, Persistable,
-    Place, Pointer, PointerRepr, ReadBackend, Result, SchemaBuilder, Slotted, TupleGuard, U16Guard,
-    U32Guard, U64Guard, U8Guard, UniquePointer, Word, WriteBackend,
+    Place, Pointer, PointerRepr, ReadBackend, Result, SchemaBuilder, Slottable, Slotted,
+    TupleGuard, U16Guard, U32Guard, U64Guard, U8Guard, UniquePointer, Word, WriteBackend,
 };
 
 // The schema and fingerprint surface, so an application can inspect its root
@@ -61,7 +61,9 @@ pub use kladde_persist::{
 // against, how it is tuned, what it reports, and where its bytes live.
 pub use kladde_store::{FileStorage, MemoryStorage, Options, Stats, Storage, Store};
 
-/// The guard of a root value of type `T`, as [`Kladde::guard`] hands it out.
+/// The guard of a root value of type `T`, as [`Kladde::guard`] hands it out:
+/// in a slotted place if `T` has a fixed encoding, and in a packed one if it
+/// does not, as `T`'s [`RootEncoding`](Persistable::RootEncoding) says.
 ///
 /// ```
 /// use kladde::{Kladde, RootGuard};
@@ -75,7 +77,17 @@ pub use kladde_store::{FileStorage, MemoryStorage, Options, Stats, Storage, Stor
 /// assert_eq!(*k.get(), 2);
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub type RootGuard<'a, T> = <T as Persistable>::Guard<'a, Store, Slotted>;
+pub type RootGuard<'a, T> = <T as Persistable>::Guard<'a, Store, <T as Persistable>::RootEncoding>;
+
+/// How many bytes the root allocation starts with: the slot of a slotted
+/// root, and nothing for a packed one, whose encoding grows it.
+fn root_slot<T: Persistable>() -> usize {
+    if <T::RootEncoding as Encoding>::PACKED {
+        0
+    } else {
+        slot_size::<T, Pointer>()
+    }
+}
 
 /// A root [`Persistable`] value paired with the file that backs it.
 ///
@@ -147,10 +159,10 @@ impl<T: Persistable + 'static> Kladde<T> {
         let table = T::schema().encode();
         let fingerprint = *T::fingerprint().as_bytes();
         let root_pointer = store.atomically(|| {
-            let pointer = store.alloc(size(slot_size::<T, Pointer>())?)?;
+            let pointer = store.alloc(size(root_slot::<T>())?)?;
             let schema = store.alloc(size(table.len())?)?;
             store.write(schema.raw(), 0, &table)?;
-            root.store::<_, Slotted>(&store, Location::new(pointer.raw(), 0))?;
+            root.store::<_, T::RootEncoding>(&store, Location::new(pointer.raw(), 0))?;
             store.set_roots(pointer.raw(), schema.raw(), fingerprint);
             Ok(pointer.raw())
         })?;
@@ -199,7 +211,7 @@ impl<T: Persistable + 'static> Kladde<T> {
         if found != expected {
             return Err(Error::SchemaMismatch { expected, found });
         }
-        let root = T::load::<_, Slotted>(&mut store, Location::new(root_pointer, 0))?;
+        let root = T::load::<_, T::RootEncoding>(&mut store, Location::new(root_pointer, 0))?;
         store.end_load();
         Ok(Kladde {
             store,
@@ -238,10 +250,8 @@ impl<T: Persistable + 'static> Kladde<T> {
     /// # Ok::<(), kladde::Error>(())
     /// ```
     pub fn guard(&mut self) -> RootGuard<'_, T> {
-        self.root.guard(
-            &self.store,
-            Slotted::at(Location::new(self.root_pointer, 0)),
-        )
+        self.root
+            .guard(&self.store, Place::at(Location::new(self.root_pointer, 0)))
     }
 
     /// Folds the journal into the file now, which also makes every mutation
@@ -508,6 +518,8 @@ mod tests {
     impl<P: PointerRepr> Persistable<P> for Counter {
         const SLOTTED_SIZE: Option<usize> = Some(4);
         const PACKED_SIZE: Option<usize> = Some(4);
+
+        type RootEncoding = Slotted;
 
         type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
             = CounterGuard<'s, B, E>

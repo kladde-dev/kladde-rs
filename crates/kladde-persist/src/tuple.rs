@@ -19,7 +19,7 @@ use kladde_store::{Error, PointerRepr, ReadBackend, WriteBackend};
 use crate::encoding::{Encoding, Slotted};
 use crate::guard::Guard;
 use crate::input::Input;
-use crate::persistable::{replace, slot_size, Persistable};
+use crate::persistable::{replace, slot_size, Persistable, Slottable};
 use crate::place::{FieldOffsets, Place};
 use crate::schema::SchemaBuilder;
 use crate::sizes::sum_sizes;
@@ -73,6 +73,14 @@ impl<'s, T, B: WriteBackend, E: Encoding> std::ops::Deref for TupleGuard<'s, T, 
     }
 }
 
+/// The [`Encoding::Join`] of `$acc` and every following encoding type.
+macro_rules! join_encodings {
+    ($acc:ty;) => { $acc };
+    ($acc:ty; $first:ty $(, $rest:ty)*) => {
+        join_encodings!(<$acc as Encoding>::Join<$first>; $($rest),*)
+    };
+}
+
 /// Generates one `impl Persistable<__P> for (T0, T1, ...)`. `$name` is the
 /// schema type name; each `$T $idx` pair is a component's type parameter and
 /// its tuple index.
@@ -80,11 +88,15 @@ macro_rules! impl_persistable_tuple {
     ($name:literal; $($T:ident $idx:tt),*) => {
         // `__P`, `__B` and `__E`, so that none collides with a component type
         // parameter literally named `P`, `B` or `E`.
+        impl<__P: PointerRepr, $($T: Slottable<__P>,)*> Slottable<__P> for ($($T,)*) {}
+
         impl<__P: PointerRepr, $($T: Persistable<__P>,)*> Persistable<__P> for ($($T,)*) {
             const SLOTTED_SIZE: Option<usize> =
                 sum_sizes(&[$(<$T as Persistable<__P>>::SLOTTED_SIZE,)*]);
             const PACKED_SIZE: Option<usize> =
                 sum_sizes(&[$(<$T as Persistable<__P>>::PACKED_SIZE,)*]);
+
+            type RootEncoding = join_encodings!(Slotted; $(<$T as Persistable<__P>>::RootEncoding),*);
 
             type Guard<'s, __B: WriteBackend<Pointer = __P>, __E: Encoding>
                 = TupleGuard<'s, Self, __B, __E>

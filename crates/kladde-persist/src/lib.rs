@@ -48,7 +48,7 @@ pub use encoding::{Encoding, Packed, Slotted};
 pub use guard::Guard;
 pub use input::{read_allocation, Input};
 pub use location::Location;
-pub use persistable::{replace, slot_size, Persistable};
+pub use persistable::{replace, slot_size, Persistable, Slottable};
 pub use place::{splice_at, write_encoded, FieldOffsets, Link, Node, Place};
 pub use scalar::{
     BoolGuard, CharGuard, F32Guard, F64Guard, I16Guard, I32Guard, I64Guard, I8Guard, U16Guard,

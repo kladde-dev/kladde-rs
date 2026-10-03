@@ -1,36 +1,55 @@
 //! What every owning container shares: the inline pointer to its content
 //! allocation, and size arithmetic that refuses to overflow.
 //!
-//! The pointer helpers take the encoding of the place the pointer sits in,
-//! although it decides nothing yet: the containers describe themselves as
-//! opaque, which keeps their pointers at their fixed width in packed places.
-#![allow(clippy::extra_unused_type_parameters)]
+//! A container's pointer takes the encoding of the place it sits in: its
+//! fixed width in a slotted place, all zeros for none, and the LEB128 varint
+//! of its id in a packed one, `0` for none. The blob, which describes itself
+//! as opaque, keeps the fixed width everywhere and passes `Slotted`.
 
 use kladde_persist::{
-    decode_option_slice, encode_option, write_encoded, Encoding, Error, Input, Place, PointerRepr,
-    Word, WriteBackend,
+    decode_option_slice, encode_option, varint_len, write_encoded, write_varint, Encoding, Error,
+    Input, Place, PointerRepr, Word, WriteBackend,
 };
 
-/// How many bytes a container's pointer takes inline: the pointer's fixed
-/// width, in either encoding, since the containers describe themselves as
-/// opaque and so keep their inline bytes in packed places too.
-pub(crate) fn pointer_size<P: PointerRepr, E: Encoding>(_pointer: Option<P>) -> usize {
-    P::BYTE_LEN
+/// How many bytes a container's pointer takes in a place of encoding `E`.
+pub(crate) fn pointer_size<P: PointerRepr, E: Encoding>(pointer: Option<P>) -> usize {
+    if E::PACKED {
+        varint_len(pointer.map_or(0, |p| p.to_u32()) as u64)
+    } else {
+        P::BYTE_LEN
+    }
 }
 
-/// Appends a container's inline pointer, `None` as the all-zero null niche.
+/// Appends a container's pointer in encoding `E`.
 pub(crate) fn encode_pointer<P: PointerRepr, E: Encoding>(pointer: Option<P>, out: &mut Vec<u8>) {
-    out.extend_from_slice(encode_option(pointer).as_ref());
+    if E::PACKED {
+        write_varint(pointer.map_or(0, |p| p.to_u32()) as u64, out);
+    } else {
+        out.extend_from_slice(encode_option(pointer).as_ref());
+    }
 }
 
 /// Reads back a pointer written by [`encode_pointer`].
 pub(crate) fn decode_pointer<P: PointerRepr, E: Encoding>(
     input: &mut Input<'_>,
 ) -> Result<Option<P>, Error> {
-    Ok(decode_option_slice(input.take(P::BYTE_LEN)?))
+    if E::PACKED {
+        let id = input.varint()?;
+        match u32::try_from(id) {
+            Ok(0) => Ok(None),
+            Ok(id) => Ok(Some(P::from_u32(id))),
+            Err(_) => Err(Error::Corrupt(format!(
+                "pointer {id} is beyond the 32 bits of an allocation id"
+            ))),
+        }
+    } else {
+        Ok(decode_option_slice(input.take(P::BYTE_LEN)?))
+    }
 }
 
-/// Writes a container's new inline pointer `new` over `old` at `place`.
+/// Writes a container's new pointer `new` over `old` at `place`: in place if
+/// its encoding keeps its size, and as a splice that the values around it
+/// hear about if not.
 pub(crate) fn publish_pointer<B: WriteBackend, E: Encoding>(
     backend: &B,
     place: &Place<'_, B, E>,

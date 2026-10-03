@@ -44,6 +44,60 @@
 //! encoding in and tells its parent, so the guards of its siblings, and of
 //! everything around it, find themselves at their new offsets.
 //!
+//! **Slotted fields and packed-only types.** A field marked
+//! `#[kladde(slotted)]` keeps its fixed encoding inside a packed value, so
+//! that it never changes size: for a counter, say, whose varint would grow
+//! at every power of 128. Its type must be `Slottable`. The derive implements
+//! `Slottable` for every type whose fields all have a fixed encoding; a type
+//! with a field that has none, such as a small string, is marked
+//! `#[kladde(packed_only)]`, gets no `Slottable` impl, and stands only in
+//! packed places.
+//!
+//! ```
+//! use kladde::{Kladde, Packed, Persistable};
+//! use kladde_types::{PackedPersistableVec, SmallPersistableString};
+//!
+//! #[derive(Persistable)]
+//! #[kladde(packed_only)]
+//! struct Page {
+//!     title: SmallPersistableString,
+//!     #[kladde(slotted)]
+//!     visits: u32,
+//! }
+//!
+//! let page = Page { title: "home".into(), visits: 300 };
+//! // A tag and four bytes of text, then the count's four fixed bytes.
+//! assert_eq!(page.encoded_size::<Packed>(), 1 + 4 + 4);
+//! let mut pages = Kladde::new(PackedPersistableVec::<Page>::new());
+//! pages.guard().push(page)?;
+//! pages.guard().get_mut(0).unwrap().visits_mut().set(301)?;
+//! # Ok::<(), kladde::Error>(())
+//! ```
+//!
+//! A type with such a field that is not marked does not compile:
+//!
+//! ```compile_fail
+//! use kladde_types::SmallPersistableString;
+//!
+//! #[derive(kladde::Persistable)]
+//! struct Page {
+//!     title: SmallPersistableString, // error: `Page` has a field without a fixed encoding, `title`: mark `Page` #[kladde(packed_only)], ...
+//! }
+//! ```
+//!
+//! Nor does a slotted field without a fixed encoding:
+//!
+//! ```compile_fail
+//! use kladde_types::SmallPersistableString;
+//!
+//! #[derive(kladde::Persistable)]
+//! #[kladde(packed_only)]
+//! struct Page {
+//!     #[kladde(slotted)]
+//!     title: SmallPersistableString, // error[E0277]: `SmallPersistableString` has no fixed encoding, so it cannot stand in a slotted place
+//! }
+//! ```
+//!
 //! **Every field must be `Persistable`.** Plain `String` is not, and the
 //! compile error is the point: a field that would silently persist nothing
 //! does not compile.
@@ -170,12 +224,16 @@ type Tokens = proc_macro2::TokenStream;
 pub fn derive_persistable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
-    let (transparent, krate) = match kladde_attrs(&input.attrs) {
+    let TypeAttrs {
+        transparent,
+        packed_only,
+        krate,
+    } = match kladde_attrs(&input.attrs) {
         Ok(parsed) => parsed,
         Err(err) => return err.to_compile_error().into(),
     };
 
-    let ctx = match Ctx::build(&input, krate) {
+    let ctx = match Ctx::build(&input, krate, packed_only) {
         Ok(ctx) => ctx,
         Err(err) => return err.to_compile_error().into(),
     };
@@ -236,10 +294,12 @@ struct Ctx {
     /// The crate every generated path is rooted at -- `::kladde` unless
     /// `#[kladde(crate = "...")]` says otherwise.
     krate: syn::Path,
+    /// `#[kladde(packed_only)]`: no `Slottable` impl.
+    packed_only: bool,
 }
 
 impl Ctx {
-    fn build(input: &DeriveInput, krate: syn::Path) -> syn::Result<Ctx> {
+    fn build(input: &DeriveInput, krate: syn::Path, packed_only: bool) -> syn::Result<Ctx> {
         for param in &input.generics.params {
             match param {
                 GenericParam::Type(_) => {}
@@ -302,6 +362,71 @@ impl Ctx {
             param_idents,
             user_where_preds,
             krate,
+            packed_only,
+        })
+    }
+
+    /// The `where` clause of the `Persistable` impl: the type's own
+    /// predicates, and a `Slottable` bound on the type of every field
+    /// declared `#[kladde(slotted)]`, so that a field without a fixed
+    /// encoding there fails to compile at the type that declares it.
+    fn persistable_where(&self, fields: &[&FieldInfo]) -> Tokens {
+        let krate = &self.krate;
+        let user = &self.user_where_preds;
+        let slotted = fields.iter().filter(|f| f.slotted).map(|f| &f.ty);
+        quote! {
+            where #user #(#slotted: #krate::Slottable<#krate::Pointer>,)*
+        }
+    }
+
+    /// The type's `Slottable` impl, or nothing for a type marked
+    /// `#[kladde(packed_only)]`.
+    ///
+    /// It requires `Slottable` of every type parameter, as `#[derive(Debug)]`
+    /// requires `Debug`, rather than of every field's type: a type that holds
+    /// itself through a container, `struct Node { children:
+    /// PersistableVec<Node> }`, would make that requirement circular. Fields
+    /// whose types name no parameter are checked by an assertion instead,
+    /// which names the attribute when it fails.
+    fn slottable_impl(&self, ident: &syn::Ident, fields: &[&FieldInfo]) -> Tokens {
+        if self.packed_only {
+            return Tokens::new();
+        }
+        let krate = &self.krate;
+        let (impl_generics, type_generics) = (&self.impl_generics, &self.type_generics);
+        let user = &self.user_where_preds;
+        let params = &self.param_idents;
+        let checks = fields
+            .iter()
+            .filter(|f| !mentions_any(&f.ty, params))
+            .map(|f| {
+                let ty = persistable(&f.ty, krate);
+                let message = format!(
+                    "`{ident}` has a field without a fixed encoding, `{}`: mark `{ident}` \
+                     #[kladde(packed_only)], so that it stands only in packed places",
+                    f.schema_name
+                );
+                quote! {
+                    const _: () = if #ty::SLOTTED_SIZE.is_none() {
+                        ::std::panic!(#message)
+                    };
+                }
+            });
+        quote! {
+            impl #impl_generics #krate::Slottable<#krate::Pointer> for #ident #type_generics
+            where #user #(#params: #krate::Slottable<#krate::Pointer>,)*
+            {}
+
+            #(#checks)*
+        }
+    }
+
+    /// The type's `RootEncoding`: `Slotted` joined with every field's.
+    fn root_encoding(&self, fields: &[&FieldInfo]) -> Tokens {
+        let krate = &self.krate;
+        fields.iter().fold(quote!(#krate::Slotted), |acc, f| {
+            let ty = persistable(&f.ty, krate);
+            quote!(<#acc as #krate::Encoding>::Join<#ty::RootEncoding>)
         })
     }
 
@@ -338,44 +463,84 @@ impl Ctx {
 /// Parses the type's `#[kladde(...)]` attributes: whether it is
 /// `transparent`, and the `crate` generated paths are rooted at. Errors on
 /// anything else, so that a typo is a compile error rather than a no-op.
-fn kladde_attrs(attrs: &[syn::Attribute]) -> syn::Result<(bool, syn::Path)> {
-    let mut transparent = false;
-    let mut krate: syn::Path = syn::parse_quote!(::kladde);
+fn kladde_attrs(attrs: &[syn::Attribute]) -> syn::Result<TypeAttrs> {
+    let mut parsed = TypeAttrs {
+        transparent: false,
+        packed_only: false,
+        krate: syn::parse_quote!(::kladde),
+    };
     for attr in attrs {
         if !attr.path().is_ident("kladde") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("transparent") {
-                transparent = true;
+                parsed.transparent = true;
+                Ok(())
+            } else if meta.path.is_ident("packed_only") {
+                parsed.packed_only = true;
                 Ok(())
             } else if meta.path.is_ident("crate") {
                 let lit: syn::LitStr = meta.value()?.parse()?;
-                krate = lit.parse()?;
+                parsed.krate = lit.parse()?;
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unknown `#[kladde(...)]` option; supported are `transparent` and `crate`",
+                    "unknown `#[kladde(...)]` option; supported are `transparent`, \
+                     `packed_only` and `crate`",
                 ))
             }
         })?;
     }
-    Ok((transparent, krate))
+    Ok(parsed)
+}
+
+/// The type's own `#[kladde(...)]` options.
+struct TypeAttrs {
+    transparent: bool,
+    /// The type holds a field without a fixed encoding, so it gets no
+    /// `Slottable` impl.
+    packed_only: bool,
+    krate: syn::Path,
+}
+
+/// Whether a field is marked `#[kladde(slotted)]`, the one option a field
+/// takes.
+fn field_slotted(attrs: &[syn::Attribute]) -> syn::Result<bool> {
+    let mut slotted = false;
+    for attr in attrs {
+        if !attr.path().is_ident("kladde") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("slotted") {
+                slotted = true;
+                Ok(())
+            } else {
+                Err(meta
+                    .error("unknown `#[kladde(...)]` option on a field; supported is `slotted`"))
+            }
+        })?;
+    }
+    Ok(slotted)
 }
 
 /// One field of a struct or of an enum variant, as the generated code needs
 /// it.
 struct FieldInfo {
     ty: syn::Type,
-    /// The encoding the field's place holds: `__E`, inherited from the value
-    /// around it.
+    /// Declared `#[kladde(slotted)]`: its place holds the fixed encoding,
+    /// whatever the value around it holds.
+    slotted: bool,
+    /// The encoding the field's place holds: `Slotted` if declared so, and
+    /// otherwise `__E`, inherited from the value around it.
     encoding: Tokens,
     /// The field's name in the schema: its identifier, or its position.
     schema_name: String,
 }
 
 impl FieldInfo {
-    fn of(fields: &Fields) -> Vec<FieldInfo> {
+    fn of(fields: &Fields, krate: &syn::Path) -> syn::Result<Vec<FieldInfo>> {
         let fields: Vec<&syn::Field> = match fields {
             Fields::Named(f) => f.named.iter().collect(),
             Fields::Unnamed(f) => f.unnamed.iter().collect(),
@@ -384,16 +549,48 @@ impl FieldInfo {
         fields
             .iter()
             .enumerate()
-            .map(|(i, f)| FieldInfo {
-                ty: f.ty.clone(),
-                encoding: quote!(__E),
-                schema_name: match &f.ident {
-                    Some(name) => name.to_string(),
-                    None => i.to_string(),
-                },
+            .map(|(i, f)| {
+                let slotted = field_slotted(&f.attrs)?;
+                Ok(FieldInfo {
+                    ty: f.ty.clone(),
+                    slotted,
+                    encoding: if slotted {
+                        quote!(#krate::Slotted)
+                    } else {
+                        quote!(__E)
+                    },
+                    schema_name: match &f.ident {
+                        Some(name) => name.to_string(),
+                        None => i.to_string(),
+                    },
+                })
             })
             .collect()
     }
+
+    /// The reference to the field's descriptor: `Slotted(T)` for a field
+    /// declared slotted, `T`'s own otherwise.
+    fn describe(&self, krate: &syn::Path) -> Tokens {
+        let ty = &self.ty;
+        if self.slotted {
+            quote!(__builder.slotted::<#krate::Pointer, #ty>())
+        } else {
+            let ty = persistable(ty, krate);
+            quote!(#ty::describe(__builder))
+        }
+    }
+}
+
+/// Whether `ty` names any of `params`.
+fn mentions_any(ty: &syn::Type, params: &[syn::Ident]) -> bool {
+    fn walk(tokens: proc_macro2::TokenStream, params: &[syn::Ident]) -> bool {
+        tokens.into_iter().any(|tree| match tree {
+            proc_macro2::TokenTree::Ident(ident) => params.contains(&ident),
+            proc_macro2::TokenTree::Group(group) => walk(group.stream(), params),
+            _ => false,
+        })
+    }
+    !params.is_empty() && walk(quote!(#ty), params)
 }
 
 /// `<ty as Persistable<Pointer>>`, the path every generated call goes
@@ -422,12 +619,24 @@ fn fixed_offsets(fields: &[FieldInfo], base: &Tokens, krate: &syn::Path) -> Vec<
 }
 
 /// The `SLOTTED_SIZE` and `PACKED_SIZE` contributions of fields laid out
-/// back to back: `Option<usize>` constant expressions.
+/// back to back: `Option<usize>` constant expressions. A field declared
+/// slotted takes its slot in either.
 fn field_sizes(fields: &[FieldInfo], krate: &syn::Path) -> (Tokens, Tokens) {
     let paths: Vec<Tokens> = fields.iter().map(|f| persistable(&f.ty, krate)).collect();
+    let packed: Vec<Tokens> = fields
+        .iter()
+        .zip(&paths)
+        .map(|(f, path)| {
+            if f.slotted {
+                quote!(#path::SLOTTED_SIZE)
+            } else {
+                quote!(#path::PACKED_SIZE)
+            }
+        })
+        .collect();
     (
         quote!(#krate::sum_sizes(&[#(#paths::SLOTTED_SIZE),*])),
-        quote!(#krate::sum_sizes(&[#(#paths::PACKED_SIZE),*])),
+        quote!(#krate::sum_sizes(&[#(#packed),*])),
     )
 }
 
@@ -658,6 +867,27 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> Tokens {
         }
     };
 
+    match field_slotted(&field.attrs) {
+        Ok(false) => {}
+        Ok(true) => {
+            return syn::Error::new_spanned(
+                field,
+                "#[kladde(transparent)] persists the field exactly as it is; it cannot be \
+                 declared slotted",
+            )
+            .to_compile_error();
+        }
+        Err(err) => return err.to_compile_error(),
+    }
+    let info = FieldInfo {
+        ty: field.ty.clone(),
+        slotted: false,
+        encoding: quote!(__E),
+        schema_name: String::new(),
+    };
+    let slottable_impl = ctx.slottable_impl(ident, &[&info]);
+    let root_encoding = ctx.root_encoding(&[&info]);
+
     let field_ty = persistable(&field.ty, krate);
     let (member, construct): (syn::Member, Tokens) = match &field.ident {
         Some(name) => (
@@ -694,9 +924,13 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> Tokens {
             }
         }
 
+        #slottable_impl
+
         impl #impl_generics #krate::Persistable<#krate::Pointer> for #ident #type_generics #where_clause {
             const SLOTTED_SIZE: ::std::option::Option<usize> = #field_ty::SLOTTED_SIZE;
             const PACKED_SIZE: ::std::option::Option<usize> = #field_ty::PACKED_SIZE;
+
+            type RootEncoding = #root_encoding;
 
             #guard_assoc
 
@@ -756,7 +990,15 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
         Fields::Unnamed(fields) => fields.unnamed.iter().collect(),
         Fields::Unit => unreachable!(),
     };
-    let fields = FieldInfo::of(&data.fields);
+    let fields = match FieldInfo::of(&data.fields, krate) {
+        Ok(fields) => fields,
+        Err(err) => return err.to_compile_error(),
+    };
+    let field_refs: Vec<&FieldInfo> = fields.iter().collect();
+    let persistable_where = ctx.persistable_where(&field_refs);
+    let slottable_impl = ctx.slottable_impl(ident, &field_refs);
+    let root_encoding = ctx.root_encoding(&field_refs);
+    let field_describe: Vec<Tokens> = fields.iter().map(|f| f.describe(krate)).collect();
     let field_count = fields.len();
     let capacity = field_count + 1;
 
@@ -823,7 +1065,7 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
     // *every* field at once, each borrowing a disjoint part of `self.inner`,
     // so that all fields can be mutated simultaneously.
     let parts_ident = format_ident!("{}Parts", ident);
-    let uses_encoding = fields.iter().any(|f| f.encoding.to_string() == "__E");
+    let uses_encoding = fields.iter().any(|f| !f.slotted);
     let (parts_decl_generics, parts_ret_generics, parts_where) = ctx.parts_generics(uses_encoding);
     let parts_doc = format!("The guards of every field of [`{ident}`] at once.");
     let (parts_struct, parts_ctor) = if is_tuple {
@@ -893,9 +1135,13 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
             }
         }
 
-        impl #impl_generics #krate::Persistable<#krate::Pointer> for #ident #type_generics #where_clause {
+        #slottable_impl
+
+        impl #impl_generics #krate::Persistable<#krate::Pointer> for #ident #type_generics #persistable_where {
             const SLOTTED_SIZE: ::std::option::Option<usize> = #slotted_size;
             const PACKED_SIZE: ::std::option::Option<usize> = #packed_size;
+
+            type RootEncoding = #root_encoding;
 
             #guard_assoc
 
@@ -937,7 +1183,7 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
                         #(
                             #krate::Field {
                                 name: ::std::string::ToString::to_string(#schema_name),
-                                ty: #ty::describe(__builder),
+                                ty: #field_describe,
                             },
                         )*
                     ],
@@ -971,6 +1217,7 @@ fn derive_unit_like_struct(
         encode_sig(krate),
         decode_sig(krate),
     );
+    let slottable_impl = ctx.slottable_impl(ident, &[]);
 
     quote! {
         #scaffold
@@ -979,9 +1226,13 @@ fn derive_unit_like_struct(
             #set
         }
 
+        #slottable_impl
+
         impl #impl_generics #krate::Persistable<#krate::Pointer> for #ident #type_generics #where_clause {
             const SLOTTED_SIZE: ::std::option::Option<usize> = ::std::option::Option::Some(0);
             const PACKED_SIZE: ::std::option::Option<usize> = ::std::option::Option::Some(0);
+
+            type RootEncoding = #krate::Slotted;
 
             #guard_assoc
 
@@ -1035,9 +1286,13 @@ enum VariantKind {
 }
 
 impl VariantInfo {
-    fn of(enum_ident: &syn::Ident, variant: &syn::Variant) -> VariantInfo {
+    fn of(
+        enum_ident: &syn::Ident,
+        variant: &syn::Variant,
+        krate: &syn::Path,
+    ) -> syn::Result<VariantInfo> {
         let v_ident = &variant.ident;
-        let fields = FieldInfo::of(&variant.fields);
+        let fields = FieldInfo::of(&variant.fields, krate)?;
         let (bindings, pattern, kind) = match &variant.fields {
             Fields::Named(f) => {
                 let names: Vec<syn::Ident> =
@@ -1062,13 +1317,13 @@ impl VariantInfo {
                 VariantKind::Unit,
             ),
         };
-        VariantInfo {
+        Ok(VariantInfo {
             ident: v_ident.clone(),
             fields,
             bindings,
             pattern,
             kind,
-        }
+        })
     }
 
     /// `Enum::Variant` built from one expression per field.
@@ -1120,11 +1375,19 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
         Err(err) => return err.to_compile_error(),
     };
 
-    let variants: Vec<VariantInfo> = data
+    let variants: Vec<VariantInfo> = match data
         .variants
         .iter()
-        .map(|v| VariantInfo::of(ident, v))
-        .collect();
+        .map(|v| VariantInfo::of(ident, v, krate))
+        .collect()
+    {
+        Ok(variants) => variants,
+        Err(err) => return err.to_compile_error(),
+    };
+    let all_fields: Vec<&FieldInfo> = variants.iter().flat_map(|v| &v.fields).collect();
+    let persistable_where = ctx.persistable_where(&all_fields);
+    let slottable_impl = ctx.slottable_impl(ident, &all_fields);
+    let root_encoding = ctx.root_encoding(&all_fields);
     let variant_count = variants.len();
     let capacity = variants.iter().map(|v| v.fields.len()).max().unwrap_or(0) + 1;
     let has_fields = capacity > 1;
@@ -1262,6 +1525,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
             }
         });
         let field_name: Vec<&String> = fields.iter().map(|f| &f.schema_name).collect();
+        let field_describe: Vec<Tokens> = fields.iter().map(|f| f.describe(krate)).collect();
         describe_variants.push(quote! {
             #krate::Variant {
                 discriminant: #discriminants[#i],
@@ -1270,7 +1534,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
                     #(
                         #krate::Field {
                             name: ::std::string::ToString::to_string(#field_name),
-                            ty: #ty::describe(__builder),
+                            ty: #field_describe,
                         },
                     )*
                 ],
@@ -1339,10 +1603,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
     // is alive. An enum without any fields gets neither: there is nothing to
     // mutate in place, and the `Parts` enum would not use its parameters.
     let parts = has_fields.then(|| {
-        let uses_encoding = variants
-            .iter()
-            .flat_map(|v| &v.fields)
-            .any(|f| f.encoding.to_string() == "__E");
+        let uses_encoding = variants.iter().flat_map(|v| &v.fields).any(|f| !f.slotted);
         let (parts_decl_generics, parts_ret_generics, parts_where) =
             ctx.parts_generics(uses_encoding);
         let parts_doc = format!(
@@ -1439,11 +1700,15 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
             const __KLADDE_DISCRIMINANT_WIDTH: usize = #width_expr;
         }
 
-        impl #impl_generics #krate::Persistable<#krate::Pointer> for #ident #type_generics #where_clause {
+        #slottable_impl
+
+        impl #impl_generics #krate::Persistable<#krate::Pointer> for #ident #type_generics #persistable_where {
             const SLOTTED_SIZE: ::std::option::Option<usize> =
                 #krate::enum_slotted_size(#disc_width, &[#(#slotted_sizes),*]);
             const PACKED_SIZE: ::std::option::Option<usize> =
                 #krate::enum_packed_size(&#discriminants, &[#(#packed_sizes),*]);
+
+            type RootEncoding = #root_encoding;
 
             #guard_assoc
 

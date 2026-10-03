@@ -32,8 +32,10 @@
 #[cfg(feature = "serde")]
 mod blob;
 mod map;
+mod offsets;
 mod packed;
 mod slot;
+mod small;
 mod string;
 mod vec;
 
@@ -44,11 +46,16 @@ mod test_support;
 pub use blob::{PersistableBlob, PersistableBlobGuard};
 pub use map::{PersistableHashMap, PersistableHashMapGuard};
 pub use packed::{PackedPersistableVec, PackedPersistableVecGuard};
+pub use small::{
+    SmallPersistableString, SmallPersistableStringGuard, SmallPersistableVec,
+    SmallPersistableVecGuard, FOLD_BELOW, SPILL_ABOVE,
+};
 pub use string::{PersistableString, PersistableStringGuard};
 pub use vec::{PersistableVec, PersistableVecGuard};
 
-/// This crate's own version, the `Opaque` descriptor version of every
-/// built-in container.
+/// This crate's own version, the `Opaque` descriptor version of the blob, the
+/// one container that does not describe its structure.
+#[cfg(feature = "serde")]
 pub(crate) fn library_version() -> kladde_persist::Version {
     kladde_persist::Version {
         major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),

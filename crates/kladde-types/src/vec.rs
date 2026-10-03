@@ -12,7 +12,8 @@
 
 use kladde_persist::{
     read_allocation, replace, slot_size, Encoding, Error, Guard, Input, Location, Persistable,
-    Place, Pointer, PointerRepr, ReadBackend, Slotted, UniquePointer, WriteBackend,
+    Place, Pointer, PointerRepr, ReadBackend, Slottable, Slotted, TypeDescriptor, UniquePointer,
+    WriteBackend,
 };
 use std::ops::Deref;
 
@@ -24,9 +25,18 @@ use crate::slot::{decode_pointer, encode_pointer, pointer_size, publish_pointer,
 /// `len`, indexing, `iter`, `first`, ... -- works on the in-memory copy at the
 /// cost of a plain memory access. Mutation goes through a
 /// [`PersistableVecGuard`], which records each change and then applies it.
-/// `T` needs only [`Persistable`]: no `Clone`, no `Serialize`. The elements
-/// are slotted, each taking its type's fixed encoding; a
-/// [`PackedPersistableVec`](crate::PackedPersistableVec) packs them instead.
+/// `T` needs only [`Slottable`]: no `Clone`, no `Serialize`. The elements are
+/// slotted, each taking its type's fixed encoding, which is why `T` must have
+/// one; a [`PackedPersistableVec`](crate::PackedPersistableVec) packs them
+/// instead, and holds any `T`.
+///
+/// ```compile_fail
+/// use kladde_types::{PersistableVec, SmallPersistableString};
+///
+/// // error[E0277]: `SmallPersistableString` has no fixed encoding, so it cannot stand in a slotted place
+/// let names = PersistableVec::<SmallPersistableString>::new();
+/// # let _ = kladde::Kladde::new(names);
+/// ```
 ///
 /// ```
 /// use kladde::Kladde;
@@ -159,10 +169,15 @@ impl<'a, T, P> IntoIterator for &'a PersistableVec<T, P> {
     }
 }
 
-impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for PersistableVec<T, P> {
+impl<T: Slottable<P>, P: PointerRepr> Slottable<P> for PersistableVec<T, P> {}
+
+impl<T: Slottable<P>, P: PointerRepr> Persistable<P> for PersistableVec<T, P> {
     /// Just the content allocation's pointer: the length lives with the store.
     const SLOTTED_SIZE: Option<usize> = Some(P::BYTE_LEN);
-    const PACKED_SIZE: Option<usize> = Some(P::BYTE_LEN);
+    /// None: packed, the pointer is a varint.
+    const PACKED_SIZE: Option<usize> = None;
+
+    type RootEncoding = Slotted;
 
     type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
         = PersistableVecGuard<'s, T, B, E>
@@ -249,17 +264,13 @@ impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for PersistableVec<T, P> 
         Ok(())
     }
 
-    fn describe_local(builder: &mut kladde_persist::SchemaBuilder) -> kladde_persist::TypeDescriptor
+    /// `Pointer(Sequence(T))`: an allocation of `T`s in their fixed
+    /// encodings.
+    fn describe_local(builder: &mut kladde_persist::SchemaBuilder) -> TypeDescriptor
     where
         Self: 'static,
     {
-        kladde_persist::TypeDescriptor::Opaque {
-            library_name: "kladde-types".into(),
-            type_name: "PersistableVec".into(),
-            version: crate::library_version(),
-            inline_size: P::BYTE_LEN as u64,
-            parameters: vec![<T as Persistable<P>>::describe(builder)],
-        }
+        TypeDescriptor::Pointer(builder.sequence::<P, T>())
     }
 }
 
@@ -292,9 +303,7 @@ pub struct PersistableVecGuard<'s, T, B: WriteBackend, E: Encoding = Slotted> {
     place: Place<'s, B, E>,
 }
 
-impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
-    PersistableVecGuard<'s, T, B, E>
-{
+impl<'s, T: Slottable<B::Pointer>, B: WriteBackend, E: Encoding> PersistableVecGuard<'s, T, B, E> {
     /// The guard of element `index`, or `None` if there is none.
     ///
     /// ```

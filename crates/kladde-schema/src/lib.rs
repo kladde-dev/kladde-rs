@@ -12,18 +12,21 @@
 //! - [`TypeDescriptor`] / [`TypeTable`] model a type graph (§2).
 //! - [`TypeTable::encode`] / [`TypeTable::decode`] are the canonical
 //!   serialization (§3).
+//! - [`TypeTable::validate`] checks the rules of nesting: where sequences,
+//!   `Packed` wrappers and types without a fixed encoding may stand.
 //!
 //! The connection to real Rust types (turning a `Persistable` type into a
 //! `TypeTable`) lives in `kladde-traits`, not here.
 
 mod descriptor;
 mod fingerprint;
+mod nesting;
 mod serialize;
 mod sha256;
 
 pub use descriptor::{
     Field, Primitive, TypeDescriptor, TypeRef, TypeTable, Variant, Version, TAG_ARRAY, TAG_ENUM,
-    TAG_OPAQUE, TAG_POINTER, TAG_STRUCT,
+    TAG_OPAQUE, TAG_PACKED, TAG_POINTER, TAG_SEQUENCE, TAG_SLOTTED, TAG_SMALL, TAG_STRUCT,
 };
 pub use fingerprint::Fingerprint;
 pub use serialize::DecodeError;

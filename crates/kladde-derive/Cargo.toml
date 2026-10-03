@@ -16,7 +16,9 @@ proc-macro2 = { workspace = true }
 [dev-dependencies]
 # The tests exercise the default path, where generated code names `::kladde`.
 # `kladde-persist` stays for the `#[kladde(crate = "...")]` escape hatch, and
-# `kladde-store` provides the store the tests run against.
+# `kladde-store` provides the store the tests run against, and `kladde-types`
+# the small string the documentation's packed-only examples hold.
 kladde = { workspace = true }
 kladde-persist = { workspace = true }
 kladde-store = { workspace = true }
+kladde-types = { workspace = true }

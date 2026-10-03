@@ -5,7 +5,8 @@
 
 use crate::descriptor::{
     canonical_variants, Field, Primitive, TypeDescriptor, TypeRef, TypeTable, Variant, Version,
-    TAG_ARRAY, TAG_ENUM, TAG_OPAQUE, TAG_POINTER, TAG_STRUCT,
+    TAG_ARRAY, TAG_ENUM, TAG_OPAQUE, TAG_PACKED, TAG_POINTER, TAG_SEQUENCE, TAG_SLOTTED, TAG_SMALL,
+    TAG_STRUCT,
 };
 
 /// Why a byte string could not be decoded into a [`TypeTable`].
@@ -16,7 +17,7 @@ pub enum DecodeError {
     /// A string field was not valid UTF-8.
     InvalidUtf8,
     /// A kind-tag byte names a kind this revision reserves but does not yet
-    /// implement (Array or Pointer).
+    /// implement (Array).
     ReservedKind(u8),
     /// A kind-tag byte names no known kind.
     UnknownKind(u8),
@@ -31,6 +32,11 @@ pub enum DecodeError {
     Empty,
     /// Bytes remained after the last descriptor.
     TrailingBytes,
+    /// Descriptor `index` stands where the rules of nesting forbid it: a
+    /// sequence or a `Packed` wrapper away from a pointer or a small value, a
+    /// type without a fixed encoding in a slotted place, or a type that
+    /// contains itself inline.
+    InvalidNesting { index: usize, reason: &'static str },
 }
 
 impl std::fmt::Display for DecodeError {
@@ -51,6 +57,9 @@ impl std::fmt::Display for DecodeError {
             }
             DecodeError::Empty => f.write_str("schema has no descriptors"),
             DecodeError::TrailingBytes => f.write_str("trailing bytes after schema"),
+            DecodeError::InvalidNesting { index, reason } => {
+                write!(f, "descriptor {index}: {reason}")
+            }
         }
     }
 }
@@ -105,7 +114,9 @@ impl TypeTable {
                 }
             }
         }
-        Ok(TypeTable::new(descriptors))
+        let table = TypeTable::new(descriptors);
+        table.validate()?;
+        Ok(table)
     }
 }
 
@@ -169,6 +180,16 @@ fn encode_descriptor(descriptor: &TypeDescriptor, out: &mut Vec<u8>) {
             kladde_varint::encode(parameters.len() as u64, out);
             for parameter in parameters {
                 encode_reference(*parameter, out);
+            }
+        }
+        TypeDescriptor::Pointer(_)
+        | TypeDescriptor::Sequence(_)
+        | TypeDescriptor::Packed(_)
+        | TypeDescriptor::Slotted(_)
+        | TypeDescriptor::Small { .. } => {
+            out.push(descriptor.wrapper_tag().expect("a wrapper kind"));
+            for reference in descriptor.references() {
+                encode_reference(reference, out);
             }
         }
     }
@@ -279,7 +300,15 @@ fn decode_descriptor(reader: &mut Reader) -> Result<TypeDescriptor, DecodeError>
                 parameters,
             })
         }
-        TAG_ARRAY | TAG_POINTER => Err(DecodeError::ReservedKind(tag)),
+        TAG_POINTER => Ok(TypeDescriptor::Pointer(reader.reference()?)),
+        TAG_SEQUENCE => Ok(TypeDescriptor::Sequence(reader.reference()?)),
+        TAG_PACKED => Ok(TypeDescriptor::Packed(reader.reference()?)),
+        TAG_SLOTTED => Ok(TypeDescriptor::Slotted(reader.reference()?)),
+        TAG_SMALL => Ok(TypeDescriptor::Small {
+            content: reader.reference()?,
+            spilled: reader.reference()?,
+        }),
+        TAG_ARRAY => Err(DecodeError::ReservedKind(tag)),
         other => Err(DecodeError::UnknownKind(other)),
     }
 }
@@ -354,6 +383,45 @@ mod tests {
             },
         ]);
         let bytes = table.encode();
+        assert_eq!(TypeTable::decode(&bytes).unwrap(), table);
+    }
+
+    #[test]
+    fn round_trips_the_structural_kinds() {
+        // A struct holding a small string and a slotted count:
+        // `Small(Sequence(char), Pointer(Packed(Sequence(char))))`.
+        let table = TypeTable::new(vec![
+            TypeDescriptor::Struct {
+                name: "Named".into(),
+                fields: vec![
+                    Field {
+                        name: "name".into(),
+                        ty: TypeRef(1),
+                    },
+                    Field {
+                        name: "count".into(),
+                        ty: TypeRef(6),
+                    },
+                ],
+            },
+            TypeDescriptor::Small {
+                content: TypeRef(2),
+                spilled: TypeRef(4),
+            },
+            TypeDescriptor::Sequence(TypeRef(3)),
+            TypeDescriptor::Primitive(Primitive::Char),
+            TypeDescriptor::Pointer(TypeRef(5)),
+            TypeDescriptor::Packed(TypeRef(2)),
+            TypeDescriptor::Slotted(TypeRef(7)),
+            TypeDescriptor::Primitive(Primitive::U32),
+        ]);
+        let bytes = table.encode();
+        // Small, Sequence, char, Pointer, Packed, Slotted, u32: each a tag
+        // and its references.
+        assert_eq!(
+            &bytes[bytes.len() - 13..],
+            [136, 2, 4, 133, 3, 11, 132, 5, 134, 2, 135, 7, 2]
+        );
         assert_eq!(TypeTable::decode(&bytes).unwrap(), table);
     }
 
