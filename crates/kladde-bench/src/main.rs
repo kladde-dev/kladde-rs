@@ -13,55 +13,16 @@
 //! `tuning`, which runs three of them with variants of the default options,
 //! and `quick`, which makes whatever runs small. Without a scenario, all run.
 
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use kladde_bench::{row, save, Rng};
 use kladde_store::{FileStorage, Options, Pointer, Stats, Store, UniquePointer, WriteBackend};
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
 /// Operations between two explicit flushes.
 const OPS_PER_FLUSH: u64 = 1000;
-
-/// xorshift64: deterministic, and good enough for workloads.
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Rng {
-        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-    }
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n.max(1)
-    }
-    fn range(&mut self, lo: u64, hi: u64) -> u64 {
-        lo + self.below(hi - lo + 1)
-    }
-    fn chance(&mut self, p: f64) -> bool {
-        (self.next() >> 11) as f64 / (1u64 << 53) as f64 <= p
-    }
-    fn bytes(&mut self, len: usize) -> Vec<u8> {
-        let seed = self.next();
-        (0..len)
-            .map(|i| (seed.wrapping_add(i as u64 * 0x9E37) >> 7) as u8)
-            .collect()
-    }
-}
-
-/// The header of every scenario's table.
-const COLUMNS: &str =
-    "scenario,variant,size,flush,ops,app_bytes,file_pages,data_pages,table_pages,\
-free_pages,live_data,live_table,alloc_bytes,allocations,statements,fragments,budget,\
-data_written,table_written,headers_written,journal_bytes,fresh_bytes,evacuated_pages,\
-evacuated_bytes,free_filled,budget_pages,table_rewrites,window_restated,defrag_rewrites,\
-defrag_bytes,compaction_flushes,truncations,flush_us,ops_us";
 
 /// One scenario run: a store on a file, the workload's counters, and the rows
 /// recorded so far.
@@ -143,41 +104,15 @@ impl Run {
         let flush_us = t.elapsed().as_micros();
         self.flushes += 1;
         let s = self.store.stats();
-        let b = &self.base;
-        self.rows.push(format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        self.rows.push(row(
             self.scenario,
-            self.variant,
+            &self.variant,
             self.size,
             self.flushes,
             self.ops,
             self.app_bytes,
-            s.file_pages,
-            s.data_pages,
-            s.table_pages,
-            s.free_pages,
-            s.live_data_bytes,
-            s.live_table_bytes,
-            s.allocation_bytes,
-            s.allocations,
-            s.statements,
-            s.fragments,
-            s.budget,
-            s.data_pages_written - b.data_pages_written,
-            s.table_pages_written - b.table_pages_written,
-            s.headers_written - b.headers_written,
-            s.journal_bytes - b.journal_bytes,
-            s.fresh_bytes - b.fresh_bytes,
-            s.evacuated_pages - b.evacuated_pages,
-            s.evacuated_bytes - b.evacuated_bytes,
-            s.free_filled_pages - b.free_filled_pages,
-            s.budget_pages - b.budget_pages,
-            s.table_rewrites - b.table_rewrites,
-            s.window_restated - b.window_restated,
-            s.defrag_rewrites - b.defrag_rewrites,
-            s.defrag_bytes - b.defrag_bytes,
-            s.compaction_flushes - b.compaction_flushes,
-            s.truncations - b.truncations,
+            &s,
+            &self.base,
             flush_us,
             ops_us,
         ));
@@ -480,34 +415,8 @@ fn typed(dir: &Path, size: u64) -> Vec<String> {
             let flush_us = f.elapsed().as_micros();
             flushes += 1;
             let s = book.stats();
-            rows.push(format!(
-                "typed,on,{size},{flushes},{ops},{app_bytes},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{flush_us},{ops_us}",
-                s.file_pages,
-                s.data_pages,
-                s.table_pages,
-                s.free_pages,
-                s.live_data_bytes,
-                s.live_table_bytes,
-                s.allocation_bytes,
-                s.allocations,
-                s.statements,
-                s.fragments,
-                s.budget,
-                s.data_pages_written - base.data_pages_written,
-                s.table_pages_written - base.table_pages_written,
-                s.headers_written - base.headers_written,
-                s.journal_bytes - base.journal_bytes,
-                s.fresh_bytes - base.fresh_bytes,
-                s.evacuated_pages - base.evacuated_pages,
-                s.evacuated_bytes - base.evacuated_bytes,
-                s.free_filled_pages - base.free_filled_pages,
-                s.budget_pages - base.budget_pages,
-                s.table_rewrites - base.table_rewrites,
-                s.window_restated - base.window_restated,
-                s.defrag_rewrites - base.defrag_rewrites,
-                s.defrag_bytes - base.defrag_bytes,
-                s.compaction_flushes - base.compaction_flushes,
-                s.truncations - base.truncations,
+            rows.push(row(
+                "typed", "on", size, flushes, ops, app_bytes, &s, &base, flush_us, ops_us,
             ));
             t = Instant::now();
         }
@@ -525,20 +434,6 @@ fn typed(dir: &Path, size: u64) -> Vec<String> {
     drop(book);
     std::fs::remove_file(&path).ok();
     rows
-}
-
-/// Writes `rows` to `<name>.csv`, and reports how long they took since `t`.
-fn save(out: &Path, name: &str, rows: &[String], t: Instant) {
-    let mut f = BufWriter::new(File::create(out.join(format!("{name}.csv"))).expect("create csv"));
-    writeln!(f, "{COLUMNS}").unwrap();
-    for r in rows {
-        writeln!(f, "{r}").unwrap();
-    }
-    eprintln!(
-        "{name}: {} rows in {:.1} s",
-        rows.len(),
-        t.elapsed().as_secs_f64()
-    );
 }
 
 /// Variants of the default options, one table per workload so that its
