@@ -11,8 +11,10 @@ use kladde_persist::{Packed, Persistable, PointerRepr};
 ///
 /// The entries are cells, so that the node an element's guard reports to can
 /// shift them through a shared reference while the element itself is
-/// borrowed mutably.
-pub(crate) struct Offsets(Vec<Cell<usize>>);
+/// borrowed mutably. They are `u32`s, since no allocation is larger than
+/// that, and a sequence fills one at most: four bytes per element is what
+/// keeping a packed vector costs in memory beyond its elements.
+pub(crate) struct Offsets(Vec<Cell<u32>>);
 
 impl Offsets {
     /// Not laid out yet.
@@ -22,14 +24,10 @@ impl Offsets {
 
     /// The offsets of `items` laid out packed, back to back.
     pub(crate) fn of<T: Persistable<P>, P: PointerRepr>(items: &[T]) -> Self {
-        let mut offsets = Vec::with_capacity(items.len() + 1);
-        let mut at = 0;
-        offsets.push(Cell::new(at));
-        for item in items {
-            at += item.encoded_size::<Packed>();
-            offsets.push(Cell::new(at));
-        }
-        Offsets(offsets)
+        items
+            .iter()
+            .map(|item| item.encoded_size::<Packed>())
+            .collect()
     }
 
     /// Whether the sequence has been laid out.
@@ -39,7 +37,7 @@ impl Offsets {
 
     /// Where element `index` starts; `index == len` is where the last ends.
     pub(crate) fn offset(&self, index: usize) -> usize {
-        self.0[index].get()
+        self.0[index].get() as usize
     }
 
     /// How many bytes element `index` takes.
@@ -49,7 +47,7 @@ impl Offsets {
 
     /// The sequence's size.
     pub(crate) fn end(&self) -> usize {
-        self.0.last().map_or(0, Cell::get)
+        self.0.last().map_or(0, |cell| cell.get() as usize)
     }
 
     /// Records an element of `len` bytes inserted at `index`.
@@ -57,7 +55,7 @@ impl Offsets {
         if self.0.is_empty() {
             self.0.push(Cell::new(0));
         }
-        let at = self.offset(index);
+        let at = self.0[index].get();
         self.0.insert(index, Cell::new(at));
         self.shift(index + 1, len as isize);
     }
@@ -72,7 +70,7 @@ impl Offsets {
     /// Moves every offset from entry `from` on by `delta` bytes.
     pub(crate) fn shift(&self, from: usize, delta: isize) {
         for cell in &self.0[from..] {
-            cell.set(cell.get().wrapping_add_signed(delta));
+            cell.set((cell.get() as isize + delta) as u32);
         }
     }
 
@@ -85,12 +83,15 @@ impl Offsets {
 impl FromIterator<usize> for Offsets {
     /// Offsets from the elements' sizes, in order.
     fn from_iter<I: IntoIterator<Item = usize>>(sizes: I) -> Self {
-        let mut at = 0;
-        let mut offsets = vec![Cell::new(0)];
+        let sizes = sizes.into_iter();
+        let mut offsets = Vec::with_capacity(sizes.size_hint().0 + 1);
+        let mut at = 0u32;
+        offsets.push(Cell::new(at));
         for size in sizes {
-            at += size;
+            at += size as u32;
             offsets.push(Cell::new(at));
         }
+        offsets.shrink_to_fit();
         Offsets(offsets)
     }
 }

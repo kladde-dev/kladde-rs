@@ -356,6 +356,8 @@ where
         data.push(T::decode::<B, Packed>(backend, content)?);
         sizes.push(content.position() - start);
     }
+    // The count is known only at the end, so the vector grew by doubling.
+    data.shrink_to_fit();
     Ok((data, sizes.into_iter().collect()))
 }
 
