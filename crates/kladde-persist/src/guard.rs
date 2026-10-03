@@ -25,13 +25,13 @@ use kladde_store::WriteBackend;
 /// `Guard<Persistable = Self, Backend = B>` constraint.
 ///
 /// ```
-/// use kladde_persist::{Guard, Location, Persistable};
+/// use kladde_persist::{Guard, Location, Persistable, Slotted};
 /// use kladde_store::{MemoryStorage, Store, WriteBackend};
 ///
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
 /// let p = store.alloc(1)?;
 /// let mut flag = false;
-/// let mut guard = flag.guard(&store, Location::new(p.raw(), 0));
+/// let mut guard = flag.guard(&store, Slotted::at(Location::new(p.raw(), 0)));
 /// guard.set(true)?;
 /// assert!(*guard.as_persistable());
 /// # Ok::<(), kladde_store::Error>(())

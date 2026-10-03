@@ -43,10 +43,12 @@ pub use kladde_derive::Persistable;
 // who hand-writes an impl finds the same items here, so there is never a second
 // dependency, and never two incompatible copies of the same trait.
 pub use kladde_persist::{
-    decode_option, decode_option_slice, encode_option, replace, Backend, BoolGuard, CharGuard,
-    Error, F32Guard, F64Guard, Guard, I16Guard, I32Guard, I64Guard, I8Guard, Location, Persistable,
-    Pointer, PointerRepr, ReadBackend, Result, SchemaBuilder, TupleGuard, U16Guard, U32Guard,
-    U64Guard, U8Guard, UniquePointer, Word, WriteBackend,
+    decode_option, decode_option_slice, encode_option, enum_packed_size, enum_slotted_size,
+    read_allocation, replace, slot_size, splice_at, sum_sizes, varint_len, write_encoded,
+    write_varint, Backend, BoolGuard, CharGuard, Encoding, Error, F32Guard, F64Guard, FieldOffsets,
+    Guard, I16Guard, I32Guard, I64Guard, I8Guard, Input, Link, Location, Node, Packed, Persistable,
+    Place, Pointer, PointerRepr, ReadBackend, Result, SchemaBuilder, Slotted, TupleGuard, U16Guard,
+    U32Guard, U64Guard, U8Guard, UniquePointer, Word, WriteBackend,
 };
 
 // The schema and fingerprint surface, so an application can inspect its root
@@ -58,6 +60,22 @@ pub use kladde_persist::{
 // The storage layer's application-facing items: the backend guards run
 // against, how it is tuned, what it reports, and where its bytes live.
 pub use kladde_store::{FileStorage, MemoryStorage, Options, Stats, Storage, Store};
+
+/// The guard of a root value of type `T`, as [`Kladde::guard`] hands it out.
+///
+/// ```
+/// use kladde::{Kladde, RootGuard};
+///
+/// fn bump(mut guard: RootGuard<'_, u32>) -> kladde::Result<()> {
+///     let next = *guard + 1;
+///     guard.set(next)
+/// }
+/// let mut k = Kladde::new(1u32);
+/// bump(k.guard())?;
+/// assert_eq!(*k.get(), 2);
+/// # Ok::<(), kladde::Error>(())
+/// ```
+pub type RootGuard<'a, T> = <T as Persistable>::Guard<'a, Store, Slotted>;
 
 /// A root [`Persistable`] value paired with the file that backs it.
 ///
@@ -129,10 +147,10 @@ impl<T: Persistable + 'static> Kladde<T> {
         let table = T::schema().encode();
         let fingerprint = *T::fingerprint().as_bytes();
         let root_pointer = store.atomically(|| {
-            let pointer = store.alloc(size(T::INLINE_SIZE)?)?;
+            let pointer = store.alloc(size(slot_size::<T, Pointer>())?)?;
             let schema = store.alloc(size(table.len())?)?;
             store.write(schema.raw(), 0, &table)?;
-            root.store(&store, Location::new(pointer.raw(), 0))?;
+            root.store::<_, Slotted>(&store, Location::new(pointer.raw(), 0))?;
             store.set_roots(pointer.raw(), schema.raw(), fingerprint);
             Ok(pointer.raw())
         })?;
@@ -181,7 +199,7 @@ impl<T: Persistable + 'static> Kladde<T> {
         if found != expected {
             return Err(Error::SchemaMismatch { expected, found });
         }
-        let root = T::load(&mut store, Location::new(root_pointer, 0))?;
+        let root = T::load::<_, Slotted>(&mut store, Location::new(root_pointer, 0))?;
         store.end_load();
         Ok(Kladde {
             store,
@@ -219,9 +237,11 @@ impl<T: Persistable + 'static> Kladde<T> {
     /// assert_eq!(*k.get(), (4, true));
     /// # Ok::<(), kladde::Error>(())
     /// ```
-    pub fn guard(&mut self) -> <T as Persistable>::Guard<'_, Store> {
-        self.root
-            .guard(&self.store, Location::new(self.root_pointer, 0))
+    pub fn guard(&mut self) -> RootGuard<'_, T> {
+        self.root.guard(
+            &self.store,
+            Slotted::at(Location::new(self.root_pointer, 0)),
+        )
     }
 
     /// Folds the journal into the file now, which also makes every mutation
@@ -364,7 +384,7 @@ pub struct Transaction<'k, T: Persistable + 'static> {
 impl<T: Persistable + 'static> Transaction<'_, T> {
     /// The root value's guard; mutations through it belong to the
     /// transaction. See [`Kladde::transaction`] for an example.
-    pub fn guard(&mut self) -> <T as Persistable>::Guard<'_, Store> {
+    pub fn guard(&mut self) -> RootGuard<'_, T> {
         self.kladde.guard()
     }
 
@@ -419,7 +439,7 @@ pub struct Batch<'k, T: Persistable + 'static> {
 impl<T: Persistable + 'static> Batch<'_, T> {
     /// The root value's guard; mutations through it belong to the batch. See
     /// [`Kladde::batch`] for an example.
-    pub fn guard(&mut self) -> <T as Persistable>::Guard<'_, Store> {
+    pub fn guard(&mut self) -> RootGuard<'_, T> {
         self.kladde.guard()
     }
 
@@ -481,48 +501,45 @@ mod tests {
     // Deliberately through the facade, exactly as an application writes it:
     // if a name an impl needs stops being re-exported, this stops building.
     use super::*;
-    use std::io::Read;
 
+    /// A `u32` that keeps its four bytes in a packed place too.
     struct Counter(u32);
 
     impl<P: PointerRepr> Persistable<P> for Counter {
-        const INLINE_SIZE: usize = 4;
+        const SLOTTED_SIZE: Option<usize> = Some(4);
+        const PACKED_SIZE: Option<usize> = Some(4);
 
-        type Guard<'s, B: WriteBackend<Pointer = P>>
-            = CounterGuard<'s, B>
+        type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
+            = CounterGuard<'s, B, E>
         where
             Self: 's,
             B: 's;
 
-        fn guard<'s, B: WriteBackend<Pointer = P>>(
+        fn guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>(
             &'s mut self,
             backend: &'s B,
-            location: Location<P, B::Size>,
-        ) -> Self::Guard<'s, B> {
+            place: Place<'s, B, E>,
+        ) -> Self::Guard<'s, B, E> {
             CounterGuard {
                 inner: self,
                 backend,
-                location,
+                place,
             }
         }
 
-        fn store<B: WriteBackend<Pointer = P>>(
-            &mut self,
-            backend: &B,
-            location: Location<P, B::Size>,
-        ) -> Result<()> {
-            backend.write(location.anchor, location.offset, &self.0.to_le_bytes())
+        fn encoded_size<E: Encoding>(&self) -> usize {
+            4
         }
 
-        fn load<B: ReadBackend<Pointer = P>>(
-            backend: &mut B,
-            location: Location<P, B::Size>,
+        fn encode<E: Encoding>(&self, out: &mut Vec<u8>) {
+            out.extend_from_slice(&self.0.to_le_bytes());
+        }
+
+        fn decode<B: ReadBackend<Pointer = P>, E: Encoding>(
+            _backend: &mut B,
+            input: &mut Input<'_>,
         ) -> Result<Self> {
-            let mut bytes = [0u8; 4];
-            backend
-                .read_at(location.anchor, location.offset)?
-                .read_exact(&mut bytes)?;
-            Ok(Counter(u32::from_le_bytes(bytes)))
+            Ok(Counter(u32::from_le_bytes(input.array()?)))
         }
 
         fn describe_local(_builder: &mut SchemaBuilder) -> TypeDescriptor {
@@ -530,25 +547,23 @@ mod tests {
         }
     }
 
-    struct CounterGuard<'s, B: WriteBackend> {
+    struct CounterGuard<'s, B: WriteBackend, E: Encoding> {
         inner: &'s mut Counter,
         backend: &'s B,
-        location: Location<B::Pointer, B::Size>,
+        place: Place<'s, B, E>,
     }
 
-    impl<'s, B: WriteBackend> CounterGuard<'s, B> {
+    impl<'s, B: WriteBackend, E: Encoding> CounterGuard<'s, B, E> {
         fn set(&mut self, value: u32) -> Result<()> {
-            self.backend.write(
-                self.location.anchor,
-                self.location.offset,
-                &value.to_le_bytes(),
-            )?;
+            let at = self.place.location();
+            self.backend
+                .write(at.anchor, at.offset, &value.to_le_bytes())?;
             self.inner.0 = value;
             Ok(())
         }
     }
 
-    impl<'s, B: WriteBackend> Guard for CounterGuard<'s, B> {
+    impl<'s, B: WriteBackend, E: Encoding> Guard for CounterGuard<'s, B, E> {
         type Persistable = Counter;
         type Backend = B;
 

@@ -1,8 +1,8 @@
 //! [`PersistableVec`] -- the backed variant of `Vec<T>`.
 //!
-//! Layout: the content allocation's pointer inline (all-zero while there is
+//! Layout: the content allocation's pointer inline (null while there is
 //! none), and the content allocation holding the elements back to back in
-//! fixed-size slots, element `i` at `i · T::INLINE_SIZE`.
+//! their fixed encodings, element `i` at `i · T`'s slot size.
 //!
 //! **The length is not stored.** It is the content allocation's size divided
 //! by the element size, since the store knows every allocation's size. That
@@ -11,12 +11,12 @@
 //! unrepresentable, and `PersistableVec` refuses one.
 
 use kladde_persist::{
-    replace, Error, Guard, Location, Persistable, Pointer, PointerRepr, ReadBackend, UniquePointer,
-    Word, WriteBackend,
+    read_allocation, replace, slot_size, Encoding, Error, Guard, Input, Location, Persistable,
+    Place, Pointer, PointerRepr, ReadBackend, Slotted, UniquePointer, WriteBackend,
 };
 use std::ops::Deref;
 
-use crate::slot::{read_slot, size, write_slot};
+use crate::slot::{decode_pointer, encode_pointer, pointer_size, publish_pointer, size};
 
 /// A growable array whose contents are persisted.
 ///
@@ -24,7 +24,9 @@ use crate::slot::{read_slot, size, write_slot};
 /// `len`, indexing, `iter`, `first`, ... -- works on the in-memory copy at the
 /// cost of a plain memory access. Mutation goes through a
 /// [`PersistableVecGuard`], which records each change and then applies it.
-/// `T` needs only [`Persistable`]: no `Clone`, no `Serialize`.
+/// `T` needs only [`Persistable`]: no `Clone`, no `Serialize`. The elements
+/// are slotted, each taking its type's fixed encoding; a
+/// [`PackedPersistableVec`](crate::PackedPersistableVec) packs them instead.
 ///
 /// ```
 /// use kladde::Kladde;
@@ -49,7 +51,7 @@ pub struct PersistableVec<T, P = Pointer> {
 /// layout could not recover.
 #[inline]
 fn stride<T: Persistable<P>, P: PointerRepr>() -> usize {
-    let elem = <T as Persistable<P>>::INLINE_SIZE;
+    let elem = slot_size::<T, P>();
     assert!(
         elem > 0,
         "PersistableVec cannot hold a zero-sized element type: its length is \
@@ -91,6 +93,13 @@ impl<T, P> PersistableVec<T, P> {
     }
 }
 
+impl<T, P: Copy> PersistableVec<T, P> {
+    /// The content allocation's id, if there is one.
+    fn raw_pointer(&self) -> Option<P> {
+        self.pointer.as_ref().map(|p| p.raw())
+    }
+}
+
 impl<T, P> Deref for PersistableVec<T, P> {
     type Target = [T];
     fn deref(&self) -> &[T] {
@@ -99,20 +108,19 @@ impl<T, P> Deref for PersistableVec<T, P> {
 }
 
 impl<P: PointerRepr> PersistableVec<u8, P> {
-    /// `store` for bytes: a first content allocation is filled with one write
-    /// rather than one per element, which is what `PersistableString` and
-    /// `PersistableBlob` store through.
-    pub(crate) fn store_bytes<B: WriteBackend<Pointer = P>>(
+    /// `prepare` for bytes: a first content allocation is filled with one
+    /// write, which is what `PersistableString` and `PersistableBlob` store
+    /// through.
+    pub(crate) fn prepare_bytes<B: WriteBackend<Pointer = P>>(
         &mut self,
         backend: &B,
-        location: Location<P, B::Size>,
     ) -> Result<(), Error> {
         if self.pointer.is_none() && !self.data.is_empty() {
             let pointer = backend.alloc(size(0)?)?;
             backend.write(pointer.raw(), size(0)?, &self.data)?;
             self.pointer = Some(pointer);
         }
-        write_slot(backend, location, self.pointer.as_ref().map(|p| p.raw()))
+        Ok(())
     }
 }
 
@@ -153,64 +161,81 @@ impl<'a, T, P> IntoIterator for &'a PersistableVec<T, P> {
 
 impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for PersistableVec<T, P> {
     /// Just the content allocation's pointer: the length lives with the store.
-    const INLINE_SIZE: usize = P::BYTE_LEN;
+    const SLOTTED_SIZE: Option<usize> = Some(P::BYTE_LEN);
+    const PACKED_SIZE: Option<usize> = Some(P::BYTE_LEN);
 
-    type Guard<'s, B: WriteBackend<Pointer = P>>
-        = PersistableVecGuard<'s, T, B>
+    type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
+        = PersistableVecGuard<'s, T, B, E>
     where
         Self: 's,
         B: 's;
 
     #[inline]
-    fn guard<'s, B: WriteBackend<Pointer = P>>(
+    fn guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>(
         &'s mut self,
         backend: &'s B,
-        location: Location<P, B::Size>,
-    ) -> Self::Guard<'s, B> {
+        place: Place<'s, B, E>,
+    ) -> Self::Guard<'s, B, E> {
         PersistableVecGuard {
             inner: self,
             backend,
-            location,
+            place,
         }
     }
 
-    /// Publishes this vec's content pointer at `location`. A vec that already
-    /// has an allocation keeps it, since guards keep its content current; one
-    /// with elements but no allocation, collected from an iterator, gets one
-    /// here, filled before the pointer publishes it.
-    fn store<B: WriteBackend<Pointer = P>>(
-        &mut self,
-        backend: &B,
-        location: Location<P, B::Size>,
-    ) -> Result<(), Error> {
-        if self.pointer.is_none() && !self.data.is_empty() {
-            let elem = stride::<T, P>();
-            let pointer = backend.alloc(size(self.data.len() * elem)?)?;
-            for (i, item) in self.data.iter_mut().enumerate() {
-                item.store(backend, Location::new(pointer.raw(), size(i * elem)?))?;
-            }
-            self.pointer = Some(pointer);
-        }
-        write_slot(backend, location, self.pointer.as_ref().map(|p| p.raw()))
+    fn encoded_size<E: Encoding>(&self) -> usize {
+        pointer_size::<P, E>(self.raw_pointer())
     }
 
-    fn load<B: ReadBackend<Pointer = P>>(
+    /// The content pointer. A vec with elements but no allocation, collected
+    /// from an iterator, must be [prepared](Persistable::prepare) first.
+    fn encode<E: Encoding>(&self, out: &mut Vec<u8>) {
+        debug_assert!(self.pointer.is_some() || self.data.is_empty());
+        encode_pointer::<P, E>(self.raw_pointer(), out);
+    }
+
+    fn decode<B: ReadBackend<Pointer = P>, E: Encoding>(
         backend: &mut B,
-        location: Location<P, B::Size>,
+        input: &mut Input<'_>,
     ) -> Result<Self, Error> {
-        let Some(target) = read_slot::<P, B>(backend, location)? else {
+        let Some(target) = decode_pointer::<P, E>(input)? else {
             return Ok(PersistableVec::new());
         };
         let elem = stride::<T, P>();
-        let len = backend.read_size(target)?.to_usize() / elem;
-        let mut data = Vec::with_capacity(len);
-        for i in 0..len {
-            data.push(T::load(backend, Location::new(target, size(i * elem)?))?);
+        let bytes = read_allocation(backend, target)?;
+        if bytes.len() % elem != 0 {
+            return Err(Error::Corrupt(format!(
+                "a vec's content of {} bytes is no whole number of {elem}-byte elements",
+                bytes.len()
+            )));
+        }
+        let mut content = Input::new(&bytes);
+        let mut data = Vec::with_capacity(bytes.len() / elem);
+        while !content.is_empty() {
+            data.push(T::decode::<B, Slotted>(backend, &mut content)?);
         }
         Ok(PersistableVec {
             data,
             pointer: Some(UniquePointer::from_pointer(target)),
         })
+    }
+
+    /// A vec that already has an allocation keeps it, since guards keep its
+    /// content current; one with elements but no allocation, collected from
+    /// an iterator, gets one here, filled with one write.
+    fn prepare<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) -> Result<(), Error> {
+        if self.pointer.is_none() && !self.data.is_empty() {
+            let elem = stride::<T, P>();
+            let pointer = backend.alloc(size(self.data.len() * elem)?)?;
+            let mut bytes = Vec::with_capacity(self.data.len() * elem);
+            for item in &mut self.data {
+                item.prepare(backend)?;
+                item.encode::<Slotted>(&mut bytes);
+            }
+            backend.write(pointer.raw(), size(0)?, &bytes)?;
+            self.pointer = Some(pointer);
+        }
+        Ok(())
     }
 
     /// Frees every element, then the content allocation.
@@ -261,13 +286,15 @@ impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for PersistableVec<T, P> 
 /// assert_eq!(db.get()[0], "a");
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub struct PersistableVecGuard<'s, T, B: WriteBackend> {
+pub struct PersistableVecGuard<'s, T, B: WriteBackend, E: Encoding = Slotted> {
     inner: &'s mut PersistableVec<T, B::Pointer>,
     backend: &'s B,
-    location: Location<B::Pointer, B::Size>,
+    place: Place<'s, B, E>,
 }
 
-impl<'s, T: Persistable<B::Pointer>, B: WriteBackend> PersistableVecGuard<'s, T, B> {
+impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
+    PersistableVecGuard<'s, T, B, E>
+{
     /// The guard of element `index`, or `None` if there is none.
     ///
     /// ```
@@ -284,14 +311,14 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend> PersistableVecGuard<'s, T,
     pub fn get_mut(
         &mut self,
         index: usize,
-    ) -> Option<<T as Persistable<B::Pointer>>::Guard<'_, B>> {
+    ) -> Option<<T as Persistable<B::Pointer>>::Guard<'_, B, Slotted>> {
         let elem = stride::<T, B::Pointer>();
         let target = self.inner.pointer.as_ref()?.raw();
         let location = Location::new(target, size(index * elem).ok()?);
         self.inner
             .data
             .get_mut(index)
-            .map(|item| item.guard(self.backend, location))
+            .map(|item| item.guard(self.backend, Slotted::at(location)))
     }
 
     /// Appends `value`: one transaction that grows the content allocation,
@@ -338,7 +365,7 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend> PersistableVecGuard<'s, T,
             "a stored vec with elements has a content allocation"
         );
         let elem = stride::<T, B::Pointer>();
-        let (backend, location) = (self.backend, self.location);
+        let (backend, place) = (self.backend, &self.place);
         let existing = &self.inner.pointer;
         let fresh = backend.atomically(|| {
             let fresh = match existing {
@@ -346,14 +373,15 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend> PersistableVecGuard<'s, T,
                 None => Some(backend.alloc(size(0)?)?),
             };
             let pointer = fresh.as_ref().or(existing.as_ref()).unwrap();
+            value.prepare(backend)?;
+            let bytes = value.to_bytes::<Slotted>();
             if index == len {
-                backend.resize(pointer, size((len + 1) * elem)?)?;
+                backend.write(pointer.raw(), size(len * elem)?, &bytes)?;
             } else {
-                backend.splice(pointer, size(index * elem)?, size(0)?, &vec![0u8; elem])?;
+                backend.splice(pointer, size(index * elem)?, size(0)?, &bytes)?;
             }
-            value.store(backend, Location::new(pointer.raw(), size(index * elem)?))?;
             if fresh.is_some() {
-                write_slot(backend, location, Some(pointer.raw()))?;
+                publish_pointer(backend, place, None, Some(pointer.raw()))?;
             }
             Ok(fresh)
         })?;
@@ -498,11 +526,11 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend> PersistableVecGuard<'s, T,
     /// # Ok::<(), kladde::Error>(())
     /// ```
     pub fn set(&mut self, value: PersistableVec<T, B::Pointer>) -> Result<(), Error> {
-        replace(self.inner, value, self.backend, self.location)
+        replace(self.inner, value, self.backend, &self.place)
     }
 }
 
-impl<'s, B: WriteBackend> PersistableVecGuard<'s, u8, B> {
+impl<'s, B: WriteBackend, E: Encoding> PersistableVecGuard<'s, u8, B, E> {
     /// Replaces the contents with `new` in one write, whatever the current
     /// length. An owned `Vec<u8>` is moved in without copying.
     ///
@@ -533,6 +561,47 @@ impl<'s, B: WriteBackend> PersistableVecGuard<'s, u8, B> {
         Ok(())
     }
 
+    /// Replaces the `old_len` bytes at `offset` with `bytes`, in one splice.
+    /// Panics if the range lies outside the contents.
+    ///
+    /// ```
+    /// use kladde::Kladde;
+    /// use kladde_types::PersistableVec;
+    ///
+    /// let mut db = Kladde::new(PersistableVec::<u8>::new());
+    /// db.guard().set_bytes(b"hello")?;
+    /// db.guard().splice_bytes(1, 3, b"ipp")?;
+    /// assert_eq!(db.get().as_slice(), b"hippo");
+    /// # Ok::<(), kladde::Error>(())
+    /// ```
+    pub fn splice_bytes(
+        &mut self,
+        offset: usize,
+        old_len: usize,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        let len = self.inner.data.len();
+        assert!(
+            offset + old_len <= len,
+            "PersistableVec::splice_bytes: range {offset}..{} out of bounds",
+            offset + old_len
+        );
+        match &self.inner.pointer {
+            Some(pointer) => self
+                .backend
+                .splice(pointer, size(offset)?, size(old_len)?, bytes)?,
+            None if bytes.is_empty() => {}
+            None => {
+                let fresh = self.fresh_content(bytes)?;
+                self.inner.pointer = Some(fresh);
+            }
+        }
+        self.inner
+            .data
+            .splice(offset..offset + old_len, bytes.iter().copied());
+        Ok(())
+    }
+
     /// Appends `bytes` in one write.
     ///
     /// ```
@@ -560,19 +629,19 @@ impl<'s, B: WriteBackend> PersistableVecGuard<'s, u8, B> {
     }
 
     /// A content allocation holding `bytes`, published at this guard's
-    /// location, in one transaction.
+    /// place, in one transaction.
     fn fresh_content(&mut self, bytes: &[u8]) -> Result<UniquePointer<B::Pointer>, Error> {
-        let (backend, location) = (self.backend, self.location);
+        let (backend, place) = (self.backend, &self.place);
         backend.atomically(|| {
             let pointer = backend.alloc(size(0)?)?;
             backend.write(pointer.raw(), size(0)?, bytes)?;
-            write_slot(backend, location, Some(pointer.raw()))?;
+            publish_pointer(backend, place, None, Some(pointer.raw()))?;
             Ok(pointer)
         })
     }
 }
 
-impl<'s, T, B: WriteBackend> Guard for PersistableVecGuard<'s, T, B> {
+impl<'s, T, B: WriteBackend, E: Encoding> Guard for PersistableVecGuard<'s, T, B, E> {
     type Persistable = PersistableVec<T, B::Pointer>;
     type Backend = B;
 
@@ -587,7 +656,7 @@ impl<'s, T, B: WriteBackend> Guard for PersistableVecGuard<'s, T, B> {
     }
 }
 
-impl<'s, T, B: WriteBackend> Deref for PersistableVecGuard<'s, T, B> {
+impl<'s, T, B: WriteBackend, E: Encoding> Deref for PersistableVecGuard<'s, T, B, E> {
     type Target = PersistableVec<T, B::Pointer>;
     fn deref(&self) -> &Self::Target {
         self.inner
@@ -602,10 +671,10 @@ mod tests {
 
     #[test]
     fn push_and_remove_round_trip() {
-        let mut f = Fixture::new(<PersistableVec<i32> as Persistable>::INLINE_SIZE);
+        let mut f = Fixture::for_type::<PersistableVec<i32>>();
         let mut vec = PersistableVec::<i32>::new();
         {
-            let mut guard = vec.guard(&f.store, f.location);
+            let mut guard = vec.guard(&f.store, f.place());
             for x in [10, 20, 30] {
                 guard.push(x).unwrap();
             }
@@ -618,31 +687,31 @@ mod tests {
 
     #[test]
     fn the_length_comes_back_from_the_allocation_size() {
-        let mut f = Fixture::new(<PersistableVec<i32> as Persistable>::INLINE_SIZE);
+        let mut f = Fixture::for_type::<PersistableVec<i32>>();
         let mut vec = PersistableVec::<i32>::new();
         {
-            let mut guard = vec.guard(&f.store, f.location);
+            let mut guard = vec.guard(&f.store, f.place());
             for i in 0..7 {
                 guard.push(i).unwrap();
             }
             assert_eq!(guard.pop().unwrap(), Some(6));
             guard.insert(0, -1).unwrap();
         }
-        assert_eq!(<PersistableVec<i32> as Persistable>::INLINE_SIZE, 4);
+        assert_eq!(<PersistableVec<i32> as Persistable>::SLOTTED_SIZE, Some(4));
         let reloaded: PersistableVec<i32> = f.reload();
         assert_eq!(reloaded.as_slice(), &[-1, 0, 1, 2, 3, 4, 5]);
     }
 
     #[test]
     fn delete_frees_what_the_element_owns() {
-        let mut f = Fixture::new(<PersistableVec<PersistableString> as Persistable>::INLINE_SIZE);
+        let mut f = Fixture::for_type::<PersistableVec<PersistableString>>();
         let mut vec = PersistableVec::<PersistableString>::new();
-        let mut guard = vec.guard(&f.store, f.location);
+        let mut guard = vec.guard(&f.store, f.place());
         guard.push(PersistableString::from("kept")).unwrap();
         guard.push(PersistableString::from("deleted")).unwrap();
         f.store.flush().unwrap();
         let before = f.store.allocations().len();
-        vec.guard(&f.store, f.location).delete(1).unwrap();
+        vec.guard(&f.store, f.place()).delete(1).unwrap();
         f.store.flush().unwrap();
         assert_eq!(f.store.allocations().len(), before - 1);
         let reloaded: PersistableVec<PersistableString> = f.reload();
@@ -652,13 +721,13 @@ mod tests {
 
     #[test]
     fn store_allocates_content_for_a_collected_vec_once() {
-        let mut f = Fixture::new(<PersistableVec<i32> as Persistable>::INLINE_SIZE);
+        let mut f = Fixture::for_type::<PersistableVec<i32>>();
         let mut vec: PersistableVec<i32> = [1, 2, 3].into_iter().collect();
-        vec.store(&f.store, f.location).unwrap();
+        vec.store::<_, Slotted>(&f.store, f.location).unwrap();
         f.store.flush().unwrap();
         let after_first = f.store.allocations().len();
-        vec.store(&f.store, f.location).unwrap();
-        vec.guard(&f.store, f.location).push(4).unwrap();
+        vec.store::<_, Slotted>(&f.store, f.location).unwrap();
+        vec.guard(&f.store, f.place()).push(4).unwrap();
         f.store.flush().unwrap();
         assert_eq!(
             f.store.allocations().len(),
@@ -671,9 +740,9 @@ mod tests {
 
     #[test]
     fn an_empty_vec_stores_as_a_null_pointer() {
-        let mut f = Fixture::new(<PersistableVec<i32> as Persistable>::INLINE_SIZE);
+        let mut f = Fixture::for_type::<PersistableVec<i32>>();
         let mut vec = PersistableVec::<i32>::new();
-        vec.store(&f.store, f.location).unwrap();
+        vec.store::<_, Slotted>(&f.store, f.location).unwrap();
         let reloaded: PersistableVec<i32> = f.reload();
         assert!(reloaded.is_empty());
         assert_eq!(f.store.allocations().len(), 1, "just the root allocation");
@@ -681,10 +750,10 @@ mod tests {
 
     #[test]
     fn set_bytes_grows_and_shrinks_one_allocation() {
-        let mut f = Fixture::new(<PersistableVec<u8> as Persistable>::INLINE_SIZE);
+        let mut f = Fixture::for_type::<PersistableVec<u8>>();
         let mut vec = PersistableVec::<u8>::new();
         for content in [b"hello".as_slice(), b"hi", b"hello there", b""] {
-            vec.guard(&f.store, f.location).set_bytes(content).unwrap();
+            vec.guard(&f.store, f.place()).set_bytes(content).unwrap();
             let reloaded: PersistableVec<u8> = f.reload();
             assert_eq!(reloaded.as_slice(), content);
             assert_eq!(f.store.allocations().len(), 2);

@@ -10,15 +10,14 @@
 //! entries, not a live count.
 
 use kladde_persist::{
-    replace, Error, Guard, Location, Persistable, Pointer, PointerRepr, ReadBackend, UniquePointer,
-    Word, WriteBackend,
+    read_allocation, replace, slot_size, Encoding, Error, Guard, Input, Location, Persistable,
+    Place, Pointer, PointerRepr, ReadBackend, Slotted, UniquePointer, WriteBackend,
 };
 use std::collections::{hash_map, BTreeSet, HashMap};
 use std::hash::Hash;
-use std::io::Read;
 use std::ops::Deref;
 
-use crate::slot::{read_slot, size, write_slot};
+use crate::slot::{decode_pointer, encode_pointer, pointer_size, publish_pointer, size};
 
 /// A hash map whose contents are persisted.
 ///
@@ -158,8 +157,8 @@ impl<'a, K, V, P> IntoIterator for &'a PersistableHashMap<K, V, P> {
 }
 
 /// One slot: a liveness tag, then the key, then the value.
-fn slot_size<K: Persistable<P>, V: Persistable<P>, P: PointerRepr>() -> usize {
-    1 + <K as Persistable<P>>::INLINE_SIZE + <V as Persistable<P>>::INLINE_SIZE
+fn entry_size<K: Persistable<P>, V: Persistable<P>, P: PointerRepr>() -> usize {
+    1 + slot_size::<K, P>() + slot_size::<V, P>()
 }
 
 impl<K, V, P> Persistable<P> for PersistableHashMap<K, V, P>
@@ -170,60 +169,66 @@ where
 {
     /// Just the slot array's pointer: its slot count is its size over the slot
     /// size.
-    const INLINE_SIZE: usize = P::BYTE_LEN;
+    const SLOTTED_SIZE: Option<usize> = Some(P::BYTE_LEN);
+    const PACKED_SIZE: Option<usize> = Some(P::BYTE_LEN);
 
-    type Guard<'s, B: WriteBackend<Pointer = P>>
-        = PersistableHashMapGuard<'s, K, V, B>
+    type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
+        = PersistableHashMapGuard<'s, K, V, B, E>
     where
         Self: 's,
         B: 's;
 
     #[inline]
-    fn guard<'s, B: WriteBackend<Pointer = P>>(
+    fn guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>(
         &'s mut self,
         backend: &'s B,
-        location: Location<P, B::Size>,
-    ) -> Self::Guard<'s, B> {
+        place: Place<'s, B, E>,
+    ) -> Self::Guard<'s, B, E> {
         PersistableHashMapGuard {
             inner: self,
             backend,
-            location,
+            place,
         }
     }
 
-    /// Publishes this map's slot array at `location`. Guards keep the slots
-    /// current, so there is nothing else to write; and there is no way to
-    /// build a map with entries but no slot array.
-    fn store<B: WriteBackend<Pointer = P>>(
-        &mut self,
-        backend: &B,
-        location: Location<P, B::Size>,
-    ) -> Result<(), Error> {
-        debug_assert!(self.pointer.is_some() || self.entries.is_empty());
-        write_slot(backend, location, self.pointer.as_ref().map(|p| p.raw()))
+    fn encoded_size<E: Encoding>(&self) -> usize {
+        pointer_size::<P, E>(self.pointer.as_ref().map(|p| p.raw()))
     }
 
-    fn load<B: ReadBackend<Pointer = P>>(
+    /// This map's slot array's pointer. Guards keep the slots current, so
+    /// there is nothing else to write; and there is no way to build a map
+    /// with entries but no slot array.
+    fn encode<E: Encoding>(&self, out: &mut Vec<u8>) {
+        debug_assert!(self.pointer.is_some() || self.entries.is_empty());
+        encode_pointer::<P, E>(self.pointer.as_ref().map(|p| p.raw()), out);
+    }
+
+    fn decode<B: ReadBackend<Pointer = P>, E: Encoding>(
         backend: &mut B,
-        location: Location<P, B::Size>,
+        input: &mut Input<'_>,
     ) -> Result<Self, Error> {
-        let Some(target) = read_slot::<P, B>(backend, location)? else {
+        let Some(target) = decode_pointer::<P, E>(input)? else {
             return Ok(PersistableHashMap::new());
         };
-        let slot = slot_size::<K, V, P>();
-        let key_size = <K as Persistable<P>>::INLINE_SIZE;
-        let capacity = backend.read_size(target)?.to_usize() / slot;
+        let slot = entry_size::<K, V, P>();
+        let bytes = read_allocation(backend, target)?;
+        if bytes.len() % slot != 0 {
+            return Err(Error::Corrupt(format!(
+                "a map's slots of {} bytes are no whole number of {slot}-byte slots",
+                bytes.len()
+            )));
+        }
+        let capacity = bytes.len() / slot;
         let mut map = PersistableHashMap::new();
+        let mut content = Input::new(&bytes);
         for i in 0..capacity {
-            let base = i * slot;
-            let mut tag = [0u8; 1];
-            backend.read_at(target, size(base)?)?.read_exact(&mut tag)?;
-            if tag[0] == 0 {
+            if content.byte()? == 0 {
                 map.vacant.insert(i);
+                content.take(slot - 1)?;
                 continue;
             }
-            let key = K::load(backend, Location::new(target, size(base + 1)?))?;
-            let value = V::load(backend, Location::new(target, size(base + 1 + key_size)?))?;
+            let key = K::decode::<B, Slotted>(backend, &mut content)?;
+            let value = V::decode::<B, Slotted>(backend, &mut content)?;
             map.entries.insert(key, (i, value));
         }
         map.capacity = capacity;
@@ -280,23 +285,22 @@ where
 /// assert_eq!(db.get().get(&PersistableString::from("b")), Some(&3));
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub struct PersistableHashMapGuard<'s, K, V, B: WriteBackend> {
+pub struct PersistableHashMapGuard<'s, K, V, B: WriteBackend, E: Encoding = Slotted> {
     inner: &'s mut PersistableHashMap<K, V, B::Pointer>,
     backend: &'s B,
-    location: Location<B::Pointer, B::Size>,
+    place: Place<'s, B, E>,
 }
 
-impl<'s, K, V, B> PersistableHashMapGuard<'s, K, V, B>
+impl<'s, K, V, B, E> PersistableHashMapGuard<'s, K, V, B, E>
 where
     K: Eq + Hash + Persistable<B::Pointer>,
     V: Persistable<B::Pointer>,
     B: WriteBackend,
+    E: Encoding,
 {
     /// Where the value of slot `slot` lives.
     fn value_location(&self, slot: usize) -> Result<Location<B::Pointer, B::Size>, Error> {
-        let at = slot * slot_size::<K, V, B::Pointer>()
-            + 1
-            + <K as Persistable<B::Pointer>>::INLINE_SIZE;
+        let at = slot * entry_size::<K, V, B::Pointer>() + 1 + slot_size::<K, B::Pointer>();
         let target = self
             .inner
             .pointer
@@ -319,11 +323,14 @@ where
     /// # Ok::<(), kladde::Error>(())
     /// ```
     #[inline]
-    pub fn get_mut(&mut self, key: &K) -> Option<<V as Persistable<B::Pointer>>::Guard<'_, B>> {
+    pub fn get_mut(
+        &mut self,
+        key: &K,
+    ) -> Option<<V as Persistable<B::Pointer>>::Guard<'_, B, Slotted>> {
         let slot = self.inner.entries.get(key)?.0;
         let location = self.value_location(slot).ok()?;
         let (_, value) = self.inner.entries.get_mut(key)?;
-        Some(value.guard(self.backend, location))
+        Some(value.guard(self.backend, Slotted::at(location)))
     }
 
     /// Inserts `value` under `key`, in one transaction.
@@ -348,17 +355,16 @@ where
         if let Some(&(slot, _)) = self.inner.entries.get(&key) {
             let at = self.value_location(slot)?;
             backend.atomically(|| {
-                value.store(backend, at)?;
+                value.store::<B, Slotted>(backend, at)?;
                 key.free(backend)
             })?;
             let (_, old) = self.inner.entries.insert(key, (slot, value)).unwrap();
             return Ok(Some(old));
         }
-        let slot_bytes = slot_size::<K, V, B::Pointer>();
-        let key_size = <K as Persistable<B::Pointer>>::INLINE_SIZE;
+        let slot_bytes = entry_size::<K, V, B::Pointer>();
         let reused = self.inner.vacant.first().copied();
         let slot = reused.unwrap_or(self.inner.capacity);
-        let location = self.location;
+        let place = &self.place;
         let existing = &self.inner.pointer;
         let fresh = backend.atomically(|| {
             let fresh = match existing {
@@ -370,14 +376,15 @@ where
             if reused.is_none() {
                 backend.resize(pointer, size(base + slot_bytes)?)?;
             }
-            key.store(backend, Location::new(pointer.raw(), size(base + 1)?))?;
-            value.store(
-                backend,
-                Location::new(pointer.raw(), size(base + 1 + key_size)?),
-            )?;
+            key.prepare(backend)?;
+            value.prepare(backend)?;
+            let mut entry = Vec::with_capacity(slot_bytes - 1);
+            key.encode::<Slotted>(&mut entry);
+            value.encode::<Slotted>(&mut entry);
+            backend.write(pointer.raw(), size(base + 1)?, &entry)?;
             backend.write(pointer.raw(), size(base)?, &[1])?;
             if fresh.is_some() {
-                write_slot(backend, location, Some(pointer.raw()))?;
+                publish_pointer(backend, place, None, Some(pointer.raw()))?;
             }
             Ok(fresh)
         })?;
@@ -407,7 +414,7 @@ where
             .as_ref()
             .expect("a map with entries has slots")
             .raw();
-        let base = slot * slot_size::<K, V, B::Pointer>();
+        let base = slot * entry_size::<K, V, B::Pointer>();
         let done = backend.atomically(|| {
             backend.write(target, size(base)?, &[0])?;
             owned_key.free(backend)?;
@@ -501,11 +508,11 @@ where
     /// # Ok::<(), kladde::Error>(())
     /// ```
     pub fn set(&mut self, value: PersistableHashMap<K, V, B::Pointer>) -> Result<(), Error> {
-        replace(self.inner, value, self.backend, self.location)
+        replace(self.inner, value, self.backend, &self.place)
     }
 }
 
-impl<'s, K, V, B: WriteBackend> Guard for PersistableHashMapGuard<'s, K, V, B> {
+impl<'s, K, V, B: WriteBackend, E: Encoding> Guard for PersistableHashMapGuard<'s, K, V, B, E> {
     type Persistable = PersistableHashMap<K, V, B::Pointer>;
     type Backend = B;
 
@@ -520,7 +527,7 @@ impl<'s, K, V, B: WriteBackend> Guard for PersistableHashMapGuard<'s, K, V, B> {
     }
 }
 
-impl<'s, K, V, B: WriteBackend> Deref for PersistableHashMapGuard<'s, K, V, B> {
+impl<'s, K, V, B: WriteBackend, E: Encoding> Deref for PersistableHashMapGuard<'s, K, V, B, E> {
     type Target = PersistableHashMap<K, V, B::Pointer>;
     fn deref(&self) -> &Self::Target {
         self.inner
@@ -537,10 +544,10 @@ mod tests {
 
     #[test]
     fn insert_remove_and_reload() {
-        let mut f = Fixture::new(<Map as Persistable>::INLINE_SIZE);
+        let mut f = Fixture::for_type::<Map>();
         let mut map = Map::new();
         {
-            let mut guard = map.guard(&f.store, f.location);
+            let mut guard = map.guard(&f.store, f.place());
             guard.insert(PersistableString::from("a"), 1).unwrap();
             guard.insert(PersistableString::from("b"), 2).unwrap();
             assert_eq!(
@@ -555,10 +562,10 @@ mod tests {
 
     #[test]
     fn insertion_reuses_the_lowest_vacant_slot() {
-        let mut f = Fixture::new(<Map as Persistable>::INLINE_SIZE);
+        let mut f = Fixture::for_type::<Map>();
         let mut map = Map::new();
         {
-            let mut guard = map.guard(&f.store, f.location);
+            let mut guard = map.guard(&f.store, f.place());
             for (i, k) in ["a", "b", "c"].into_iter().enumerate() {
                 guard.insert(PersistableString::from(k), i as i32).unwrap();
             }
@@ -575,14 +582,14 @@ mod tests {
 
     #[test]
     fn removal_frees_the_key() {
-        let f = Fixture::new(<Map as Persistable>::INLINE_SIZE);
+        let f = Fixture::for_type::<Map>();
         let mut map = Map::new();
-        map.guard(&f.store, f.location)
+        map.guard(&f.store, f.place())
             .insert(PersistableString::from("key"), 1)
             .unwrap();
         f.store.flush().unwrap();
         let before = f.store.allocations().len();
-        map.guard(&f.store, f.location)
+        map.guard(&f.store, f.place())
             .delete(&PersistableString::from("key"))
             .unwrap();
         f.store.flush().unwrap();

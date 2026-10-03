@@ -262,19 +262,19 @@ fn statistics_count_precision_and_coverage() {
 
 #[cfg(not(feature = "f64"))]
 #[test]
-fn inline_sizes_are_what_the_plan_estimated() {
-    assert_eq!(<PathSegment as Persistable>::INLINE_SIZE, 26);
-    assert_eq!(<Length as Persistable>::INLINE_SIZE, 5);
+fn slot_sizes_are_what_the_plan_estimated() {
+    assert_eq!(<PathSegment as Persistable>::SLOTTED_SIZE, Some(26));
+    assert_eq!(<Length as Persistable>::SLOTTED_SIZE, Some(5));
     assert_eq!(
-        <kladde_svg::model::Element as Persistable>::INLINE_SIZE,
-        1 + 20 + 4 * 4
+        <kladde_svg::model::Element as Persistable>::SLOTTED_SIZE,
+        Some(1 + 20 + 4 * 4)
     );
-    assert_eq!(<Node as Persistable>::INLINE_SIZE, 1 + 37);
+    assert_eq!(<Node as Persistable>::SLOTTED_SIZE, Some(1 + 37));
 }
 
 #[cfg(feature = "f64")]
 #[test]
-fn inline_sizes_with_f64() {
-    assert_eq!(<PathSegment as Persistable>::INLINE_SIZE, 50);
-    assert_eq!(<Length as Persistable>::INLINE_SIZE, 9);
+fn slot_sizes_with_f64() {
+    assert_eq!(<PathSegment as Persistable>::SLOTTED_SIZE, Some(50));
+    assert_eq!(<Length as Persistable>::SLOTTED_SIZE, Some(9));
 }

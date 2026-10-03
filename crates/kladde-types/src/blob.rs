@@ -8,7 +8,8 @@
 
 use crate::vec::PersistableVec;
 use kladde_persist::{
-    replace, Error, Guard, Location, Persistable, Pointer, PointerRepr, ReadBackend, WriteBackend,
+    replace, Encoding, Error, Guard, Input, Persistable, Place, Pointer, PointerRepr, ReadBackend,
+    Slotted, WriteBackend,
 };
 use std::ops::Deref;
 
@@ -87,41 +88,44 @@ impl<T, P: PointerRepr> Persistable<P> for PersistableBlob<T, P>
 where
     T: serde::Serialize + serde::de::DeserializeOwned + Default,
 {
-    /// The byte vec's pointer: a blob *is* that vec, representationally.
-    const INLINE_SIZE: usize = <PersistableVec<u8, P> as Persistable<P>>::INLINE_SIZE;
+    /// The byte vec's pointer: a blob *is* that vec, representationally. Its
+    /// descriptor is opaque, so the pointer keeps its fixed width in a packed
+    /// place too.
+    const SLOTTED_SIZE: Option<usize> = Some(P::BYTE_LEN);
+    const PACKED_SIZE: Option<usize> = Some(P::BYTE_LEN);
 
-    type Guard<'s, B: WriteBackend<Pointer = P>>
-        = PersistableBlobGuard<'s, T, B>
+    type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
+        = PersistableBlobGuard<'s, T, B, E>
     where
         Self: 's,
         B: 's;
 
     #[inline]
-    fn guard<'s, B: WriteBackend<Pointer = P>>(
+    fn guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>(
         &'s mut self,
         backend: &'s B,
-        location: Location<P, B::Size>,
-    ) -> Self::Guard<'s, B> {
+        place: Place<'s, B, E>,
+    ) -> Self::Guard<'s, B, E> {
         PersistableBlobGuard {
             inner: self,
             backend,
-            location,
+            place,
         }
     }
 
-    fn store<B: WriteBackend<Pointer = P>>(
-        &mut self,
-        backend: &B,
-        location: Location<P, B::Size>,
-    ) -> Result<(), Error> {
-        self.serialized.store_bytes(backend, location)
+    fn encoded_size<E: Encoding>(&self) -> usize {
+        P::BYTE_LEN
     }
 
-    fn load<B: ReadBackend<Pointer = P>>(
+    fn encode<E: Encoding>(&self, out: &mut Vec<u8>) {
+        self.serialized.encode::<Slotted>(out)
+    }
+
+    fn decode<B: ReadBackend<Pointer = P>, E: Encoding>(
         backend: &mut B,
-        location: Location<P, B::Size>,
+        input: &mut Input<'_>,
     ) -> Result<Self, Error> {
-        let serialized = <PersistableVec<u8, P> as Persistable<P>>::load(backend, location)?;
+        let serialized = PersistableVec::<u8, P>::decode::<B, Slotted>(backend, input)?;
         let value = if serialized.is_empty() {
             T::default()
         } else {
@@ -130,6 +134,10 @@ where
             })?
         };
         Ok(PersistableBlob { value, serialized })
+    }
+
+    fn prepare<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) -> Result<(), Error> {
+        self.serialized.prepare_bytes(backend)
     }
 
     fn free<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) -> Result<(), Error> {
@@ -169,16 +177,17 @@ where
 /// assert_eq!(**db.get(), 3);
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub struct PersistableBlobGuard<'s, T, B: WriteBackend> {
+pub struct PersistableBlobGuard<'s, T, B: WriteBackend, E: Encoding = Slotted> {
     inner: &'s mut PersistableBlob<T, B::Pointer>,
     backend: &'s B,
-    location: Location<B::Pointer, B::Size>,
+    place: Place<'s, B, E>,
 }
 
-impl<'s, T, B> PersistableBlobGuard<'s, T, B>
+impl<'s, T, B, E> PersistableBlobGuard<'s, T, B, E>
 where
     T: serde::Serialize + serde::de::DeserializeOwned + Default,
     B: WriteBackend,
+    E: Encoding,
 {
     /// Replaces the value with `value`. See [`PersistableBlobGuard`] for an
     /// example.
@@ -186,7 +195,7 @@ where
         let bytes = serialize(&value);
         self.inner
             .serialized
-            .guard(self.backend, self.location)
+            .guard(self.backend, self.place.cast::<Slotted>())
             .set_bytes(bytes)?;
         self.inner.value = value;
         Ok(())
@@ -201,7 +210,7 @@ where
         let written = self
             .inner
             .serialized
-            .guard(self.backend, self.location)
+            .guard(self.backend, self.place.cast::<Slotted>())
             .set_bytes(bytes);
         if written.is_err() {
             // The old serialization is still in memory: recover from it.
@@ -228,11 +237,11 @@ where
     /// # Ok::<(), kladde::Error>(())
     /// ```
     pub fn replace(&mut self, value: PersistableBlob<T, B::Pointer>) -> Result<(), Error> {
-        replace(self.inner, value, self.backend, self.location)
+        replace(self.inner, value, self.backend, &self.place)
     }
 }
 
-impl<'s, T, B: WriteBackend> Guard for PersistableBlobGuard<'s, T, B> {
+impl<'s, T, B: WriteBackend, E: Encoding> Guard for PersistableBlobGuard<'s, T, B, E> {
     type Persistable = PersistableBlob<T, B::Pointer>;
     type Backend = B;
 
@@ -247,7 +256,7 @@ impl<'s, T, B: WriteBackend> Guard for PersistableBlobGuard<'s, T, B> {
     }
 }
 
-impl<'s, T, B: WriteBackend> Deref for PersistableBlobGuard<'s, T, B> {
+impl<'s, T, B: WriteBackend, E: Encoding> Deref for PersistableBlobGuard<'s, T, B, E> {
     type Target = PersistableBlob<T, B::Pointer>;
     fn deref(&self) -> &Self::Target {
         self.inner
@@ -267,11 +276,11 @@ mod tests {
 
     #[test]
     fn values_round_trip_and_reuse_one_allocation() {
-        let mut f = Fixture::new(<PersistableBlob<String> as Persistable>::INLINE_SIZE);
+        let mut f = Fixture::for_type::<PersistableBlob<String>>();
         let mut value = PersistableBlob::new(String::from("hi"));
-        value.store(&f.store, f.location).unwrap();
+        value.store::<_, Slotted>(&f.store, f.location).unwrap();
         for text in ["a much longer string than before", "x", "medium"] {
-            value.guard(&f.store, f.location).set(text.into()).unwrap();
+            value.guard(&f.store, f.place()).set(text.into()).unwrap();
             let reloaded: PersistableBlob<String> = f.reload();
             assert_eq!(&*reloaded, text);
             assert_eq!(f.store.allocations().len(), 2);
@@ -280,9 +289,9 @@ mod tests {
 
     #[test]
     fn the_default_value_is_stored_as_nothing() {
-        let mut f = Fixture::new(<PersistableBlob<i32> as Persistable>::INLINE_SIZE);
+        let mut f = Fixture::for_type::<PersistableBlob<i32>>();
         let mut value = PersistableBlob::<i32>::default();
-        value.store(&f.store, f.location).unwrap();
+        value.store::<_, Slotted>(&f.store, f.location).unwrap();
         let reloaded: PersistableBlob<i32> = f.reload();
         assert_eq!(*reloaded, 0);
         assert_eq!(f.store.allocations().len(), 1, "just the root");
@@ -290,14 +299,14 @@ mod tests {
 
     #[test]
     fn update_changes_one_field() {
-        let mut f = Fixture::new(<PersistableBlob<Rec> as Persistable>::INLINE_SIZE);
+        let mut f = Fixture::for_type::<PersistableBlob<Rec>>();
         let mut value = PersistableBlob::new(Rec {
             a: 1,
             b: "one".into(),
         });
-        value.store(&f.store, f.location).unwrap();
+        value.store::<_, Slotted>(&f.store, f.location).unwrap();
         value
-            .guard(&f.store, f.location)
+            .guard(&f.store, f.place())
             .update(|r| r.a = 2)
             .unwrap();
         let reloaded: PersistableBlob<Rec> = f.reload();

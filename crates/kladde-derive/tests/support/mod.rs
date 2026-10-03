@@ -7,10 +7,10 @@
 #![allow(dead_code)]
 
 use kladde_persist::{
-    Error, Guard, Location, Persistable, Pointer, PointerRepr, ReadBackend, WriteBackend,
+    slot_size, write_encoded, Encoding, Error, Guard, Input, Location, Packed, Persistable, Place,
+    Pointer, PointerRepr, ReadBackend, Slotted, WriteBackend,
 };
 use kladde_store::{MemoryStorage, Store};
-use std::io::Read;
 
 /// A store whose root allocation holds the value under test.
 pub struct Fixture {
@@ -28,11 +28,31 @@ impl Fixture {
         }
     }
 
+    /// A store whose root allocation is a slot for a `T`.
+    pub fn for_type<T: Persistable>() -> Fixture {
+        Fixture::new(slot_size::<T, Pointer>())
+    }
+
+    /// The root allocation, as a slotted place.
+    pub fn place(&self) -> Place<'static, Store, Slotted> {
+        Slotted::at(self.location)
+    }
+
+    /// The root allocation, as a packed place.
+    pub fn packed(&self) -> Place<'static, Store, Packed> {
+        Packed::at(self.location)
+    }
+
     /// Flushes, then loads a `T` from the root allocation.
     pub fn reload<T: Persistable>(&mut self) -> T {
+        self.reload_as::<T, Slotted>()
+    }
+
+    /// Flushes, then loads a `T` in encoding `E` from the root allocation.
+    pub fn reload_as<T: Persistable, E: Encoding>(&mut self) -> T {
         self.store.flush().unwrap();
         self.store.check();
-        T::load(&mut self.store, self.location).unwrap()
+        T::load::<_, E>(&mut self.store, self.location).unwrap()
     }
 
     /// Flushes, then returns the root allocation's bytes.
@@ -42,47 +62,45 @@ impl Fixture {
     }
 }
 
+/// A hand-written `i32` stand-in: four bytes in either encoding.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Number(pub i32);
 
 impl<P: PointerRepr> Persistable<P> for Number {
-    const INLINE_SIZE: usize = 4;
+    const SLOTTED_SIZE: Option<usize> = Some(4);
+    const PACKED_SIZE: Option<usize> = Some(4);
 
-    type Guard<'s, B: WriteBackend<Pointer = P>>
-        = NumberGuard<'s, B>
+    type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
+        = NumberGuard<'s, B, E>
     where
         Self: 's,
         B: 's;
 
-    fn guard<'s, B: WriteBackend<Pointer = P>>(
+    fn guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>(
         &'s mut self,
         backend: &'s B,
-        location: Location<P, B::Size>,
-    ) -> Self::Guard<'s, B> {
+        place: Place<'s, B, E>,
+    ) -> Self::Guard<'s, B, E> {
         NumberGuard {
             inner: self,
             backend,
-            location,
+            place,
         }
     }
 
-    fn store<B: WriteBackend<Pointer = P>>(
-        &mut self,
-        backend: &B,
-        location: Location<P, B::Size>,
-    ) -> Result<(), Error> {
-        backend.write(location.anchor, location.offset, &self.0.to_le_bytes())
+    fn encoded_size<E: Encoding>(&self) -> usize {
+        4
     }
 
-    fn load<B: ReadBackend<Pointer = P>>(
-        backend: &mut B,
-        location: Location<P, B::Size>,
+    fn encode<E: Encoding>(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.0.to_le_bytes());
+    }
+
+    fn decode<B: ReadBackend<Pointer = P>, E: Encoding>(
+        _backend: &mut B,
+        input: &mut Input<'_>,
     ) -> Result<Self, Error> {
-        let mut bytes = [0u8; 4];
-        backend
-            .read_at(location.anchor, location.offset)?
-            .read_exact(&mut bytes)?;
-        Ok(Number(i32::from_le_bytes(bytes)))
+        Ok(Number(i32::from_le_bytes(input.array()?)))
     }
 
     fn describe_local(
@@ -92,25 +110,21 @@ impl<P: PointerRepr> Persistable<P> for Number {
     }
 }
 
-pub struct NumberGuard<'s, B: WriteBackend> {
+pub struct NumberGuard<'s, B: WriteBackend, E: Encoding> {
     inner: &'s mut Number,
     backend: &'s B,
-    location: Location<B::Pointer, B::Size>,
+    place: Place<'s, B, E>,
 }
 
-impl<'s, B: WriteBackend> NumberGuard<'s, B> {
+impl<'s, B: WriteBackend, E: Encoding> NumberGuard<'s, B, E> {
     pub fn set(&mut self, value: i32) -> Result<(), Error> {
-        self.backend.write(
-            self.location.anchor,
-            self.location.offset,
-            &value.to_le_bytes(),
-        )?;
+        write_encoded(self.backend, &self.place, 4, &value.to_le_bytes())?;
         self.inner.0 = value;
         Ok(())
     }
 }
 
-impl<'s, B: WriteBackend> Guard for NumberGuard<'s, B> {
+impl<'s, B: WriteBackend, E: Encoding> Guard for NumberGuard<'s, B, E> {
     type Persistable = Number;
     type Backend = B;
 

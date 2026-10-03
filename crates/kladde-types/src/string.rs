@@ -8,7 +8,8 @@
 
 use crate::vec::PersistableVec;
 use kladde_persist::{
-    replace, Error, Guard, Location, Persistable, Pointer, PointerRepr, ReadBackend, WriteBackend,
+    replace, Encoding, Error, Guard, Input, Persistable, Place, Pointer, PointerRepr, ReadBackend,
+    Slotted, WriteBackend,
 };
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
@@ -151,46 +152,51 @@ impl<P> PartialEq<PersistableString<P>> for &str {
 }
 
 impl<P: PointerRepr> Persistable<P> for PersistableString<P> {
-    const INLINE_SIZE: usize = <PersistableVec<u8, P> as Persistable<P>>::INLINE_SIZE;
+    const SLOTTED_SIZE: Option<usize> = <PersistableVec<u8, P> as Persistable<P>>::SLOTTED_SIZE;
+    const PACKED_SIZE: Option<usize> = <PersistableVec<u8, P> as Persistable<P>>::PACKED_SIZE;
 
-    type Guard<'s, B: WriteBackend<Pointer = P>>
-        = PersistableStringGuard<'s, B>
+    type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
+        = PersistableStringGuard<'s, B, E>
     where
         Self: 's,
         B: 's;
 
     #[inline]
-    fn guard<'s, B: WriteBackend<Pointer = P>>(
+    fn guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>(
         &'s mut self,
         backend: &'s B,
-        location: Location<P, B::Size>,
-    ) -> Self::Guard<'s, B> {
+        place: Place<'s, B, E>,
+    ) -> Self::Guard<'s, B, E> {
         PersistableStringGuard {
             inner: self,
             backend,
-            location,
+            place,
         }
     }
 
-    fn store<B: WriteBackend<Pointer = P>>(
-        &mut self,
-        backend: &B,
-        location: Location<P, B::Size>,
-    ) -> Result<(), Error> {
-        self.0.store_bytes(backend, location)
+    fn encoded_size<E: Encoding>(&self) -> usize {
+        self.0.encoded_size::<E>()
     }
 
-    fn load<B: ReadBackend<Pointer = P>>(
+    fn encode<E: Encoding>(&self, out: &mut Vec<u8>) {
+        self.0.encode::<E>(out)
+    }
+
+    fn decode<B: ReadBackend<Pointer = P>, E: Encoding>(
         backend: &mut B,
-        location: Location<P, B::Size>,
+        input: &mut Input<'_>,
     ) -> Result<Self, Error> {
-        let bytes = PersistableVec::load(backend, location)?;
+        let bytes = PersistableVec::decode::<B, E>(backend, input)?;
         if std::str::from_utf8(bytes.as_slice()).is_err() {
             return Err(Error::Corrupt(
                 "a PersistableString holds invalid UTF-8".into(),
             ));
         }
         Ok(PersistableString(bytes))
+    }
+
+    fn prepare<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) -> Result<(), Error> {
+        self.0.prepare_bytes(backend)
     }
 
     fn free<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) -> Result<(), Error> {
@@ -228,19 +234,19 @@ impl<P: PointerRepr> Persistable<P> for PersistableString<P> {
 /// assert_eq!(&*guard, "ada lovelace");
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub struct PersistableStringGuard<'s, B: WriteBackend> {
+pub struct PersistableStringGuard<'s, B: WriteBackend, E: Encoding = Slotted> {
     inner: &'s mut PersistableString<B::Pointer>,
     backend: &'s B,
-    location: Location<B::Pointer, B::Size>,
+    place: Place<'s, B, E>,
 }
 
-impl<'s, B: WriteBackend> PersistableStringGuard<'s, B> {
+impl<'s, B: WriteBackend, E: Encoding> PersistableStringGuard<'s, B, E> {
     /// Appends `s` in one write. See [`PersistableStringGuard`] for an
     /// example.
     pub fn push_str(&mut self, s: &str) -> Result<(), Error> {
         self.inner
             .0
-            .guard(self.backend, self.location)
+            .guard(self.backend, self.place)
             .extend_from_slice(s.as_bytes())
     }
 
@@ -250,8 +256,38 @@ impl<'s, B: WriteBackend> PersistableStringGuard<'s, B> {
     pub fn set(&mut self, new: impl Into<String>) -> Result<(), Error> {
         self.inner
             .0
-            .guard(self.backend, self.location)
+            .guard(self.backend, self.place)
             .set_bytes(new.into().into_bytes())
+    }
+
+    /// Replaces the text in byte range `range` with `with`, in one splice,
+    /// as [`String::replace_range`] does. Panics if the range does not lie on
+    /// `char` boundaries.
+    ///
+    /// ```
+    /// use kladde::Kladde;
+    /// use kladde_types::PersistableString;
+    ///
+    /// let mut name = Kladde::new(PersistableString::from("ada"));
+    /// name.guard().replace_range(1..2, "nn")?;
+    /// assert_eq!(name.get(), "anna");
+    /// # Ok::<(), kladde::Error>(())
+    /// ```
+    pub fn replace_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        with: &str,
+    ) -> Result<(), Error> {
+        let text: &str = self.inner;
+        assert!(
+            text.is_char_boundary(range.start) && text.is_char_boundary(range.end),
+            "PersistableString::replace_range: {range:?} does not lie on char boundaries"
+        );
+        self.inner.0.guard(self.backend, self.place).splice_bytes(
+            range.start,
+            range.end - range.start,
+            with.as_bytes(),
+        )
     }
 
     /// Replaces the whole value: stores `value`, then frees the old one, in
@@ -268,11 +304,11 @@ impl<'s, B: WriteBackend> PersistableStringGuard<'s, B> {
     /// # Ok::<(), kladde::Error>(())
     /// ```
     pub fn replace(&mut self, value: PersistableString<B::Pointer>) -> Result<(), Error> {
-        replace(self.inner, value, self.backend, self.location)
+        replace(self.inner, value, self.backend, &self.place)
     }
 }
 
-impl<'s, B: WriteBackend> Guard for PersistableStringGuard<'s, B> {
+impl<'s, B: WriteBackend, E: Encoding> Guard for PersistableStringGuard<'s, B, E> {
     type Persistable = PersistableString<B::Pointer>;
     type Backend = B;
 
@@ -287,7 +323,7 @@ impl<'s, B: WriteBackend> Guard for PersistableStringGuard<'s, B> {
     }
 }
 
-impl<'s, B: WriteBackend> Deref for PersistableStringGuard<'s, B> {
+impl<'s, B: WriteBackend, E: Encoding> Deref for PersistableStringGuard<'s, B, E> {
     type Target = str;
     fn deref(&self) -> &str {
         self.inner
@@ -308,24 +344,30 @@ mod tests {
 
     #[test]
     fn push_str_and_set_round_trip() {
-        let mut f = Fixture::new(<PersistableString as Persistable>::INLINE_SIZE);
+        let mut f = Fixture::for_type::<PersistableString>();
         let mut value = PersistableString::new();
-        let mut guard = value.guard(&f.store, f.location);
+        let mut guard = value.guard(&f.store, f.place());
         guard.push_str("hello").unwrap();
         guard.push_str(" world").unwrap();
         assert_eq!(&*value, "hello world");
         let reloaded: PersistableString = f.reload();
         assert_eq!(reloaded, value);
-        value.guard(&f.store, f.location).set("short").unwrap();
+        value.guard(&f.store, f.place()).set("short").unwrap();
         let reloaded: PersistableString = f.reload();
         assert_eq!(reloaded, "short");
+        value
+            .guard(&f.store, f.place())
+            .replace_range(0..1, "S")
+            .unwrap();
+        let reloaded: PersistableString = f.reload();
+        assert_eq!(reloaded, "Short");
     }
 
     #[test]
     fn equality_ignores_allocation_state() {
-        let mut f = Fixture::new(<PersistableString as Persistable>::INLINE_SIZE);
+        let mut f = Fixture::for_type::<PersistableString>();
         let mut value = PersistableString::new();
-        value.guard(&f.store, f.location).push_str("same").unwrap();
+        value.guard(&f.store, f.place()).push_str("same").unwrap();
         let reloaded: PersistableString = f.reload();
         assert_eq!(value, reloaded);
         assert_eq!(value, PersistableString::from("same"));

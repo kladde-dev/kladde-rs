@@ -10,7 +10,7 @@
 mod support;
 
 use kladde_derive::Persistable;
-use kladde_persist::Persistable;
+use kladde_persist::{Packed, Persistable, Slotted};
 use support::{Fixture, Number};
 
 #[derive(Persistable)]
@@ -30,16 +30,21 @@ struct PlainLabel {
     value: Number,
 }
 
+/// A transparent wrapper of a type whose packed encoding differs.
+#[derive(Persistable)]
+#[kladde(transparent)]
+struct Count(u32);
+
 #[test]
 fn transparent_tuple_newtype_round_trips_as_its_field() {
     assert_eq!(
-        <Meters as Persistable>::INLINE_SIZE,
-        <Number as Persistable>::INLINE_SIZE
+        <Meters as Persistable>::SLOTTED_SIZE,
+        <Number as Persistable>::SLOTTED_SIZE
     );
-    let mut f = Fixture::new(<Meters as Persistable>::INLINE_SIZE);
+    let mut f = Fixture::for_type::<Meters>();
     let mut m = Meters(Number(0));
     {
-        let mut guard = m.guard(&f.store, f.location);
+        let mut guard = m.guard(&f.store, f.place());
         // `get_mut()` hands back the inner type's own guard.
         guard.get_mut().set(42).unwrap();
         assert_eq!(guard.0, Number(42));
@@ -50,49 +55,68 @@ fn transparent_tuple_newtype_round_trips_as_its_field() {
 
 #[test]
 fn transparent_braced_newtype_round_trips_as_its_field() {
-    let mut f = Fixture::new(<Label as Persistable>::INLINE_SIZE);
+    let mut f = Fixture::for_type::<Label>();
     let mut label = Label { value: Number(0) };
-    label.guard(&f.store, f.location).get_mut().set(7).unwrap();
+    label.guard(&f.store, f.place()).get_mut().set(7).unwrap();
     let reloaded: Label = f.reload();
     assert_eq!(reloaded.value, Number(7));
 }
 
 #[test]
 fn non_transparent_newtype_round_trips_the_same_way() {
-    let mut f = Fixture::new(<PlainLabel as Persistable>::INLINE_SIZE);
+    let mut f = Fixture::for_type::<PlainLabel>();
     let mut label = PlainLabel { value: Number(0) };
-    label
-        .guard(&f.store, f.location)
-        .value_mut()
-        .set(7)
-        .unwrap();
+    label.guard(&f.store, f.place()).value_mut().set(7).unwrap();
     let reloaded: PlainLabel = f.reload();
     assert_eq!(reloaded.value, Number(7));
 }
 
 #[test]
+fn a_transparent_wrapper_packs_as_its_field() {
+    assert_eq!(
+        Count(300).to_bytes::<Packed>(),
+        <u32 as Persistable>::to_bytes::<Packed>(&300)
+    );
+    let mut f = Fixture::new(0);
+    let mut count = Count(1);
+    count.store::<_, Packed>(&f.store, f.location).unwrap();
+    count
+        .guard(&f.store, f.packed())
+        .get_mut()
+        .set(1 << 20)
+        .unwrap();
+    assert_eq!(f.bytes().len(), 3);
+    let reloaded: Count = f.reload_as::<_, Packed>();
+    assert_eq!(reloaded.0, 1 << 20);
+}
+
+#[test]
 fn newtypes_share_layout_regardless_of_transparency() {
-    let size = <Number as Persistable>::INLINE_SIZE;
-    assert_eq!(<Meters as Persistable>::INLINE_SIZE, size);
-    assert_eq!(<Label as Persistable>::INLINE_SIZE, size);
-    assert_eq!(<PlainLabel as Persistable>::INLINE_SIZE, size);
+    let size = <Number as Persistable>::SLOTTED_SIZE;
+    assert_eq!(<Meters as Persistable>::SLOTTED_SIZE, size);
+    assert_eq!(<Label as Persistable>::SLOTTED_SIZE, size);
+    assert_eq!(<PlainLabel as Persistable>::SLOTTED_SIZE, size);
 
     // Storing the same inner value through the transparent wrapper, the plain
     // one, or the bare inner type writes the same bytes.
     let via_inner = {
-        let mut f = Fixture::new(size);
-        Number(42).store(&f.store, f.location).unwrap();
+        let mut f = Fixture::for_type::<Number>();
+        Number(42)
+            .store::<_, Slotted>(&f.store, f.location)
+            .unwrap();
         f.bytes()
     };
     let via_transparent = {
-        let mut f = Fixture::new(size);
-        Meters(Number(42)).store(&f.store, f.location).unwrap();
+        let mut f = Fixture::for_type::<Meters>();
+        Meters(Number(42))
+            .store::<_, Slotted>(&f.store, f.location)
+            .unwrap();
         f.bytes()
     };
     let via_plain = {
-        let mut f = Fixture::new(size);
+        let mut f = Fixture::for_type::<PlainLabel>();
         PlainLabel { value: Number(42) }
-            .store(&f.store, f.location)
+            .store::<_, Slotted>(&f.store, f.location)
             .unwrap();
         f.bytes()
     };
