@@ -27,6 +27,9 @@ use std::sync::{Arc, Mutex};
 /// assert_eq!(&buf, b"\0kladde\0");
 /// # Ok::<(), std::io::Error>(())
 /// ```
+// `len` is a fallible file length, not a collection's, and a kladde file is
+// never empty: an `is_empty` would have nothing to say.
+#[allow(clippy::len_without_is_empty)]
 pub trait Storage: Send {
     /// The current length in bytes.
     fn len(&self) -> io::Result<u64>;

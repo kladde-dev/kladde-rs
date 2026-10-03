@@ -472,7 +472,7 @@ where
         };
         backend.atomically(|| {
             backend.resize(pointer, size(0)?)?;
-            for (_, (_, value)) in entries.iter_mut() {
+            for (_, value) in entries.values_mut() {
                 value.free(backend)?;
             }
             Ok(())

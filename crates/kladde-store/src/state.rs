@@ -342,7 +342,7 @@ impl Dirty {
 
 /// The store's in-memory state: the committed file, plus what a flush in
 /// progress has taken.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct State {
     pub frags: BTreeMap<Key, Fragment>,
     pub slab: Slab,
@@ -361,24 +361,6 @@ pub struct State {
     /// The epoch of the flush in progress: pages written in it are never
     /// victims.
     pub flush_epoch: u64,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        State {
-            frags: BTreeMap::new(),
-            slab: Slab::default(),
-            allocs: IdMap::default(),
-            recyclable: BTreeMap::new(),
-            pages: Vec::new(),
-            data_buckets: Buckets::default(),
-            table_buckets: Buckets::default(),
-            reverse: IdMap::default(),
-            pending: Vec::new(),
-            dropped_candidates: IdSet::default(),
-            flush_epoch: 0,
-        }
-    }
 }
 
 /// The data page and in-page offset of a file address.
@@ -925,6 +907,9 @@ impl State {
                 pins[t.idx()] += 1;
             }
         }
+        // `s` indexes four parallel arrays, the counts here and the slab's
+        // pins, pages and framing, so it stays an index.
+        #[allow(clippy::needless_range_loop)]
         for s in 1..pins.len() {
             let live = self.slab.pins[s] > 0;
             if live {
