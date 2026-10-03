@@ -14,7 +14,6 @@
 use std::fmt;
 use std::str::FromStr;
 
-use kladde_types::PersistableVec;
 use roxmltree as xml;
 
 use crate::model::{
@@ -141,9 +140,9 @@ impl Parser {
             }
         }
         Ok(Document {
-            prolog: PersistableVec::from_iter(prolog),
+            prolog: prolog.into_iter().collect(),
             root: self.element(root, false),
-            epilog: PersistableVec::from_iter(epilog),
+            epilog: epilog.into_iter().collect(),
         })
     }
 
@@ -275,10 +274,10 @@ impl Parser {
 
         Element {
             kind,
-            transform: PersistableVec::from_iter(transform),
-            attrs: PersistableVec::from_iter(attrs),
-            style: PersistableVec::from_iter(style),
-            children: PersistableVec::from_iter(children),
+            transform: transform.into_iter().collect(),
+            attrs: attrs.into_iter().collect(),
+            style: style.into_iter().collect(),
+            children: children.into_iter().collect(),
         }
     }
 
@@ -305,7 +304,7 @@ impl Parser {
             (K::Path { d }, "d") => {
                 return match self.path(value) {
                     Some(segments) => {
-                        *d = PersistableVec::from_iter(segments);
+                        *d = segments.into_iter().collect();
                         Geometry::Set
                     }
                     None => Geometry::Invalid,
@@ -314,7 +313,7 @@ impl Parser {
             (K::Polyline { points } | K::Polygon { points }, "points") => {
                 return match self.points(value) {
                     Some(list) => {
-                        *points = PersistableVec::from_iter(list);
+                        *points = list.into_iter().collect();
                         Geometry::Set
                     }
                     None => Geometry::Invalid,
@@ -371,7 +370,7 @@ impl Parser {
             "ry" => self.length(t).map(Attr::Ry),
             "stroke-dasharray" => self
                 .length_list(t)
-                .map(|list| Attr::StrokeDasharray(PersistableVec::from_iter(list))),
+                .map(|list| Attr::StrokeDasharray(list.into_iter().collect())),
             "stroke-linecap" => match t {
                 "butt" => Some(LineCap::Butt),
                 "round" => Some(LineCap::Round),
@@ -395,10 +394,10 @@ impl Parser {
             "viewBox" => self.view_box(t),
             "gradientTransform" => self
                 .transform_list(value)
-                .map(|ops| Attr::GradientTransform(PersistableVec::from_iter(ops))),
+                .map(|ops| Attr::GradientTransform(ops.into_iter().collect())),
             "patternTransform" => self
                 .transform_list(value)
-                .map(|ops| Attr::PatternTransform(PersistableVec::from_iter(ops))),
+                .map(|ops| Attr::PatternTransform(ops.into_iter().collect())),
             _ => None,
         };
         typed.unwrap_or_else(|| self.other(name, value))
@@ -647,7 +646,7 @@ fn kind_for(local: &str) -> Option<ElementKind> {
         "symbol" => K::Symbol,
         "use" => K::Use { x: z, y: z },
         "path" => K::Path {
-            d: PersistableVec::new(),
+            d: Default::default(),
         },
         "rect" => K::Rect {
             x: z,
@@ -664,10 +663,10 @@ fn kind_for(local: &str) -> Option<ElementKind> {
             y2: z,
         },
         "polyline" => K::Polyline {
-            points: PersistableVec::new(),
+            points: Default::default(),
         },
         "polygon" => K::Polygon {
-            points: PersistableVec::new(),
+            points: Default::default(),
         },
         "text" => K::Text,
         "tspan" => K::Tspan,

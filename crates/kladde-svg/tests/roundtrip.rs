@@ -1,7 +1,7 @@
 //! The canonical form is stable, the model types what it should, and a
 //! document survives a trip through kladde, a reopen included, byte for byte.
 
-use kladde::{Kladde, MemoryStorage, Options, Persistable};
+use kladde::{Kladde, MemoryStorage, Options};
 use kladde_svg::model::{
     Attr, Document, ElementKind, Length, LengthUnit, Node, Paint, PathSegment,
 };
@@ -260,21 +260,22 @@ fn statistics_count_precision_and_coverage() {
     );
 }
 
-#[cfg(not(feature = "f64"))]
+// With `small-attrs`, an element holds small lists and has no fixed encoding.
+#[cfg(not(any(feature = "f64", feature = "small-attrs")))]
 #[test]
 fn slot_sizes_are_what_the_plan_estimated() {
-    assert_eq!(<PathSegment as Persistable>::SLOTTED_SIZE, Some(26));
-    assert_eq!(<Length as Persistable>::SLOTTED_SIZE, Some(5));
+    assert_eq!(<PathSegment as kladde::Persistable>::SLOTTED_SIZE, Some(26));
+    assert_eq!(<Length as kladde::Persistable>::SLOTTED_SIZE, Some(5));
     assert_eq!(
-        <kladde_svg::model::Element as Persistable>::SLOTTED_SIZE,
+        <kladde_svg::model::Element as kladde::Persistable>::SLOTTED_SIZE,
         Some(1 + 20 + 4 * 4)
     );
-    assert_eq!(<Node as Persistable>::SLOTTED_SIZE, Some(1 + 37));
+    assert_eq!(<Node as kladde::Persistable>::SLOTTED_SIZE, Some(1 + 37));
 }
 
 #[cfg(feature = "f64")]
 #[test]
 fn slot_sizes_with_f64() {
-    assert_eq!(<PathSegment as Persistable>::SLOTTED_SIZE, Some(50));
-    assert_eq!(<Length as Persistable>::SLOTTED_SIZE, Some(9));
+    assert_eq!(<PathSegment as kladde::Persistable>::SLOTTED_SIZE, Some(50));
+    assert_eq!(<Length as kladde::Persistable>::SLOTTED_SIZE, Some(9));
 }
