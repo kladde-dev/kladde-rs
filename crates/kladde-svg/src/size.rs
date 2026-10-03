@@ -4,7 +4,7 @@
 //! A benchmark counts what an edit stores with [`Payload::payload_bytes`], the
 //! measure kladde-bench calls the bytes the application wrote.
 
-use kladde::Persistable;
+use kladde::{Persistable, Slotted};
 use kladde_types::{PersistableString, PersistableVec};
 
 use crate::model::{
@@ -28,9 +28,9 @@ pub trait Payload: Persistable {
     /// counting its own inline bytes.
     fn owned_bytes(&self) -> u64;
 
-    /// The value's inline bytes plus everything it owns.
+    /// The value's inline bytes in a slotted place, plus everything it owns.
     fn payload_bytes(&self) -> u64 {
-        <Self as Persistable>::INLINE_SIZE as u64 + self.owned_bytes()
+        self.encoded_size::<Slotted>() as u64 + self.owned_bytes()
     }
 }
 

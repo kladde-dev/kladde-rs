@@ -27,7 +27,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use kladde::{Kladde, Persistable, Pointer, WriteBackend};
+use kladde::{slot_size, Kladde, Pointer, WriteBackend};
 use kladde_bench::{row, save, Rng};
 use kladde_svg::model::{
     Attr, AttrParts, Color, Element, ElementGuard, ElementKind, ElementKindParts, Node, NodeParts,
@@ -510,7 +510,7 @@ impl Bench {
         }
         tx.commit().expect("a commit");
         self.kladde_time += t.elapsed();
-        self.app_bytes += <Node as Persistable>::INLINE_SIZE as u64;
+        self.app_bytes += slot_size::<Node, Pointer>() as u64;
         self.stale = true;
     }
 

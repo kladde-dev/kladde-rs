@@ -33,6 +33,9 @@ pub enum Error {
     /// The encoded value does not fit in a `u64` (more groups than a
     /// 64-bit integer can hold).
     Overflow,
+    /// The value was encoded in more bytes than it needs: its last group is
+    /// zero. Only [`decode_minimal`] reports this.
+    Overlong,
 }
 
 impl std::fmt::Display for Error {
@@ -40,6 +43,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Truncated => f.write_str("varint is truncated"),
             Error::Overflow => f.write_str("varint does not fit in a u64"),
+            Error::Overlong => f.write_str("varint is longer than its value needs"),
         }
     }
 }
@@ -103,6 +107,47 @@ pub fn decode(input: &[u8]) -> Result<(u64, &[u8]), Error> {
         }
         shift += 7;
     }
+}
+
+/// Like [`decode`], but also refuses a value written in more bytes than it
+/// needs ([`Error::Overlong`]), so that every value has exactly one accepted
+/// encoding.
+///
+/// ```
+/// assert_eq!(kladde_varint::decode_minimal(&[0x05]), Ok((5, &[][..])));
+/// assert_eq!(
+///     kladde_varint::decode_minimal(&[0x85, 0x00]),
+///     Err(kladde_varint::Error::Overlong)
+/// );
+/// ```
+pub fn decode_minimal(input: &[u8]) -> Result<(u64, &[u8]), Error> {
+    let (value, rest) = decode(input)?;
+    if input.len() - rest.len() != encoded_len(value) {
+        return Err(Error::Overlong);
+    }
+    Ok((value, rest))
+}
+
+/// Maps a signed integer onto an unsigned one so that numbers of small
+/// magnitude stay small: 0, -1, 1, -2, 2, ... become 0, 1, 2, 3, 4, ...,
+/// which [`encode`] then writes in few bytes.
+///
+/// ```
+/// assert_eq!(kladde_varint::zigzag(-1), 1);
+/// assert_eq!(kladde_varint::zigzag(1), 2);
+/// assert_eq!(kladde_varint::unzigzag(kladde_varint::zigzag(i64::MIN)), i64::MIN);
+/// ```
+pub fn zigzag(value: i64) -> u64 {
+    ((value << 1) ^ (value >> 63)) as u64
+}
+
+/// The inverse of [`zigzag`].
+///
+/// ```
+/// assert_eq!(kladde_varint::unzigzag(3), -2);
+/// ```
+pub fn unzigzag(value: u64) -> i64 {
+    ((value >> 1) as i64) ^ -((value & 1) as i64)
 }
 
 #[cfg(test)]
@@ -182,5 +227,23 @@ mod tests {
         // Ten bytes whose tenth group sets more than the single available bit.
         let too_big = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
         assert_eq!(decode(&too_big), Err(Error::Overflow));
+    }
+
+    #[test]
+    fn decode_minimal_refuses_trailing_zero_groups() {
+        assert_eq!(decode_minimal(&[0x80, 0x01]), Ok((128, &[][..])));
+        assert_eq!(decode_minimal(&[0x80, 0x00]), Err(Error::Overlong));
+        assert_eq!(decode(&[0x80, 0x00]), Ok((0, &[][..])));
+    }
+
+    #[test]
+    fn zigzag_interleaves_signs() {
+        for (signed, unsigned) in [(0, 0), (-1, 1), (1, 2), (-2, 3), (2, 4)] {
+            assert_eq!(zigzag(signed), unsigned);
+            assert_eq!(unzigzag(unsigned), signed);
+        }
+        for value in [i64::MIN, i64::MAX, -12345, 12345] {
+            assert_eq!(unzigzag(zigzag(value)), value);
+        }
     }
 }

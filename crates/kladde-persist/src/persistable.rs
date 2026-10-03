@@ -1,5 +1,5 @@
-//! [`Persistable`]: a type that knows how to store itself into, and load itself
-//! from, a backend allocation at a given [`Location`].
+//! [`Persistable`]: a type that knows how to encode itself, in either of its
+//! two encodings, and how to decode itself again.
 //!
 //! Parametric over the *pointer type* `P` (default `Pointer`), **not** over the
 //! size type: allocation sizes belong to the store (a container queries
@@ -8,23 +8,37 @@
 //! is the only width a `Persistable` type is pinned to, and `Size` flows from
 //! the backend as `B::Size`.
 //!
+//! ## Encodings
+//!
+//! Every method that touches bytes takes the encoding as a type parameter
+//! `E`: [`Slotted`](crate::Slotted) for a type's fixed encoding,
+//! [`Packed`](crate::Packed) for its packed one. A value is written by first
+//! [preparing](Persistable::prepare) it -- creating the allocations it owns
+//! but has not got yet, which settles every pointer -- and then
+//! [encoding](Persistable::encode) it into one buffer, written with one
+//! record.
+//!
 //! ## The `&self` / `&mut self` asymmetry
 //!
-//! [`store`](Persistable::store) and [`guard`](Persistable::guard) take a shared
-//! `&B`, so a parent guard can hand the same backend to every field guard by
-//! reborrow. [`load`](Persistable::load) takes `&mut B`, because a load is
-//! *sequential* -- one field or element after another -- and `ReadBackend`
-//! hands out a real seekable cursor rather than a copied buffer. As a free side
-//! effect the borrow checker forbids loading while any guard is alive.
+//! [`guard`](Persistable::guard) takes a shared `&B`, so a parent guard can
+//! hand the same backend to every field guard by reborrow.
+//! [`decode`](Persistable::decode) takes `&mut B`, because a load is
+//! *sequential* -- one field or element after another -- and reads the
+//! allocations it follows through a real cursor. As a free side effect the
+//! borrow checker forbids loading while any guard is alive.
 
 use kladde_schema::{Fingerprint, TypeDescriptor, TypeRef, TypeTable};
-use kladde_store::{Error, Pointer, PointerRepr, ReadBackend, WriteBackend};
+use kladde_store::{Error, Pointer, PointerRepr, ReadBackend, Word, WriteBackend};
 
+use crate::encoding::Encoding;
 use crate::guard::Guard;
+use crate::input::{read_allocation, Input};
 use crate::location::Location;
+use crate::place::{write_encoded, Place};
 use crate::schema::SchemaBuilder;
 
-/// A type with a fixed inline byte size that can round-trip through a backend.
+/// A type that can round-trip through a backend, in a slotted or a packed
+/// place.
 ///
 /// A `Persistable` is a plain in-memory value; reading it is ordinary reading.
 /// Mutating it in a way that is recorded goes through its [`Guard`], which
@@ -36,88 +50,155 @@ use crate::schema::SchemaBuilder;
 /// simply ignores it and works at every width.
 ///
 /// ```
-/// use kladde_persist::{Location, Persistable};
+/// use kladde_persist::{Location, Persistable, Slotted};
 /// use kladde_store::{MemoryStorage, Store, WriteBackend};
 ///
 /// let mut store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
-/// let p = store.alloc(<(u16, bool) as Persistable>::INLINE_SIZE as u32)?;
+/// let size = <(u16, bool) as Persistable>::SLOTTED_SIZE.unwrap();
+/// let p = store.alloc(size as u32)?;
 /// let at = Location::new(p.raw(), 0);
 /// let mut value = (7u16, true);
-/// value.store(&store, at)?;
+/// value.store::<_, Slotted>(&store, at)?;
 /// store.flush()?;
-/// assert_eq!(<(u16, bool)>::load(&mut store, at)?, (7, true));
+/// assert_eq!(<(u16, bool)>::load::<_, Slotted>(&mut store, at)?, (7, true));
 /// # Ok::<(), kladde_store::Error>(())
 /// ```
 pub trait Persistable<P: PointerRepr = Pointer>: Sized {
-    /// The number of bytes this value occupies *inline* in its parent
-    /// allocation.
+    /// How many bytes this type's fixed encoding takes -- the slot a slotted
+    /// place reserves for it -- or `None` if it has no fixed encoding and can
+    /// stand only in packed places.
     ///
-    /// For a scalar it is the value's own bytes; for a derived struct, the sum
-    /// of its fields'; for a derived enum, a 4-byte discriminant plus its
+    /// For a scalar it is the value's own width; for a derived struct, the
+    /// sum of its fields'; for a derived enum, its discriminant plus its
     /// largest variant; and for an owning type with a separate content
     /// allocation (`PersistableVec`, `PersistableString`, ...), just
     /// `P::BYTE_LEN`: the pointer alone, since the store knows the
-    /// allocation's size. Having *some* fixed inline size is what makes
-    /// sibling fields' offsets statically computable.
+    /// allocation's size. A constant slot size is what makes the offsets of
+    /// slotted fields static.
     ///
-    /// [`store`](Persistable::store) writes exactly this many bytes, and
-    /// [`load`](Persistable::load) reads them.
-    const INLINE_SIZE: usize;
+    /// ```
+    /// use kladde_persist::Persistable;
+    ///
+    /// assert_eq!(<u32 as Persistable>::SLOTTED_SIZE, Some(4));
+    /// ```
+    const SLOTTED_SIZE: Option<usize>;
 
-    /// The mutation-capable view onto this type. See [`Guard`].
-    type Guard<'s, B: WriteBackend<Pointer = P>>: Guard<Persistable = Self, Backend = B>
+    /// How many bytes this type's packed encoding takes, if that is the same
+    /// for every value: `Some` exactly for a *fixed-size* type, whose two
+    /// encodings are one.
+    ///
+    /// ```
+    /// use kladde_persist::Persistable;
+    ///
+    /// assert_eq!(<f32 as Persistable>::PACKED_SIZE, Some(4));
+    /// assert_eq!(<u32 as Persistable>::PACKED_SIZE, None); // a varint
+    /// ```
+    const PACKED_SIZE: Option<usize>;
+
+    /// The mutation-capable view onto this type, for a value in a place of
+    /// encoding `E`. See [`Guard`].
+    type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>: Guard<
+        Persistable = Self,
+        Backend = B,
+    >
     where
         Self: 's,
         B: 's;
 
     /// Borrows both `self` and a backend for `'s`, producing a [`Guard`]
-    /// through which mutations are recorded and applied. `location` is where
-    /// *this* value's own inline representation lives.
+    /// through which mutations are recorded and applied. `place` is where
+    /// *this* value's encoding lives, and which encoding it is.
     ///
     /// ```
-    /// use kladde_persist::{Location, Persistable};
+    /// use kladde_persist::{Location, Persistable, Slotted};
     /// use kladde_store::{MemoryStorage, Store, WriteBackend};
     ///
     /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
     /// let p = store.alloc(4)?;
     /// let mut count = 0u32;
-    /// count.guard(&store, Location::new(p.raw(), 0)).set(5)?;
+    /// count.guard(&store, Slotted::at(Location::new(p.raw(), 0))).set(5)?;
     /// assert_eq!(count, 5);
     /// # Ok::<(), kladde_store::Error>(())
     /// ```
-    fn guard<'s, B: WriteBackend<Pointer = P>>(
+    fn guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>(
         &'s mut self,
         backend: &'s B,
-        location: Location<P, B::Size>,
-    ) -> Self::Guard<'s, B>;
+        place: Place<'s, B, E>,
+    ) -> Self::Guard<'s, B, E>;
 
-    /// Writes `self`'s current value as its inline representation at
-    /// `location`, first creating and writing whatever separate content
-    /// allocation it needs, so that the inline bytes, written last, publish
-    /// it.
+    /// How many bytes [`encode`](Persistable::encode) writes for this value
+    /// in encoding `E`: [`SLOTTED_SIZE`](Persistable::SLOTTED_SIZE) for
+    /// [`Slotted`](crate::Slotted), and the value's own count for
+    /// [`Packed`](crate::Packed).
     ///
-    /// Takes `&mut self`, not `&self`: a type holding its own allocation
-    /// pointer may need to *learn* that pointer here -- a value built with
-    /// `from_iter` holds real content but no pointer until it is first
-    /// stored. With only `&self` it could still allocate and write correctly,
-    /// but the caller's copy would stay stuck believing it has no allocation,
-    /// breaking any guard obtained from it afterwards.
+    /// A value that owns an allocation counts its pointer as it stands, so
+    /// [`prepare`](Persistable::prepare) it first if it may not have its
+    /// allocation yet.
     ///
-    /// Storing a value that already owns allocations writes only its
-    /// pointers, so moving a value into a container copies none of its
-    /// content. See [`Persistable`] for an example.
-    fn store<B: WriteBackend<Pointer = P>>(
-        &mut self,
-        backend: &B,
-        location: Location<P, B::Size>,
-    ) -> Result<(), Error>;
+    /// ```
+    /// use kladde_persist::{Packed, Persistable, Slotted};
+    ///
+    /// assert_eq!(<u32 as Persistable>::encoded_size::<Slotted>(&300), 4);
+    /// assert_eq!(<u32 as Persistable>::encoded_size::<Packed>(&300), 2);
+    /// ```
+    fn encoded_size<E: Encoding>(&self) -> usize;
 
-    /// Reconstructs a value purely from what is stored at `location`, as of
-    /// the backend's last flush. See [`Persistable`] for an example.
-    fn load<B: ReadBackend<Pointer = P>>(
+    /// Appends this value's encoding `E` to `out`.
+    ///
+    /// Writes pointers as they stand: [`prepare`](Persistable::prepare) a
+    /// value first if it may own content that has no allocation yet.
+    ///
+    /// ```
+    /// use kladde_persist::{Packed, Persistable};
+    ///
+    /// let mut bytes = Vec::new();
+    /// <u32 as Persistable>::encode::<Packed>(&300, &mut bytes);
+    /// assert_eq!(bytes, [0xac, 0x02]);
+    /// ```
+    fn encode<E: Encoding>(&self, out: &mut Vec<u8>);
+
+    /// Reconstructs a value from its encoding `E` at the front of `input`,
+    /// advancing past it, and following pointers into other allocations
+    /// through `backend`, as of its last flush.
+    ///
+    /// Fails with [`Error::Corrupt`] on bytes that no value encodes to,
+    /// including a packed encoding that is not canonical.
+    ///
+    /// ```
+    /// use kladde_persist::{Input, Packed, Persistable};
+    /// use kladde_store::{MemoryStorage, Store};
+    ///
+    /// let mut store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
+    /// let mut input = Input::new(&[0xac, 0x02]);
+    /// assert_eq!(<u32 as Persistable>::decode::<_, Packed>(&mut store, &mut input)?, 300);
+    /// # Ok::<(), kladde_store::Error>(())
+    /// ```
+    fn decode<B: ReadBackend<Pointer = P>, E: Encoding>(
         backend: &mut B,
-        location: Location<P, B::Size>,
+        input: &mut Input<'_>,
     ) -> Result<Self, Error>;
+
+    /// Creates and fills every allocation this value owns but does not have
+    /// yet, recursively, so that its encoding is settled.
+    ///
+    /// A value built with `from_iter` holds real content but no pointer until
+    /// it is first stored, and its pointer's packed encoding depends on the id
+    /// its allocation gets. A value that owns nothing, or already has every
+    /// allocation it owns, keeps the default, which does nothing.
+    ///
+    /// ```
+    /// use kladde_persist::Persistable;
+    /// use kladde_store::{MemoryStorage, Store};
+    ///
+    /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
+    /// let mut scalar = 3i64;
+    /// scalar.prepare(&store)?; // owns nothing: nothing to do
+    /// # Ok::<(), kladde_store::Error>(())
+    /// ```
+    fn prepare<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) -> Result<(), Error> {
+        let _ = backend;
+        Ok(())
+    }
 
     /// Releases every allocation this value owns, recursively. A type that
     /// owns nothing keeps the default, which does nothing.
@@ -138,6 +219,50 @@ pub trait Persistable<P: PointerRepr = Pointer>: Sized {
     fn free<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) -> Result<(), Error> {
         let _ = backend;
         Ok(())
+    }
+
+    /// Writes this value in encoding `E` at `location` with one write, after
+    /// [preparing](Persistable::prepare) it, so that the inline bytes,
+    /// written last, publish whatever content it owns.
+    ///
+    /// Takes `&mut self`, not `&self`: a value holding its own allocation
+    /// pointer may need to *learn* that pointer here. Storing a value that
+    /// already owns allocations writes only its pointers, so moving a value
+    /// into a container copies none of its content. See [`Persistable`] for
+    /// an example.
+    fn store<B: WriteBackend<Pointer = P>, E: Encoding>(
+        &mut self,
+        backend: &B,
+        location: Location<P, B::Size>,
+    ) -> Result<(), Error> {
+        self.prepare(backend)?;
+        let bytes = self.to_bytes::<E>();
+        backend.write(location.anchor, location.offset, &bytes)
+    }
+
+    /// Reconstructs a value from its encoding `E` at `location`, as of the
+    /// backend's last flush. See [`Persistable`] for an example.
+    fn load<B: ReadBackend<Pointer = P>, E: Encoding>(
+        backend: &mut B,
+        location: Location<P, B::Size>,
+    ) -> Result<Self, Error> {
+        let bytes = read_allocation(backend, location.anchor)?;
+        let mut input = Input::new(&bytes);
+        input.take(location.offset.to_usize())?;
+        Self::decode::<B, E>(backend, &mut input)
+    }
+
+    /// This value's encoding `E`, as a fresh buffer.
+    ///
+    /// ```
+    /// use kladde_persist::{Persistable, Slotted};
+    ///
+    /// assert_eq!(<u16 as Persistable>::to_bytes::<Slotted>(&258), [2, 1]);
+    /// ```
+    fn to_bytes<E: Encoding>(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.encoded_size::<E>());
+        self.encode::<E>(&mut out);
+        out
     }
 
     /// Builds this type's own descriptor node -- the common-case schema hook.
@@ -232,37 +357,57 @@ pub trait Persistable<P: PointerRepr = Pointer>: Sized {
     }
 }
 
-/// Replaces `*current` with `new`: stores `new` at `location`, which
-/// publishes it, then frees what the old value owned, all in one transaction,
-/// and only then updates `*current`.
+/// The slot size of `T`, for code that has made sure `T` stands in a slotted
+/// place only if it has one. Panics for a type without a fixed encoding.
+///
+/// ```
+/// assert_eq!(kladde_persist::slot_size::<u64, kladde_persist::Pointer>(), 8);
+/// ```
+pub fn slot_size<T: Persistable<P>, P: PointerRepr>() -> usize {
+    match T::SLOTTED_SIZE {
+        Some(size) => size,
+        None => panic!(
+            "{} has no fixed encoding, so it cannot stand in a slotted place",
+            std::any::type_name::<T>()
+        ),
+    }
+}
+
+/// Replaces `*current` with `new`: prepares `new`, writes its encoding over
+/// the current one at `place` -- in place if the size stays, as a splice its
+/// ancestors hear about if not -- then frees what the old value owned, all in
+/// one transaction, and only then updates `*current`.
 ///
 /// This is the whole-value `set` of every generated guard and of most
 /// hand-written ones. If anything fails, `*current` is left as it was.
 ///
 /// ```
-/// use kladde_persist::{replace, Location};
+/// use kladde_persist::{replace, Location, Slotted};
 /// use kladde_store::{MemoryStorage, Store, WriteBackend};
 ///
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
 /// let p = store.alloc(8)?;
 /// let mut pair = (1u32, 2u32);
-/// replace(&mut pair, (3, 4), &store, Location::new(p.raw(), 0))?;
+/// replace(&mut pair, (3, 4), &store, &Slotted::at(Location::new(p.raw(), 0)))?;
 /// assert_eq!(pair, (3, 4));
 /// # Ok::<(), kladde_store::Error>(())
 /// ```
-pub fn replace<P, T, B>(
+pub fn replace<P, T, B, E>(
     current: &mut T,
     mut new: T,
     backend: &B,
-    location: Location<P, B::Size>,
+    place: &Place<'_, B, E>,
 ) -> Result<(), Error>
 where
     P: PointerRepr,
     T: Persistable<P>,
     B: WriteBackend<Pointer = P>,
+    E: Encoding,
 {
     backend.atomically(|| {
-        new.store(backend, location)?;
+        new.prepare(backend)?;
+        let bytes = new.to_bytes::<E>();
+        write_encoded(backend, place, current.encoded_size::<E>(), &bytes)?;
         current.free(backend)
     })?;
     *current = new;

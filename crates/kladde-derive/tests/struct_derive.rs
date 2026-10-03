@@ -1,7 +1,7 @@
 mod support;
 
 use kladde_derive::Persistable;
-use kladde_persist::Persistable;
+use kladde_persist::{Encoding, Input, Packed, Persistable, Place, Slotted};
 use kladde_store::WriteBackend;
 use support::{Fixture, Number};
 
@@ -13,12 +13,12 @@ struct Point {
 
 #[test]
 fn generated_guard_exposes_a_mut_accessor_per_field() {
-    let mut f = Fixture::new(<Point as Persistable>::INLINE_SIZE);
+    let mut f = Fixture::for_type::<Point>();
     let mut point = Point {
         x: Number(1),
         y: Number(2),
     };
-    let mut guard = point.guard(&f.store, f.location);
+    let mut guard = point.guard(&f.store, f.place());
     guard.x_mut().set(10).unwrap();
     guard.y_mut().set(20).unwrap();
     // Deref gives read-only access to the plain value.
@@ -34,13 +34,13 @@ fn generated_guard_exposes_a_mut_accessor_per_field() {
 
 #[test]
 fn set_replaces_the_whole_value() {
-    let mut f = Fixture::new(<Point as Persistable>::INLINE_SIZE);
+    let mut f = Fixture::for_type::<Point>();
     let mut point = Point {
         x: Number(1),
         y: Number(2),
     };
     point
-        .guard(&f.store, f.location)
+        .guard(&f.store, f.place())
         .set(Point {
             x: Number(3),
             y: Number(4),
@@ -56,10 +56,11 @@ struct Empty;
 
 #[test]
 fn unit_struct_derives_without_error() {
-    let f = Fixture::new(<Empty as Persistable>::INLINE_SIZE);
+    let f = Fixture::for_type::<Empty>();
     let mut empty = Empty;
-    let _guard = empty.guard(&f.store, f.location);
-    assert_eq!(<Empty as Persistable>::INLINE_SIZE, 0);
+    let _guard = empty.guard(&f.store, f.place());
+    assert_eq!(<Empty as Persistable>::SLOTTED_SIZE, Some(0));
+    assert_eq!(<Empty as Persistable>::PACKED_SIZE, Some(0));
 }
 
 #[derive(Persistable)]
@@ -69,7 +70,7 @@ struct Nested {
 
 #[test]
 fn nested_persistable_fields_reborrow_the_same_backend() {
-    let mut f = Fixture::new(<Nested as Persistable>::INLINE_SIZE);
+    let mut f = Fixture::for_type::<Nested>();
     let mut nested = Nested {
         point: Point {
             x: Number(0),
@@ -77,7 +78,7 @@ fn nested_persistable_fields_reborrow_the_same_backend() {
         },
     };
     nested
-        .guard(&f.store, f.location)
+        .guard(&f.store, f.place())
         .point_mut()
         .x_mut()
         .set(7)
@@ -85,6 +86,69 @@ fn nested_persistable_fields_reborrow_the_same_backend() {
     assert_eq!(nested.point.x.0, 7);
     let reloaded: Nested = f.reload();
     assert_eq!(reloaded.point.x.0, 7);
+}
+
+/// Integers whose packed encodings are varints.
+#[derive(Persistable, Debug, PartialEq)]
+struct Counts {
+    small: u32,
+    signed: i64,
+    flag: bool,
+}
+
+#[test]
+fn a_struct_packs_its_fields() {
+    let counts = Counts {
+        small: 5,
+        signed: -3,
+        flag: true,
+    };
+    assert_eq!(<Counts as Persistable>::SLOTTED_SIZE, Some(4 + 8 + 1));
+    assert_eq!(<Counts as Persistable>::PACKED_SIZE, None);
+    assert_eq!(counts.encoded_size::<Packed>(), 3);
+    assert_eq!(counts.to_bytes::<Packed>(), [5, 5, 1]);
+    let bytes = counts.to_bytes::<Slotted>();
+    assert_eq!(bytes.len(), 13);
+    let mut f = Fixture::new(0);
+    let mut input = Input::new(&bytes);
+    assert_eq!(
+        Counts::decode::<_, Slotted>(&mut f.store, &mut input).unwrap(),
+        counts
+    );
+}
+
+#[test]
+fn packed_fields_find_themselves_after_a_sibling_grows() {
+    let mut f = Fixture::new(0);
+    let mut counts = Counts {
+        small: 5,
+        signed: -3,
+        flag: false,
+    };
+    counts.store::<_, Packed>(&f.store, f.location).unwrap();
+    {
+        let mut guard = counts.guard(&f.store, f.packed());
+        let mut parts = guard.parts();
+        parts.small.set(1 << 30).unwrap(); // five bytes now
+        parts.flag.set(true).unwrap();
+        parts.signed.set(-1000).unwrap(); // two bytes now
+        parts.small.set(1).unwrap();
+    }
+    {
+        let mut guard = counts.guard(&f.store, f.packed());
+        guard.signed_mut().set(i64::MIN).unwrap();
+    }
+    assert_eq!(f.bytes().len(), 1 + 10 + 1);
+    let reloaded: Counts = f.reload_as::<_, Packed>();
+    assert_eq!(reloaded, counts);
+    assert_eq!(
+        reloaded,
+        Counts {
+            small: 1,
+            signed: i64::MIN,
+            flag: true
+        }
+    );
 }
 
 /// A field that owns an allocation of its own, to see `free` recurse.
@@ -118,52 +182,52 @@ impl<'s, B: WriteBackend> kladde_persist::Guard for BoxedGuard<'s, B> {
 }
 
 impl Persistable for Boxed {
-    const INLINE_SIZE: usize = 4;
-    type Guard<'s, B: WriteBackend<Pointer = kladde_store::Pointer>>
+    const SLOTTED_SIZE: Option<usize> = Some(4);
+    const PACKED_SIZE: Option<usize> = Some(4);
+
+    type Guard<'s, B: WriteBackend<Pointer = kladde_store::Pointer>, E: Encoding>
         = BoxedGuard<'s, B>
     where
         B: 's;
 
-    fn guard<'s, B: WriteBackend<Pointer = kladde_store::Pointer>>(
+    fn guard<'s, B: WriteBackend<Pointer = kladde_store::Pointer>, E: Encoding>(
         &'s mut self,
         backend: &'s B,
-        _location: kladde_persist::Location<kladde_store::Pointer, B::Size>,
-    ) -> Self::Guard<'s, B> {
+        _place: Place<'s, B, E>,
+    ) -> Self::Guard<'s, B, E> {
         BoxedGuard {
             inner: self,
             backend,
         }
     }
 
-    fn store<B: WriteBackend<Pointer = kladde_store::Pointer>>(
+    fn encoded_size<E: Encoding>(&self) -> usize {
+        4
+    }
+
+    fn encode<E: Encoding>(&self, out: &mut Vec<u8>) {
+        let id = self.0.as_ref().map(|p| p.raw());
+        out.extend_from_slice(&kladde_store::encode_option(id));
+    }
+
+    fn decode<B: kladde_store::ReadBackend<Pointer = kladde_store::Pointer>, E: Encoding>(
+        _backend: &mut B,
+        input: &mut Input<'_>,
+    ) -> Result<Self, kladde_persist::Error> {
+        Ok(Boxed(
+            kladde_store::decode_option::<kladde_store::Pointer>(input.array()?)
+                .map(kladde_store::UniquePointer::from_pointer),
+        ))
+    }
+
+    fn prepare<B: WriteBackend<Pointer = kladde_store::Pointer>>(
         &mut self,
         backend: &B,
-        location: kladde_persist::Location<kladde_store::Pointer, B::Size>,
     ) -> Result<(), kladde_persist::Error> {
         if self.0.is_none() {
             self.0 = Some(backend.alloc(kladde_store::Word::from_usize(4))?);
         }
-        let id = self.0.as_ref().unwrap().raw();
-        backend.write(
-            location.anchor,
-            location.offset,
-            &kladde_store::encode_option(Some(id)),
-        )
-    }
-
-    fn load<B: kladde_store::ReadBackend<Pointer = kladde_store::Pointer>>(
-        backend: &mut B,
-        location: kladde_persist::Location<kladde_store::Pointer, B::Size>,
-    ) -> Result<Self, kladde_persist::Error> {
-        let mut bytes = [0u8; 4];
-        std::io::Read::read_exact(
-            &mut backend.read_at(location.anchor, location.offset)?,
-            &mut bytes,
-        )?;
-        Ok(Boxed(
-            kladde_store::decode_option::<kladde_store::Pointer>(bytes)
-                .map(kladde_store::UniquePointer::from_pointer),
-        ))
+        Ok(())
     }
 
     fn free<B: WriteBackend<Pointer = kladde_store::Pointer>>(
@@ -183,16 +247,16 @@ impl Persistable for Boxed {
 
 #[test]
 fn set_frees_what_the_old_value_owned() {
-    let mut f = Fixture::new(<Owner as Persistable>::INLINE_SIZE);
+    let mut f = Fixture::for_type::<Owner>();
     let mut owner = Owner {
         id: Number(1),
         data: Boxed(None),
     };
-    owner.store(&f.store, f.location).unwrap();
+    owner.store::<_, Slotted>(&f.store, f.location).unwrap();
     f.store.flush().unwrap();
     assert_eq!(f.store.allocations().len(), 2, "the root and one box");
     owner
-        .guard(&f.store, f.location)
+        .guard(&f.store, f.place())
         .set(Owner {
             id: Number(2),
             data: Boxed(None),

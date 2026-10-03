@@ -1,5 +1,6 @@
-//! The built-in backed containers: [`PersistableVec`], [`PersistableString`],
-//! [`PersistableHashMap`], and, with the `serde` feature, `PersistableBlob`.
+//! The built-in backed containers: [`PersistableVec`] and
+//! [`PackedPersistableVec`], [`PersistableString`], [`PersistableHashMap`],
+//! and, with the `serde` feature, `PersistableBlob`.
 //!
 //! They are hand-implemented against the same public `Persistable` and `Guard`
 //! surface any crate can use, the way `std`'s collections hand-write their raw
@@ -31,6 +32,7 @@
 #[cfg(feature = "serde")]
 mod blob;
 mod map;
+mod packed;
 mod slot;
 mod string;
 mod vec;
@@ -41,6 +43,7 @@ mod test_support;
 #[cfg(feature = "serde")]
 pub use blob::{PersistableBlob, PersistableBlobGuard};
 pub use map::{PersistableHashMap, PersistableHashMapGuard};
+pub use packed::{PackedPersistableVec, PackedPersistableVecGuard};
 pub use string::{PersistableString, PersistableStringGuard};
 pub use vec::{PersistableVec, PersistableVecGuard};
 
