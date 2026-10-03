@@ -1,11 +1,14 @@
-//! How many bytes a model value takes in a kladde file: its inline bytes plus
-//! the content of every allocation it owns.
+//! How many bytes a model value takes in a kladde file: its encoding in the
+//! place that holds it, plus the content of every allocation it owns.
 //!
 //! A benchmark counts what an edit stores with [`Payload::payload_bytes`], the
 //! measure kladde-bench calls the bytes the application wrote.
 
-use kladde::{Persistable, Slotted};
-use kladde_types::{PersistableString, PersistableVec};
+use kladde::{Encoding, Packed, Persistable, Slotted};
+use kladde_types::{
+    PackedPersistableVec, PersistableString, PersistableVec, SmallPersistableString,
+    SmallPersistableVec,
+};
 
 use crate::model::{
     Attr, Color, Document, Element, ElementKind, FillRule, Length, LengthUnit, LineCap, LineJoin,
@@ -18,19 +21,21 @@ use crate::model::{
 /// use kladde_svg::size::Payload;
 ///
 /// let doc = kladde_svg::parse(r#"<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0L1 1"/></svg>"#)?;
-/// // Two path segments, of 26 bytes each with `f32`, owned by the path.
+/// // Two path segments, of 10 bytes each packed and 26 slotted with `f32`,
+/// // owned by the path, or inline in its element.
 /// let path = &doc.root.children[0];
-/// assert!(path.owned_bytes() >= 2 * 26);
+/// assert!(path.payload_bytes::<kladde_svg::model::ListEncoding>() >= 2 * 10);
 /// # Ok::<(), kladde_svg::ParseError>(())
 /// ```
 pub trait Payload: Persistable {
     /// The content of every allocation this value owns, recursively, not
-    /// counting its own inline bytes.
+    /// counting its own encoding.
     fn owned_bytes(&self) -> u64;
 
-    /// The value's inline bytes in a slotted place, plus everything it owns.
-    fn payload_bytes(&self) -> u64 {
-        self.encoded_size::<Slotted>() as u64 + self.owned_bytes()
+    /// The value's encoding in a place of encoding `E`, plus everything it
+    /// owns.
+    fn payload_bytes<E: Encoding>(&self) -> u64 {
+        self.encoded_size::<E>() as u64 + self.owned_bytes()
     }
 }
 
@@ -40,9 +45,38 @@ impl Payload for PersistableString {
     }
 }
 
+/// Inline, the text is part of the string's own encoding.
+impl Payload for SmallPersistableString {
+    fn owned_bytes(&self) -> u64 {
+        if self.is_inline() {
+            0
+        } else {
+            self.len() as u64
+        }
+    }
+}
+
 impl<T: Payload + kladde::Slottable> Payload for PersistableVec<T> {
     fn owned_bytes(&self) -> u64 {
-        self.iter().map(Payload::payload_bytes).sum()
+        self.iter().map(Payload::payload_bytes::<Slotted>).sum()
+    }
+}
+
+impl<T: Payload> Payload for PackedPersistableVec<T> {
+    fn owned_bytes(&self) -> u64 {
+        self.iter().map(Payload::payload_bytes::<Packed>).sum()
+    }
+}
+
+/// Inline, the elements' encodings are part of the vector's own; what they
+/// own is not.
+impl<T: Payload> Payload for SmallPersistableVec<T> {
+    fn owned_bytes(&self) -> u64 {
+        if self.is_inline() {
+            self.iter().map(Payload::owned_bytes).sum()
+        } else {
+            self.iter().map(Payload::payload_bytes::<Packed>).sum()
+        }
     }
 }
 
@@ -121,11 +155,10 @@ impl Payload for Paint {
 impl Payload for Attr {
     fn owned_bytes(&self) -> u64 {
         match self {
-            Attr::Id(s)
-            | Attr::Class(s)
-            | Attr::Href(s)
-            | Attr::XlinkHref(s)
-            | Attr::FontFamily(s) => s.owned_bytes(),
+            Attr::Id(id) => id.owned_bytes(),
+            Attr::Class(s) | Attr::Href(s) | Attr::XlinkHref(s) | Attr::FontFamily(s) => {
+                s.owned_bytes()
+            }
             Attr::Fill(p) | Attr::Stroke(p) => p.owned_bytes(),
             Attr::StrokeDasharray(list) => list.owned_bytes(),
             Attr::GradientTransform(ops) | Attr::PatternTransform(ops) => ops.owned_bytes(),

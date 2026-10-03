@@ -5,7 +5,10 @@
 //! value that owns no allocation yet. [`DeepCopy`] does that for every type of
 //! the model.
 
-use kladde_types::{PersistableString, PersistableVec};
+use kladde_types::{
+    PackedPersistableVec, PersistableString, PersistableVec, SmallPersistableString,
+    SmallPersistableVec,
+};
 
 use crate::model::{
     Attr, Color, Document, Element, ElementKind, FillRule, Length, LengthUnit, LineCap, LineJoin,
@@ -42,7 +45,25 @@ impl DeepCopy for PersistableString {
     }
 }
 
+impl DeepCopy for SmallPersistableString {
+    fn deep_copy(&self) -> Self {
+        SmallPersistableString::from(&**self)
+    }
+}
+
 impl<T: DeepCopy> DeepCopy for PersistableVec<T> {
+    fn deep_copy(&self) -> Self {
+        self.iter().map(DeepCopy::deep_copy).collect()
+    }
+}
+
+impl<T: DeepCopy> DeepCopy for PackedPersistableVec<T> {
+    fn deep_copy(&self) -> Self {
+        self.iter().map(DeepCopy::deep_copy).collect()
+    }
+}
+
+impl<T: DeepCopy> DeepCopy for SmallPersistableVec<T> {
     fn deep_copy(&self) -> Self {
         self.iter().map(DeepCopy::deep_copy).collect()
     }

@@ -16,6 +16,15 @@ publish.workspace = true
 [features]
 # Store every decimal as `f64` instead of `f32`, to measure what `f32` costs.
 f64 = []
+# The layout of the model, in three cumulative steps (see `model`):
+# lists of enums whose variants differ widely in size are packed vectors...
+packed = []
+# ...an element's `id` is a small string, inline in its attribute...
+small-ids = ["packed"]
+# ...attribute lists and every string are small, inline in their element...
+small-attrs = ["small-ids"]
+# ...and so are transform lists, path data, points and child lists.
+small = ["small-attrs"]
 # Render original and round-tripped SVG with resvg and compare the pixels.
 render = ["dep:resvg"]
 

@@ -1,22 +1,27 @@
 //! Benchmarks a drawing editor's edits on an SVG drawing stored in kladde.
 //!
 //! ```text
-//! svg-bench <drawing.svg> <output directory> [--quick] [--seed N] [--variant NAME]
+//! svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME]
 //! ```
+//!
+//! `--only Restack`, say, makes every edit a restack where the drawing allows
+//! one, to measure what one kind of edit costs.
 //!
 //! The drawing is converted into a kladde file, which is not measured, and
 //! then edited by a seeded mix of what a drawing editor does — dragging shapes,
 //! moving, inserting and deleting path nodes, recoloring, duplicating,
 //! deleting and restacking shapes, editing text — until the edits have stored
-//! eight times the drawing's live size (once with `--quick`). Every 1000 edits
+//! eight times the drawing's live size (once with `--quick`), or for exactly
+//! `N` edits with `--edits`, which makes runs of the model's layouts (see
+//! `kladde_svg::model`) make the same edits. Every 1000 edits
 //! the file is flushed and one row is recorded in kladde-bench's format, to
 //! `svg-<variant>.csv` in the output directory, so that `plot-evaluation.py`
 //! in kladde-docs reads it like kladde-bench's tables. The variant is the
 //! drawing's file name unless `--variant` says otherwise.
 //!
 //! `app_bytes` counts what each edit stores: the bytes of the numbers it sets,
-//! or the inline size of a value it stores plus everything that value owns;
-//! deletions count nothing. `ops_us` counts the time spent in kladde's calls
+//! or the encoding of a value it stores, in the place it stores it, plus
+//! everything that value owns; deletions count nothing. `ops_us` counts the time spent in kladde's calls
 //! only, not choosing the edits.
 //!
 //! At the end, the file is closed and reopened, and the drawing must write the
@@ -27,11 +32,12 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use kladde::{slot_size, Kladde, Pointer, WriteBackend};
+use kladde::{Encoding, Kladde, Persistable, Pointer, WriteBackend};
 use kladde_bench::{row, save, Rng};
 use kladde_svg::model::{
-    Attr, AttrParts, Color, Element, ElementGuard, ElementKind, ElementKindParts, Node, NodeParts,
-    Paint, PaintParts, PathSegment, PathSegmentParts, TransformOp, TransformOpParts,
+    Attr, AttrParts, Color, Element, ElementGuard, ElementKind, ElementKindParts, ListEncoding,
+    Node, NodeParts, Paint, PaintParts, PathSegment, PathSegmentParts, TransformOp,
+    TransformOpParts,
 };
 use kladde_svg::size::Payload;
 use kladde_svg::{parse, write, DeepCopy, Document, Number};
@@ -148,25 +154,58 @@ fn element<'a>(root: &'a Element, path: &[usize]) -> &'a Element {
     })
 }
 
-/// Runs `f` on the guard of the element at `path` below `g`'s element.
-fn at<B: WriteBackend<Pointer = Pointer>, R>(
-    g: &mut ElementGuard<'_, B>,
-    path: &[usize],
-    f: impl FnOnce(&mut ElementGuard<'_, B>) -> R,
-) -> R {
-    match path.split_first() {
-        None => f(g),
-        Some((&i, rest)) => {
-            let mut children = g.children_mut();
-            let mut node = children
-                .get_mut(i)
-                .expect("an index from the element index");
-            match node.parts() {
-                NodeParts::Element(mut child) => at(&mut child, rest, f),
-                _ => unreachable!("the index names elements only"),
-            }
-        }
+/// Runs `f` on the guard of the element at `rest` below child `i` of the
+/// element `g` guards. Every element below the root stands in a list of
+/// children, so its guard takes the lists' encoding, whatever `g`'s is.
+fn below<B, E, R>(
+    g: &mut ElementGuard<'_, B, E>,
+    i: usize,
+    rest: &[usize],
+    f: impl FnOnce(&mut ElementGuard<'_, B, ListEncoding>) -> R,
+) -> R
+where
+    B: WriteBackend<Pointer = Pointer>,
+    E: Encoding,
+{
+    let mut children = g.children_mut();
+    let mut node = children
+        .get_mut(i)
+        .expect("an index from the element index");
+    match node.parts() {
+        NodeParts::Element(mut child) => match rest.split_first() {
+            None => f(&mut child),
+            Some((&j, rest)) => below(&mut child, j, rest, f),
+        },
+        _ => unreachable!("the index names elements only"),
     }
+}
+
+/// Evaluates `$body` with `$e` bound to the guard of the element at `$path`
+/// below the root element guarded by `$root`. A macro rather than a
+/// function: the root element's guard and those below it take different
+/// encodings in some layouts, and the body is type-checked against each.
+macro_rules! on_element {
+    ($root:expr, $path:expr, |$e:ident| $body:expr) => {{
+        let root = $root;
+        let path: &[usize] = $path;
+        match path.split_first() {
+            None => (|$e: &mut ElementGuard<'_, _, _>| $body)(root),
+            Some((&i, rest)) => below(root, i, rest, |$e| $body),
+        }
+    }};
+}
+
+/// Times one mutation of the element at `$path`, made by `$body`.
+macro_rules! mutate {
+    ($bench:expr, $path:expr, |$e:ident| $body:expr) => {{
+        let t = Instant::now();
+        {
+            let mut g = $bench.drawing.guard();
+            let mut root = g.root_mut();
+            on_element!(&mut root, $path, |$e| $body).expect("an edit");
+        }
+        $bench.kladde_time += t.elapsed();
+    }};
 }
 
 /// A path segment's end point, as the coordinates it has.
@@ -207,6 +246,8 @@ struct Bench {
     /// Time spent in kladde's calls since the last row.
     kladde_time: Duration,
     counts: Vec<(Edit, u64)>,
+    /// The one kind of edit to make, if `--only` names one.
+    only: Option<Edit>,
 }
 
 impl Bench {
@@ -216,21 +257,6 @@ impl Bench {
 
     fn pick<T: Clone>(&mut self, list: &[T]) -> T {
         list[self.rng.below(list.len() as u64) as usize].clone()
-    }
-
-    /// Times one mutation of the element at `path`.
-    fn mutate(
-        &mut self,
-        path: &[usize],
-        f: impl FnOnce(&mut ElementGuard<'_, kladde::Store>) -> kladde::Result<()>,
-    ) {
-        let t = Instant::now();
-        {
-            let mut g = self.drawing.guard();
-            let mut root = g.root_mut();
-            at(&mut root, path, f).expect("an edit");
-        }
-        self.kladde_time += t.elapsed();
     }
 
     /// One edit, chosen from the mix.
@@ -247,6 +273,9 @@ impl Bench {
                 break;
             }
             r -= share;
+        }
+        if let Some(only) = self.only {
+            edit = only;
         }
         // Keep the drawing near its starting size, and fall back where the
         // drawing has nothing to edit.
@@ -294,7 +323,7 @@ impl Bench {
         match first {
             Some(TransformOp::Translate { tx, ty }) => {
                 let (tx, ty) = (tx + dx, ty + dy);
-                self.mutate(&path, |e| {
+                mutate!(self, &path, |e| {
                     let mut transform = e.transform_mut();
                     let mut op = transform.get_mut(0).unwrap();
                     let TransformOpParts::Translate {
@@ -310,12 +339,12 @@ impl Bench {
                 self.app_bytes += 2 * NUMBER;
             }
             Some(_) => {
-                self.mutate(&path, |e| e.transform_mut().insert(0, new));
-                self.app_bytes += new.payload_bytes();
+                mutate!(self, &path, |e| e.transform_mut().insert(0, new));
+                self.app_bytes += new.payload_bytes::<ListEncoding>();
             }
             None => {
-                self.mutate(&path, |e| e.transform_mut().push(new));
-                self.app_bytes += new.payload_bytes();
+                mutate!(self, &path, |e| e.transform_mut().push(new));
+                self.app_bytes += new.payload_bytes::<ListEncoding>();
             }
         }
     }
@@ -335,7 +364,7 @@ impl Bench {
         let (x, y) = end_point(&Self::path_data(&self.drawing, &path)[i]);
         let (dx, dy) = (self.delta(), self.delta());
         let (x, y) = (x.map(|x| x + dx), y.map(|y| y + dy));
-        self.mutate(&path, |e| {
+        mutate!(self, &path, |e| {
             let mut kind = e.kind_mut();
             let ElementKindParts::Path { mut d } = kind.parts() else {
                 unreachable!()
@@ -360,7 +389,7 @@ impl Bench {
             if let (Some(mut g), Some(y)) = (gy, y) {
                 g.set(y)?;
             }
-            Ok(())
+            Ok::<(), kladde::Error>(())
         });
         self.app_bytes += (x.is_some() as u64 + y.is_some() as u64) * NUMBER;
     }
@@ -375,14 +404,14 @@ impl Bench {
             x: self.delta(),
             y: self.delta(),
         };
-        self.mutate(&path, |e| {
+        mutate!(self, &path, |e| {
             let mut kind = e.kind_mut();
             let ElementKindParts::Path { mut d } = kind.parts() else {
                 unreachable!()
             };
             d.insert(i, segment)
         });
-        self.app_bytes += segment.payload_bytes();
+        self.app_bytes += segment.payload_bytes::<ListEncoding>();
     }
 
     /// Deletes a node of a path, never its first, and never below two.
@@ -393,7 +422,7 @@ impl Bench {
             return self.insert_node();
         }
         let i = 1 + self.rng.below(len - 1) as usize;
-        self.mutate(&path, |e| {
+        mutate!(self, &path, |e| {
             let mut kind = e.kind_mut();
             let ElementKindParts::Path { mut d } = kind.parts() else {
                 unreachable!()
@@ -438,7 +467,7 @@ impl Bench {
         match fill {
             Fill::Attr(k, is_color) | Fill::Style(k, is_color) => {
                 let in_style = matches!(fill, Fill::Style(..));
-                self.mutate(&path, |e| {
+                mutate!(self, &path, |e| {
                     let mut list = if in_style {
                         e.style_mut()
                     } else {
@@ -458,15 +487,15 @@ impl Bench {
                     }
                 });
                 self.app_bytes += if is_color {
-                    color.payload_bytes()
+                    color.payload_bytes::<ListEncoding>()
                 } else {
-                    Paint::Color(color).payload_bytes()
+                    Paint::Color(color).payload_bytes::<ListEncoding>()
                 };
             }
             Fill::Unset => {
                 let attr = Attr::Fill(Paint::Color(color));
-                self.app_bytes += attr.payload_bytes();
-                self.mutate(&path, |e| e.attrs_mut().push(attr));
+                self.app_bytes += attr.payload_bytes::<ListEncoding>();
+                mutate!(self, &path, |e| e.attrs_mut().push(attr));
             }
         }
     }
@@ -476,8 +505,8 @@ impl Bench {
         let path = self.pick(&self.index.leaves.clone());
         let (&i, parent) = path.split_last().unwrap();
         let copy = Node::Element(element(&self.drawing.get().root, &path).deep_copy());
-        self.app_bytes += copy.payload_bytes();
-        self.mutate(parent, |p| p.children_mut().insert(i + 1, copy));
+        self.app_bytes += copy.payload_bytes::<ListEncoding>();
+        mutate!(self, parent, |p| p.children_mut().insert(i + 1, copy));
         self.stale = true;
     }
 
@@ -485,7 +514,7 @@ impl Bench {
     fn delete(&mut self) {
         let path = self.pick(&self.index.leaves.clone());
         let (&i, parent) = path.split_last().unwrap();
-        self.mutate(parent, |p| p.children_mut().delete(i));
+        mutate!(self, parent, |p| p.children_mut().delete(i));
         self.stale = true;
     }
 
@@ -496,12 +525,14 @@ impl Bench {
         let (&i, parent) = path.split_last().unwrap();
         let siblings = element(&self.drawing.get().root, parent).children.len() as u64;
         let j = self.rng.below(siblings) as usize;
+        let moved =
+            element(&self.drawing.get().root, parent).children[i].encoded_size::<ListEncoding>();
         let t = Instant::now();
         let mut tx = self.drawing.transaction();
         {
             let mut g = tx.guard();
             let mut root = g.root_mut();
-            at(&mut root, parent, |p| {
+            on_element!(&mut root, parent, |p| {
                 let mut children = p.children_mut();
                 let node = children.remove(i)?;
                 children.insert(j, node)
@@ -510,7 +541,8 @@ impl Bench {
         }
         tx.commit().expect("a commit");
         self.kladde_time += t.elapsed();
-        self.app_bytes += slot_size::<Node, Pointer>() as u64;
+        // The node's encoding moves; what it owns stays where it is.
+        self.app_bytes += moved as u64;
         self.stale = true;
     }
 
@@ -526,7 +558,7 @@ impl Bench {
             _ => unreachable!("the index lists text nodes"),
         };
         self.app_bytes += typed.len() as u64;
-        self.mutate(&path, |e| {
+        mutate!(self, &path, |e| {
             let mut children = e.children_mut();
             let mut node = children.get_mut(child).unwrap();
             let NodeParts::Text(mut s) = node.parts() else {
@@ -549,16 +581,21 @@ fn median(mut v: Vec<u128>) -> u128 {
 fn main() {
     let mut args = std::env::args().skip(1);
     let (mut positional, mut quick, mut seed, mut variant) = (Vec::new(), false, 1u64, None);
+    let (mut edits, mut only): (Option<u64>, Option<String>) = (None, None);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--quick" => quick = true,
             "--seed" => seed = args.next().and_then(|s| s.parse().ok()).expect("--seed N"),
+            "--edits" => edits = Some(args.next().and_then(|s| s.parse().ok()).expect("--edits N")),
+            "--only" => only = Some(args.next().expect("--only KIND")),
             "--variant" => variant = Some(args.next().expect("--variant NAME")),
             _ => positional.push(PathBuf::from(arg)),
         }
     }
     let [input, out] = positional.as_slice() else {
-        eprintln!("usage: svg-bench <drawing.svg> <output directory> [--quick] [--seed N] [--variant NAME]");
+        eprintln!(
+            "usage: svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME]"
+        );
         std::process::exit(2);
     };
     let variant = variant.unwrap_or_else(|| {
@@ -601,11 +638,20 @@ fn main() {
         app_bytes: 0,
         kladde_time: Duration::ZERO,
         counts: MIX.iter().map(|&(e, _)| (e, 0)).collect(),
+        only: only.map(|name| {
+            MIX.iter()
+                .map(|&(e, _)| e)
+                .find(|e| format!("{e:?}").eq_ignore_ascii_case(&name))
+                .unwrap_or_else(|| panic!("--only takes one of {:?}", MIX.map(|(e, _)| e)))
+        }),
     };
     let target = if quick { live } else { 8 * live };
     let started = Instant::now();
     let (mut rows, mut flushes, mut flush_times) = (Vec::new(), 0u64, Vec::new());
-    while bench.app_bytes < target {
+    while match edits {
+        Some(n) => bench.ops < n,
+        None => bench.app_bytes < target,
+    } {
         bench.edit();
         if bench.ops.is_multiple_of(OPS_PER_FLUSH) {
             let t = Instant::now();
