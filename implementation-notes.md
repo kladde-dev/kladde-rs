@@ -99,9 +99,9 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
   The root's allocation and the descriptor table's are ordinary allocations, and count in `Kladde::stats`.
 - **A derived enum's generated code bound its variants' fields by their own names**, so a field called `backend` or `location` shadowed the parameter of `store` it was stored with, and did not compile.
   The bindings are prefixed now; `tests/enum_derive.rs` has such an enum.
-- **`parts()` cannot be called on a temporary guard and its result kept**, for enums as for structs: it borrows the guard, so `let ShapeParts::Circle(r) = guard.kind_mut().parts() else { .. }` fails with "temporary value dropped while borrowed", and the guard needs a `let` of its own.
-  kladde-svg's benchmark, which descends into enums at every edit, met it at every site.
-  A consuming `into_parts(self)`, returning the field guards for the guard's whole lifetime, would make the one-liner work; it would need a line in `rust/derive-macro.md` and `rust/tutorial/deriving.md`, and is proposed rather than built.
+- **`parts()` on a temporary guard works in a `match` but not in a `let`**, for enums as for structs: it borrows the guard, and a `let … else` drops the temporary at the end of the statement, so `let ShapeParts::Circle(r) = guard.kind_mut().parts() else { .. }` fails with "temporary value dropped while borrowed", while a `match` keeps it alive to its end.
+  kladde-svg's benchmark bound the guard with a `let` of its own at three of its nine `parts()` calls.
+  A consuming `into_parts(self)`, handing out the field guards for the guard's whole lifetime, would make the `let` form work too; it would need a line in `rust/derive-macro.md` and `rust/tutorial/deriving.md`, and is proposed rather than built.
 
 ## Consolidation
 
@@ -150,12 +150,12 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
   `impl/consolidator-state.md#checking-it` asks about every statement naming it; statements that are physically present but dead are not in memory after a load.
   A dead statement newer than every live one is rare (a `Grow` below the size, from another writer), and the cost of missing it is an age that errs toward old.
 - **The consolidator state's allocation is hidden from `Store::allocations` and the statistics**, since the application never allocated it.
-- **A new file's first `close` keeps the pages its creating journal took, ahead of its data.**
-  `rust/tutorial/durability.md` says that `close()` "flushes and then shrinks the file to its live pages".
-  Right after `Kladde::create`, it does not, most likely because the root's first store is journaled before any data page exists, the flush writes the data past those journal pages, and the truncation can return only what lies past the last live page; the code has not been checked for it.
-  kladde-svg's `svg-roundtrip` measured it: a drawing of 203 KB of live allocations closes at 173 pages, 117 of them free, and settles at 57 pages once two more sessions have opened and closed it; the tiger closes at 89 pages, 59 free.
-  The largest drawing measured settles at once, for a reason not looked into: the world map, 972 KB live, closes with 2 free pages of 253.
-  Either `close` could run compaction until the holes are returned, or the tutorial could say that a file settles over its first sessions.
+- **`close` truncates after the last live page, and a new file's free pages lie below it.**
+  `rust/tutorial/durability.md` said that `close()` "flushes and then shrinks the file to its live pages"; it now says that it does not, and that calling `flush()` a few times before `close()` reclaims more.
+  Right after `Kladde::create`, the file holds free pages ahead of its data, most likely the pages the creating journal took; the code has not been checked for it.
+  Space a flush frees becomes reusable only from the next flush on, and compaction mode then moves the data down, so a new file shrinks to its live pages only once `close` follows one or two explicit flushes.
+  Measured with kladde-svg's drawings, closed right after `create` with 0, 1 and 2 explicit flushes: the coat of arms, 203 KB live, at 173, 173 and 57 pages; the tiger at 89, 89 and 31; the world map, 972 KB live, at 869, 253 and 256.
+  `close` could instead flush until compaction mode has nothing left to return, at the price of a slower close.
 - **Compaction mode counts holes by scanning the page table once per flush.**
   `impl/consolidation.md#compaction-mode` keeps a cached index of the highest live page instead; the scan costs `O(pages)` per flush, which is small next to what a flush writes, but is not the `O(1)` amortised the design promises.
   Interior pages are passed over like journal pages, since every cut that needs them writes them afresh.

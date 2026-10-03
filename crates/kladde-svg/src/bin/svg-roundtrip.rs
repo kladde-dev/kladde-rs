@@ -12,10 +12,11 @@
 //! 3. the sizes of the original, the canonical form, both gzipped, and the
 //!    kladde file are recorded, with the store's live allocation bytes,
 //!    allocations and statements, and the closed file's pages by kind. The
-//!    kladde file's size is taken twice: as first closed, and *settled*, once
-//!    two more sessions have opened and closed it. A new file's first close
-//!    still holds the pages its creating journal took, ahead of the data, and
-//!    consolidation returns them only over the following sessions;
+//!    kladde file's size is taken twice: as first closed, after one explicit
+//!    flush, and *settled*, once two more sessions have opened and closed it.
+//!    A new file holds free pages ahead of its data, which `close` cannot
+//!    truncate, and consolidation returns them only over the following
+//!    flushes;
 //! 4. so are how many numbers changed their shortest decimal by being stored
 //!    as a `Number`, and how many attribute bytes the model kept verbatim;
 //! 5. with `--render` (and the crate's `render` feature), the original and the

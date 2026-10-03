@@ -243,7 +243,14 @@ impl<T: Persistable + 'static> Kladde<T> {
         self.store.flush()
     }
 
-    /// Flushes, then shrinks the file to its live pages.
+    /// Flushes, then truncates the file after its last live page.
+    ///
+    /// Free pages below that page stay in the file. Each flush consolidates a
+    /// bounded amount, moving live content down, and space a flush frees is
+    /// available from the next flush on; so calling [`flush`](Self::flush) a
+    /// few times before closing lets more of the file be truncated. A freshly
+    /// created file, for instance, needs one or two flushes before `close` to
+    /// shrink to its live pages.
     ///
     /// Closing is optional: a file dropped without it, or left by a crash,
     /// opens with every mutation that returned `Ok`. See [`Kladde`] for an
