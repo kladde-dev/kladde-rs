@@ -1,8 +1,10 @@
 //! Checks SVG files' round trip through kladde, and compares sizes.
 //!
 //! ```text
-//! svg-roundtrip [--csv <table.csv>] [--render] <file or directory>...
+//! svg-roundtrip [--csv <table.csv>] [--render] [--journal-budget PAGES] <file or directory>...
 //! ```
+//!
+//! `--journal-budget` sets the store's [`Options::journal_budget_pages`].
 //!
 //! For every `.svg` file under the given paths:
 //!
@@ -32,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use kladde::Kladde;
+use kladde::{FileStorage, Kladde, Options};
 use kladde_svg::{canon, parse, parse_with_stats, write, Document, ParseStats};
 
 const COLUMNS: &str = "file,status,orig_bytes,orig_gz,canon_bytes,canon_gz,kladde_bytes,\
@@ -135,7 +137,7 @@ fn collect(path: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn check(file: &Path, work: &Path, render: bool) -> Row {
+fn check(file: &Path, work: &Path, render: bool, opts: &Options) -> Row {
     let mut row = Row {
         file: file.display().to_string(),
         ..Row::default()
@@ -170,18 +172,23 @@ fn check(file: &Path, work: &Path, render: bool) -> Row {
 
     let path = work.join("roundtrip.kladde");
     let file_len = |path: &Path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let open = |path: &Path| -> kladde::Result<Kladde<Document>> {
+        Kladde::open_in(Box::new(FileStorage::open(path)?), opts.clone())
+    };
     let stored = (|| -> kladde::Result<(kladde::Stats, kladde::Stats, String, u128, u64, u64)> {
-        let mut drawing = Kladde::<Document>::create(&path, parse(&text).expect("parsed above"))?;
+        let storage = Box::new(FileStorage::create(&path)?);
+        let doc = parse(&text).expect("parsed above");
+        let mut drawing = Kladde::<Document>::create_in(storage, doc, opts.clone())?;
         drawing.flush()?;
         let stats = drawing.stats();
         drawing.close()?;
         let first = file_len(&path);
         let t = Instant::now();
-        let reopened = Kladde::<Document>::open(&path)?;
+        let reopened = open(&path)?;
         let open_us = t.elapsed().as_micros();
         let (pages, written) = (reopened.stats(), write(reopened.get()));
         reopened.close()?;
-        Kladde::<Document>::open(&path)?.close()?;
+        open(&path)?.close()?;
         Ok((stats, pages, written, open_us, first, file_len(&path)))
     })();
     match stored {
@@ -372,16 +379,25 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let mut csv = PathBuf::from("svg-roundtrip.csv");
     let mut render = false;
+    let mut opts = Options::default();
     let mut paths = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--csv" => csv = PathBuf::from(args.next().expect("--csv needs a path")),
             "--render" => render = true,
+            "--journal-budget" => {
+                opts.journal_budget_pages = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .expect("--journal-budget PAGES")
+            }
             _ => paths.push(PathBuf::from(arg)),
         }
     }
     if paths.is_empty() {
-        eprintln!("usage: svg-roundtrip [--csv <table.csv>] [--render] <file or directory>...");
+        eprintln!(
+            "usage: svg-roundtrip [--csv <table.csv>] [--render] [--journal-budget PAGES] <file or directory>..."
+        );
         return ExitCode::FAILURE;
     }
     if render && !cfg!(feature = "render") {
@@ -396,7 +412,10 @@ fn main() -> ExitCode {
     std::fs::create_dir_all(&work).expect("create a work directory");
 
     let t = Instant::now();
-    let rows: Vec<Row> = files.iter().map(|f| check(f, &work, render)).collect();
+    let rows: Vec<Row> = files
+        .iter()
+        .map(|f| check(f, &work, render, &opts))
+        .collect();
     std::fs::remove_dir_all(&work).ok();
 
     let mut out = String::from(COLUMNS);

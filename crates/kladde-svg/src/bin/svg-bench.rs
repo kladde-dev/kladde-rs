@@ -1,11 +1,13 @@
 //! Benchmarks a drawing editor's edits on an SVG drawing stored in kladde.
 //!
 //! ```text
-//! svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME]
+//! svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--journal-budget PAGES]
 //! ```
 //!
 //! `--only Restack`, say, makes every edit a restack where the drawing allows
-//! one, to measure what one kind of edit costs.
+//! one, to measure what one kind of edit costs. `--journal-budget` sets the
+//! store's [`Options::journal_budget_pages`], so that the store also flushes
+//! by itself whenever the journal outgrows that many pages.
 //!
 //! The drawing is converted into a kladde file, which is not measured, and
 //! then edited by a seeded mix of what a drawing editor does — dragging shapes,
@@ -25,14 +27,15 @@
 //! only, not choosing the edits.
 //!
 //! At the end, the file is closed and reopened, and the drawing must write the
-//! same canonical SVG as before. A summary on stderr compares the time to open
-//! the SVG and the kladde file, and what kladde wrote per edit with what
-//! saving the whole SVG would write.
+//! same canonical SVG as before. A summary on stderr gives the closed file's
+//! size, compares the time to open the SVG and the kladde file, which is
+//! reopened 21 times for a median, and compares what kladde wrote per edit
+//! with what saving the whole SVG would write.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use kladde::{Encoding, Kladde, Persistable, Pointer, WriteBackend};
+use kladde::{Encoding, FileStorage, Kladde, Options, Persistable, Pointer, WriteBackend};
 use kladde_bench::{row, save, Rng};
 use kladde_svg::model::{
     Attr, AttrParts, Color, Element, ElementGuard, ElementKind, ElementKindParts, ListEncoding,
@@ -582,6 +585,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let (mut positional, mut quick, mut seed, mut variant) = (Vec::new(), false, 1u64, None);
     let (mut edits, mut only): (Option<u64>, Option<String>) = (None, None);
+    let mut opts = Options::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--quick" => quick = true,
@@ -589,12 +593,18 @@ fn main() {
             "--edits" => edits = Some(args.next().and_then(|s| s.parse().ok()).expect("--edits N")),
             "--only" => only = Some(args.next().expect("--only KIND")),
             "--variant" => variant = Some(args.next().expect("--variant NAME")),
+            "--journal-budget" => {
+                opts.journal_budget_pages = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .expect("--journal-budget PAGES")
+            }
             _ => positional.push(PathBuf::from(arg)),
         }
     }
     let [input, out] = positional.as_slice() else {
         eprintln!(
-            "usage: svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME]"
+            "usage: svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--journal-budget PAGES]"
         );
         std::process::exit(2);
     };
@@ -613,7 +623,9 @@ fn main() {
     let parse_time = t.elapsed();
     let canonical_before = write(&doc).len();
 
-    let mut drawing = Kladde::<Document>::create(&file, doc).expect("create the kladde file");
+    let storage = FileStorage::create(&file).expect("create the kladde file");
+    let mut drawing = Kladde::<Document>::create_in(Box::new(storage), doc, opts.clone())
+        .expect("create the kladde file");
     drawing.flush().expect("flush");
     let base = drawing.stats();
     let live = base.allocation_bytes;
@@ -688,15 +700,27 @@ fn main() {
     let canonical = write(bench.drawing.get());
     let write_time = t.elapsed();
     let file_bytes = s.file_pages * 4096;
+    let all_flushes = s.flushes - base.flushes;
     bench.drawing.close().expect("close");
-    let t = Instant::now();
-    let reopened = Kladde::<Document>::open(&file).expect("reopen");
-    let open_time = t.elapsed();
+    let closed_bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+    let reopen = || {
+        let storage = FileStorage::open(&file).expect("reopen");
+        let t = Instant::now();
+        let reopened =
+            Kladde::<Document>::open_in(Box::new(storage), opts.clone()).expect("reopen");
+        (t.elapsed(), reopened)
+    };
+    let (open_time, reopened) = reopen();
     assert!(
         write(reopened.get()) == canonical,
         "{variant}: the drawing differs after reopening"
     );
     drop(reopened);
+    let mut open_times: Vec<u128> = vec![open_time.as_micros()];
+    for _ in 1..21 {
+        open_times.push(reopen().0.as_micros());
+    }
+    let open_time = Duration::from_micros(median(open_times) as u64);
     std::fs::remove_file(&file).ok();
     std::fs::remove_dir(out.join("files")).ok();
     save(out, &format!("svg-{variant}"), &rows, started);
@@ -705,7 +729,7 @@ fn main() {
     let per_op = |bytes: f64| bytes / ops.max(1) as f64;
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
     eprintln!(
-        "{ops} edits storing {} bytes ({:.1} per edit), {flushes} flushes",
+        "{ops} edits storing {} bytes ({:.1} per edit), {all_flushes} flushes, {flushes} of them at rows",
         bench.app_bytes,
         per_op(bench.app_bytes as f64)
     );
@@ -734,7 +758,11 @@ fn main() {
         median(flush_times) as f64 / 1e3,
     );
     eprintln!(
-        "opening: parsing the SVG took {:.1} ms, opening the kladde file {:.1} ms; writing the SVG took {:.1} ms",
+        "closed: the file takes {closed_bytes} bytes, {:.2} times the live size",
+        closed_bytes as f64 / s.allocation_bytes.max(1) as f64,
+    );
+    eprintln!(
+        "opening: parsing the SVG took {:.1} ms, reopening the closed kladde file {:.2} ms at the median of 21; writing the SVG took {:.1} ms",
         ms(parse_time),
         ms(open_time),
         ms(write_time),
