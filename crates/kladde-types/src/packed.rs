@@ -20,7 +20,9 @@ use kladde_persist::{
 };
 
 use crate::offsets::Layout;
-use crate::slot::{decode_pointer, encode_pointer, pointer_size, publish_pointer, size};
+use crate::slot::{
+    decode_pointer, encode_pointer, move_bytes, pointer_size, publish_pointer, size,
+};
 
 /// A growable array whose contents are persisted packed: each element takes
 /// as many bytes as its value needs.
@@ -499,6 +501,56 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
         self.backend.splice(pointer, size(at)?, size(len)?, &[])?;
         self.inner.seq.remove(index);
         Ok(self.inner.data.remove(index))
+    }
+
+    /// Moves element `from` to index `to`, shifting the elements between, as
+    /// removing it and inserting it at `to` would. Panics if either index is
+    /// out of bounds.
+    ///
+    /// One transaction, which takes the element's bytes from where they lie
+    /// rather than encoding it again, so that the next flush can leave them
+    /// there and write only where they are now: moving an element costs no
+    /// data bytes, however large it is, and leaves what it owns untouched.
+    ///
+    /// ```
+    /// use kladde::Kladde;
+    /// use kladde_types::PackedPersistableVec;
+    ///
+    /// let mut db = Kladde::new(PackedPersistableVec::<u32>::new());
+    /// for x in [1, 300, 70_000] {
+    ///     db.guard().push(x)?;
+    /// }
+    /// db.guard().move_element(2, 0)?;
+    /// assert_eq!(db.get().as_slice(), &[70_000, 1, 300]);
+    /// # Ok::<(), kladde::Error>(())
+    /// ```
+    pub fn move_element(&mut self, from: usize, to: usize) -> Result<(), Error> {
+        let len = self.inner.data.len();
+        assert!(
+            from < len && to < len,
+            "PackedPersistableVec::move_element: index {from} or {to} out of bounds"
+        );
+        if from == to {
+            return Ok(());
+        }
+        let seq = &self.inner.seq;
+        let pointer = seq
+            .content
+            .as_ref()
+            .expect("a vec with elements has content")
+            .raw();
+        let (at, bytes) = (seq.offset(from), seq.len_of(from));
+        // Before what is now at `to`, or after it when moving up.
+        let dst = seq.offset(if to > from { to + 1 } else { to });
+        let content = Location::new(pointer, size(0)?);
+        let backend = self.backend;
+        backend.atomically(|| move_bytes(backend, content, at, bytes, dst))?;
+        let PackedPersistableVec { data, seq } = &mut *self.inner;
+        seq.remove(from);
+        seq.insert(to, bytes);
+        let item = data.remove(from);
+        data.insert(to, item);
+        Ok(())
     }
 
     /// Removes element `index` and frees everything it owns, in one

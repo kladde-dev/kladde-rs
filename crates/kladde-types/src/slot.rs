@@ -1,5 +1,6 @@
 //! What every owning container shares: the inline pointer to its content
-//! allocation, and size arithmetic that refuses to overflow.
+//! allocation, size arithmetic that refuses to overflow, and moving an
+//! element's bytes within the content.
 //!
 //! A container's pointer takes the encoding of the place it sits in: its
 //! fixed width in a slotted place, all zeros for none, and the LEB128 varint
@@ -7,8 +8,8 @@
 //! as opaque, keeps the fixed width everywhere and passes `Slotted`.
 
 use kladde_persist::{
-    decode_option_slice, encode_option, varint_len, write_encoded, write_varint, Encoding, Error,
-    Input, Place, PointerRepr, Word, WriteBackend,
+    decode_option_slice, encode_option, splice_at, varint_len, write_encoded, write_varint,
+    Encoding, Error, Input, Location, Place, PointerRepr, Word, WriteBackend,
 };
 
 /// How many bytes a container's pointer takes in a place of encoding `E`.
@@ -65,4 +66,26 @@ pub(crate) fn publish_pointer<B: WriteBackend, E: Encoding>(
 /// not fit.
 pub(crate) fn size<S: Word>(n: usize) -> Result<S, Error> {
     S::try_from_usize(n).ok_or(Error::OutOfBounds)
+}
+
+/// Moves the `len` bytes at `src` of the content that starts at `content` so
+/// that they stand before the bytes now at `dst`, shifting those between;
+/// `dst` lies outside `[src, src + len]`. Three records, to be made inside a
+/// transaction: a gap opened at `dst`, the bytes copied into it from where
+/// they lie, and their old place closed, so that the flush finds the bytes
+/// shifted within their allocation and can state them where they lie.
+pub(crate) fn move_bytes<B: WriteBackend>(
+    backend: &B,
+    content: Location<B::Pointer, B::Size>,
+    src: usize,
+    len: usize,
+    dst: usize,
+) -> Result<(), Error> {
+    let at = |x: usize| content + <B::Size as Word>::from_usize(x);
+    // Opening the gap shifts the bytes up when they lie behind it.
+    let from = if dst < src { src + len } else { src };
+    splice_at(backend, at(dst), 0, &vec![0; len])?;
+    let (s, d) = (at(from), at(dst));
+    backend.copy(s.anchor, s.offset, size(len)?, d.anchor, d.offset)?;
+    splice_at(backend, at(from), len, &[])
 }

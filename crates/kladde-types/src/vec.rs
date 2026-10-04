@@ -17,7 +17,9 @@ use kladde_persist::{
 };
 use std::ops::Deref;
 
-use crate::slot::{decode_pointer, encode_pointer, pointer_size, publish_pointer, size};
+use crate::slot::{
+    decode_pointer, encode_pointer, move_bytes, pointer_size, publish_pointer, size,
+};
 
 /// A growable array whose contents are persisted.
 ///
@@ -459,6 +461,59 @@ impl<'s, T: Slottable<B::Pointer>, B: WriteBackend, E: Encoding> PersistableVecG
         self.backend
             .splice(pointer, size(index * elem)?, size(elem)?, &[])?;
         Ok(self.inner.data.remove(index))
+    }
+
+    /// Moves element `from` to index `to`, shifting the elements between, as
+    /// removing it and inserting it at `to` would. Panics if either index is
+    /// out of bounds.
+    ///
+    /// One transaction, which takes the element's bytes from where they lie
+    /// rather than encoding it again, so that the next flush can leave them
+    /// there and write only where they are now: moving an element costs no
+    /// data bytes, however large it is, and leaves what it owns untouched.
+    ///
+    /// ```
+    /// use kladde::Kladde;
+    /// use kladde_types::PersistableVec;
+    ///
+    /// let mut db = Kladde::new(PersistableVec::<u8>::new());
+    /// for x in [1, 2, 3, 4] {
+    ///     db.guard().push(x)?;
+    /// }
+    /// db.guard().move_element(0, 2)?;
+    /// assert_eq!(db.get().as_slice(), &[2, 3, 1, 4]);
+    /// db.guard().move_element(3, 0)?;
+    /// assert_eq!(db.get().as_slice(), &[4, 2, 3, 1]);
+    /// # Ok::<(), kladde::Error>(())
+    /// ```
+    pub fn move_element(&mut self, from: usize, to: usize) -> Result<(), Error> {
+        let len = self.inner.data.len();
+        assert!(
+            from < len && to < len,
+            "PersistableVec::move_element: index {from} or {to} out of bounds"
+        );
+        if from == to {
+            return Ok(());
+        }
+        let elem = stride::<T, B::Pointer>();
+        let pointer = self
+            .inner
+            .pointer
+            .as_ref()
+            .expect("a vec with elements has content")
+            .raw();
+        // Before what is now at `to`, or after it when moving up.
+        let dst = if to > from {
+            (to + 1) * elem
+        } else {
+            to * elem
+        };
+        let content = Location::new(pointer, size(0)?);
+        let backend = self.backend;
+        backend.atomically(|| move_bytes(backend, content, from * elem, elem, dst))?;
+        let item = self.inner.data.remove(from);
+        self.inner.data.insert(to, item);
+        Ok(())
     }
 
     /// Removes element `index` and frees everything it owns, in one

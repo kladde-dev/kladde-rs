@@ -521,8 +521,9 @@ impl Bench {
         self.stale = true;
     }
 
-    /// Moves a shape to another place among its siblings, in one transaction,
-    /// since removing it and inserting it again belong together.
+    /// Moves a shape to another place among its siblings, which the child
+    /// list does in one transaction, taking the shape's bytes from where they
+    /// lie.
     fn restack(&mut self) {
         let path = self.pick(&self.index.movable.clone());
         let (&i, parent) = path.split_last().unwrap();
@@ -530,20 +531,7 @@ impl Bench {
         let j = self.rng.below(siblings) as usize;
         let moved =
             element(&self.drawing.get().root, parent).children[i].encoded_size::<ListEncoding>();
-        let t = Instant::now();
-        let mut tx = self.drawing.transaction();
-        {
-            let mut g = tx.guard();
-            let mut root = g.root_mut();
-            on_element!(&mut root, parent, |p| {
-                let mut children = p.children_mut();
-                let node = children.remove(i)?;
-                children.insert(j, node)
-            })
-            .expect("an edit");
-        }
-        tx.commit().expect("a commit");
-        self.kladde_time += t.elapsed();
+        mutate!(self, parent, |p| p.children_mut().move_element(i, j));
         // The node's encoding moves; what it owns stays where it is.
         self.app_bytes += moved as u64;
         self.stale = true;

@@ -31,7 +31,7 @@ use kladde_persist::{
 
 use crate::offsets::Layout;
 use crate::packed::{decode_elements, encode_elements, packed_size, PackedPersistableVec};
-use crate::slot::size;
+use crate::slot::{move_bytes, size};
 use crate::PersistableString;
 
 /// Content of more than this many bytes moves to an allocation of its own.
@@ -1055,6 +1055,51 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
     /// ```
     pub fn remove(&mut self, index: usize) -> Result<T, Error> {
         self.take(index, false)
+    }
+
+    /// Moves element `from` to index `to`, shifting the elements between, as
+    /// removing it and inserting it at `to` would. Panics if either index is
+    /// out of bounds.
+    ///
+    /// One transaction, which takes the element's bytes from where they lie,
+    /// inline or spilled, rather than encoding it again, so that the next
+    /// flush can leave them there and write only where they are now; the
+    /// content keeps its size, so nothing around the vector changes.
+    ///
+    /// ```
+    /// use kladde::Kladde;
+    /// use kladde_types::SmallPersistableVec;
+    ///
+    /// let mut db = Kladde::new(SmallPersistableVec::<u16>::new());
+    /// for x in [1, 2, 3] {
+    ///     db.guard().push(x)?;
+    /// }
+    /// db.guard().move_element(0, 2)?;
+    /// assert_eq!(db.get().as_slice(), &[2, 3, 1]);
+    /// # Ok::<(), kladde::Error>(())
+    /// ```
+    pub fn move_element(&mut self, from: usize, to: usize) -> Result<(), Error> {
+        let len = self.inner.data.len();
+        assert!(
+            from < len && to < len,
+            "SmallPersistableVec::move_element: index {from} or {to} out of bounds"
+        );
+        if from == to {
+            return Ok(());
+        }
+        let (backend, place) = (self.backend, &self.place);
+        let seq = &self.inner.seq;
+        let (at, bytes) = (seq.offset(from), seq.len_of(from));
+        // Before what is now at `to`, or after it when moving up.
+        let dst = seq.offset(if to > from { to + 1 } else { to });
+        let content = seq.content_start(place.link());
+        backend.atomically(|| move_bytes(backend, content, at, bytes, dst))?;
+        let SmallPersistableVec { data, seq } = &mut *self.inner;
+        seq.remove(from);
+        seq.insert(to, bytes);
+        let item = data.remove(from);
+        data.insert(to, item);
+        Ok(())
     }
 
     /// Removes element `index` and frees everything it owns, in one
