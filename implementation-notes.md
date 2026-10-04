@@ -55,9 +55,13 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 - **The header's eviction ranks by allocation, not by fragment.**
   A pending fragment's heat is the number of flushes since its allocation's `last_written`, where `impl/flush.md#the-header-as-write-buffer` keeps an eviction clock per fragment.
   All statements of one allocation therefore stay in the header or leave it together, which is coarser for a large allocation with a hot tail and a cold head, but needs no clock at all, and `impl/consolidator-state.md#what-stays-out` seeds the clock from the same content ages anyway.
-- **The interior layer is rebuilt by every cut that needs one.**
-  `impl/flush.md#the-shape-of-the-tree` path-copies from the changed leaves up.
+- **The interior layer is rebuilt by every cut that needs one, and that loses another writer's statements in a page with children.**
+  `impl/flush.md#the-shape-of-the-tree` path-copies from the changed leaves up, and `impl/consolidation.md#unlinking-an-emptied-page` records each table page's parent for it.
   With the header naming up to 600 leaves directly, a file needs an interior layer only past that, and rebuilding it costs one page per 800 leaves per flush.
+  The cut keeps or rewrites leaves only, and drops the header's children that have children of their own without taking their statements, which is right only for the pages this implementation writes, and `impl/consolidation.md` says it must not rely on those.
+  A file in which a non-header page holds both child references and statements opens correctly, but its first flush drops those statements, and the next open misses their allocations: found with a hand-built file, with consolidation off; with it on, the same test passed only because compaction moved the data and restated it.
+  A page with children further down is neither kept nor dropped, and stays allocated in memory until the file is reopened.
+  Open; the path copy of `impl/` fixes both.
 - **`Store::open` folds a recovered journal before it returns.**
   `spec/journal.md#the-start-of-a-session` asks only that a non-empty recovered journal be folded before anything is appended.
   Folding at open is simpler, and it lets reads, which see flushed state only, see every recovered transaction at once.

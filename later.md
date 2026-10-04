@@ -1,5 +1,18 @@
 # Ideas for Later
 
+## High priority
+
+- **⚠️ Data loss: a flush drops the statements of a non-header address-table page that also has child references.**
+  The spec lets any address-table page hold both `child_ref`s and statements (`spec/address-table.md#physical-format`), and `impl/consolidation.md#unlinking-an-emptied-page` says an implementation must not rely on the tree shape it writes itself.
+  kladde-rs writes such a page only as the header, and its cut rebuilds everything above the leaves in every flush: it keeps or rewrites leaves only, and drops the header's children that have children of their own without taking their statements.
+  A file from another writer that has such a page therefore opens correctly, but its first flush drops those statements, and the next open fails on their allocations with `DanglingPointer`.
+  Reproduced on 2026-10-04 with a hand-built file and consolidation off; with consolidation on, the same file survived only because compaction happened to move the data and restate it.
+  Debug builds trip the commit's assertion that a dropped table page holds no live statements; release builds lose the data silently.
+  Related, from reading the code and not tested: a page with children below the header's children is neither kept nor dropped by the cut, and stays allocated in memory until the file is reopened.
+  Fix: implement the path copy of `impl/consolidation.md#unlinking-an-emptied-page` — keep every table page whose child list does not change, rewrite the ancestors of each dropped page up to the header, take a rewritten page's live statements into the flush first, and give the surviving children of a dropped page a new parent.
+  Test it with the tree limits (600 children in the header, 800 per interior page) settable from tests, and with hand-built files: take a file kladde-rs wrote, move one allocation's statements into a non-header page that names a leaf, open it, flush, and reopen.
+  Recorded in `implementation-notes.md` under Flush.
+
 ## Potential major redesigns
 
 - When opening a kladde file, is there a way around either reading the entire file (or at least all of its memory allocations) into memory initially or performing lots of random read access (i.e., lots of `seek`s)? As long as memory can be allocated anywhere, reconstructing a nested structure of data types can require arbitrary jumping around in the file. Thus, when we're almost done with parsing the file and reconstructing the stored data structure, but not quite yet (and thus still have to hold the file itself in memory too), we temporarily have about twice the memory requirements compared to the in-memory representation only.
