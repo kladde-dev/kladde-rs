@@ -69,7 +69,28 @@ fn implicit_repetitions_and_separators_are_normalized() {
     let canonical = check(&svg(r#"<path d="M 10,20 30,40 L.5-.5 1e1 2e-1 z"/>"#));
     assert_eq!(
         canonical,
-        svg(r#"<path d="M10 20L30 40L0.5 -0.5L10 0.2z"/>"#)
+        svg(r#"<path d="M10 20 30 40 0.5-0.5 10 0.2z"/>"#)
+    );
+}
+
+#[test]
+fn a_letter_is_left_out_only_where_the_grammar_implies_it() {
+    // A relative lineto after an absolute moveto, a moveto after a moveto,
+    // and anything after a closepath keep their letters; a relative lineto
+    // after a relative moveto, and a repeated command, do not.
+    let text = svg(r#"<path d="M1 2l3 4M5 6m7-8 9 10c1 2 3 4 5 6-1-2-3-4-5-6zZm1 1"/>"#);
+    assert_eq!(check(&text), text);
+}
+
+#[test]
+fn the_tigers_path_data_keeps_its_compact_form() {
+    let d = "m-122.3,84.285s0.1,1.894-0.73,1.875c-0.82-0.019-17.27-48.094-37.8-45.851,0,0,17.78-7.353,38.53,43.976z";
+    let canonical = check(&svg(&format!(r#"<path d="{d}"/>"#)));
+    assert_eq!(
+        canonical,
+        svg(
+            r#"<path d="m-122.3 84.285s0.1 1.894-0.73 1.875c-0.82-0.019-17.27-48.094-37.8-45.851 0 0 17.78-7.353 38.53 43.976z"/>"#
+        )
     );
 }
 

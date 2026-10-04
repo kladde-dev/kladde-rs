@@ -486,9 +486,15 @@ fn write_transform(out: &mut String, ops: &[TransformOp]) {
     }
 }
 
-/// Path data with every command letter written out, segments back to back.
+/// Path data in the path grammar's two shortcuts: a command letter is left out
+/// where the previous segment implies it, and a number starting with a minus
+/// sign needs no separator before it.
 pub(crate) fn write_path(out: &mut String, d: &[PathSegment]) {
     let flag = |b: bool| if b { 1.0 } else { 0.0 };
+    // The letter a segment may leave out: the previous segment's, except
+    // that further coordinate pairs after a moveto are linetos of its case,
+    // and nothing repeats a closepath.
+    let mut implied: Option<char> = None;
     for segment in d {
         let (letter, abs, args): (u8, bool, &[Number]) = match segment {
             PathSegment::MoveTo { abs, x, y } => (b'm', *abs, &[*x, *y]),
@@ -531,12 +537,29 @@ pub(crate) fn write_path(out: &mut String, d: &[PathSegment]) {
             ),
             PathSegment::ClosePath { abs } => (b'z', *abs, &[]),
         };
-        out.push(if abs {
+        let letter = if abs {
             letter.to_ascii_uppercase()
         } else {
             letter
-        } as char);
-        write_numbers(out, args);
+        } as char;
+        let mut separate = implied == Some(letter);
+        if !separate {
+            out.push(letter);
+        }
+        for n in args {
+            let start = out.len();
+            write_number(out, *n);
+            if separate && !out[start..].starts_with('-') {
+                out.insert(start, ' ');
+            }
+            separate = true;
+        }
+        implied = match letter {
+            'm' => Some('l'),
+            'M' => Some('L'),
+            'z' | 'Z' => None,
+            other => Some(other),
+        };
     }
 }
 
