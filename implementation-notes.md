@@ -38,10 +38,11 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 
 ## Flush
 
-- **Every piece the fold sources from elsewhere is read and written afresh.**
-  That covers `Copy` and `Move` sources and the tail a `Splice` shifts, which the flush writes as new bytes rather than restating existing ones at new offsets.
-  So the flush has no ordering phase (`impl/flush.md#phase-c--ordering`) and no content-blind fast path; the fold's output is only ever new bytes or bytes left where they are.
-  It keeps every data byte referenced at most once and the reverse index valid without any splice rule, at the price of rewriting a spliced tail, which makes a `remove(0)` on a large vector cost the vector's size.
+- **Bytes an allocation shifts within itself are restated; bytes from another allocation, and copies, are read and written afresh.**
+  A piece that the fold sources from the same id's committed bytes at another offset — the tail a `Splice` shifts, or a range a `Move` within the id relocates — becomes the fragments those bytes lie in, each taken at its new offset where it lies: a `Ref` keeps its address, an `Inline` payload is copied into the new table page as the cut copies every payload, and zeros become a `Zero` below the old size.
+  That is the shift of `impl/flush.md#per-record-rules`, applied only where it is a transfer: a piece is restated only if no other piece of the id names the same committed bytes, so every data byte stays referenced by at most one live statement, and the bytes a segment copied within an id are written afresh, in both places, at piece granularity.
+  A piece is also written afresh when describing it would cost more than its bytes, by estimate: about 9 bytes per `Ref`, a payload and 4 per `Inline`, 4 per `Zero`, against the bytes and a `Ref` per page they fill, which happens only for tails made of fragments of a few bytes.
+  Pieces from another id — `Copy` and `Move` between allocations — are still read and written afresh, so the flush needs no ordering phase (`impl/flush.md#phase-c--ordering`): a restated fragment moves no bytes, and the only care it needs is the reverse index's rule 1, widening the window of the page it lies in to its new offsets.
 - **The header's eviction ranks by allocation, not by fragment.**
   A pending fragment's heat is the number of flushes since its allocation's `last_written`, where `impl/flush.md#the-header-as-write-buffer` keeps an eviction clock per fragment.
   All statements of one allocation therefore stay in the header or leave it together, which is coarser for a large allocation with a hot tail and a cold head, but needs no clock at all, and `impl/consolidator-state.md#what-stays-out` seeds the clock from the same content ages anyway.

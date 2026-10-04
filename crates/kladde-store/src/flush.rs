@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use crate::consts::*;
 use crate::error::{corrupt, Error};
 use crate::fold::{fold, Fold, Source};
+use crate::hash::IdMap;
 use crate::page::{decode_page, new_page, seal_page, PageBuf};
 use crate::state::*;
 use crate::statement::{Kind, TableReader};
@@ -23,6 +24,89 @@ impl DataPage {
     pub fn room(&self) -> usize {
         MAX_PAGE_CONTENT - self.used
     }
+}
+
+/// Per id, the fragments that the bytes it shifted within itself become:
+/// each a destination range, and the pending content that states it there.
+type Restated = IdMap<Vec<(u32, u32, Pending)>>;
+
+/// About what a `Ref` statement's framing takes, in bytes: a tag, an offset,
+/// a size and an address, each a short varint.
+const REF_FRAMING: u64 = 9;
+
+/// About what the framing of an `Inline` or a `Zero` statement takes.
+const SHORT_FRAMING: u64 = 4;
+
+/// Zeros, stated as such.
+fn zero_pending() -> Pending {
+    Pending {
+        origin: Origin::None,
+        place: Place::Zero,
+        heat: 0,
+        rewrite: false,
+    }
+}
+
+/// Splits the pieces of `table` that name `id`'s committed bytes where those
+/// bytes enter or leave a range that more than one piece names, and returns
+/// those ranges: so that a piece lies wholly inside them, to be written
+/// again, or wholly outside, to be restated.
+fn split_at_copies(id: u32, table: &mut crate::fold::Table) -> Vec<(u32, u32)> {
+    let keys: Vec<(u32, Source)> = table.pieces.iter().map(|(&k, &s)| (k, s)).collect();
+    let copied = copied_ranges(id, &keys, table.size);
+    if copied.is_empty() {
+        return copied;
+    }
+    for (i, &(k, s)) in keys.iter().enumerate() {
+        let Source::Storage(src, so) = s else {
+            continue;
+        };
+        if src != id {
+            continue;
+        }
+        let end = keys.get(i + 1).map_or(table.size, |n| n.0);
+        let se = so + (end - k);
+        for &(a, b) in &copied {
+            for cut in [a, b] {
+                if so < cut && cut < se {
+                    table
+                        .pieces
+                        .insert(k + (cut - so), Source::Storage(id, cut));
+                }
+            }
+        }
+    }
+    copied
+}
+
+/// The ranges of `id`'s committed bytes that more than one piece of its
+/// table names, merged: what the segment copied rather than moved.
+fn copied_ranges(id: u32, keys: &[(u32, Source)], size: u32) -> Vec<(u32, u32)> {
+    let mut sources: Vec<(u32, u32)> = keys
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(k, s))| match s {
+            Source::Storage(src, so) if src == id => {
+                let end = keys.get(i + 1).map_or(size, |n| n.0);
+                Some((so, so + (end - k)))
+            }
+            _ => None,
+        })
+        .collect();
+    sources.sort_unstable();
+    let mut copied: Vec<(u32, u32)> = Vec::new();
+    let mut reach = 0u32;
+    for &(a, b) in &sources {
+        if a < reach {
+            let overlap = (a, b.min(reach));
+            match copied.last_mut() {
+                Some(last) if last.1 >= overlap.0 => last.1 = last.1.max(overlap.1),
+                _ => copied.push(overlap),
+            }
+        }
+        reach = reach.max(b);
+    }
+    copied
 }
 
 /// A pending fragment waiting for a data page.
@@ -84,12 +168,13 @@ impl Inner {
         // 1. The header's content, taken whole.
         self.take_header(&mut dirty)?;
 
-        // 2. The fold, with every read from elsewhere hoisted into the arena.
+        // 2. The fold, with every read from elsewhere hoisted into the arena,
+        //    but for the bytes an id shifted within itself, which it restates.
         let mut f = fold(&self.segment_records, |id| {
             self.state.allocs.get(&id).map(|m| m.size)
         });
-        self.hoist(&mut f)?;
-        self.apply_fold(f, &mut dirty)?;
+        let restated = self.hoist(&mut f)?;
+        self.apply_fold(f, restated, &mut dirty)?;
         if self.opts.consolidate {
             if self.opts.consolidator_state {
                 self.write_consolidator_state(&mut dirty)?;
@@ -265,21 +350,50 @@ impl Inner {
     // ------------------------------------------------------------ the fold
 
     /// Reads every piece that the fold sources from committed content other
-    /// than where it already lies, and turns it into a literal.
-    fn hoist(&mut self, f: &mut Fold) -> Result<(), Error> {
+    /// than where it already lies, and turns it into a literal; except a
+    /// piece that an id still in its committed incarnation shifted within
+    /// itself, by a splice or a move, whose bytes no other piece names. Such
+    /// a piece is restated instead, unless describing it would cost more than
+    /// writing it: returned per id are the fragments it becomes, each a
+    /// destination range and what states it there.
+    ///
+    /// Bytes that two pieces name were copied, and are written again, so that
+    /// no data byte is referenced by two live statements.
+    fn hoist(&mut self, f: &mut Fold) -> Result<Restated, Error> {
         let mut reads: Vec<(u32, u32, u32, u32, u32)> = Vec::new();
+        let mut restated = Restated::default();
+        let mut copies: IdMap<Vec<(u32, u32)>> = IdMap::default();
+        for (&id, e) in f.ids.iter_mut() {
+            if e.exists && e.existed && !e.ended && e.committed_live {
+                let copied = split_at_copies(id, &mut e.table);
+                if !copied.is_empty() {
+                    copies.insert(id, copied);
+                }
+            }
+        }
         for (&id, e) in &f.ids {
             if !e.exists {
                 continue;
             }
             let keys: Vec<(u32, Source)> = e.table.pieces.iter().map(|(&k, &s)| (k, s)).collect();
+            let persistent = e.existed && !e.ended && e.committed_live;
+            let copied = copies.get(&id).map_or(&[][..], |c| &c[..]);
             for (i, &(k, s)) in keys.iter().enumerate() {
                 if let Source::Storage(src, so) = s {
                     let identity = src == id && so == k && e.committed_live;
-                    if !identity {
-                        let end = keys.get(i + 1).map_or(e.table.size, |n| n.0);
-                        reads.push((id, k, src, so, end - k));
+                    if identity {
+                        continue;
                     }
+                    let end = keys.get(i + 1).map_or(e.table.size, |n| n.0);
+                    let len = end - k;
+                    let shifted = persistent && src == id;
+                    if shifted && !copied.iter().any(|&(a, b)| a < so + len && so < b) {
+                        if let Some(takes) = self.restatement(id, k, end, so) {
+                            restated.entry(id).or_default().extend(takes);
+                            continue;
+                        }
+                    }
+                    reads.push((id, k, src, so, len));
                 }
             }
         }
@@ -295,18 +409,88 @@ impl Inner {
                 .pieces
                 .insert(k, Source::Literal(pos));
         }
-        Ok(())
+        Ok(restated)
+    }
+
+    /// The fragments that the committed bytes `[so, so + end - k)` of `id`
+    /// lie in, as pending fragments over `[k, end)`, their new place; or
+    /// `None` if stating them would cost more than writing the bytes again.
+    ///
+    /// The costs are estimates in bytes: a `Ref` statement takes about
+    /// [`REF_FRAMING`] bytes, an `Inline` one its payload and
+    /// [`SHORT_FRAMING`] more, and a `Zero` one [`SHORT_FRAMING`]; writing
+    /// the bytes again costs the bytes and a `Ref` for every page they fill.
+    fn restatement(&self, id: u32, k: u32, end: u32, so: u32) -> Option<Vec<(u32, u32, Pending)>> {
+        let (len, se) = (end - k, so + (end - k));
+        let size = self.state.size_of(id);
+        let mut out = Vec::new();
+        let mut cost = 0u64;
+        let mut at = so;
+        while at < se {
+            if at >= size {
+                // Past the committed size: zeros.
+                out.push((k + at - so, end, zero_pending()));
+                cost += SHORT_FRAMING;
+                break;
+            }
+            let (fk, frag, fend) = self.state.resolve(id, at)?;
+            let d = at - koff(fk);
+            let to = fend.min(se);
+            let p = match frag {
+                Fragment::Bytes { page, offset, stmt } => {
+                    let a = address(page, offset + d as u16);
+                    if self.state.slab.kinds[stmt.idx()] == Kind::Inline {
+                        cost += SHORT_FRAMING + (to - at) as u64;
+                        Pending {
+                            origin: Origin::File(a),
+                            place: Place::Inline,
+                            heat: 0,
+                            rewrite: false,
+                        }
+                    } else {
+                        cost += REF_FRAMING;
+                        Pending {
+                            origin: Origin::File(a),
+                            place: Place::Data(a),
+                            heat: 0,
+                            rewrite: false,
+                        }
+                    }
+                }
+                Fragment::Zero { .. } => {
+                    cost += SHORT_FRAMING;
+                    zero_pending()
+                }
+                Fragment::Pending(p) => {
+                    let mut q = self.state.pending[p as usize].advanced(d);
+                    q.heat = 0;
+                    cost += match q.place {
+                        Place::Data(_) | Place::Unplaced => REF_FRAMING,
+                        Place::Inline => SHORT_FRAMING + (to - at) as u64,
+                        Place::Zero => SHORT_FRAMING,
+                    };
+                    q
+                }
+            };
+            out.push((k + at - so, k + to - so, p));
+            at = to;
+        }
+        let pages = (len as u64).div_ceil(MAX_PAGE_CONTENT as u64);
+        let rewrite = len as u64 + REF_FRAMING * pages;
+        (cost <= rewrite).then_some(out)
     }
 
     /// Takes the pieces of `table` that change `id`'s content: literals,
-    /// grouped into runs that go `Inline` when short; and zeros below
-    /// `zero_limit`, which deny content the id had before.
+    /// grouped into runs that go `Inline` when short; zeros below
+    /// `zero_limit`, which deny content the id had before; and `restated`,
+    /// the fragments of the pieces [`hoist`](Self::hoist) left to restate.
     fn take_pieces(
         &mut self,
         id: u32,
         table: &crate::fold::Table,
         identity: bool,
         zero_limit: u32,
+        restated: Vec<(u32, u32, Pending)>,
         dirty: &mut Dirty,
     ) {
         let keys: Vec<(u32, Source)> = table.pieces.iter().map(|(&k, &s)| (k, s)).collect();
@@ -316,7 +500,13 @@ impl Inner {
             let end = keys.get(i + 1).map_or(table.size, |n| n.0);
             match s {
                 Source::Storage(src, so) if identity && src == id && so == k => i += 1,
-                Source::Storage(..) => unreachable!("hoisted"),
+                Source::Storage(src, _) => {
+                    debug_assert!(
+                        identity && src == id && restated.iter().any(|t| t.0 == k),
+                        "a piece from elsewhere that was neither hoisted nor restated"
+                    );
+                    i += 1;
+                }
                 Source::Zero => {
                     let e = end.min(zero_limit);
                     if k < e {
@@ -362,6 +552,25 @@ impl Inner {
                 }
             }
         }
+        for (a, b, p) in restated {
+            // Zeros at or past the old size are pending already, as the
+            // zeros the growth exposed.
+            let b = if p.place == Place::Zero {
+                b.min(zero_limit)
+            } else {
+                b
+            };
+            if a >= b {
+                continue;
+            }
+            self.state.take(id, a, b, p, dirty);
+            if let Place::Data(addr) = p.place {
+                // The bytes lie where they did, at a new offset: widen the
+                // reverse index's window, the one rule that keeps it true.
+                self.state.note_reverse(split_address(addr).0, id, a, b);
+            }
+            self.stats.restated_bytes += (b - a) as u64;
+        }
     }
 
     /// Grows `id` to `new`. The range the growth exposes is taken as zeros,
@@ -378,7 +587,12 @@ impl Inner {
         self.state.grow_size_to(id, new, p, dirty);
     }
 
-    fn apply_fold(&mut self, f: Fold, dirty: &mut Dirty) -> Result<(), Error> {
+    fn apply_fold(
+        &mut self,
+        f: Fold,
+        mut restated: Restated,
+        dirty: &mut Dirty,
+    ) -> Result<(), Error> {
         for (id, e) in f.ids {
             match (e.existed, e.ended, e.exists) {
                 (true, false, true) => {
@@ -390,7 +604,8 @@ impl Inner {
                     } else if new > old {
                         self.grow(id, new, dirty);
                     }
-                    self.take_pieces(id, &e.table, true, old.min(new), dirty);
+                    let takes = restated.remove(&id).unwrap_or_default();
+                    self.take_pieces(id, &e.table, true, old.min(new), takes, dirty);
                 }
                 (true, true, false) => self.free(id, dirty),
                 (true, true, true) => {
@@ -404,11 +619,11 @@ impl Inner {
                     } else if new > old {
                         self.grow(id, new, dirty);
                     }
-                    self.take_pieces(id, &e.table, false, old.min(new), dirty);
+                    self.take_pieces(id, &e.table, false, old.min(new), Vec::new(), dirty);
                 }
                 (false, _, true) => {
                     self.allocate(id, e.table.size, dirty);
-                    self.take_pieces(id, &e.table, false, 0, dirty);
+                    self.take_pieces(id, &e.table, false, 0, Vec::new(), dirty);
                 }
                 (false, _, false) => {
                     let live = self

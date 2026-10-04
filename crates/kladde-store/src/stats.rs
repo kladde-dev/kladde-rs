@@ -55,6 +55,10 @@ pub struct Stats {
     pub defrag_bytes: u64,
     /// Bytes the application wrote into data pages through flushes.
     pub fresh_bytes: u64,
+    /// Bytes a splice or a move shifted within their allocation that flushes
+    /// stated at their new offsets where they lie, rather than writing them
+    /// again.
+    pub restated_bytes: u64,
 
     // A snapshot of the file, filled when the stats are read.
     /// The file's length in pages.
