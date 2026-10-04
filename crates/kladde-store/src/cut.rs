@@ -616,6 +616,11 @@ impl Inner {
     /// Gives `d` its slab slot, fragments, pins, and coverage.
     fn bind(&mut self, d: &Derived, page: u32, framing: u8, payload_pos: usize) {
         let id = d.stmt.id;
+        // The page takes this flush's epoch now rather than at the commit:
+        // binding an anchor or a grow witness compares the epochs of the
+        // pages they lie in, and a reused page still carries its old one,
+        // which would make a new witness look older than its anchor.
+        self.state.pages[page as usize].epoch = self.state.flush_epoch;
         let s = self.state.slab.alloc(page, framing, id, d.stmt.kind);
         self.state.cover(page, framing as u32);
         if let Some(m) = self.state.allocs.get_mut(&id) {

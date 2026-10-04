@@ -1,7 +1,8 @@
 //! Differential tests: random mutations against a naive model of byte
-//! vectors, with flushes and reopenings in between.
+//! vectors, with flushes and reopenings in between. The model is kept in
+//! ordered maps, so that a seed makes the same mutations in every run.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use kladde_store::{Backend, MemoryStorage, Options, Pointer, Store, UniquePointer, WriteBackend};
 
@@ -25,8 +26,8 @@ impl Rng {
 struct World {
     store: Store,
     storage: MemoryStorage,
-    model: HashMap<u32, Vec<u8>>,
-    owned: HashMap<u32, UniquePointer>,
+    model: BTreeMap<u32, Vec<u8>>,
+    owned: BTreeMap<u32, UniquePointer>,
     opts: Options,
 }
 
@@ -37,8 +38,8 @@ impl World {
         World {
             store,
             storage,
-            model: HashMap::new(),
-            owned: HashMap::new(),
+            model: BTreeMap::new(),
+            owned: BTreeMap::new(),
             opts,
         }
     }
@@ -246,4 +247,17 @@ fn a_tiny_journal_budget_flushes_often() {
     for seed in 1..10 {
         run(seed, 500, 3000, opts.clone());
     }
+}
+
+/// A grow witness bound into a reused table page must not look older than
+/// its allocation's anchor because the page still carries its old epoch:
+/// declared dead, it left with its page, and the allocation reopened at its
+/// anchored size. This seed lost one so.
+#[test]
+fn a_grow_witness_in_a_reused_page_survives() {
+    let opts = Options {
+        journal_budget_pages: 1,
+        ..Default::default()
+    };
+    run(229, 800, 3000, opts);
 }
