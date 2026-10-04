@@ -19,7 +19,7 @@ use kladde_persist::{
     UniquePointer, Word, WriteBackend,
 };
 
-use crate::offsets::Offsets;
+use crate::offsets::Layout;
 use crate::slot::{decode_pointer, encode_pointer, pointer_size, publish_pointer, size};
 
 /// A growable array whose contents are persisted packed: each element takes
@@ -56,35 +56,21 @@ pub struct PackedPersistableVec<T, P = Pointer> {
     seq: Sequence<P>,
 }
 
-/// What a packed vector keeps beside its elements: its allocation, and where
-/// each element starts in it. It is the [`Node`] its elements' guards link
-/// to, kept apart from the elements so that a guard can borrow one element
-/// mutably and this immutably.
-pub(crate) struct Sequence<P> {
-    /// The content allocation, `None` until something needs one.
-    pointer: Option<UniquePointer<P>>,
-    /// Where each element starts in it.
-    offsets: Offsets,
-}
-
-impl<P> Sequence<P> {
-    fn new() -> Self {
-        Sequence {
-            pointer: None,
-            offsets: Offsets::new(),
-        }
-    }
-}
+/// What a packed vector keeps beside its elements: its content allocation,
+/// `None` until something needs one, and where each element starts in it. It
+/// is the [`Node`] its elements' guards link to, kept apart from the elements
+/// so that a guard can borrow one element mutably and this immutably.
+pub(crate) type Sequence<P> = Layout<Option<UniquePointer<P>>>;
 
 impl<P: PointerRepr, B: WriteBackend<Pointer = P>> Node<B> for Sequence<P> {
     fn location_of(&self, _owner: &Link<'_, B>, index: usize) -> Location<P, B::Size> {
         let pointer = self
-            .pointer
+            .content
             .as_ref()
             .expect("a vec with elements has content");
         Location::new(
             pointer.raw(),
-            <B::Size as Word>::from_usize(self.offsets.offset(index)),
+            <B::Size as Word>::from_usize(self.offset(index)),
         )
     }
 
@@ -99,7 +85,7 @@ impl<P: PointerRepr, B: WriteBackend<Pointer = P>> Node<B> for Sequence<P> {
         old: usize,
         new: usize,
     ) -> Result<(), Error> {
-        self.offsets.shift(index + 1, new as isize - old as isize);
+        self.shift(index + 1, new as isize - old as isize);
         Ok(())
     }
 }
@@ -128,7 +114,7 @@ impl<T, P> PackedPersistableVec<T, P> {
     pub fn new() -> Self {
         PackedPersistableVec {
             data: Vec::new(),
-            seq: Sequence::new(),
+            seq: Layout::new(None),
         }
     }
 
@@ -156,13 +142,13 @@ impl<T, P> PackedPersistableVec<T, P> {
     /// assert_eq!(db.get().content_size(), 1 + 2 + 3);
     /// ```
     pub fn content_size(&self) -> usize {
-        self.seq.offsets.end()
+        self.seq.end()
     }
 }
 
 impl<T, P: Copy> PackedPersistableVec<T, P> {
     fn raw_pointer(&self) -> Option<P> {
-        self.seq.pointer.as_ref().map(|p| p.raw())
+        self.seq.content.as_ref().map(|p| p.raw())
     }
 }
 
@@ -209,7 +195,7 @@ impl<T, P> FromIterator<T> for PackedPersistableVec<T, P> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         PackedPersistableVec {
             data: Vec::from_iter(iter),
-            seq: Sequence::new(),
+            seq: Layout::new(None),
         }
     }
 }
@@ -259,7 +245,7 @@ impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for PackedPersistableVec<
     /// The content pointer. A vec with elements but no allocation, collected
     /// from an iterator, must be [prepared](Persistable::prepare) first.
     fn encode<E: Encoding>(&self, out: &mut Vec<u8>) {
-        debug_assert!(self.seq.pointer.is_some() || self.data.is_empty());
+        debug_assert!(self.seq.content.is_some() || self.data.is_empty());
         encode_pointer::<P, E>(self.raw_pointer(), out);
     }
 
@@ -271,13 +257,10 @@ impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for PackedPersistableVec<
             return Ok(PackedPersistableVec::new());
         };
         let bytes = read_allocation(backend, target)?;
-        let (data, offsets) = decode_elements::<T, P, B>(backend, &mut Input::new(&bytes))?;
+        let (data, layout) = decode_elements::<T, P, B>(backend, &mut Input::new(&bytes))?;
         Ok(PackedPersistableVec {
             data,
-            seq: Sequence {
-                pointer: Some(UniquePointer::from_pointer(target)),
-                offsets,
-            },
+            seq: layout.with_content(Some(UniquePointer::from_pointer(target))),
         })
     }
 
@@ -285,14 +268,11 @@ impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for PackedPersistableVec<
     /// content current; one with elements but no allocation, collected from
     /// an iterator, gets one here, filled with one write.
     fn prepare<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) -> Result<(), Error> {
-        if self.seq.pointer.is_none() && !self.data.is_empty() {
+        if self.seq.content.is_none() && !self.data.is_empty() {
             let pointer = backend.alloc(size(0)?)?;
-            let (bytes, offsets) = encode_elements(&mut self.data, backend)?;
+            let (bytes, layout) = encode_elements(&mut self.data, backend)?;
             backend.write(pointer.raw(), size(0)?, &bytes)?;
-            self.seq = Sequence {
-                pointer: Some(pointer),
-                offsets,
-            };
+            self.seq = layout.with_content(Some(pointer));
         }
         Ok(())
     }
@@ -302,7 +282,7 @@ impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for PackedPersistableVec<
         for item in &mut self.data {
             item.free(backend)?;
         }
-        if let Some(pointer) = self.seq.pointer.take() {
+        if let Some(pointer) = self.seq.content.take() {
             backend.free(pointer)?;
         }
         Ok(())
@@ -323,7 +303,7 @@ impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for PackedPersistableVec<
 pub(crate) fn encode_elements<T, P, B>(
     items: &mut [T],
     backend: &B,
-) -> Result<(Vec<u8>, Offsets), Error>
+) -> Result<(Vec<u8>, Layout<()>), Error>
 where
     T: Persistable<P>,
     P: PointerRepr,
@@ -343,7 +323,7 @@ where
 pub(crate) fn decode_elements<T, P, B>(
     backend: &mut B,
     content: &mut Input<'_>,
-) -> Result<(Vec<T>, Offsets), Error>
+) -> Result<(Vec<T>, Layout<()>), Error>
 where
     T: Persistable<P>,
     P: PointerRepr,
@@ -443,25 +423,21 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
             "PackedPersistableVec::insert: index {index} out of bounds"
         );
         debug_assert!(
-            self.inner.seq.pointer.is_some() || len == 0,
+            self.inner.seq.content.is_some() || len == 0,
             "a stored vec with elements has a content allocation"
         );
         let (backend, place) = (self.backend, &self.place);
         let seq = &self.inner.seq;
         let (fresh, bytes) = backend.atomically(|| {
-            let fresh = match &seq.pointer {
+            let fresh = match &seq.content {
                 Some(_) => None,
                 None => Some(backend.alloc(size(0)?)?),
             };
-            let pointer = fresh.as_ref().or(seq.pointer.as_ref()).unwrap();
+            let pointer = fresh.as_ref().or(seq.content.as_ref()).unwrap();
             value.prepare(backend)?;
             packed_size(&value);
             let bytes = value.to_bytes::<Packed>();
-            let at = if len == 0 {
-                0
-            } else {
-                seq.offsets.offset(index)
-            };
+            let at = seq.offset(index);
             if index == len {
                 backend.write(pointer.raw(), size(at)?, &bytes)?;
             } else {
@@ -473,9 +449,9 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
             Ok((fresh, bytes.len()))
         })?;
         if fresh.is_some() {
-            self.inner.seq.pointer = fresh;
+            self.inner.seq.content = fresh;
         }
-        self.inner.seq.offsets.insert(index, bytes);
+        self.inner.seq.insert(index, bytes);
         self.inner.data.insert(index, value);
         Ok(())
     }
@@ -495,12 +471,12 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
     /// ```
     pub fn pop(&mut self) -> Result<Option<T>, Error> {
         let len = self.inner.data.len();
-        let Some(pointer) = self.inner.seq.pointer.as_ref().filter(|_| len > 0) else {
+        let Some(pointer) = self.inner.seq.content.as_ref().filter(|_| len > 0) else {
             return Ok(None);
         };
         self.backend
-            .resize(pointer, size(self.inner.seq.offsets.offset(len - 1))?)?;
-        self.inner.seq.offsets.remove(len - 1);
+            .resize(pointer, size(self.inner.seq.offset(len - 1))?)?;
+        self.inner.seq.remove(len - 1);
         Ok(self.inner.data.pop())
     }
 
@@ -516,12 +492,12 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
         );
         let seq = &self.inner.seq;
         let pointer = seq
-            .pointer
+            .content
             .as_ref()
             .expect("a vec with elements has content");
-        let (at, len) = (seq.offsets.offset(index), seq.offsets.len_of(index));
+        let (at, len) = (seq.offset(index), seq.len_of(index));
         self.backend.splice(pointer, size(at)?, size(len)?, &[])?;
-        self.inner.seq.offsets.remove(index);
+        self.inner.seq.remove(index);
         Ok(self.inner.data.remove(index))
     }
 
@@ -547,15 +523,15 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
         let backend = self.backend;
         let PackedPersistableVec { data, seq } = &mut *self.inner;
         let pointer = seq
-            .pointer
+            .content
             .as_ref()
             .expect("a vec with elements has content");
-        let (at, len) = (seq.offsets.offset(index), seq.offsets.len_of(index));
+        let (at, len) = (seq.offset(index), seq.len_of(index));
         backend.atomically(|| {
             backend.splice(pointer, size(at)?, size(len)?, &[])?;
             data[index].free(backend)
         })?;
-        seq.offsets.remove(index);
+        seq.remove(index);
         data.remove(index);
         Ok(())
     }
@@ -576,7 +552,7 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
     pub fn clear(&mut self) -> Result<(), Error> {
         let backend = self.backend;
         let PackedPersistableVec { data, seq } = &mut *self.inner;
-        let Some(pointer) = seq.pointer.as_ref() else {
+        let Some(pointer) = seq.content.as_ref() else {
             return Ok(());
         };
         backend.atomically(|| {
@@ -587,7 +563,7 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
             Ok(())
         })?;
         data.clear();
-        seq.offsets.clear();
+        seq.clear();
         Ok(())
     }
 

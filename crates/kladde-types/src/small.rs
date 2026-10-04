@@ -29,7 +29,7 @@ use kladde_persist::{
     PointerRepr, ReadBackend, TypeDescriptor, UniquePointer, Word, WriteBackend,
 };
 
-use crate::offsets::Offsets;
+use crate::offsets::Layout;
 use crate::packed::{decode_elements, encode_elements, packed_size, PackedPersistableVec};
 use crate::slot::size;
 use crate::PersistableString;
@@ -590,16 +590,12 @@ pub struct SmallPersistableVec<T, P = Pointer> {
     seq: SmallSequence<P>,
 }
 
-/// What a small vector keeps beside its elements: where its content is, and
-/// where each element starts in it. The [`Node`] its elements' guards link
-/// to, which rewrites the tag when an element changes size inline, and moves
-/// the content when it crosses a threshold.
-pub(crate) struct SmallSequence<P> {
-    /// The allocation the content spilled into, if it did; owned.
-    spilled: Cell<Option<P>>,
-    /// Where each element starts in the content, inline or spilled alike.
-    offsets: Offsets,
-}
+/// What a small vector keeps beside its elements: the allocation its content
+/// spilled into, if it did, which it owns, and where each element starts in
+/// the content, inline or spilled alike. The [`Node`] its elements' guards
+/// link to, which rewrites the tag when an element changes size inline, and
+/// moves the content when it crosses a threshold.
+pub(crate) type SmallSequence<P> = Layout<Cell<Option<P>>>;
 
 impl<P: PointerRepr> SmallSequence<P> {
     /// Where the content starts, for a vector at `owner`.
@@ -607,7 +603,7 @@ impl<P: PointerRepr> SmallSequence<P> {
         &self,
         owner: &Link<'_, B>,
     ) -> Location<P, B::Size> {
-        match self.spilled.get() {
+        match self.content.get() {
             Some(p) => Location::new(p, <B::Size as Word>::zero()),
             None => owner.location() + <B::Size as Word>::from_usize(1),
         }
@@ -616,7 +612,7 @@ impl<P: PointerRepr> SmallSequence<P> {
 
 impl<P: PointerRepr, B: WriteBackend<Pointer = P>> Node<B> for SmallSequence<P> {
     fn location_of(&self, owner: &Link<'_, B>, index: usize) -> Location<P, B::Size> {
-        self.content_start(owner) + <B::Size as Word>::from_usize(self.offsets.offset(index))
+        self.content_start(owner) + <B::Size as Word>::from_usize(self.offset(index))
     }
 
     /// The element has spliced its new encoding into the content. Inline,
@@ -633,10 +629,10 @@ impl<P: PointerRepr, B: WriteBackend<Pointer = P>> Node<B> for SmallSequence<P> 
         old: usize,
         new: usize,
     ) -> Result<(), Error> {
-        let before = self.offsets.end();
+        let before = self.end();
         let after = before + new - old;
         let one = <B::Size as Word>::from_usize(1);
-        let spilled = match self.spilled.get() {
+        let spilled = match self.content.get() {
             None if after <= SPILL_ABOVE => {
                 let at = owner.location();
                 backend.write(at.anchor, at.offset, &[after as u8])?;
@@ -671,8 +667,8 @@ impl<P: PointerRepr, B: WriteBackend<Pointer = P>> Node<B> for SmallSequence<P> 
                 None
             }
         };
-        self.spilled.set(spilled);
-        self.offsets.shift(index + 1, new as isize - old as isize);
+        self.content.set(spilled);
+        self.shift(index + 1, new as isize - old as isize);
         Ok(())
     }
 }
@@ -688,10 +684,7 @@ impl<T, P> SmallPersistableVec<T, P> {
     pub fn new() -> Self {
         SmallPersistableVec {
             data: Vec::new(),
-            seq: SmallSequence {
-                spilled: Cell::new(None),
-                offsets: Offsets::new(),
-            },
+            seq: Layout::new(Cell::new(None)),
         }
     }
 
@@ -718,7 +711,7 @@ impl<T, P> SmallPersistableVec<T, P> {
     /// assert_eq!(db.get().content_size(), 1 + 2);
     /// ```
     pub fn content_size(&self) -> usize {
-        self.seq.offsets.end()
+        self.seq.end()
     }
 }
 
@@ -726,7 +719,7 @@ impl<T, P: Copy> SmallPersistableVec<T, P> {
     /// Whether the elements are inline, rather than in an allocation of
     /// their own. See [`SmallPersistableVec`] for an example.
     pub fn is_inline(&self) -> bool {
-        self.seq.spilled.get().is_none()
+        self.seq.content.get().is_none()
     }
 }
 
@@ -792,10 +785,10 @@ impl<'a, T, P> IntoIterator for &'a SmallPersistableVec<T, P> {
 impl<T: Persistable<P>, P: PointerRepr> SmallPersistableVec<T, P> {
     /// The content's size, laid out or not.
     fn content_len(&self) -> usize {
-        if self.seq.offsets.laid_out() {
-            self.seq.offsets.end()
+        if self.seq.laid_out(self.data.len()) {
+            self.seq.end()
         } else {
-            Offsets::of::<T, P>(&self.data).end()
+            Layout::of::<T, P>(&self.data).end()
         }
     }
 
@@ -838,7 +831,7 @@ impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for SmallPersistableVec<T
         if !E::PACKED {
             return slot_size::<Self, P>();
         }
-        small_size(self.seq.spilled.get(), self.content_len())
+        small_size(self.seq.content.get(), self.content_len())
     }
 
     /// The tag and the elements, or the tag 255 and the pointer to them. A
@@ -846,7 +839,7 @@ impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for SmallPersistableVec<T
     /// decides its form.
     fn encode<E: Encoding>(&self, out: &mut Vec<u8>) {
         debug_assert!(E::PACKED, "a small vector stands only in packed places");
-        match self.seq.spilled.get() {
+        match self.seq.content.get() {
             Some(p) => out.extend_from_slice(&spilled_encoding(p)),
             None => out.extend_from_slice(&inline_encoding(&self.content())),
         }
@@ -860,13 +853,10 @@ impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for SmallPersistableVec<T
             return not_slotted();
         }
         let (bytes, spilled) = decode_content(backend, input)?;
-        let (data, offsets) = decode_elements::<T, P, B>(backend, &mut Input::new(&bytes))?;
+        let (data, layout) = decode_elements::<T, P, B>(backend, &mut Input::new(&bytes))?;
         Ok(SmallPersistableVec {
             data,
-            seq: SmallSequence {
-                spilled: Cell::new(spilled),
-                offsets,
-            },
+            seq: layout.with_content(Cell::new(spilled)),
         })
     }
 
@@ -874,26 +864,30 @@ impl<T: Persistable<P>, P: PointerRepr> Persistable<P> for SmallPersistableVec<T
     /// [`SPILL_ABOVE`] bytes, and otherwise spilled into an allocation
     /// filled with one write.
     fn prepare<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) -> Result<(), Error> {
-        if !self.seq.offsets.laid_out() {
-            let (bytes, offsets) = encode_elements(&mut self.data, backend)?;
+        if !self.seq.laid_out(self.data.len()) {
+            let (bytes, layout) = encode_elements(&mut self.data, backend)?;
+            let mut spilled = None;
             if bytes.len() > SPILL_ABOVE {
                 let pointer = backend.alloc(size(0)?)?;
                 backend.write(pointer.raw(), size(0)?, &bytes)?;
-                self.seq.spilled.set(Some(pointer.raw()));
+                spilled = Some(pointer.raw());
             }
-            self.seq.offsets = offsets;
+            self.seq = layout.with_content(Cell::new(spilled));
         }
         Ok(())
     }
 
     /// Frees every element, then the allocation the content spilled into.
+    /// The vector is left not laid out, so that storing it again lays it
+    /// out afresh, preparing its elements, whose allocations are gone too.
     fn free<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) -> Result<(), Error> {
         for item in &mut self.data {
             item.free(backend)?;
         }
-        if let Some(pointer) = self.seq.spilled.take() {
+        if let Some(pointer) = self.seq.content.take() {
             backend.free(UniquePointer::from_pointer(pointer))?;
         }
+        self.seq = Layout::new(Cell::new(None));
         Ok(())
     }
 
@@ -985,24 +979,17 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
             index <= len,
             "SmallPersistableVec::insert: index {index} out of bounds"
         );
-        debug_assert!(
-            self.inner.seq.offsets.laid_out(),
-            "a stored vector is laid out"
-        );
+        debug_assert!(self.inner.seq.laid_out(len), "a stored vector is laid out");
         let (backend, place) = (self.backend, &self.place);
         let inner = &*self.inner;
-        let before = inner.seq.offsets.end();
-        let at = if len == 0 {
-            0
-        } else {
-            inner.seq.offsets.offset(index)
-        };
+        let before = inner.seq.end();
+        let at = inner.seq.offset(index);
         let (bytes, spilled) = backend.atomically(|| {
             value.prepare(backend)?;
             packed_size(&value);
             let bytes = value.to_bytes::<Packed>();
             let after = before + bytes.len();
-            let spilled = match inner.seq.spilled.get() {
+            let spilled = match inner.seq.content.get() {
                 None if after <= SPILL_ABOVE => {
                     let tag = place.location();
                     backend.write(tag.anchor, tag.offset, &[after as u8])?;
@@ -1026,8 +1013,8 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
             };
             Ok((bytes.len(), spilled))
         })?;
-        self.inner.seq.spilled.set(spilled);
-        self.inner.seq.offsets.insert(index, bytes);
+        self.inner.seq.content.set(spilled);
+        self.inner.seq.insert(index, bytes);
         self.inner.data.insert(index, value);
         Ok(())
     }
@@ -1097,11 +1084,11 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
         );
         let (backend, place) = (self.backend, &self.place);
         let SmallPersistableVec { data, seq } = &mut *self.inner;
-        let before = seq.offsets.end();
-        let (at, gone) = (seq.offsets.offset(index), seq.offsets.len_of(index));
+        let before = seq.end();
+        let (at, gone) = (seq.offset(index), seq.len_of(index));
         let after = before - gone;
         let spilled = backend.atomically(|| {
-            let spilled = match seq.spilled.get() {
+            let spilled = match seq.content.get() {
                 None => {
                     let tag = place.location();
                     backend.write(tag.anchor, tag.offset, &[after as u8])?;
@@ -1136,8 +1123,8 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
             }
             Ok(spilled)
         })?;
-        seq.spilled.set(spilled);
-        seq.offsets.remove(index);
+        seq.content.set(spilled);
+        seq.remove(index);
         Ok(data.remove(index))
     }
 
@@ -1147,8 +1134,8 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
     pub fn clear(&mut self) -> Result<(), Error> {
         let (backend, place) = (self.backend, &self.place);
         let SmallPersistableVec { data, seq } = &mut *self.inner;
-        let before = seq.offsets.end();
-        let spilled = seq.spilled.get();
+        let before = seq.end();
+        let spilled = seq.content.get();
         backend.atomically(|| {
             write_encoded(backend, place, small_size(spilled, before), &[0])?;
             if let Some(p) = spilled {
@@ -1159,8 +1146,8 @@ impl<'s, T: Persistable<B::Pointer>, B: WriteBackend, E: Encoding>
             }
             Ok(())
         })?;
-        seq.spilled.set(None);
-        seq.offsets.clear();
+        seq.content.set(None);
+        seq.clear();
         data.clear();
         Ok(())
     }

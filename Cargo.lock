@@ -242,6 +242,7 @@ dependencies = [
  "kladde-store",
  "postcard",
  "serde",
+ "thin-vec",
 ]
 
 [[package]]
@@ -535,6 +536,12 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "thin-vec"
+version = "0.2.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4568d7e143ec86d2021c338bae2afa88699e84b8e0af523626654fe6f03a1748"
 
 [[package]]
 name = "thiserror"

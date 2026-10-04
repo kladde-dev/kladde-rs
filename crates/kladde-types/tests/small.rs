@@ -8,8 +8,8 @@
 
 use kladde::{Kladde, MemoryStorage, Options, Persistable};
 use kladde_types::{
-    PackedPersistableVec, PersistableVec, SmallPersistableString, SmallPersistableVec, FOLD_BELOW,
-    SPILL_ABOVE,
+    PackedPersistableVec, PersistableString, PersistableVec, SmallPersistableString,
+    SmallPersistableVec, FOLD_BELOW, SPILL_ABOVE,
 };
 
 #[derive(Persistable, Debug)]
@@ -347,4 +347,28 @@ fn a_packed_only_root_is_packed() {
     .unwrap();
     let texts: Vec<&str> = reopened.get().iter().map(|s| &**s).collect();
     assert_eq!(texts, ["item 0", "item 1", "item 2", "three", "item 4"]);
+}
+
+#[test]
+fn a_freed_small_vector_is_laid_out_afresh_when_stored_again() {
+    type Lists = PackedPersistableVec<SmallPersistableVec<PersistableString>>;
+    let storage = MemoryStorage::new();
+    let strings = |n: usize| (0..n).map(|i| PersistableString::from(format!("string {i}")));
+    let lists: Lists = [strings(3).collect(), strings(200).collect()]
+        .into_iter()
+        .collect();
+    let mut db = Kladde::create_in(Box::new(storage.clone()), lists, Options::default()).unwrap();
+    assert!(db.get()[0].is_inline());
+    assert!(!db.get()[1].is_inline());
+    for _ in 0..2 {
+        let mut list = db.guard().remove(0).unwrap();
+        list.free(db.store()).unwrap();
+        db.guard().push(list).unwrap();
+    }
+    let image = MemoryStorage::from_image(storage.image());
+    let reopened = Kladde::<Lists>::open_in(Box::new(image), Options::default()).unwrap();
+    let lens: Vec<usize> = reopened.get().iter().map(|l| l.len()).collect();
+    assert_eq!(lens, [3, 200]);
+    assert_eq!(&*reopened.get()[1][199], "string 199");
+    assert!(!reopened.get()[1].is_inline());
 }
