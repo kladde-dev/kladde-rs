@@ -196,9 +196,7 @@ impl Inner {
         for p in leaves {
             if self.flush_rewritten.contains(&p) {
                 out.dropped_tables.push(p);
-            } else if self.state.pages[p as usize].state == PageState::Table
-                && self.state.pages[p as usize].coverage == 0
-            {
+            } else if self.state.live(p).coverage == 0 {
                 self.drop_page_statements(p)?;
                 out.dropped_tables.push(p);
             } else {
@@ -207,12 +205,13 @@ impl Inner {
         }
         // The interior layer is rebuilt by every cut that needs one.
         let header_children = self
+            .state
             .children
             .get(&self.header_slot)
             .cloned()
             .unwrap_or_default();
         for p in header_children {
-            if self.state.pages[p as usize].state == PageState::Interior {
+            if self.state.has_children(p) {
                 out.dropped_tables.push(p);
             }
         }
@@ -223,15 +222,14 @@ impl Inner {
     pub(crate) fn all_leaves(&self) -> Vec<u32> {
         let mut out = Vec::new();
         let mut stack = self
+            .state
             .children
             .get(&self.header_slot)
             .cloned()
             .unwrap_or_default();
         while let Some(p) = stack.pop() {
-            match self.state.pages[p as usize].state {
-                PageState::Interior => {
-                    stack.extend(self.children.get(&p).cloned().unwrap_or_default())
-                }
+            match self.state.children.get(&p) {
+                Some(kids) if !kids.is_empty() => stack.extend(kids),
                 _ => out.push(p),
             }
         }
@@ -516,8 +514,19 @@ impl Inner {
             header_children.sort_unstable();
         }
 
-        // Encode every page, noting where each statement landed.
+        // Encode every page, noting where each statement landed. The slot
+        // the header goes to held the header before the governing one, which
+        // left the world at the last commit, or which a load retired.
         let new_slot = ((self.epoch + 1) % 2) as u32;
+        debug_assert!(
+            matches!(
+                self.state.pages[new_slot as usize],
+                Page::Reusable | Page::Fallback
+            ),
+            "the header slot being overwritten is {:?}",
+            self.state.pages[new_slot as usize]
+        );
+        self.state.pages[new_slot as usize] = Filling::taken(PageKind::Header);
         let mut placed: Vec<(u32, u8, usize)> = vec![(0, 0, 0); derived.len()];
         let mut encode = |page: u32, children: &[u32], set: &[usize], base: usize| -> Vec<u8> {
             let mut w = TableWriter::new();
@@ -531,12 +540,12 @@ impl Inner {
             }
             w.into_content()
         };
-        let mut contents: Vec<(u32, Vec<u8>, bool)> = Vec::new();
+        let mut contents: Vec<(u32, Vec<u8>)> = Vec::new();
         for (set, &p) in lay.leaves.iter().zip(&leaf_pages) {
-            contents.push((p, encode(p, &[], set, CONTENT_OFFSET), false));
+            contents.push((p, encode(p, &[], set, CONTENT_OFFSET)));
         }
         for (p, kids) in &interiors {
-            contents.push((*p, encode(*p, kids, &[], CONTENT_OFFSET), true));
+            contents.push((*p, encode(*p, kids, &[], CONTENT_OFFSET)));
         }
         let header_content = encode(
             new_slot,
@@ -548,23 +557,11 @@ impl Inner {
             return Err(corrupt("the header overflowed its page"));
         }
 
-        // The tree: parents and child lists.
-        self.children.insert(new_slot, header_children.clone());
-        for &p in &header_children {
-            self.state.pages[p as usize].parent = new_slot;
-        }
-        for (p, kids) in &interiors {
-            for &k in kids {
-                self.state.pages[k as usize].parent = *p;
-            }
-            self.children.insert(*p, kids.clone());
-            self.state.pages[*p as usize].coverage = TableWriter::children_len(kids) as u32;
-        }
-        if cfg!(debug_assertions) && self.state.pages[new_slot as usize].coverage != 0 {
-            panic!(
-                "the header slot being overwritten still holds live statements: {:?}",
-                self.live_statements_in(new_slot)
-            );
+        // The tree: child lists, charged to the non-header pages holding them.
+        self.state.children.insert(new_slot, header_children);
+        for (p, kids) in interiors {
+            self.state.cover(p, charged_child_bytes(&kids));
+            self.state.children.insert(p, kids);
         }
 
         // Bind: every statement gets its slot, its fragments, and its pins.
@@ -594,6 +591,7 @@ impl Inner {
             &mut self.file_pages,
             &mut *self.storage,
             &mut self.stats,
+            Filling::taken(PageKind::Table),
         )
     }
 
@@ -616,11 +614,6 @@ impl Inner {
     /// Gives `d` its slab slot, fragments, pins, and coverage.
     fn bind(&mut self, d: &Derived, page: u32, framing: u8, payload_pos: usize) {
         let id = d.stmt.id;
-        // The page takes this flush's epoch now rather than at the commit:
-        // binding an anchor or a grow witness compares the epochs of the
-        // pages they lie in, and a reused page still carries its old one,
-        // which would make a new witness look older than its anchor.
-        self.state.pages[page as usize].epoch = self.state.flush_epoch;
         let s = self.state.slab.alloc(page, framing, id, d.stmt.kind);
         self.state.cover(page, framing as u32);
         if let Some(m) = self.state.allocs.get_mut(&id) {

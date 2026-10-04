@@ -56,7 +56,7 @@ impl Inner {
         let owned = |s: StmtRef| {
             let i = s.idx();
             let share = self.state.slab.framing[i] as f64 / self.state.slab.pins[i].max(1) as f64;
-            let placed = self.state.pages[self.state.slab.page(s) as usize].epoch;
+            let placed = self.state.epoch_of(self.state.slab.page(s));
             (share, Some(self.state.flush_epoch.saturating_sub(placed)))
         };
         let (share, per_byte, age) = match f {
@@ -182,12 +182,7 @@ impl Inner {
             if let Fragment::Pending(p) = f {
                 match self.state.pending[p as usize].place {
                     Place::Unplaced => return None,
-                    Place::Data(a)
-                        if self.state.pages[split_address(a).0 as usize].state
-                            == PageState::Claimed =>
-                    {
-                        return None
-                    }
+                    Place::Data(a) if self.state.is_filling(split_address(a).0) => return None,
                     _ => {}
                 }
             }

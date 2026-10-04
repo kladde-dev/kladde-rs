@@ -6,7 +6,7 @@ use std::num::NonZeroU32;
 
 use crate::consts::{MAX_PAGE_CONTENT, PAGE_SIZE};
 use crate::hash::{IdMap, IdSet};
-use crate::statement::Kind;
+use crate::statement::{Kind, TableWriter};
 
 /// A fragment-map key: `(id, offset)` packed with the id in the high half, so
 /// that integer order is `(id, offset)` order.
@@ -202,58 +202,88 @@ pub struct Recyclable {
     pub tombstone: Option<StmtRef>,
 }
 
-/// What a page is, as far as the store is concerned.
+/// A page of the file, in the states of `spec/durability.md#page-states`,
+/// plus one of the implementation's own: filling.
+///
+/// Only a filling or live page has a kind and coverage, and only a live page
+/// an epoch and a place among the victims.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PageState {
-    /// Reusable: in the ready pool.
-    Free,
-    /// Dropped by the last commit; reusable after the next one.
-    Retiring,
-    /// A live data page.
-    Data,
-    /// A live address-table leaf.
-    Table,
-    /// A live interior address-table page, holding child references only.
-    Interior,
-    /// Part of the current journal segment.
+pub enum Page {
+    /// In neither header's world: the flush may write it. The header slot
+    /// the next commit overwrites is reusable after a load, but never joins
+    /// the ready pool.
+    Reusable,
+    /// In the world of the older header only; reusable after the next commit.
+    Fallback,
+    /// Part of the current journal segment, or named by the header for it.
+    /// Live in the sense of the spec, but the segment keeps what it holds.
     Journal,
-    /// Page 0 or 1.
-    Header,
-    /// Taken by the flush in progress, and not written yet.
-    Claimed,
+    /// Taken by the flush in progress, which writes it at its commit: its
+    /// epoch is that flush's. The spec counts it reusable until the commit;
+    /// a failed flush poisons the store, so nothing ever reads a page that a
+    /// flush took and did not commit.
+    Filling(Filling),
+    /// In the governing header's world.
+    Live(Live),
 }
 
-/// Per-page state.
-#[derive(Clone, Copy, Debug)]
-pub struct PageInfo {
-    pub state: PageState,
-    pub epoch: u64,
-    /// Bytes current state relies on.
+/// What a page the flush in progress writes holds so far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Filling {
+    /// As [`Live::coverage`].
     pub coverage: u32,
-    /// For a table page, the page naming it.
-    pub parent: u32,
-    /// Its content size when written.
-    pub written: u16,
-    /// Bucket membership: 255 for none.
-    pub bucket: u8,
-    pub slot: u32,
+    pub kind: PageKind,
 }
 
-impl Default for PageInfo {
-    fn default() -> Self {
-        PageInfo {
-            state: PageState::Free,
-            epoch: 0,
-            coverage: 0,
-            parent: 0,
-            written: 0,
-            bucket: NO_BUCKET,
-            slot: 0,
+/// What a live page holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Live {
+    /// The epoch the page was written in.
+    pub epoch: u64,
+    /// Bytes current state relies on: data a fragment resolves to, statement
+    /// framing and inline payloads, and a non-header page's child references.
+    pub coverage: u32,
+    pub kind: PageKind,
+    /// Where it sits among the victims of its kind, if it is one.
+    pub slot: Option<BucketSlot>,
+}
+
+/// The kind of a filling or live page, as its frame states it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageKind {
+    Data,
+    /// A non-header address-table page, with or without children; the tree
+    /// is [`State::children`].
+    Table,
+    /// The governing header, or the slot the flush in progress writes.
+    Header,
+}
+
+/// Where a page sits in the victim buckets of its kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BucketSlot {
+    pub bucket: u8,
+    pub index: u32,
+}
+
+impl Filling {
+    /// A page of kind `kind` that the flush in progress takes to write.
+    pub fn taken(kind: PageKind) -> Page {
+        Page::Filling(Filling { coverage: 0, kind })
+    }
+
+    /// The page once the commit of epoch `epoch` has written it. It joins
+    /// the victims, if it is one, when it is rebucketed.
+    pub fn commit(self, epoch: u64) -> Live {
+        Live {
+            epoch,
+            coverage: self.coverage,
+            kind: self.kind,
+            slot: None,
         }
     }
 }
 
-pub const NO_BUCKET: u8 = 255;
 /// Buckets per page kind.
 pub const BUCKETS: usize = 16;
 
@@ -352,7 +382,11 @@ pub struct State {
     pub slab: Slab,
     pub allocs: IdMap<AllocationMeta>,
     pub recyclable: BTreeMap<u32, Recyclable>,
-    pub pages: Vec<PageInfo>,
+    /// Every page of the file, by page number.
+    pub pages: Vec<Page>,
+    /// The address-table tree: each live table page's child references, the
+    /// header's included; empty for a page without children.
+    pub children: IdMap<Vec<u32>>,
     pub data_buckets: Buckets,
     pub table_buckets: Buckets,
     /// Data page -> `(id, lo, hi)`: ids that may have bytes in it, and the
@@ -362,9 +396,20 @@ pub struct State {
     pub pending: Vec<Pending>,
     /// Pages whose coverage fell during the flush.
     pub dropped_candidates: IdSet,
-    /// The epoch of the flush in progress: pages written in it are never
-    /// victims.
+    /// The epoch of the flush in progress, and of every page it fills; or
+    /// between flushes, the governing header's.
     pub flush_epoch: u64,
+}
+
+/// The bytes of a non-header table page's child list that its coverage
+/// carries: the list with its delimiter, or nothing for a page without
+/// children, whose delimiter alone must not keep it alive.
+pub fn charged_child_bytes(children: &[u32]) -> u32 {
+    if children.is_empty() {
+        0
+    } else {
+        TableWriter::children_len(children) as u32
+    }
 }
 
 /// The data page and in-page offset of a file address.
@@ -384,68 +429,136 @@ pub fn address(page: u32, offset: u16) -> u64 {
 impl State {
     // ---------------------------------------------------------------- pages
 
+    /// Makes room for page records up to `page`, which the file now holds:
+    /// a page that comes into existence is reusable.
     pub fn ensure_page(&mut self, page: u32) {
         if self.pages.len() <= page as usize {
-            self.pages.resize(page as usize + 1, PageInfo::default());
+            self.pages.resize(page as usize + 1, Page::Reusable);
         }
     }
 
-    /// The bucket `page` belongs in: live data pages and leaves by coverage,
-    /// and nothing for a page with no coverage left, which is no victim.
-    fn wanted_bucket(&self, page: u32) -> u8 {
-        let info = &self.pages[page as usize];
-        match info.state {
-            PageState::Data | PageState::Table if info.coverage > 0 => {
-                Buckets::bucket_of(info.coverage)
+    /// The record of `page`, which must be live.
+    #[inline]
+    pub fn live(&self, page: u32) -> &Live {
+        match &self.pages[page as usize] {
+            Page::Live(l) => l,
+            other => panic!("page {page} is not live but {other:?}"),
+        }
+    }
+
+    #[inline]
+    pub fn live_mut(&mut self, page: u32) -> &mut Live {
+        match &mut self.pages[page as usize] {
+            Page::Live(l) => l,
+            other => panic!("page {page} is not live but {other:?}"),
+        }
+    }
+
+    /// The epoch of `page`, which holds content that current state refers
+    /// to: its own if it is live, the flush's if it is filling.
+    #[inline]
+    pub fn epoch_of(&self, page: u32) -> u64 {
+        match &self.pages[page as usize] {
+            Page::Live(l) => l.epoch,
+            Page::Filling(_) => self.flush_epoch,
+            other => panic!("page {page} holds no content but is {other:?}"),
+        }
+    }
+
+    /// The coverage of `page`, which must be filling or live.
+    #[inline]
+    fn coverage_mut(&mut self, page: u32) -> &mut u32 {
+        match &mut self.pages[page as usize] {
+            Page::Live(Live { coverage, .. }) | Page::Filling(Filling { coverage, .. }) => coverage,
+            other => panic!("page {page} holds no content but is {other:?}"),
+        }
+    }
+
+    pub fn is_filling(&self, page: u32) -> bool {
+        matches!(self.pages[page as usize], Page::Filling(_))
+    }
+
+    /// Whether table page `page` names other pages.
+    pub fn has_children(&self, page: u32) -> bool {
+        self.children.get(&page).is_some_and(|k| !k.is_empty())
+    }
+
+    /// The record of `page` if it may be a consolidation victim: a live data
+    /// page or leaf with live content. Pages with children are rebuilt by
+    /// every cut that needs them, and so are never victims.
+    pub fn victim(&self, page: u32) -> Option<&Live> {
+        match &self.pages[page as usize] {
+            Page::Live(l)
+                if l.coverage > 0
+                    && match l.kind {
+                        PageKind::Data => true,
+                        PageKind::Table => !self.has_children(page),
+                        PageKind::Header => false,
+                    } =>
+            {
+                Some(l)
             }
-            _ => NO_BUCKET,
+            _ => None,
+        }
+    }
+
+    /// The bucket `page` belongs in: victims by coverage, and nothing for
+    /// any other page.
+    fn wanted_bucket(&self, page: u32) -> Option<u8> {
+        self.victim(page).map(|l| Buckets::bucket_of(l.coverage))
+    }
+
+    fn current_bucket(&self, page: u32) -> Option<u8> {
+        match &self.pages[page as usize] {
+            Page::Live(l) => l.slot.map(|s| s.bucket),
+            _ => None,
+        }
+    }
+
+    fn buckets_of(&mut self, kind: PageKind) -> &mut Buckets {
+        match kind {
+            PageKind::Data => &mut self.data_buckets,
+            PageKind::Table => &mut self.table_buckets,
+            PageKind::Header => unreachable!("a header is never a victim"),
         }
     }
 
     /// Moves `page` to the bucket its coverage calls for, or out of buckets.
     pub fn rebucket(&mut self, page: u32) {
         let want = self.wanted_bucket(page);
-        if self.pages[page as usize].bucket == want {
+        if self.current_bucket(page) == want {
             return;
         }
         self.unbucket(page);
-        if want != NO_BUCKET {
-            let is_data = self.pages[page as usize].state == PageState::Data;
-            let buckets = if is_data {
-                &mut self.data_buckets
-            } else {
-                &mut self.table_buckets
-            };
-            let list = &mut buckets.lists[want as usize];
-            let slot = list.len() as u32;
+        if let Some(bucket) = want {
+            let kind = self.live(page).kind;
+            let list = &mut self.buckets_of(kind).lists[bucket as usize];
+            let index = list.len() as u32;
             list.push(page);
-            let info = &mut self.pages[page as usize];
-            info.bucket = want;
-            info.slot = slot;
+            self.live_mut(page).slot = Some(BucketSlot { bucket, index });
         }
     }
 
-    /// Takes `page` out of its bucket, before its state changes.
+    /// Takes `page` out of its bucket, before it stops being live.
     pub fn unbucket(&mut self, page: u32) {
-        let info = self.pages[page as usize];
-        if info.bucket == NO_BUCKET {
+        let Page::Live(Live {
+            kind,
+            slot: Some(s),
+            ..
+        }) = self.pages[page as usize]
+        else {
             return;
-        }
-        let in_data =
-            self.data_buckets.lists[info.bucket as usize].get(info.slot as usize) == Some(&page);
-        let buckets = if in_data {
-            &mut self.data_buckets
-        } else {
-            &mut self.table_buckets
         };
-        let list = &mut buckets.lists[info.bucket as usize];
-        let slot = info.slot as usize;
-        list.swap_remove(slot);
-        if slot < list.len() {
-            let moved = list[slot];
-            self.pages[moved as usize].slot = slot as u32;
+        let list = &mut self.buckets_of(kind).lists[s.bucket as usize];
+        let index = s.index as usize;
+        list.swap_remove(index);
+        if index < list.len() {
+            let moved = list[index];
+            if let Some(m) = &mut self.live_mut(moved).slot {
+                m.index = index as u32;
+            }
         }
-        self.pages[page as usize].bucket = NO_BUCKET;
+        self.live_mut(page).slot = None;
     }
 
     #[inline]
@@ -453,8 +566,8 @@ impl State {
         if n == 0 {
             return;
         }
-        self.pages[page as usize].coverage += n;
-        if self.wanted_bucket(page) != self.pages[page as usize].bucket {
+        *self.coverage_mut(page) += n;
+        if self.wanted_bucket(page) != self.current_bucket(page) {
             self.rebucket(page);
         }
     }
@@ -464,11 +577,11 @@ impl State {
         if n == 0 {
             return;
         }
-        let info = &mut self.pages[page as usize];
-        debug_assert!(info.coverage >= n, "coverage of page {page} underflows");
-        info.coverage -= n;
+        let coverage = self.coverage_mut(page);
+        debug_assert!(*coverage >= n, "coverage of page {page} underflows");
+        *coverage -= n;
         self.dropped_candidates.insert(page);
-        if self.wanted_bucket(page) != self.pages[page as usize].bucket {
+        if self.wanted_bucket(page) != self.current_bucket(page) {
             self.rebucket(page);
         }
     }
@@ -849,18 +962,34 @@ impl State {
                 assert_eq!(pins[s], 0, "a dead statement {s} is referenced");
             }
         }
-        for (p, info) in self.pages.iter().enumerate() {
-            if matches!(info.state, PageState::Header) {
-                continue;
-            }
-            let want = coverage.get(&(p as u32)).copied().unwrap_or(0);
-            // Interior pages carry child references, which only they count.
-            if !matches!(info.state, PageState::Interior) {
-                assert_eq!(
-                    info.coverage, want,
-                    "coverage of page {p} ({:?})",
-                    info.state
-                );
+        for (p, page) in self.pages.iter().enumerate() {
+            let p = p as u32;
+            let want = coverage.get(&p).copied().unwrap_or(0);
+            match page {
+                Page::Live(l) => {
+                    // A non-header page's child references are charged to
+                    // it; the header's, which every flush rewrites, are not.
+                    let kids = match l.kind {
+                        PageKind::Header => 0,
+                        _ => self.children.get(&p).map_or(0, |k| charged_child_bytes(k)),
+                    };
+                    assert_eq!(l.coverage, want + kids, "coverage of page {p} ({l:?})");
+                    assert_eq!(
+                        l.slot.map(|s| s.bucket),
+                        self.wanted_bucket(p),
+                        "bucket of page {p} ({l:?})"
+                    );
+                    if let Some(s) = l.slot {
+                        let buckets = match l.kind {
+                            PageKind::Data => &self.data_buckets,
+                            _ => &self.table_buckets,
+                        };
+                        let list = &buckets.lists[s.bucket as usize];
+                        assert_eq!(list.get(s.index as usize), Some(&p), "slot of page {p}");
+                    }
+                }
+                Page::Filling(f) => panic!("page {p} is filling outside a flush: {f:?}"),
+                other => assert_eq!(want, 0, "live content in page {p}, which is {other:?}"),
             }
         }
         let _: BTreeSet<u32> = BTreeSet::new();

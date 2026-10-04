@@ -87,7 +87,7 @@ impl Inner {
         self.cons.tail = self.file_pages.saturating_sub(1);
         let holes = match self.tail() {
             Some(t) => (2..t)
-                .filter(|&p| self.state.pages[p as usize].state == PageState::Free)
+                .filter(|&p| self.state.pages[p as usize] == Page::Reusable)
                 .count(),
             None => 0,
         };
@@ -98,15 +98,14 @@ impl Inner {
         }
     }
 
-    /// The highest page with live data or statements that is no victim of
-    /// this flush yet: where compaction mode works down from. Journal pages
-    /// are passed over, since the next flush moves the journal by itself.
+    /// The highest page that may be a victim and is none of this flush yet:
+    /// where compaction mode works down from. Journal pages are passed over,
+    /// since the next flush moves the journal by itself, and so are pages
+    /// with children, which every cut that needs them writes afresh.
     fn tail(&mut self) -> Option<u32> {
         let mut p = self.cons.tail;
         while p >= 2 && (p as usize) < self.state.pages.len() {
-            let info = &self.state.pages[p as usize];
-            let live =
-                matches!(info.state, PageState::Data | PageState::Table) && info.coverage > 0;
+            let live = self.state.victim(p).is_some();
             if live && !self.cons.skip.contains(&p) && !self.flush_rewritten.contains(&p) {
                 self.cons.tail = p;
                 return Some(p);
@@ -123,13 +122,10 @@ impl Inner {
         if !self.cons.compaction {
             return None;
         }
-        let want = if data {
-            PageState::Data
-        } else {
-            PageState::Table
-        };
-        self.tail()
-            .filter(|&t| self.state.pages[t as usize].state == want)
+        self.tail().filter(|&t| {
+            let is_data = self.state.live(t).kind == PageKind::Data;
+            is_data == data
+        })
     }
 
     /// The compaction tail, if a page that is reusable now lies below it for
@@ -146,9 +142,9 @@ impl Inner {
 
     /// LFS's cost-benefit score: sparse and long untouched first.
     fn score(&self, p: u32) -> f64 {
-        let info = &self.state.pages[p as usize];
-        let u = info.coverage as f64 / C as f64;
-        let age = self.state.flush_epoch.saturating_sub(info.epoch) as f64;
+        let live = self.state.live(p);
+        let u = live.coverage as f64 / C as f64;
+        let age = self.state.flush_epoch.saturating_sub(live.epoch) as f64;
         (1.0 - u) * age / (1.0 + u)
     }
 
@@ -189,7 +185,7 @@ impl Inner {
                 .sample(data, b)
                 .into_iter()
                 .filter(|&p| {
-                    let cov = self.state.pages[p as usize].coverage;
+                    let cov = self.state.live(p).coverage;
                     cov > 0 && cov <= max && !self.cons.skip.contains(&p) && ok(self, p)
                 })
                 .max_by(|&x, &y| self.score(x).total_cmp(&self.score(y)));
@@ -256,7 +252,7 @@ impl Inner {
     fn all_survivors(&mut self, v: u32) -> Option<Vec<Survivor>> {
         let surv = self.survivors(v);
         let total: u64 = surv.iter().map(|s| s.len() as u64).sum();
-        if total != self.state.pages[v as usize].coverage as u64 {
+        if total != self.state.live(v).coverage as u64 {
             debug_assert!(false, "the reverse index lost a referrer of page {v}");
             self.cons.skip.insert(v);
             return None;
@@ -366,7 +362,7 @@ impl Inner {
             // lies below it.
             let tail = self
                 .compaction_tail(true)
-                .filter(|&t| open.page < t && self.state.pages[t as usize].coverage <= room);
+                .filter(|&t| open.page < t && self.state.live(t).coverage <= room);
             let Some(v) = tail.or_else(|| self.pick_victim(true, b, room, &|_, _| true)) else {
                 break;
             };
@@ -435,7 +431,7 @@ impl Inner {
         // In compaction mode, the tail first, whatever its fill: it returns a
         // whole page to the file system, not only to the pool.
         if let Some(t) = self.compaction_victim(true) {
-            let cov = self.state.pages[t as usize].coverage;
+            let cov = self.state.live(t).coverage;
             let taken = if cov <= room {
                 offer.whole.push(t);
                 room -= cov;
@@ -462,7 +458,7 @@ impl Inner {
             let Some(v) = self.pick_victim(true, b, room.min(max), &not_chosen) else {
                 break;
             };
-            let cov = self.state.pages[v as usize].coverage;
+            let cov = self.state.live(v).coverage;
             chosen.insert(v);
             offer.whole.push(v);
             offer.reclaimed += (C - cov) as f64;
@@ -471,11 +467,10 @@ impl Inner {
         }
         if may_cut && room as f64 > self.opts.theta * C as f64 && room < max {
             let from = Buckets::bucket_of(room + 1) as usize;
-            let too_big = |i: &Inner, p: u32| {
-                !chosen.contains(&p) && i.state.pages[p as usize].coverage > room
-            };
+            let too_big =
+                |i: &Inner, p: u32| !chosen.contains(&p) && i.state.live(p).coverage > room;
             if let Some(v) = self.pick_victim(true, from, max, &too_big) {
-                let cov = self.state.pages[v as usize].coverage;
+                let cov = self.state.live(v).coverage;
                 offer.cut = Some(v);
                 offer.reclaimed += (C - cov) as f64;
                 offer.written += cov as f64;
@@ -550,7 +545,7 @@ impl Inner {
         let mut offer = Offer::default();
         let mut chosen = IdSet::default();
         if let Some(t) = self.compaction_victim(false) {
-            let cov = self.state.pages[t as usize].coverage;
+            let cov = self.state.live(t).coverage;
             chosen.insert(t);
             offer.whole.push(t);
             offer.tail = true;
@@ -564,7 +559,7 @@ impl Inner {
             let Some(v) = self.pick_victim(false, b, limit, &fresh) else {
                 break;
             };
-            let cov = self.state.pages[v as usize].coverage;
+            let cov = self.state.live(v).coverage;
             chosen.insert(v);
             offer.whole.push(v);
             offer.reclaimed += (C - cov) as f64;
@@ -606,11 +601,11 @@ impl Inner {
             let fresh = |i: &Inner, p: u32| !i.flush_rewritten.contains(&p);
             let tail = self
                 .compaction_victim(false)
-                .filter(|&t| self.state.pages[t as usize].coverage <= limit && fresh(self, t));
+                .filter(|&t| self.state.live(t).coverage <= limit && fresh(self, t));
             let Some(v) = tail.or_else(|| self.pick_victim(false, b, limit, &fresh)) else {
                 break;
             };
-            room -= self.state.pages[v as usize].coverage as f64 * RESTATE;
+            room -= self.state.live(v).coverage as f64 * RESTATE;
             self.rewrite_table_victims(&[v], fillers)?;
             victims.push(v);
         }
@@ -718,12 +713,9 @@ impl Inner {
             return Ok(());
         }
         let mut live = 0u64;
-        for info in self.state.pages.iter().skip(2) {
-            if matches!(
-                info.state,
-                PageState::Data | PageState::Table | PageState::Interior
-            ) {
-                live += info.coverage as u64;
+        for page in self.state.pages.iter().skip(2) {
+            if let Page::Live(l) = page {
+                live += l.coverage as u64;
             }
         }
         let pages = self.file_pages.saturating_sub(2) as u64;
@@ -739,21 +731,31 @@ impl Inner {
 
     pub(crate) fn fill_stats(&self, s: &mut Stats) {
         s.file_pages = self.file_pages as u64;
-        for (p, info) in self.state.pages.iter().enumerate() {
-            if p < 2 {
-                continue;
-            }
-            match info.state {
-                PageState::Data => {
+        for page in self.state.pages.iter().skip(2) {
+            match page {
+                Page::Live(Live {
+                    coverage,
+                    kind: PageKind::Data,
+                    ..
+                }) => {
                     s.data_pages += 1;
-                    s.live_data_bytes += info.coverage as u64;
+                    s.live_data_bytes += *coverage as u64;
                 }
-                PageState::Table | PageState::Interior => {
+                Page::Live(Live {
+                    coverage,
+                    kind: PageKind::Table,
+                    ..
+                }) => {
                     s.table_pages += 1;
-                    s.live_table_bytes += info.coverage as u64;
+                    s.live_table_bytes += *coverage as u64;
                 }
-                PageState::Free | PageState::Retiring => s.free_pages += 1,
-                _ => {}
+                Page::Reusable | Page::Fallback => s.free_pages += 1,
+                Page::Journal
+                | Page::Live(Live {
+                    kind: PageKind::Header,
+                    ..
+                }) => {}
+                Page::Filling(f) => unreachable!("a page is filling between flushes: {f:?}"),
             }
         }
         // The consolidator state is the store's own, not the application's.

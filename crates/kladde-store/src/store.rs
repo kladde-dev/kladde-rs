@@ -88,7 +88,6 @@ pub(crate) struct Inner {
     pub header_slot: u32,
     pub state: State,
     pub table_pages: IdMap<Box<PageBuf>>,
-    pub children: IdMap<Vec<u32>>,
     pub ready: BTreeSet<u32>,
     pub retiring: Vec<u32>,
     pub file_pages: u32,
@@ -192,17 +191,18 @@ impl Store {
         let file_pages = loaded.file_pages;
         state.ensure_page(file_pages.saturating_sub(1).max(1));
         let mut ready = BTreeSet::new();
-        for &p in &recovered.pages {
-            state.pages[p as usize].state = PageState::Journal;
-        }
         // The page the header names for the journal is in its world, written
-        // to or not.
+        // to or not, and so is every page the segment went on to.
         let jp = loaded.header.fields.journal_pointer;
-        if jp >= 2 && jp < file_pages {
-            state.pages[jp as usize].state = PageState::Journal;
+        let named = (jp >= 2 && jp < file_pages).then_some(jp);
+        for &p in recovered.pages.iter().chain(&named) {
+            match state.pages[p as usize] {
+                Page::Reusable | Page::Journal => state.pages[p as usize] = Page::Journal,
+                _ => return Err(corrupt(format!("journal page {p} is in the table's world"))),
+            }
         }
         for p in 2..file_pages {
-            if state.pages[p as usize].state == PageState::Free {
+            if state.pages[p as usize] == Page::Reusable {
                 ready.insert(p);
             }
         }
@@ -242,7 +242,6 @@ impl Store {
             header_slot: loaded.header.slot,
             state,
             table_pages: loaded.table_pages,
-            children: loaded.children,
             ready,
             retiring: Vec::new(),
             file_pages,
@@ -484,10 +483,9 @@ impl Store {
             let stmt = f.stmt().map(|s| {
                 let page = i.state.slab.page(s);
                 format!(
-                    "{:?} in page {page} ({:?}, epoch {}), pins {}",
+                    "{:?} in page {page} ({:?}), pins {}",
                     i.state.slab.kinds[s.idx()],
-                    i.state.pages[page as usize].state,
-                    i.state.pages[page as usize].epoch,
+                    i.state.pages[page as usize],
                     i.state.slab.pins[s.idx()]
                 )
             });
@@ -884,9 +882,7 @@ impl Inner {
             ..
         } = self;
         let mut alloc = |s: &mut dyn Storage| -> Result<u32, Error> {
-            let p = take_page(ready, state, file_pages, s, stats)?;
-            state.pages[p as usize].state = PageState::Journal;
-            Ok(p)
+            take_page(ready, state, file_pages, s, stats, Page::Journal)
         };
         let before = segment.bytes;
         if let Err(e) = segment.append(&payload, &mut **storage, &mut alloc) {
@@ -934,7 +930,7 @@ impl Inner {
             self.storage.set_len(len)?;
             for q in self.file_pages..p {
                 self.state.ensure_page(q);
-                if q >= 2 && self.state.pages[q as usize].state == PageState::Free {
+                if q >= 2 && self.state.pages[q as usize] == Page::Reusable {
                     self.ready.insert(q);
                 }
             }
@@ -942,7 +938,7 @@ impl Inner {
             self.state.ensure_page(p);
         }
         self.ready.remove(&p);
-        self.state.pages[p as usize].state = PageState::Journal;
+        self.state.pages[p as usize] = Page::Journal;
         Ok(())
     }
 
@@ -1046,30 +1042,32 @@ fn segment_delta(before: u64, after: u64) -> u64 {
     after - before
 }
 
-/// Takes the lowest reusable page, or grows the file by one page.
+/// Takes the lowest reusable page, or grows the file by one page, and makes
+/// it `page`.
 pub(crate) fn take_page(
     ready: &mut BTreeSet<u32>,
     state: &mut State,
     file_pages: &mut u32,
     storage: &mut dyn Storage,
     stats: &mut Stats,
+    page: Page,
 ) -> Result<u32, Error> {
-    if let Some(p) = ready.pop_first() {
-        state.pages[p as usize].state = PageState::Claimed;
-        return Ok(p);
-    }
-    let p = *file_pages;
-    if p == u32::MAX {
-        return Err(Error::OutOfBounds);
-    }
-    storage.set_len((p as u64 + 1) * PAGE_SIZE as u64)?;
-    *file_pages = p + 1;
-    state.ensure_page(p);
-    state.pages[p as usize] = PageInfo {
-        state: PageState::Claimed,
-        ..Default::default()
+    let p = match ready.pop_first() {
+        Some(p) => p,
+        None => {
+            let p = *file_pages;
+            if p == u32::MAX {
+                return Err(Error::OutOfBounds);
+            }
+            storage.set_len((p as u64 + 1) * PAGE_SIZE as u64)?;
+            *file_pages = p + 1;
+            state.ensure_page(p);
+            stats.file_grew += 1;
+            p
+        }
     };
-    stats.file_grew += 1;
+    debug_assert_eq!(state.pages[p as usize], Page::Reusable, "taking page {p}");
+    state.pages[p as usize] = page;
     Ok(p)
 }
 

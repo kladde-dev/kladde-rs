@@ -122,7 +122,7 @@ pub(crate) struct Chunk {
 pub(crate) struct Output {
     pub data: Vec<DataPage>,
     /// Address-table pages other than the header: page and content.
-    pub tables: Vec<(u32, Vec<u8>, bool)>,
+    pub tables: Vec<(u32, Vec<u8>)>,
     pub header_content: Vec<u8>,
     /// Table pages this flush unlinked or replaced.
     pub dropped_tables: Vec<u32>,
@@ -709,6 +709,7 @@ impl Inner {
             &mut self.file_pages,
             &mut *self.storage,
             &mut self.stats,
+            Filling::taken(PageKind::Data),
         )?;
         Ok(DataPage {
             page,
@@ -830,33 +831,34 @@ impl Inner {
             Some(p) => p,
             None => self.file_pages,
         };
+        let slot = (e % 2) as u32;
+        // Every page this flush filled, and nothing else, is written here.
+        let written: Vec<u32> = (out.data.iter().map(|dp| dp.page))
+            .chain(out.tables.iter().map(|&(p, _)| p))
+            .chain([slot])
+            .collect();
+        debug_assert_eq!(
+            written.len(),
+            self.state
+                .pages
+                .iter()
+                .filter(|p| matches!(p, Page::Filling(_)))
+                .count(),
+            "a page the flush took is not written"
+        );
         for mut dp in out.data {
             seal_page(&mut dp.buf, None, KIND_DATA, e, dp.used);
             self.storage
                 .write_at(&dp.buf[..], dp.page as u64 * PAGE_SIZE as u64)?;
-            let info = &mut self.state.pages[dp.page as usize];
-            info.state = PageState::Data;
-            info.epoch = e;
-            info.written = dp.used as u16;
             self.stats.data_pages_written += 1;
-            self.state.rebucket(dp.page);
         }
-        for (p, content, interior) in &out.tables {
+        for (p, content) in &out.tables {
             let mut buf = new_page();
             crate::page::encode_page(&mut buf, None, KIND_ADDRESS_TABLE, e, content);
             self.storage
                 .write_at(&buf[..], *p as u64 * PAGE_SIZE as u64)?;
-            let info = &mut self.state.pages[*p as usize];
-            info.state = if *interior {
-                PageState::Interior
-            } else {
-                PageState::Table
-            };
-            info.epoch = e;
-            info.written = content.len() as u16;
             self.table_pages.insert(*p, buf);
             self.stats.table_pages_written += 1;
-            self.state.rebucket(*p);
         }
         // A session's first flush clears the page it names for the next
         // segment (`spec/journal.md#the-start-of-a-session`).
@@ -865,7 +867,6 @@ impl Inner {
                 .write_at(&new_page()[..], jp as u64 * PAGE_SIZE as u64)?;
         }
         self.storage.sync()?;
-        let slot = (e % 2) as u32;
         self.header.journal_pointer = jp;
         self.header.format_version = FORMAT_VERSION;
         self.header.min_reader_version = MIN_READER_VERSION;
@@ -881,50 +882,78 @@ impl Inner {
             .write_at(&hbuf[..], slot as u64 * PAGE_SIZE as u64)?;
         self.stats.headers_written += 1;
 
+        // The pages the flush filled are in the world now.
+        for &p in &written {
+            match self.state.pages[p as usize] {
+                Page::Filling(f) => self.state.pages[p as usize] = Page::Live(f.commit(e)),
+                other => unreachable!("page {p} was written but is {other:?}"),
+            }
+        }
+
         // Bookkeeping: the rotation of reusable pages first.
         for p in std::mem::take(&mut self.retiring) {
-            self.state.pages[p as usize].state = PageState::Free;
-            self.state.pages[p as usize].coverage = 0;
+            debug_assert_eq!(self.state.pages[p as usize], Page::Fallback);
+            self.state.pages[p as usize] = Page::Reusable;
             self.ready.insert(p);
         }
         let mut retiring = Vec::new();
         let candidates: Vec<u32> = self.state.dropped_candidates.drain().collect();
         for p in candidates {
-            let info = self.state.pages[p as usize];
-            if info.state == PageState::Data && info.coverage == 0 {
+            if let Page::Live(Live {
+                coverage: 0,
+                kind: PageKind::Data,
+                ..
+            }) = self.state.pages[p as usize]
+            {
                 self.state.unbucket(p);
-                self.state.pages[p as usize].state = PageState::Retiring;
+                self.state.pages[p as usize] = Page::Fallback;
                 self.state.reverse.remove(&p);
                 retiring.push(p);
             }
         }
         for p in out.dropped_tables {
-            if cfg!(debug_assertions) && self.state.pages[p as usize].state == PageState::Table {
+            if cfg!(debug_assertions) {
                 let live = self.live_statements_in(p);
                 assert!(
                     live.is_empty(),
-                    "unlinked leaf {p} still holds live statements: {live:?}"
+                    "unlinked table page {p} still holds live statements: {live:?}"
                 );
             }
             self.state.unbucket(p);
-            self.state.pages[p as usize].state = PageState::Retiring;
+            self.state.pages[p as usize] = Page::Fallback;
             self.table_pages.remove(&p);
-            self.children.remove(&p);
+            self.state.children.remove(&p);
             retiring.push(p);
         }
         for &p in &self.segment.pages {
-            if p < self.file_pages && self.state.pages[p as usize].state == PageState::Journal {
-                self.state.pages[p as usize].state = PageState::Retiring;
+            if p < self.file_pages && self.state.pages[p as usize] == Page::Journal {
+                self.state.pages[p as usize] = Page::Fallback;
                 retiring.push(p);
             }
         }
         self.retiring = retiring;
+        // The header this commit replaced leaves the world; the flush took
+        // everything it stated.
+        let old = self.header_slot;
+        if cfg!(debug_assertions) {
+            let live = self.live_statements_in(old);
+            assert!(
+                live.is_empty(),
+                "the replaced header still holds live statements: {live:?}"
+            );
+        }
+        self.state.pages[old as usize] = Page::Fallback;
+        self.state.children.remove(&old);
+        self.table_pages.remove(&old);
         self.table_pages.insert(slot, hbuf);
-        self.state.pages[slot as usize].epoch = e;
         self.header_slot = slot;
         self.epoch = e;
+        for p in written {
+            self.state.rebucket(p);
+        }
         if jp < self.file_pages {
-            self.state.pages[jp as usize].state = PageState::Journal;
+            debug_assert_eq!(self.state.pages[jp as usize], Page::Reusable);
+            self.state.pages[jp as usize] = Page::Journal;
         }
         self.segment = crate::journal::SegmentWriter::new(e + 1, jp);
         self.segment_records = crate::journal::Records::new();
@@ -957,11 +986,11 @@ impl Inner {
         let mut top = self.file_pages;
         while top > 2 {
             let p = top - 1;
-            let st = self.state.pages[p as usize].state;
-            let empty_journal = st == PageState::Journal
+            let page = self.state.pages[p as usize];
+            let empty_journal = page == Page::Journal
                 && self.segment.transactions == 0
                 && self.segment.pages == [p];
-            if st == PageState::Free || (force && empty_journal) {
+            if page == Page::Reusable || (force && empty_journal) {
                 top -= 1;
             } else {
                 break;
@@ -974,7 +1003,6 @@ impl Inner {
         self.storage.set_len(top as u64 * PAGE_SIZE as u64)?;
         for p in top..self.file_pages {
             self.ready.remove(&p);
-            self.state.pages[p as usize] = PageInfo::default();
         }
         self.state.pages.truncate(top.max(2) as usize);
         self.file_pages = top;

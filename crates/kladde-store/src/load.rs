@@ -74,8 +74,6 @@ pub struct Loaded {
     pub header: PickedHeader,
     /// Resident address-table pages, the governing header's included.
     pub table_pages: IdMap<Box<PageBuf>>,
-    /// Each table page's child list, the header's under its slot.
-    pub children: IdMap<Vec<u32>>,
     /// The number of pages in the file.
     pub file_pages: u32,
 }
@@ -162,7 +160,9 @@ struct Entry {
 struct Sink {
     state: State,
     emitted: Vec<(Key, Fragment)>,
-    data_pages: IdSet,
+    /// Each data page a resolved `Ref` points into, and the bytes resolved
+    /// to it: its coverage once its frame has been checked.
+    data_pages: IdMap<u32>,
     youngest: IdMap<u64>,
 }
 
@@ -202,9 +202,7 @@ impl Sink {
         let f = match it.stmt.kind {
             Kind::Ref => {
                 let (page, off) = split_address(it.stmt.address + d as u64);
-                self.state.ensure_page(page);
-                self.state.pages[page as usize].coverage += end - start;
-                self.data_pages.insert(page);
+                *self.data_pages.entry(page).or_default() += end - start;
                 self.state.note_reverse(page, id, start, end);
                 let y = self.youngest.entry(id).or_default();
                 *y = (*y).max(u64::from(page) << 32);
@@ -216,7 +214,7 @@ impl Sink {
             }
             Kind::Inline => {
                 let (_, off) = split_address(it.stmt.address + d as u64);
-                self.state.pages[it.page as usize].coverage += end - start;
+                self.state.cover(it.page, end - start);
                 Fragment::Bytes {
                     page: it.page,
                     offset: off,
@@ -376,32 +374,35 @@ fn resolve_id(sink: &mut Sink, merge: &mut Merge) -> Result<(), Error> {
 /// Loads the world of the governing header, after the caller's `fsync`.
 pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error> {
     let file_pages = (storage.len()? / PAGE_SIZE as u64).min(u32::MAX as u64) as u32;
-    let mut state = State::default();
-    state
-        .pages
-        .resize(file_pages.max(2) as usize, PageInfo::default());
-    for slot in 0..2 {
-        state.pages[slot].state = PageState::Header;
-    }
+    let mut state = State {
+        flush_epoch: header.epoch,
+        ..State::default()
+    };
+    // Every page starts reusable, the other header slot included: the
+    // caller's `fsync` retired the older world.
+    state.ensure_page(file_pages.max(2) - 1);
 
     // 1. Walk the tree, keeping every table page resident.
     let mut table_pages: IdMap<Box<PageBuf>> = IdMap::default();
-    let mut children: IdMap<Vec<u32>> = IdMap::default();
     let mut contents: Vec<(u32, u64, std::ops::Range<usize>)> = Vec::new();
     let mut seen = IdSet::default();
-    let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
+    let mut queue: VecDeque<u32> = VecDeque::new();
     {
         let d = decode_page(&header.page, true)
             .map_err(|_| corrupt("the governing header does not decode"))?;
         let (kids, _) = TableReader::open(&header.page[..], d.content.clone())?;
         contents.push((header.slot, header.epoch, d.content));
-        for &c in &kids {
-            queue.push_back((c, header.slot));
-        }
-        children.insert(header.slot, kids);
+        queue.extend(&kids);
+        state.children.insert(header.slot, kids);
+        state.pages[header.slot as usize] = Page::Live(Live {
+            epoch: header.epoch,
+            coverage: 0,
+            kind: PageKind::Header,
+            slot: None,
+        });
         seen.insert(header.slot);
     }
-    while let Some((p, parent)) = queue.pop_front() {
+    while let Some(p) = queue.pop_front() {
         if p < 2 || p >= file_pages || !seen.insert(p) {
             return Err(corrupt("the address-table pages do not form a tree"));
         }
@@ -418,42 +419,25 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
             )));
         }
         let (kids, _) = TableReader::open(&page[..], d.content.clone())?;
-        let info = &mut state.pages[p as usize];
-        info.epoch = d.epoch;
-        info.parent = parent;
-        info.written = (d.content.end - d.content.start) as u16;
-        for &c in &kids {
-            queue.push_back((c, p));
-        }
+        // Its child references are charged to it; its statements are added
+        // as the merge resolves them.
+        state.pages[p as usize] = Page::Live(Live {
+            epoch: d.epoch,
+            coverage: charged_child_bytes(&kids),
+            kind: PageKind::Table,
+            slot: None,
+        });
+        queue.extend(&kids);
         contents.push((p, d.epoch, d.content));
-        children.insert(p, kids);
+        state.children.insert(p, kids);
         table_pages.insert(p, page);
     }
-    // A page with children is interior; it holds child references only, and
-    // they count as its coverage.
-    for (&p, kids) in &children {
-        if p >= 2 && !kids.is_empty() {
-            state.pages[p as usize].state = PageState::Interior;
-        }
-    }
-    for &(p, _, _) in &contents {
-        if p >= 2 && state.pages[p as usize].state != PageState::Interior {
-            state.pages[p as usize].state = PageState::Table;
-        }
-    }
-    for (&p, kids) in &children {
-        if p >= 2 && !kids.is_empty() {
-            state.pages[p as usize].coverage =
-                crate::statement::TableWriter::children_len(kids) as u32;
-        }
-    }
-    state.pages[header.slot as usize].epoch = header.epoch;
 
     // 2. Merge and resolve.
     let mut sink = Sink {
         state,
         emitted: Vec::new(),
-        data_pages: IdSet::default(),
+        data_pages: IdMap::default(),
         youngest: IdMap::default(),
     };
     {
@@ -485,9 +469,12 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
     } = sink;
     state.frags = emitted.into_iter().collect();
 
-    // 3. Mirror nothing, but check every data page current state reaches.
+    // 3. Check every data page current state reaches against what the `Ref`s
+    //    into it say it is, and record it with the epoch its frame gives.
     let mut buf = new_page();
-    for &p in &data_pages {
+    let mut data_pages: Vec<(u32, u32)> = data_pages.into_iter().collect();
+    data_pages.sort_unstable();
+    for (p, coverage) in data_pages {
         if p < 2 || p >= file_pages {
             return Err(corrupt(format!(
                 "a Ref points outside the file, into page {p}"
@@ -506,12 +493,12 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
                 "page {p} is newer than its header: the fsync contract was broken"
             )));
         }
-        let info = &mut state.pages[p as usize];
-        info.state = PageState::Data;
-        info.epoch = d.epoch;
-        info.written = (d.content.end - d.content.start) as u16;
-    }
-    for p in 2..file_pages {
+        state.pages[p as usize] = Page::Live(Live {
+            epoch: d.epoch,
+            coverage,
+            kind: PageKind::Data,
+            slot: None,
+        });
         state.rebucket(p);
     }
     state.dropped_candidates.clear();
@@ -521,7 +508,6 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
         state,
         header,
         table_pages,
-        children,
         file_pages,
     })
 }

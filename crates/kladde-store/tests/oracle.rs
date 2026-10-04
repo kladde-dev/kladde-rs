@@ -249,10 +249,10 @@ fn a_tiny_journal_budget_flushes_often() {
     }
 }
 
-/// A grow witness bound into a reused table page must not look older than
-/// its allocation's anchor because the page still carries its old epoch:
-/// declared dead, it left with its page, and the allocation reopened at its
-/// anchored size. This seed lost one so.
+/// A grow witness a flush binds into a page it reuses is that flush's, and
+/// must not look older than its allocation's anchor: declared dead, it left
+/// with its page, and the allocation reopened at its anchored size. This seed
+/// lost one so.
 #[test]
 fn a_grow_witness_in_a_reused_page_survives() {
     let opts = Options {

@@ -30,6 +30,15 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 - **`Origin::Arena` holds a `u64`.**
   `impl/consolidation.md#how-a-flush-and-consolidation-compose` halves `Origin` with a 32-bit arena position and a flush forced before the arena outgrows it.
   The implementation keeps 64 bits and relies on the journal budget to keep the arena small; a single transaction is still capped at `2^32 - 1` bytes by the journal's length prefix.
+- **A page's record holds what its state has, and nothing else.**
+  It is an enum over the states of `spec/durability.md#page-states`, where `impl/in-memory-state.md#4-the-page-table` lists an epoch, a kind and coverage for every page.
+  Kept as leftovers in reusable and fallback pages, those fields once let a flush read a reused page's old epoch.
+  A page a flush takes is in a state of the implementation's own, filling, which the spec counts as reusable: it has a kind and coverage but no epoch, since its epoch is the flush's, and no place among the victims, so no rule can mistake it for a committed page.
+  The commit turns every page it wrote into a live one; a failed flush poisons the store, so nothing reads the pages it left filling.
+  Only a live page has an epoch and a victim bucket.
+  Journal pages are a state of their own, although the spec counts them live, since the segment keeps what they hold.
+  The other header slot is fallback after a commit and reusable after a load, as the spec has it, and joins the ready pool in neither case.
+  A table page records no parent; see the interior layer under Flush.
 - **A page whose coverage reaches zero leaves its bucket at once.**
   It is retired at the next commit either way, and keeping it would waste the samples that victim selection draws from the sparsest bucket, which is exactly where such pages collect.
 - **The statement slab also keeps each statement's id and kind: 14 bytes per slot, where `rust/store.md#the-statement-slab` has 9.**

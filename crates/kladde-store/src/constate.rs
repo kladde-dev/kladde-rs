@@ -113,7 +113,7 @@ impl Inner {
     /// current.
     fn youngest_pages(&self) -> (IdMap<u64>, IdMap<u64>) {
         let (mut content, mut statements): (IdMap<u64>, IdMap<u64>) = Default::default();
-        let epoch_of = |page: u32| self.state.pages[page as usize].epoch;
+        let epoch_of = |page: u32| self.state.epoch_of(page);
         let raise = |m: &mut IdMap<u64>, id: u32, e: u64| {
             let y = m.entry(id).or_default();
             *y = (*y).max(e);
@@ -302,13 +302,13 @@ impl Inner {
                 Fragment::Bytes { page, .. } => Some(page),
                 Fragment::Zero { stmt } => Some(self.state.slab.page(stmt)),
                 Fragment::Pending(p) => match self.state.pending[p as usize].place {
-                    Place::Data(a) => Some(split_address(a).0)
-                        .filter(|&pg| self.state.pages[pg as usize].state != PageState::Claimed),
+                    Place::Data(a) => Some(split_address(a).0),
                     _ => None,
                 },
             };
-            // Anything this flush states lands in a page of this epoch.
-            let epoch = page.map_or(e, |pg| self.state.pages[pg as usize].epoch);
+            // Anything this flush states or places lands in a page of this
+            // epoch, which is what a page it fills reports.
+            let epoch = page.map_or(e, |pg| self.state.epoch_of(pg));
             let y = fallback.entry(kid(k)).or_default();
             *y = (*y).max(epoch);
         }
