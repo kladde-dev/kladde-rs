@@ -1,13 +1,14 @@
 //! Benchmarks a drawing editor's edits on an SVG drawing stored in kladde.
 //!
 //! ```text
-//! svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--journal-budget PAGES]
+//! svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--journal-budget PAGES] [--shift-decay FACTOR]
 //! ```
 //!
 //! `--only Restack`, say, makes every edit a restack where the drawing allows
 //! one, to measure what one kind of edit costs. `--journal-budget` sets the
 //! store's [`Options::journal_budget_pages`], so that the store also flushes
-//! by itself whenever the journal outgrows that many pages.
+//! by itself whenever the journal outgrows that many pages, and
+//! `--shift-decay` its [`Options::shift_decay`].
 //!
 //! The drawing is converted into a kladde file, which is not measured, and
 //! then edited by a seeded mix of what a drawing editor does — dragging shapes,
@@ -587,12 +588,18 @@ fn main() {
                     .and_then(|s| s.parse().ok())
                     .expect("--journal-budget PAGES")
             }
+            "--shift-decay" => {
+                opts.shift_decay = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .expect("--shift-decay FACTOR")
+            }
             _ => positional.push(PathBuf::from(arg)),
         }
     }
     let [input, out] = positional.as_slice() else {
         eprintln!(
-            "usage: svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--journal-budget PAGES]"
+            "usage: svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--journal-budget PAGES] [--shift-decay FACTOR]"
         );
         std::process::exit(2);
     };
@@ -759,8 +766,12 @@ fn main() {
 
 /// The seconds spent in kladde's calls, summed over the rows.
 fn rows_time(rows: &[String]) -> f64 {
+    let column = kladde_bench::COLUMNS
+        .split(',')
+        .position(|c| c == "ops_us")
+        .expect("an ops_us column");
     rows.iter()
-        .filter_map(|r| r.rsplit(',').next()?.parse::<f64>().ok())
+        .filter_map(|r| r.split(',').nth(column)?.parse::<f64>().ok())
         .sum::<f64>()
         / 1e6
 }

@@ -30,7 +30,7 @@ pub const COLUMNS: &str =
 free_pages,live_data,live_table,alloc_bytes,allocations,statements,fragments,budget,\
 data_written,table_written,headers_written,journal_bytes,fresh_bytes,evacuated_pages,\
 evacuated_bytes,free_filled,budget_pages,table_rewrites,window_restated,defrag_rewrites,\
-defrag_bytes,compaction_flushes,truncations,flush_us,ops_us";
+defrag_bytes,compaction_flushes,truncations,flush_us,ops_us,restated_bytes,merged_bytes";
 
 /// xorshift64: deterministic, and good enough for workloads.
 ///
@@ -104,7 +104,7 @@ pub fn row(
 ) -> String {
     let b = base;
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         scenario,
         variant,
         size,
@@ -139,6 +139,8 @@ pub fn row(
         s.truncations - b.truncations,
         flush_us,
         ops_us,
+        s.restated_bytes - b.restated_bytes,
+        s.merged_bytes - b.merged_bytes,
     )
 }
 

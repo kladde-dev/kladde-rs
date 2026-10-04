@@ -30,6 +30,15 @@ impl DataPage {
 /// each a destination range, and the pending content that states it there.
 type Restated = IdMap<Vec<(u32, u32, Pending)>>;
 
+/// What becomes of part of a range an id shifted within itself.
+enum Shifted {
+    /// A fragment, restated over `[a, b)` where its bytes lie.
+    State(u32, u32, Pending),
+    /// A run of fragments, written again over `[a, b)` as one chunk, from
+    /// the committed bytes at `from`.
+    Write { a: u32, b: u32, from: u32 },
+}
+
 /// About what a `Ref` statement's framing takes, in bytes: a tag, an offset,
 /// a size and an address, each a short varint.
 const REF_FRAMING: u64 = 9;
@@ -353,9 +362,12 @@ impl Inner {
     /// than where it already lies, and turns it into a literal; except a
     /// piece that an id still in its committed incarnation shifted within
     /// itself, by a splice or a move, whose bytes no other piece names. Such
-    /// a piece is restated instead, unless describing it would cost more than
-    /// writing it: returned per id are the fragments it becomes, each a
-    /// destination range and what states it there.
+    /// a piece is restated instead, but for runs of fragments that are
+    /// cheaper to write again than to describe at this and the later shifts
+    /// the allocation's history predicts, which are read and written again
+    /// as one chunk each (see [`restatement`](Self::restatement)): returned
+    /// per id are the fragments it becomes, each a destination range and
+    /// what states it there.
     ///
     /// Bytes that two pieces name were copied, and are written again, so that
     /// no data byte is referenced by two live statements.
@@ -371,6 +383,10 @@ impl Inner {
                 }
             }
         }
+        // Runs of shifted bytes to write again, as (id, at, end, from).
+        let mut merges: Vec<(u32, u32, u32, u32)> = Vec::new();
+        let mut shifted_ids: Vec<u32> = Vec::new();
+        let (epoch, decay) = (self.state.flush_epoch, self.opts.shift_decay);
         for (&id, e) in &f.ids {
             if !e.exists {
                 continue;
@@ -378,6 +394,12 @@ impl Inner {
             let keys: Vec<(u32, Source)> = e.table.pieces.iter().map(|(&k, &s)| (k, s)).collect();
             let persistent = e.existed && !e.ended && e.committed_live;
             let copied = copies.get(&id).map_or(&[][..], |c| &c[..]);
+            let horizon = self
+                .state
+                .allocs
+                .get(&id)
+                .map_or(0.0, |m| m.shifts_at(epoch, decay));
+            let mut shifted_here = false;
             for (i, &(k, s)) in keys.iter().enumerate() {
                 if let Source::Storage(src, so) = s {
                     let identity = src == id && so == k && e.committed_live;
@@ -388,14 +410,44 @@ impl Inner {
                     let len = end - k;
                     let shifted = persistent && src == id;
                     if shifted && !copied.iter().any(|&(a, b)| a < so + len && so < b) {
-                        if let Some(takes) = self.restatement(id, k, end, so) {
-                            restated.entry(id).or_default().extend(takes);
+                        if let Some(parts) = self.restatement(id, k, end, so, horizon) {
+                            shifted_here = true;
+                            for part in parts {
+                                match part {
+                                    Shifted::State(a, b, p) => {
+                                        restated.entry(id).or_default().push((a, b, p));
+                                    }
+                                    Shifted::Write { a, b, from } => merges.push((id, a, b, from)),
+                                }
+                            }
                             continue;
                         }
                     }
                     reads.push((id, k, src, so, len));
                 }
             }
+            if shifted_here {
+                shifted_ids.push(id);
+            }
+        }
+        for id in shifted_ids {
+            if let Some(m) = self.state.allocs.get_mut(&id) {
+                m.shifts = (m.shifts_at(epoch, decay) + 1.0) as f32;
+                m.shifted_epoch = epoch as u32;
+            }
+        }
+        for (id, a, b, from) in merges {
+            let mut bytes = vec![0u8; (b - a) as usize];
+            self.read_committed(id, from, &mut bytes)?;
+            let pos = self.segment_records.arena.len() as u64;
+            self.segment_records.arena.extend_from_slice(&bytes);
+            let p = Pending {
+                origin: Origin::Arena(pos),
+                place: Place::Unplaced,
+                heat: 0,
+                rewrite: false,
+            };
+            restated.entry(id).or_default().push((a, b, p));
         }
         for (id, k, src, so, len) in reads {
             let mut bytes = vec![0u8; len as usize];
@@ -412,72 +464,162 @@ impl Inner {
         Ok(restated)
     }
 
-    /// The fragments that the committed bytes `[so, so + end - k)` of `id`
-    /// lie in, as pending fragments over `[k, end)`, their new place; or
-    /// `None` if stating them would cost more than writing the bytes again.
+    /// What becomes of the committed bytes `[so, so + end - k)` of `id`,
+    /// shifted to `[k, end)`: in order, runs of the fragments they lie in,
+    /// each restated where it lies, and runs written again as one chunk, to
+    /// merge fragments whose statements would cost more than their bytes.
     ///
     /// The costs are estimates in bytes: a `Ref` statement takes about
     /// [`REF_FRAMING`] bytes, an `Inline` one its payload and
-    /// [`SHORT_FRAMING`] more, and a `Zero` one [`SHORT_FRAMING`]; writing
-    /// the bytes again costs the bytes and a `Ref` for every page they fill.
-    fn restatement(&self, id: u32, k: u32, end: u32, so: u32) -> Option<Vec<(u32, u32, Pending)>> {
-        let (len, se) = (end - k, so + (end - k));
+    /// [`SHORT_FRAMING`] more, and a `Zero` one [`SHORT_FRAMING`]; writing a
+    /// run again costs its bytes and a `Ref` for every page it fills. A
+    /// statement is paid not only now but at every later flush that shifts
+    /// the bytes again, which `horizon` predicts from the allocation's past
+    /// shifts; so a run is written again where its statements, times one
+    /// plus the horizon, would cost more than its bytes plus its new `Ref`s,
+    /// times the same.
+    fn restatement(
+        &self,
+        id: u32,
+        k: u32,
+        end: u32,
+        so: u32,
+        horizon: f64,
+    ) -> Option<Vec<Shifted>> {
+        /// A fragment of the shifted range: where it goes, what restates
+        /// it, what that costs per flush, and whether it may be merged.
+        struct Piece {
+            a: u32,
+            b: u32,
+            p: Pending,
+            cost: u64,
+            mergeable: bool,
+        }
+        let se = so + (end - k);
         let size = self.state.size_of(id);
-        let mut out = Vec::new();
-        let mut cost = 0u64;
+        let mut pieces = Vec::new();
         let mut at = so;
         while at < se {
             if at >= size {
-                // Past the committed size: zeros.
-                out.push((k + at - so, end, zero_pending()));
-                cost += SHORT_FRAMING;
+                // Past the committed size: zeros, below the old size never
+                // stated, and so never worth merging.
+                pieces.push(Piece {
+                    a: k + at - so,
+                    b: end,
+                    p: zero_pending(),
+                    cost: SHORT_FRAMING,
+                    mergeable: false,
+                });
                 break;
             }
             let (fk, frag, fend) = self.state.resolve(id, at)?;
             let d = at - koff(fk);
             let to = fend.min(se);
-            let p = match frag {
+            let (p, cost) = match frag {
                 Fragment::Bytes { page, offset, stmt } => {
                     let a = address(page, offset + d as u16);
                     if self.state.slab.kinds[stmt.idx()] == Kind::Inline {
-                        cost += SHORT_FRAMING + (to - at) as u64;
-                        Pending {
+                        let p = Pending {
                             origin: Origin::File(a),
                             place: Place::Inline,
                             heat: 0,
                             rewrite: false,
-                        }
+                        };
+                        (p, SHORT_FRAMING + (to - at) as u64)
                     } else {
-                        cost += REF_FRAMING;
-                        Pending {
+                        let p = Pending {
                             origin: Origin::File(a),
                             place: Place::Data(a),
                             heat: 0,
                             rewrite: false,
-                        }
+                        };
+                        (p, REF_FRAMING)
                     }
                 }
-                Fragment::Zero { .. } => {
-                    cost += SHORT_FRAMING;
-                    zero_pending()
-                }
+                Fragment::Zero { .. } => (zero_pending(), SHORT_FRAMING),
                 Fragment::Pending(p) => {
                     let mut q = self.state.pending[p as usize].advanced(d);
                     q.heat = 0;
-                    cost += match q.place {
+                    let cost = match q.place {
                         Place::Data(_) | Place::Unplaced => REF_FRAMING,
                         Place::Inline => SHORT_FRAMING + (to - at) as u64,
                         Place::Zero => SHORT_FRAMING,
                     };
-                    q
+                    (q, cost)
                 }
             };
-            out.push((k + at - so, k + to - so, p));
+            pieces.push(Piece {
+                a: k + at - so,
+                b: k + to - so,
+                p,
+                cost,
+                mergeable: true,
+            });
             at = to;
         }
-        let pages = (len as u64).div_ceil(MAX_PAGE_CONTENT as u64);
-        let rewrite = len as u64 + REF_FRAMING * pages;
-        (cost <= rewrite).then_some(out)
+
+        // The runs worth writing again: in every stretch of mergeable pieces,
+        // Kadane's maximum-weight run, where a piece weighs what restating
+        // it costs over the horizon less its bytes, kept if it outweighs the
+        // `Ref`s it would need over the same horizon.
+        let m = 1.0 + horizon;
+        let weight = |p: &Piece| m * p.cost as f64 - (p.b - p.a) as f64;
+        let worth = |run: &[Piece]| {
+            let len = (run[run.len() - 1].b - run[0].a) as u64;
+            let refs = m * (REF_FRAMING * len.div_ceil(MAX_PAGE_CONTENT as u64)) as f64;
+            run.iter().map(weight).sum::<f64>() > refs
+        };
+        let mut merge = vec![false; pieces.len()];
+        let (mut cur, mut from) = (0.0f64, 0usize);
+        let mut best: Option<(f64, usize, usize)> = None;
+        let close = |best: &mut Option<(f64, usize, usize)>, merge: &mut [bool]| {
+            if let Some((_, i, j)) = best.take() {
+                if worth(&pieces[i..=j]) {
+                    merge[i..=j].fill(true);
+                }
+            }
+        };
+        for (j, p) in pieces.iter().enumerate() {
+            if !p.mergeable {
+                close(&mut best, &mut merge);
+                cur = 0.0;
+                continue;
+            }
+            let x = weight(p);
+            if cur <= 0.0 {
+                close(&mut best, &mut merge);
+                (cur, from) = (x, j);
+            } else {
+                cur += x;
+            }
+            if cur > 0.0 && best.is_none_or(|(s, _, _)| cur > s) {
+                best = Some((cur, from, j));
+            }
+        }
+        close(&mut best, &mut merge);
+
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < pieces.len() {
+            if merge[i] {
+                let mut j = i;
+                while j + 1 < pieces.len() && merge[j + 1] {
+                    j += 1;
+                }
+                let (a, b) = (pieces[i].a, pieces[j].b);
+                out.push(Shifted::Write {
+                    a,
+                    b,
+                    from: so + (a - k),
+                });
+                i = j + 1;
+            } else {
+                let p = &pieces[i];
+                out.push(Shifted::State(p.a, p.b, p.p));
+                i += 1;
+            }
+        }
+        Some(out)
     }
 
     /// Takes the pieces of `table` that change `id`'s content: literals,
@@ -528,8 +670,14 @@ impl Inner {
                         j += 1;
                         run_end = keys.get(j + 1).map_or(table.size, |n| n.0);
                     }
-                    let place = if run_end - k <= self.opts.inline_threshold.min(MAX_INLINE as u32)
-                    {
+                    // A short run goes inline, unless it borders shifted
+                    // bytes written again, which it joins in a data page,
+                    // so that the cut can state both in one `Ref`.
+                    let borders_merge = restated.iter().any(|&(a, b, p)| {
+                        matches!(p.origin, Origin::Arena(_)) && (b == k || a == run_end)
+                    });
+                    let inline = run_end - k <= self.opts.inline_threshold.min(MAX_INLINE as u32);
+                    let place = if inline && !borders_merge {
                         Place::Inline
                     } else {
                         Place::Unplaced
@@ -564,6 +712,11 @@ impl Inner {
                 continue;
             }
             self.state.take(id, a, b, p, dirty);
+            if let Origin::Arena(_) = p.origin {
+                // A run written again to merge its fragments.
+                self.stats.merged_bytes += (b - a) as u64;
+                continue;
+            }
             if let Place::Data(addr) = p.place {
                 // The bytes lie where they did, at a new offset: widen the
                 // reverse index's window, the one rule that keeps it true.

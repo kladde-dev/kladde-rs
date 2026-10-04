@@ -91,3 +91,47 @@ fn a_copy_within_the_allocation_is_written_again() {
     bytes.splice(0..0, [1, 2, 3]);
     assert_eq!(reopened(&storage, &p), bytes);
 }
+
+/// Splices 20 single bytes into an allocation of 16 KiB at spread offsets,
+/// flushing after each round, for `rounds` rounds; returns the allocation's
+/// statements at the end and the bytes merged, after checking the content
+/// survives a reopen.
+fn spliced_often(decay: f64, rounds: usize) -> (u64, u64) {
+    let storage = MemoryStorage::new();
+    let opts = Options {
+        shift_decay: decay,
+        ..Default::default()
+    };
+    let store = Store::create(Box::new(storage.clone()), opts).unwrap();
+    let p = store.alloc(0).unwrap();
+    let mut bytes: Vec<u8> = (0..16 * 1024u32).map(|i| (i % 251) as u8).collect();
+    store.write(p.raw(), 0, &bytes).unwrap();
+    store.flush().unwrap();
+    for round in 0..rounds {
+        for i in 0..20u32 {
+            let at = (i * 811 + round as u32 * 37) % bytes.len() as u32;
+            let b = (round as u8).wrapping_mul(31).wrapping_add(i as u8);
+            store.splice(&p, at, 0, &[b]).unwrap();
+            bytes.insert(at as usize, b);
+        }
+        store.flush().unwrap();
+        store.check();
+    }
+    let stats = store.stats();
+    assert_eq!(reopened(&storage, &p), bytes);
+    (stats.statements, stats.merged_bytes)
+}
+
+#[test]
+fn an_allocation_spliced_often_merges_its_fragments() {
+    let (judged_alone, merged_alone) = spliced_often(0.0, 30);
+    let (with_history, merged) = spliced_often(Options::default().shift_decay, 30);
+    assert!(
+        merged > merged_alone,
+        "{merged} bytes merged, {merged_alone} without history"
+    );
+    assert!(
+        with_history * 2 < judged_alone,
+        "{with_history} statements with a history of shifts, {judged_alone} without"
+    );
+}

@@ -193,6 +193,24 @@ pub struct AllocationMeta {
     /// an id allocated again, its old tombstone until the cut binds the new
     /// incarnation's.
     pub size_statement: Option<StmtRef>,
+    /// How often flushes found the id's bytes shifted within it: one for
+    /// each flush that did, decayed by [`Options::shift_decay`] for every
+    /// flush since, as of the flush at `shifted_epoch`. In memory only, so it
+    /// starts at zero when a file is opened.
+    ///
+    /// [`Options::shift_decay`]: crate::Options::shift_decay
+    pub shifts: f32,
+    /// The epoch that `shifts` was last brought up to, truncated: only
+    /// differences of a few flushes matter.
+    pub shifted_epoch: u32,
+}
+
+impl AllocationMeta {
+    /// `shifts` decayed to `epoch`, without counting it.
+    pub fn shifts_at(&self, epoch: u64, decay: f64) -> f64 {
+        let since = (epoch as u32).wrapping_sub(self.shifted_epoch);
+        self.shifts as f64 * decay.powi(since.min(1 << 16) as i32)
+    }
 }
 
 /// What a non-existent id still carries.

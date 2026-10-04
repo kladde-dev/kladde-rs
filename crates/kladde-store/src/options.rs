@@ -45,6 +45,12 @@ pub struct Options {
     pub defrag_share: u32,
     /// The price per byte a defragmentation writes.
     pub mu: f64,
+    /// How much of an allocation's history of shifts each flush keeps: the
+    /// flushes that shifted bytes within an allocation, each decayed by this
+    /// factor per flush since, predict how often its fragments will be
+    /// stated again, and so whether a shifted range is better written again
+    /// to merge its fragments. 0 judges every shift on its own.
+    pub shift_decay: f64,
     /// The share of holes above which compaction mode runs.
     pub hole_share: f64,
     /// Truncate once the reusable tail reaches this many pages.
@@ -71,6 +77,7 @@ impl Default for Options {
             walk: 512,
             defrag_share: 1,
             mu: 0.02,
+            shift_decay: 0.75,
             hole_share: 0.25,
             truncate_tail: 16,
             consolidator_state: true,
