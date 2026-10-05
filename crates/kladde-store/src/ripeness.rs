@@ -122,7 +122,10 @@ impl Moments {
     /// The Gamma prior with the mean and the spread of the pages' rates, the
     /// spread being what is left of their losses' scatter once the Poisson
     /// noise is taken out, floored at a thousandth of the mean squared; once
-    /// two pages' worth are in.
+    /// two pages' worth are in. Its weight in events is capped at the loss
+    /// events the pages have shown, `Σk`, and at least `A_MIN`, with its mean
+    /// kept: pages that have lost nothing yet teach a mean at the floor rate,
+    /// but not the confidence of a thousand events in it.
     pub fn prior(&self) -> Option<Prior> {
         if self.n < 2.0 || self.e <= 0.0 {
             return None;
@@ -136,10 +139,8 @@ impl Moments {
             0.0
         };
         let spread = spread.max(mean * mean / 1000.0);
-        Some(Prior {
-            a: mean * mean / spread,
-            b: mean / spread,
-        })
+        let a = (mean * mean / spread).min(self.k.max(A_MIN));
+        Some(Prior { a, b: a / mean })
     }
 }
 
@@ -902,6 +903,26 @@ mod tests {
     use super::*;
 
     const PAGE: f64 = 4096.0;
+
+    #[test]
+    fn the_prior_weighs_no_more_events_than_were_seen() {
+        // Pages that have lost nothing: the floor rate, at next to no weight.
+        let mut quiet = Moments::default();
+        for _ in 0..10 {
+            quiet.add(0.0, 50.0);
+        }
+        let p = quiet.prior().unwrap();
+        assert_eq!(p.a, A_MIN);
+        assert!((p.a / p.b - R_MIN).abs() < 1e-12);
+        // Pages with many events: the weight the scatter allows, unchanged.
+        let mut busy = Moments::default();
+        for (k, e) in [(40.0, 100.0), (60.0, 100.0), (55.0, 120.0), (45.0, 90.0)] {
+            busy.add(k, e);
+        }
+        let p = busy.prior().unwrap();
+        assert!(p.a < busy.k, "{p:?}");
+        assert!((p.a / p.b - busy.k / busy.e).abs() < 1e-12);
+    }
 
     #[test]
     fn phi_solves_its_equation() {

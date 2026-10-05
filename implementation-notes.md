@@ -229,6 +229,8 @@ The notes on `ripeness` above still hold, except for the estimate; of those on `
   Until two pages' worth have been watched that long, the losses so far of the pages still young stand in; before any, the prior is `A₀ = 0.05` events over an exposure of one, which a page's first losses outweigh.
   The mean rate is floored at `R_MIN`, so that a file whose pages never lose a byte learns a prior of rates near it.
   The young pages are not kept across sessions; the sums are.
+- **The empirical prior weighs no more loss events than its pages have shown**: its shape `A₀` is capped at their discounted count, `Σk`, and kept at least `A_MIN`, with its mean unchanged, as kladde-docs' `evaluation/bayesian-ripeness.md` recommends.
+  Without the cap, fresh pages that had lost nothing yet taught a prior of 1000 events at the floor rate, the spread's floor, and the pages written then looked static for about a hundred flushes while they drained.
 - **Moved content brings its source's draining share into its new page's class prior**, as the `ripeness2` branch brought its fitted share: `π₀` is the page's bytes weighted by their sources' posterior mean shares, fresh content counting as draining and a description defragmentation's rewrite as static.
   A source's share is the one the ranking last found, so a page fuller than `u₀`, which the ranking passes over, passes on its prior's.
 - **The index is found by regula falsi on logarithms**: both rules come down to where what waiting saves, which falls with `ln κ` at a slope between −1 and −1/2 in its logarithm, meets what cleaning gains, and the Illinois variant of regula falsi pins `ln κ` within `[−24, 12]` down to 10⁻⁹ in about 10 evaluations, where bisection takes 32 for 10⁻⁸.
