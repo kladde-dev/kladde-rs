@@ -1,15 +1,14 @@
 //! Benchmarks a drawing editor's edits on an SVG drawing stored in kladde.
 //!
 //! ```text
-//! svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--focus SHARE] [--focus-moves N] [--journal-budget PAGES] [--shift-decay FACTOR] [--churn-floor λ] [--target-fill τ]
+//! svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--focus SHARE] [--focus-moves N] [--journal-budget PAGES] [--shift-decay FACTOR] [--target-fill τ]
 //! ```
 //!
 //! `--only Restack`, say, makes every edit a restack where the drawing allows
 //! one, to measure what one kind of edit costs. `--journal-budget` sets the
 //! store's [`Options::journal_budget_pages`], so that the store also flushes
 //! by itself whenever the journal outgrows that many pages, `--shift-decay`
-//! its [`Options::shift_decay`], `--churn-floor` its
-//! [`Options::churn_floor`], and `--target-fill` its
+//! its [`Options::shift_decay`], and `--target-fill` its
 //! [`Options::target_fill`].
 //!
 //! The drawing is converted into a kladde file, which is not measured, and
@@ -632,12 +631,6 @@ fn main() {
                     .filter(|&n| n > 0)
                     .expect("--focus-moves N, at least 1")
             }
-            "--churn-floor" => {
-                opts.churn_floor = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .expect("--churn-floor λ")
-            }
             "--target-fill" => {
                 opts.target_fill = args
                     .next()
@@ -666,7 +659,7 @@ fn main() {
     }
     let [input, out] = positional.as_slice() else {
         eprintln!(
-            "usage: svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--focus SHARE] [--focus-moves N] [--journal-budget PAGES] [--shift-decay FACTOR] [--churn-floor λ] [--target-fill τ]"
+            "usage: svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--focus SHARE] [--focus-moves N] [--journal-budget PAGES] [--shift-decay FACTOR] [--target-fill τ]"
         );
         std::process::exit(2);
     };

@@ -18,6 +18,9 @@ pub(crate) struct DataPage {
     pub page: u32,
     pub buf: Box<PageBuf>,
     pub used: usize,
+    /// Its content's drain rates, weighted by bytes: what its estimate
+    /// starts from.
+    pub rate: f64,
 }
 
 impl DataPage {
@@ -179,14 +182,26 @@ impl Inner {
 
         // 2. The fold, with every read from elsewhere hoisted into the arena,
         //    but for the bytes an id shifted within itself, which it restates.
+        //    What it supersedes is what pages lose naturally, and so is what
+        //    the consolidator state's own rewrite supersedes; bytes restated
+        //    where they lie are charged to their page again, and so are no
+        //    loss.
         let mut f = fold(&self.segment_records, |id| {
             self.state.allocs.get(&id).map(|m| m.size)
         });
         let restated = self.hoist(&mut f)?;
-        self.apply_fold(f, restated, &mut dirty)?;
+        self.state.natural = true;
+        let folded = self.apply_fold(f, restated, &mut dirty);
+        self.state.natural = false;
+        folded?;
+        self.apply_losses(true);
         if self.opts.consolidate {
             if self.opts.consolidator_state {
-                self.write_consolidator_state(&mut dirty)?;
+                self.state.natural = true;
+                let written = self.write_consolidator_state(&mut dirty);
+                self.state.natural = false;
+                written?;
+                self.apply_losses(false);
             }
             // Description defragmentation's share: rewrites chosen now are
             // written like the flush's own.
@@ -868,14 +883,28 @@ impl Inner {
             page,
             buf: new_page(),
             used: 0,
+            rate: 0.0,
         })
     }
 
-    /// Places the chunk at `key` into `dp`, copying its bytes.
+    /// Places the chunk at `key` into `dp`, copying its bytes. Moved content
+    /// brings its source page's drain rate along, and fresh content the rate
+    /// fresh pages have been losing at; a description defragmentation's
+    /// rewrite, cold by selection, brings none.
     pub(crate) fn place(&mut self, dp: &mut DataPage, key: Key, len: u32) -> Result<(), Error> {
         let Some(Fragment::Pending(p)) = self.state.frags.get(&key).copied() else {
             return Err(corrupt("placing a chunk that is not pending"));
         };
+        let pending = self.state.pending[p as usize];
+        let rate = match pending.origin {
+            _ if pending.rewrite => 0.0,
+            Origin::File(a) => match self.state.pages[split_address(a).0 as usize] {
+                Page::Live(l) => l.drain.rate(self.state.flush_epoch),
+                _ => self.fresh_rate(true),
+            },
+            _ => self.fresh_rate(true),
+        };
+        dp.rate += rate * len as f64;
         let at = CONTENT_OFFSET + dp.used;
         let mut bytes = vec![0u8; len as usize];
         self.read_fragment(Fragment::Pending(p), 0, &mut bytes)?;
@@ -999,20 +1028,40 @@ impl Inner {
                 .count(),
             "a page the flush took is not written"
         );
+        // What each page holds as it is written, and the rate its content
+        // starts to drain at; and the data pages and leaves among them.
+        let mut held: IdMap<(u16, Drain)> = IdMap::default();
+        let mut fresh: Vec<(u32, bool)> = Vec::with_capacity(written.len());
         for mut dp in out.data {
             seal_page(&mut dp.buf, None, KIND_DATA, e, dp.used);
             self.storage
                 .write_at(&dp.buf[..], dp.page as u64 * PAGE_SIZE as u64)?;
+            let drain = Drain {
+                rho: (dp.rate / dp.used.max(1) as f64) as f32,
+                at: e,
+            };
+            held.insert(dp.page, (dp.used as u16, drain));
             self.stats.data_pages_written += 1;
+            fresh.push((dp.page, true));
         }
+        let leaf_rate = self.fresh_rate(false) as f32;
         for (p, content) in &out.tables {
             let mut buf = new_page();
             crate::page::encode_page(&mut buf, None, KIND_ADDRESS_TABLE, e, content);
             self.storage
                 .write_at(&buf[..], *p as u64 * PAGE_SIZE as u64)?;
+            let drain = Drain {
+                rho: leaf_rate,
+                at: e,
+            };
+            held.insert(*p, (content.len() as u16, drain));
             self.table_pages.insert(*p, buf);
             self.stats.table_pages_written += 1;
+            if !self.state.has_children(*p) {
+                fresh.push((*p, false));
+            }
         }
+        held.insert(slot, (out.header_content.len() as u16, Drain::default()));
         // A session's first flush clears the page it names for the next
         // segment (`spec/journal.md#the-start-of-a-session`).
         if self.first_flush && jp < self.file_pages {
@@ -1038,7 +1087,10 @@ impl Inner {
         // The pages the flush filled are in the world now.
         for &p in &written {
             match self.state.pages[p as usize] {
-                Page::Filling(f) => self.state.pages[p as usize] = Page::Live(f.commit(e)),
+                Page::Filling(f) => {
+                    let (size, drain) = held[&p];
+                    self.state.pages[p as usize] = Page::Live(f.commit(e, size, drain));
+                }
                 other => unreachable!("page {p} was written but is {other:?}"),
             }
         }
@@ -1058,7 +1110,7 @@ impl Inner {
                 ..
             }) = self.state.pages[p as usize]
             {
-                self.state.unbucket(p);
+                self.state.unrank(p);
                 self.state.pages[p as usize] = Page::Fallback;
                 self.state.reverse.remove(&p);
                 retiring.push(p);
@@ -1072,7 +1124,7 @@ impl Inner {
                     "unlinked table page {p} still holds live statements: {live:?}"
                 );
             }
-            self.state.unbucket(p);
+            self.state.unrank(p);
             self.state.pages[p as usize] = Page::Fallback;
             self.table_pages.remove(&p);
             self.state.children.remove(&p);
@@ -1102,7 +1154,7 @@ impl Inner {
         self.header_slot = slot;
         self.epoch = e;
         for p in written {
-            self.state.rebucket(p);
+            self.state.rerank(p);
         }
         if jp < self.file_pages {
             debug_assert_eq!(self.state.pages[jp as usize], Page::Reusable);
@@ -1129,6 +1181,20 @@ impl Inner {
             }
         }
         self.stats.flushes += 1;
+        // What the next flush's fold takes from these pages is what fresh
+        // pages lose; the cursor looks for its next page among the data pages.
+        self.cons.just_written = fresh
+            .iter()
+            .map(|&(p, data)| (p, data, self.state.live(p).coverage))
+            .collect();
+        let data_pages: Vec<u32> = fresh
+            .iter()
+            .filter(|&&(_, data)| data)
+            .map(|&(p, _)| p)
+            .collect();
+        if !data_pages.is_empty() {
+            self.cons.prev_data_pages = data_pages;
+        }
         self.after_commit()?;
         self.truncate(false)
     }

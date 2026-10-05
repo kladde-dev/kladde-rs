@@ -438,8 +438,8 @@ fn typed(dir: &Path, size: u64) -> Vec<String> {
 
 /// Variants of the default options, one table per workload so that its
 /// variants compare directly: `tuning-uniform.csv` and `tuning-skewed.csv`
-/// vary the churn floor and the target fill, `tuning-append.csv` the pages
-/// reserved for description defragmentation.
+/// vary the target fill, `tuning-append.csv` the pages reserved for
+/// description defragmentation.
 fn tuning(out: &Path, work: &Path, quick: bool) {
     let with = |f: &dyn Fn(&mut Options)| {
         let mut o = Options::default();
@@ -451,9 +451,10 @@ fn tuning(out: &Path, work: &Path, quick: bool) {
         let t = Instant::now();
         let mut rows = Vec::new();
         for (variant, options) in [
-            ("lambda=0.5", with(&|o| o.churn_floor = 0.5)),
-            ("lambda=1", Options::default()),
-            ("lambda=2", with(&|o| o.churn_floor = 2.0)),
+            ("tau=0.85", with(&|o| o.target_fill = 0.85)),
+            ("tau=0.8", with(&|o| o.target_fill = 0.8)),
+            ("tau=0.75", Options::default()),
+            ("tau=0.7", with(&|o| o.target_fill = 0.7)),
             ("tau=0.6", with(&|o| o.target_fill = 0.6)),
             ("tau=0.5", with(&|o| o.target_fill = 0.5)),
         ] {

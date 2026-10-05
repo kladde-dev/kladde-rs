@@ -391,6 +391,7 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
         let d = decode_page(&header.page, true)
             .map_err(|_| corrupt("the governing header does not decode"))?;
         let (kids, _) = TableReader::open(&header.page[..], d.content.clone())?;
+        let written = d.content.len() as u16;
         contents.push((header.slot, header.epoch, d.content));
         queue.extend(&kids);
         state.children.insert(header.slot, kids);
@@ -398,7 +399,8 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
             epoch: header.epoch,
             coverage: 0,
             kind: PageKind::Header,
-            slot: None,
+            written,
+            drain: Drain::default(),
         });
         seen.insert(header.slot);
     }
@@ -425,7 +427,8 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
             epoch: d.epoch,
             coverage: charged_child_bytes(&kids),
             kind: PageKind::Table,
-            slot: None,
+            written: d.content.len() as u16,
+            drain: Drain::default(),
         });
         queue.extend(&kids);
         contents.push((p, d.epoch, d.content));
@@ -497,9 +500,12 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
             epoch: d.epoch,
             coverage,
             kind: PageKind::Data,
-            slot: None,
+            written: d.content.len() as u16,
+            drain: Drain::default(),
         });
-        state.rebucket(p);
+    }
+    for p in 2..file_pages {
+        state.rerank(p);
     }
     state.dropped_candidates.clear();
     let mut header = header;

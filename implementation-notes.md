@@ -145,3 +145,41 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 - **Compaction mode counts holes by scanning the page table once per flush.**
   `impl/consolidation.md#compaction-mode` keeps a cached index of the highest live page instead; the scan costs `O(pages)` per flush, which is small next to what a flush writes, but is not the `O(1)` amortised the design promises.
   Interior pages are passed over like journal pages, since every cut that needs them writes them afresh.
+
+## Cleaning by ripeness (branch `ripeness`)
+
+This branch implements `drafts/ripeness.md`, as of kladde-docs commit `b33a836`, in place of data-page scoring, the churn floor, and the budget controller, so the notes above about buckets, sampling, offers within the churn floor, and the budget controller describe the main branch.
+The notes below say what the draft leaves open, and where the implementation departs from it.
+
+- **The constants the draft leaves open**: `β = 0.1` per epoch, `R_MIN = 10⁻⁴` and a starting `κ = 0.01` (the draft's own examples), `W = 8` epochs for the cursor, `κ` within `[10⁻⁶, 1]`, and at most 64 ripe pages considered per offer.
+- **The controller measures the fill of data pages and leaves, not of the whole file, and aims them at `τ = 0.75` by default.**
+  A first version measured the whole file, as the main branch's budget controller does, and its price swung by two to three decades, a swing per one to two live sizes of writes, at 8 MiB and targets of 0.5 to 0.6.
+  The whole file answers a change of price only as new writes reuse the pages cleaning frees, long after the flush that freed them, and an integral controller on a lagging measure cycles.
+  The pages cleaning acts on answer within the flush: measured there, the price held within a few percent in every run, and landed on the curve that fixed prices trace.
+  Holes are compaction mode's to return, as they are anyway.
+  Because the measure differs, so does the meaning of `τ`, and its default: 0.75 of the live pages, where the main branch's 0.8 of the whole file is out of reach.
+- **The price holds where moving it could change nothing**: it does not fall after a flush that cleaned nothing, nor rise after one that spent its whole budget.
+  Without this, a file that starts full drove the price to its floor within the first flushes, and it took one to two live sizes of writes to climb back.
+- **The budget is a fixed cap**, `budget_pages`, 256 by default, and the fill floor `1 − θ` still holds every offer.
+- **Offers take ripe pages in index order.**
+  A data offer takes them whole while they fit, and cuts the first that does not, as the main branch cuts its victims; on the budget's last page, which may not cut, it passes over the ones that do not fit.
+  A table offer takes ripe leaves while their estimated restatements fit a leaf.
+  The kind of the highest ripe page decides which offer goes first.
+- **Natural losses are what the fold and the consolidator state's own rewrite release**, recorded per page with its coverage before the first of them and applied once per flush.
+- **What fresh pages lose is estimated per kind**, data pages and leaves: the share of their coverage the pages of the previous flush lose in the next fold, averaged over flushes with weight `1 − e^(−β)`.
+  The consolidator state carries both estimates from one session to the next, which the draft does not ask for: without them, a session's first flush would start its pages from nothing, and they would look frozen, which the draft rules out for per-page estimates.
+  Only a new file has no estimate yet, and its first pages start at the floor.
+- **A new leaf starts from the leaves' fresh rate**, not from the rates of the statements it restates, whose sources the cut does not track.
+- **A description defragmentation's rewrite starts at the floor**, as content cold by selection: its bytes pass through the arena, so its source pages are unknown when it is placed.
+- **Free filling no longer takes spare defragmentation candidates**, following the draft's two sources, small ripe victims and the cursor; on the main branch they added nothing measurable, since the reserved share takes nearly all candidates.
+- **The ranking is refreshed lazily**: a page whose coverage, state, or estimate changes is marked, and marked pages are ranked again before the next query, once however many of its fragments changed.
+- **The consolidator state's layout here is tagged `kladrip2`**: the price takes the budget's place, the rates fresh content starts from follow it, and its records are typed, age records and drain records.
+  A flush records the estimates it changed and those of the pages the previous flush wrote; the snapshot holds every page emptier than `u₀ = 1 − θ`, which is every page that could be ripe, so a fuller page's estimate is seeded again at open once a snapshot has dropped it.
+  The records are written right after the fold, so content consolidation moves out of a page later in the same flush looks, at a reopen, like a natural loss in the gap, which the draft's rule for a gap then counts.
+- **A page's estimate is seeded at open from its content size, its coverage, and its age**, as the draft says, with the estimate's epoch at the governing header's.
+- **`Options::myopic_ripeness` runs the draft's ablation**: pages are ranked by `(1 − x)/x` over their rate, in place of `h(x)`, and nothing else changes.
+  `KLADDE_BENCH_MYOPIC` sets it in kladde-bench.
+- **Ported onto `defrag-shifts` as branch `ripeness-svg`**, so that kladde-svg's drawings can run under ripeness.
+  Bytes the fold restates where they lie, because a splice or a move shifted them within their allocation, are released and charged to their page again in the same fold; only the difference counts as a natural loss, so a shift drains nothing.
+  Runs the fold writes again to merge their fragments leave their old page as content does that the application overwrote, and count as its natural loss.
+  A live page keeps its content size when written again, which `defrag-shifts` had dropped, since open seeds a page's estimate from it.

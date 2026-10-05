@@ -494,6 +494,52 @@ impl Store {
         out
     }
 
+    /// The live bytes of each allocation in each data page, as `(page, id,
+    /// bytes)` per fragment: for measuring how allocations share pages.
+    #[doc(hidden)]
+    pub fn describe_data_pages(&self) -> Vec<(u32, u32, u32)> {
+        let i = self.inner.borrow();
+        let mut out = Vec::new();
+        let mut frags = i.state.frags.iter().peekable();
+        while let Some((&k, &f)) = frags.next() {
+            let Fragment::Bytes { page, .. } = f else {
+                continue;
+            };
+            let is_data = |p: &Page| matches!(p, Page::Live(l) if l.kind == PageKind::Data);
+            if !i.state.pages.get(page as usize).is_some_and(is_data) {
+                continue;
+            }
+            let end = match frags.peek() {
+                Some((&n, _)) if kid(n) == kid(k) => koff(n),
+                _ => i.state.size_of(kid(k)),
+            };
+            out.push((page, kid(k), end - koff(k)));
+        }
+        out
+    }
+
+    /// The rates fresh content starts from, in data pages and in leaves,
+    /// once estimated. For tests.
+    #[doc(hidden)]
+    pub fn describe_fresh_rates(&self) -> [Option<f64>; 2] {
+        self.inner.borrow().cons.fresh
+    }
+
+    /// Every live data page and leaf emptier than the fill survivors are
+    /// packed at, with its estimate: `(page, rate at the estimate's epoch,
+    /// that epoch)`. For tests.
+    #[doc(hidden)]
+    pub fn describe_drains(&self) -> Vec<(u32, f32, u64)> {
+        let i = self.inner.borrow();
+        let packed = crate::ripeness::packed_fill(i.opts.theta);
+        (2..i.state.pages.len() as u32)
+            .filter_map(|p| {
+                let l = i.state.victim(p)?;
+                ((l.coverage as f64) < packed).then_some((p, l.drain.rho, l.drain.at))
+            })
+            .collect()
+    }
+
     /// Checks the in-memory invariants, panicking at the first violation.
     ///
     /// Takes time linear in the size of the in-memory state; meant for

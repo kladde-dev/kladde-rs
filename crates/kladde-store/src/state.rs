@@ -4,8 +4,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
-use crate::consts::{MAX_PAGE_CONTENT, PAGE_SIZE};
+use crate::consts::PAGE_SIZE;
 use crate::hash::{IdMap, IdSet};
+pub use crate::ripeness::{Drain, Ripeness};
 use crate::statement::{Kind, TableWriter};
 
 /// A fragment-map key: `(id, offset)` packed with the id in the high half, so
@@ -224,8 +225,8 @@ pub struct Recyclable {
 /// plus one of the implementation's own: filling.
 ///
 /// Only a filling or live page has a kind and coverage, and only a live page
-/// an epoch and a place among the victims.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// an epoch and an estimate of how fast it drains.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Page {
     /// In neither header's world: the flush may write it. The header slot
     /// the next commit overwrites is reusable after a load, but never joins
@@ -254,7 +255,7 @@ pub struct Filling {
 }
 
 /// What a live page holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Live {
     /// The epoch the page was written in.
     pub epoch: u64,
@@ -262,8 +263,10 @@ pub struct Live {
     /// framing and inline payloads, and a non-header page's child references.
     pub coverage: u32,
     pub kind: PageKind,
-    /// Where it sits among the victims of its kind, if it is one.
-    pub slot: Option<BucketSlot>,
+    /// Its content size when written.
+    pub written: u16,
+    /// How fast its content still dies.
+    pub drain: Drain,
 }
 
 /// The kind of a filling or live page, as its frame states it.
@@ -277,48 +280,23 @@ pub enum PageKind {
     Header,
 }
 
-/// Where a page sits in the victim buckets of its kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BucketSlot {
-    pub bucket: u8,
-    pub index: u32,
-}
-
 impl Filling {
     /// A page of kind `kind` that the flush in progress takes to write.
     pub fn taken(kind: PageKind) -> Page {
         Page::Filling(Filling { coverage: 0, kind })
     }
 
-    /// The page once the commit of epoch `epoch` has written it. It joins
-    /// the victims, if it is one, when it is rebucketed.
-    pub fn commit(self, epoch: u64) -> Live {
+    /// The page once the commit of epoch `epoch` has written `written` bytes
+    /// of content into it, which drains as `drain` says. It joins the
+    /// ranking, if it may be a victim, when it is reranked.
+    pub fn commit(self, epoch: u64, written: u16, drain: Drain) -> Live {
         Live {
             epoch,
             coverage: self.coverage,
             kind: self.kind,
-            slot: None,
+            written,
+            drain,
         }
-    }
-}
-
-/// Buckets per page kind.
-pub const BUCKETS: usize = 16;
-
-/// Pages bucketed by live fraction, for `O(1)` victim selection.
-#[derive(Debug, Default)]
-pub struct Buckets {
-    pub lists: [Vec<u32>; BUCKETS],
-}
-
-impl Buckets {
-    pub fn bucket_of(coverage: u32) -> u8 {
-        ((coverage as usize * BUCKETS) / (MAX_PAGE_CONTENT + 1)).min(BUCKETS - 1) as u8
-    }
-
-    /// The sparsest non-empty bucket.
-    pub fn lowest_non_empty(&self) -> Option<usize> {
-        self.lists.iter().position(|l| !l.is_empty())
     }
 }
 
@@ -405,8 +383,15 @@ pub struct State {
     /// The address-table tree: each live table page's child references, the
     /// header's included; empty for a page without children.
     pub children: IdMap<Vec<u32>>,
-    pub data_buckets: Buckets,
-    pub table_buckets: Buckets,
+    /// Live data pages and leaves ranked by ripeness.
+    pub ripeness: Ripeness,
+    /// Whether coverage the flush releases now is a natural loss: one the
+    /// application's writes, frees, and shrinks caused, as opposed to
+    /// consolidation moving content.
+    pub natural: bool,
+    /// Page -> `(lost, live)`: the natural losses of the flush in progress,
+    /// and the page's coverage before the first of them.
+    pub losses: IdMap<(u32, u32)>,
     /// Data page -> `(id, lo, hi)`: ids that may have bytes in it, and the
     /// window of offsets they may occupy. A superset, pruned on use.
     pub reverse: IdMap<Vec<(u32, u32, u32)>>,
@@ -464,14 +449,6 @@ impl State {
         }
     }
 
-    #[inline]
-    pub fn live_mut(&mut self, page: u32) -> &mut Live {
-        match &mut self.pages[page as usize] {
-            Page::Live(l) => l,
-            other => panic!("page {page} is not live but {other:?}"),
-        }
-    }
-
     /// The epoch of `page`, which holds content that current state refers
     /// to: its own if it is live, the flush's if it is filling.
     #[inline]
@@ -501,6 +478,30 @@ impl State {
         self.children.get(&page).is_some_and(|k| !k.is_empty())
     }
 
+    /// The record of `page` if it is a live data page or leaf, whose
+    /// draining ripeness estimates; `None` past the end of the file.
+    pub fn data_or_leaf(&self, page: u32) -> Option<&Live> {
+        match self.pages.get(page as usize)? {
+            Page::Live(l)
+                if l.kind == PageKind::Data
+                    || (l.kind == PageKind::Table && !self.has_children(page)) =>
+            {
+                Some(l)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn data_or_leaf_mut(&mut self, page: u32) -> Option<&mut Live> {
+        let leaf = !self.has_children(page);
+        match self.pages.get_mut(page as usize)? {
+            Page::Live(l) if l.kind == PageKind::Data || (l.kind == PageKind::Table && leaf) => {
+                Some(l)
+            }
+            _ => None,
+        }
+    }
+
     /// The record of `page` if it may be a consolidation victim: a live data
     /// page or leaf with live content. Pages with children are rebuilt by
     /// every cut that needs them, and so are never victims.
@@ -520,63 +521,44 @@ impl State {
         }
     }
 
-    /// The bucket `page` belongs in: victims by coverage, and nothing for
-    /// any other page.
-    fn wanted_bucket(&self, page: u32) -> Option<u8> {
-        self.victim(page).map(|l| Buckets::bucket_of(l.coverage))
+    /// Marks `page` for ranking again: its coverage, state, or estimate
+    /// changed.
+    #[inline]
+    pub fn rerank(&mut self, page: u32) {
+        self.ripeness.stale.insert(page);
     }
 
-    fn current_bucket(&self, page: u32) -> Option<u8> {
-        match &self.pages[page as usize] {
-            Page::Live(l) => l.slot.map(|s| s.bucket),
-            _ => None,
-        }
+    /// Takes `page` out of the ranking at once, before it stops being live.
+    pub fn unrank(&mut self, page: u32) {
+        self.ripeness.remove(page);
+        self.ripeness.stale.remove(&page);
     }
 
-    fn buckets_of(&mut self, kind: PageKind) -> &mut Buckets {
-        match kind {
-            PageKind::Data => &mut self.data_buckets,
-            PageKind::Table => &mut self.table_buckets,
-            PageKind::Header => unreachable!("a header is never a victim"),
-        }
-    }
-
-    /// Moves `page` to the bucket its coverage calls for, or out of buckets.
-    pub fn rebucket(&mut self, page: u32) {
-        let want = self.wanted_bucket(page);
-        if self.current_bucket(page) == want {
-            return;
-        }
-        self.unbucket(page);
-        if let Some(bucket) = want {
-            let kind = self.live(page).kind;
-            let list = &mut self.buckets_of(kind).lists[bucket as usize];
-            let index = list.len() as u32;
-            list.push(page);
-            self.live_mut(page).slot = Some(BucketSlot { bucket, index });
-        }
-    }
-
-    /// Takes `page` out of its bucket, before it stops being live.
-    pub fn unbucket(&mut self, page: u32) {
-        let Page::Live(Live {
-            kind,
-            slot: Some(s),
-            ..
-        }) = self.pages[page as usize]
-        else {
-            return;
-        };
-        let list = &mut self.buckets_of(kind).lists[s.bucket as usize];
-        let index = s.index as usize;
-        list.swap_remove(index);
-        if index < list.len() {
-            let moved = list[index];
-            if let Some(m) = &mut self.live_mut(moved).slot {
-                m.index = index as u32;
+    /// Ranks every stale page again as of `now`: a victim with coverage
+    /// below `packed` bytes, the fill survivors are packed at, written before
+    /// the flush in progress; anything else leaves the ranking. Its fill
+    /// counts relative to `packed`, in `h`, or in the myopic `g` if `myopic`.
+    pub fn refresh_ranking(&mut self, now: u64, packed: f64, myopic: bool) {
+        for page in std::mem::take(&mut self.ripeness.stale) {
+            let ranked = if (page as usize) < self.pages.len() {
+                self.victim(page)
+                    .map(|l| (l.coverage as f64 / packed, l.epoch, l.drain))
+                    .filter(|&(x, epoch, _)| x < 1.0 && epoch < now)
+            } else {
+                None
+            };
+            match ranked {
+                Some((x, _, drain)) => {
+                    let f = if myopic {
+                        crate::ripeness::g(x)
+                    } else {
+                        crate::ripeness::h(x)
+                    };
+                    self.ripeness.insert(page, f, drain, now);
+                }
+                None => self.ripeness.remove(page),
             }
         }
-        self.live_mut(page).slot = None;
     }
 
     #[inline]
@@ -585,9 +567,14 @@ impl State {
             return;
         }
         *self.coverage_mut(page) += n;
-        if self.wanted_bucket(page) != self.current_bucket(page) {
-            self.rebucket(page);
+        // Bytes a natural loss released and the same flush charged to the
+        // page again, as a restatement in place, were never lost.
+        if self.natural {
+            if let Some(e) = self.losses.get_mut(&page) {
+                e.0 = e.0.saturating_sub(n);
+            }
         }
+        self.rerank(page);
     }
 
     #[inline]
@@ -595,13 +582,16 @@ impl State {
         if n == 0 {
             return;
         }
+        let natural = self.natural;
         let coverage = self.coverage_mut(page);
         debug_assert!(*coverage >= n, "coverage of page {page} underflows");
+        let before = *coverage;
         *coverage -= n;
-        self.dropped_candidates.insert(page);
-        if self.wanted_bucket(page) != self.current_bucket(page) {
-            self.rebucket(page);
+        if natural {
+            self.losses.entry(page).or_insert((0, before)).0 += n;
         }
+        self.dropped_candidates.insert(page);
+        self.rerank(page);
     }
 
     // ------------------------------------------------------------ allocations
@@ -992,19 +982,6 @@ impl State {
                         _ => self.children.get(&p).map_or(0, |k| charged_child_bytes(k)),
                     };
                     assert_eq!(l.coverage, want + kids, "coverage of page {p} ({l:?})");
-                    assert_eq!(
-                        l.slot.map(|s| s.bucket),
-                        self.wanted_bucket(p),
-                        "bucket of page {p} ({l:?})"
-                    );
-                    if let Some(s) = l.slot {
-                        let buckets = match l.kind {
-                            PageKind::Data => &self.data_buckets,
-                            _ => &self.table_buckets,
-                        };
-                        let list = &buckets.lists[s.bucket as usize];
-                        assert_eq!(list.get(s.index as usize), Some(&p), "slot of page {p}");
-                    }
                 }
                 Page::Filling(f) => panic!("page {p} is filling outside a flush: {f:?}"),
                 other => assert_eq!(want, 0, "live content in page {p}, which is {other:?}"),
