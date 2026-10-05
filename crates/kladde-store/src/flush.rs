@@ -18,8 +18,9 @@ pub(crate) struct DataPage {
     pub page: u32,
     pub buf: Box<PageBuf>,
     pub used: usize,
-    /// Its content's drain rates, weighted by bytes: what its estimate
-    /// starts from.
+    /// The bytes of its content that drain, and their drain rates summed
+    /// over those bytes: what its estimate starts from.
+    pub fast: f64,
     pub rate: f64,
 }
 
@@ -883,28 +884,31 @@ impl Inner {
             page,
             buf: new_page(),
             used: 0,
+            fast: 0.0,
             rate: 0.0,
         })
     }
 
     /// Places the chunk at `key` into `dp`, copying its bytes. Moved content
-    /// brings its source page's drain rate along, and fresh content the rate
-    /// fresh pages have been losing at; a description defragmentation's
-    /// rewrite, cold by selection, brings none.
+    /// brings its source page's split along, draining at the source's rate;
+    /// fresh content drains at the rate fresh pages have been losing at; a
+    /// description defragmentation's rewrite, cold by selection, is static.
     pub(crate) fn place(&mut self, dp: &mut DataPage, key: Key, len: u32) -> Result<(), Error> {
         let Some(Fragment::Pending(p)) = self.state.frags.get(&key).copied() else {
             return Err(corrupt("placing a chunk that is not pending"));
         };
         let pending = self.state.pending[p as usize];
-        let rate = match pending.origin {
-            _ if pending.rewrite => 0.0,
+        let (share, rate) = match pending.origin {
+            _ if pending.rewrite => (0.0, 0.0),
             Origin::File(a) => match self.state.pages[split_address(a).0 as usize] {
-                Page::Live(l) => l.drain.rate(self.state.flush_epoch),
-                _ => self.fresh_rate(true),
+                Page::Live(l) => (l.drain.share as f64, l.drain.rate(self.state.flush_epoch)),
+                _ => (1.0, self.fresh_rate(true)),
             },
-            _ => self.fresh_rate(true),
+            _ => (1.0, self.fresh_rate(true)),
         };
-        dp.rate += rate * len as f64;
+        let fast = share * len as f64;
+        dp.fast += fast;
+        dp.rate += rate * fast;
         let at = CONTENT_OFFSET + dp.used;
         let mut bytes = vec![0u8; len as usize];
         self.read_fragment(Fragment::Pending(p), 0, &mut bytes)?;
@@ -1036,24 +1040,24 @@ impl Inner {
             seal_page(&mut dp.buf, None, KIND_DATA, e, dp.used);
             self.storage
                 .write_at(&dp.buf[..], dp.page as u64 * PAGE_SIZE as u64)?;
-            let drain = Drain {
-                rho: (dp.rate / dp.used.max(1) as f64) as f32,
-                at: e,
+            let r0 = if dp.fast > 0.0 {
+                dp.rate / dp.fast
+            } else {
+                0.0
             };
+            let drain = Drain::start(dp.fast, r0, dp.used as f64, e);
             held.insert(dp.page, (dp.used as u16, drain));
             self.stats.data_pages_written += 1;
             fresh.push((dp.page, true));
         }
-        let leaf_rate = self.fresh_rate(false) as f32;
+        let leaf_rate = self.fresh_rate(false);
         for (p, content) in &out.tables {
             let mut buf = new_page();
             crate::page::encode_page(&mut buf, None, KIND_ADDRESS_TABLE, e, content);
             self.storage
                 .write_at(&buf[..], *p as u64 * PAGE_SIZE as u64)?;
-            let drain = Drain {
-                rho: leaf_rate,
-                at: e,
-            };
+            let len = content.len() as f64;
+            let drain = Drain::start(len, leaf_rate, len, e);
             held.insert(*p, (content.len() as u16, drain));
             self.table_pages.insert(*p, buf);
             self.stats.table_pages_written += 1;

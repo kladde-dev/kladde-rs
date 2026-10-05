@@ -535,7 +535,7 @@ impl Store {
         (2..i.state.pages.len() as u32)
             .filter_map(|p| {
                 let l = i.state.victim(p)?;
-                ((l.coverage as f64) < packed).then_some((p, l.drain.rho, l.drain.at))
+                ((l.coverage as f64) < packed).then_some((p, l.drain.rate, l.drain.at))
             })
             .collect()
     }

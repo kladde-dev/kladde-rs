@@ -62,6 +62,9 @@ pub struct ConsState {
     /// What pages lose in the flush after they are written, for data pages
     /// and for leaves: the rate fresh content starts from.
     pub fresh: [Option<f64>; 2],
+    /// The bytes each live statement states on average, in data pages and
+    /// in leaves: the units in which those pages lose content.
+    pub statement: [f64; 2],
     /// Pages whose estimate this flush changed, for the consolidator state.
     pub drained: Vec<u32>,
     /// Victims this flush took, anywhere.
@@ -189,7 +192,6 @@ impl Inner {
             other => unreachable!("page {p} is ranked but is {other:?}"),
         };
         let (skip, rewritten) = (&self.cons.skip, &self.flush_rewritten);
-        let drain = |p: u32| live(p).drain;
         let mut ok = |p: u32| {
             let info = live(p);
             kind.is_none_or(|k| info.kind == k)
@@ -200,7 +202,7 @@ impl Inner {
         };
         self.state
             .ripeness
-            .ripe(now, self.cons.kappa, &drain, &mut ok, limit)
+            .ripe(now, self.cons.kappa, &mut ok, limit)
     }
 
     /// The cursor page, which the room of the flush's own pages takes
@@ -761,6 +763,7 @@ impl Inner {
         if !self.opts.consolidate {
             return Ok(());
         }
+        self.measure_statements();
         let (mut live, mut pages) = (0u64, 0u64);
         for p in 2..self.state.pages.len() as u32 {
             if let Some(info) = self.state.data_or_leaf(p) {
@@ -781,12 +784,28 @@ impl Inner {
         Ok(())
     }
 
-    /// Turns the natural losses the flush has recorded since the last call
-    /// into estimates: each page that lost content drains that much faster.
-    /// On the flush's first call, what the pages the previous flush wrote
-    /// have lost also updates the rate that fresh content starts from.
+    /// Measures the bytes each live statement states on average, in data
+    /// pages and in leaves, for the fit's test of a static share.
+    pub(crate) fn measure_statements(&mut self) {
+        let (mut data, mut leaves) = (0u64, 0u64);
+        for p in 2..self.state.pages.len() as u32 {
+            match self.state.data_or_leaf(p) {
+                Some(l) if l.kind == PageKind::Data => data += l.coverage as u64,
+                Some(l) => leaves += l.coverage as u64,
+                None => {}
+            }
+        }
+        let statements = self.state.slab.live.max(1) as f64;
+        self.cons.statement = [data as f64 / statements, leaves as f64 / statements];
+    }
+
+    /// Fits the natural losses the flush has recorded since the last call
+    /// into the estimates of the pages that lost them. On the flush's first
+    /// call, what the pages the previous flush wrote have lost also updates
+    /// the rate that fresh content starts from.
     pub(crate) fn apply_losses(&mut self, first: bool) {
         let now = self.state.flush_epoch;
+        let statement = self.cons.statement;
         let losses = std::mem::take(&mut self.state.losses);
         if first {
             let mut sums = [(0u64, 0u64); 2];
@@ -807,11 +826,13 @@ impl Inner {
             let just_written = std::mem::take(&mut self.cons.just_written);
             self.cons.drained = just_written.into_iter().map(|(p, ..)| p).collect();
         }
-        for (p, (lost, live)) in losses {
+        for (p, (lost, _)) in losses {
             let Some(info) = self.state.data_or_leaf_mut(p) else {
                 continue;
             };
-            info.drain.lose(lost, live, now);
+            let age = now.saturating_sub(info.epoch);
+            let unit = statement[usize::from(info.kind != PageKind::Data)];
+            info.drain.lose(lost, info.coverage, age, now, unit);
             self.state.rerank(p);
             self.cons.drained.push(p);
         }
@@ -824,6 +845,12 @@ impl Inner {
 
     pub(crate) fn fill_stats(&self, s: &mut Stats) {
         s.file_pages = self.file_pages as u64;
+        for p in 2..self.state.pages.len() as u32 {
+            if let Some(info) = self.state.data_or_leaf(p).filter(|l| l.drain.share < 1.0) {
+                s.static_pages += 1;
+                s.static_bytes += ((1.0 - info.drain.share as f64) * info.coverage as f64) as u64;
+            }
+        }
         for page in self.state.pages.iter().skip(2) {
             match page {
                 Page::Live(Live {

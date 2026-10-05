@@ -539,22 +539,23 @@ impl State {
     /// the flush in progress; anything else leaves the ranking. Its fill
     /// counts relative to `packed`, in `h`, or in the myopic `g` if `myopic`.
     pub fn refresh_ranking(&mut self, now: u64, packed: f64, myopic: bool) {
+        let fill = if myopic {
+            crate::ripeness::g
+        } else {
+            crate::ripeness::h
+        };
         for page in std::mem::take(&mut self.ripeness.stale) {
             let ranked = if (page as usize) < self.pages.len() {
                 self.victim(page)
-                    .map(|l| (l.coverage as f64 / packed, l.epoch, l.drain))
-                    .filter(|&(x, epoch, _)| x < 1.0 && epoch < now)
+                    .map(|l| (l.coverage as f64, l.epoch, l.drain))
+                    .filter(|&(coverage, epoch, _)| coverage < packed && epoch < now)
             } else {
                 None
             };
             match ranked {
-                Some((x, _, drain)) => {
-                    let f = if myopic {
-                        crate::ripeness::g(x)
-                    } else {
-                        crate::ripeness::h(x)
-                    };
-                    self.ripeness.insert(page, f, drain, now);
+                Some((coverage, _, drain)) => {
+                    let (key, floor) = crate::ripeness::keys(&drain, coverage, packed, fill);
+                    self.ripeness.insert(page, key, floor, now);
                 }
                 None => self.ripeness.remove(page),
             }
@@ -583,10 +584,23 @@ impl State {
             return;
         }
         let natural = self.natural;
-        let coverage = self.coverage_mut(page);
+        let (coverage, drain) = match &mut self.pages[page as usize] {
+            Page::Live(Live {
+                coverage, drain, ..
+            }) => (coverage, Some(drain)),
+            Page::Filling(Filling { coverage, .. }) => (coverage, None),
+            other => panic!("page {page} holds no content but is {other:?}"),
+        };
         debug_assert!(*coverage >= n, "coverage of page {page} underflows");
         let before = *coverage;
         *coverage -= n;
+        if !natural && before > n {
+            // Content moved out: the estimate shrinks with the page. A page
+            // emptied keeps its estimate, which its survivors carry along.
+            if let Some(drain) = drain {
+                drain.shrink((before - n) as f64 / before as f64);
+            }
+        }
         if natural {
             self.losses.entry(page).or_insert((0, before)).0 += n;
         }
