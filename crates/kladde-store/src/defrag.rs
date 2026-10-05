@@ -216,6 +216,7 @@ impl Inner {
             place,
             heat,
             rewrite: true,
+            from: None,
         };
         self.state.take(c.id, c.start, c.end, p, dirty);
         self.stats.defrag_rewrites += 1;

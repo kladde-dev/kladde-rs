@@ -615,6 +615,14 @@ impl Inner {
     fn bind(&mut self, d: &Derived, page: u32, framing: u8, payload_pos: usize) {
         let id = d.stmt.id;
         let s = self.state.slab.alloc(page, framing, id, d.stmt.kind);
+        // A chunk of its leaf, and a `Ref`'s payload one of its data page.
+        let data = (d.stmt.kind == Kind::Ref).then(|| split_address(d.stmt.address).0);
+        let stated = match d.stmt.kind {
+            Kind::Ref | Kind::Inline => d.stmt.size,
+            _ => 0,
+        };
+        let carried = data.is_some() && self.state.carries_touch(&d.keys);
+        self.state.add_chunk(s, page, data, stated, carried);
         self.state.cover(page, framing as u32);
         if let Some(m) = self.state.allocs.get_mut(&id) {
             m.mentions += 1;

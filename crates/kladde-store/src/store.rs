@@ -518,24 +518,28 @@ impl Store {
         out
     }
 
-    /// The rates fresh content starts from, in data pages and in leaves,
-    /// once estimated. For tests.
+    /// The priors on the rate that new data pages and leaves start from, as
+    /// `(events, exposure)`. For tests.
     #[doc(hidden)]
-    pub fn describe_fresh_rates(&self) -> [Option<f64>; 2] {
-        self.inner.borrow().cons.fresh
+    pub fn describe_priors(&self) -> [(f64, f64); 2] {
+        self.inner.borrow().cons.prior.map(|p| (p.a, p.b))
     }
 
     /// Every live data page and leaf emptier than the fill survivors are
-    /// packed at, with its estimate: `(page, rate at the estimate's epoch,
-    /// that epoch)`. For tests.
+    /// packed at, with its estimate: `(page, the draining share's rate if
+    /// every untouched chunk drains, as of the estimate's epoch, that
+    /// epoch)`. For tests.
     #[doc(hidden)]
-    pub fn describe_drains(&self) -> Vec<(u32, f32, u64)> {
+    pub fn describe_drains(&self) -> Vec<(u32, f64, u64)> {
         let i = self.inner.borrow();
         let packed = crate::ripeness::packed_fill(i.opts.theta);
+        let sigma = i.state.sigma();
         (2..i.state.pages.len() as u32)
             .filter_map(|p| {
                 let l = i.state.victim(p)?;
-                ((l.coverage as f64) < packed).then_some((p, l.drain.rate, l.drain.at))
+                let s = sigma[usize::from(l.kind != PageKind::Data)];
+                ((l.coverage as f64) < packed)
+                    .then(|| (p, l.drain.mean_rate(&l.view(), s), l.drain.at))
             })
             .collect()
     }
@@ -1098,6 +1102,7 @@ pub(crate) fn take_page(
     stats: &mut Stats,
     page: Page,
 ) -> Result<u32, Error> {
+    // A filling page counts its chunks afresh as the cut states them.
     let p = match ready.pop_first() {
         Some(p) => p,
         None => {

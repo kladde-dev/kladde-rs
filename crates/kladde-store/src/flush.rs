@@ -18,10 +18,9 @@ pub(crate) struct DataPage {
     pub page: u32,
     pub buf: Box<PageBuf>,
     pub used: usize,
-    /// The bytes of its content that drain, and their drain rates summed
-    /// over those bytes: what its estimate starts from.
+    /// The bytes of its content expected to drain: what the prior on its
+    /// chunks' class starts from.
     pub fast: f64,
-    pub rate: f64,
 }
 
 impl DataPage {
@@ -57,6 +56,7 @@ fn zero_pending() -> Pending {
         place: Place::Zero,
         heat: 0,
         rewrite: false,
+        from: None,
     }
 }
 
@@ -174,6 +174,7 @@ impl Inner {
         self.state.flush_epoch = e;
         self.state.pending.clear();
         self.state.dropped_candidates.clear();
+        self.state.carry.clear();
         self.flush_rewritten.clear();
         self.begin_consolidation();
         let mut dirty = Dirty::default();
@@ -245,6 +246,7 @@ impl Inner {
                         place: Place::Inline,
                         heat,
                         rewrite: false,
+                        from: None,
                     }
                 } else {
                     Pending {
@@ -252,6 +254,7 @@ impl Inner {
                         place: Place::Data(a),
                         heat,
                         rewrite: false,
+                        from: Some(stmt),
                     }
                 }
             }
@@ -260,6 +263,7 @@ impl Inner {
                 place: Place::Zero,
                 heat,
                 rewrite: false,
+                from: None,
             },
             Fragment::Pending(_) => return,
         };
@@ -462,6 +466,7 @@ impl Inner {
                 place: Place::Unplaced,
                 heat: 0,
                 rewrite: false,
+                from: None,
             };
             restated.entry(id).or_default().push((a, b, p));
         }
@@ -540,6 +545,7 @@ impl Inner {
                             place: Place::Inline,
                             heat: 0,
                             rewrite: false,
+                            from: None,
                         };
                         (p, SHORT_FRAMING + (to - at) as u64)
                     } else {
@@ -548,6 +554,7 @@ impl Inner {
                             place: Place::Data(a),
                             heat: 0,
                             rewrite: false,
+                            from: Some(stmt),
                         };
                         (p, REF_FRAMING)
                     }
@@ -673,6 +680,7 @@ impl Inner {
                             place: Place::Zero,
                             heat: 0,
                             rewrite: false,
+                            from: None,
                         };
                         self.state.take(id, k, e, p, dirty);
                     }
@@ -708,6 +716,7 @@ impl Inner {
                             place,
                             heat: 0,
                             rewrite: false,
+                            from: None,
                         };
                         self.state.take(id, pk, pe, p, dirty);
                         self.stats.fresh_bytes += (pe - pk) as u64;
@@ -752,6 +761,7 @@ impl Inner {
             place: Place::Zero,
             heat: 0,
             rewrite: false,
+            from: None,
         };
         self.state.grow_size_to(id, new, p, dirty);
     }
@@ -885,30 +895,26 @@ impl Inner {
             buf: new_page(),
             used: 0,
             fast: 0.0,
-            rate: 0.0,
         })
     }
 
     /// Places the chunk at `key` into `dp`, copying its bytes. Moved content
-    /// brings its source page's split along, draining at the source's rate;
-    /// fresh content drains at the rate fresh pages have been losing at; a
-    /// description defragmentation's rewrite, cold by selection, is static.
+    /// brings its source page's draining share along; fresh content drains;
+    /// a description defragmentation's rewrite, cold by selection, is static.
     pub(crate) fn place(&mut self, dp: &mut DataPage, key: Key, len: u32) -> Result<(), Error> {
         let Some(Fragment::Pending(p)) = self.state.frags.get(&key).copied() else {
             return Err(corrupt("placing a chunk that is not pending"));
         };
         let pending = self.state.pending[p as usize];
-        let (share, rate) = match pending.origin {
-            _ if pending.rewrite => (0.0, 0.0),
+        let share = match pending.origin {
+            _ if pending.rewrite => 0.0,
             Origin::File(a) => match self.state.pages[split_address(a).0 as usize] {
-                Page::Live(l) => (l.drain.share as f64, l.drain.rate(self.state.flush_epoch)),
-                _ => (1.0, self.fresh_rate(true)),
+                Page::Live(l) => l.drain.share as f64,
+                _ => 1.0,
             },
-            _ => (1.0, self.fresh_rate(true)),
+            _ => 1.0,
         };
-        let fast = share * len as f64;
-        dp.fast += fast;
-        dp.rate += rate * fast;
+        dp.fast += share * len as f64;
         let at = CONTENT_OFFSET + dp.used;
         let mut bytes = vec![0u8; len as usize];
         self.read_fragment(Fragment::Pending(p), 0, &mut bytes)?;
@@ -1040,24 +1046,19 @@ impl Inner {
             seal_page(&mut dp.buf, None, KIND_DATA, e, dp.used);
             self.storage
                 .write_at(&dp.buf[..], dp.page as u64 * PAGE_SIZE as u64)?;
-            let r0 = if dp.fast > 0.0 {
-                dp.rate / dp.fast
-            } else {
-                0.0
-            };
-            let drain = Drain::start(dp.fast, r0, dp.used as f64, e);
+            let pi = dp.fast / (dp.used as f64).max(1.0);
+            let drain = Drain::start(self.cons.prior[0], pi, e);
             held.insert(dp.page, (dp.used as u16, drain));
             self.stats.data_pages_written += 1;
             fresh.push((dp.page, true));
         }
-        let leaf_rate = self.fresh_rate(false);
+        let leaf_prior = self.cons.prior[1];
         for (p, content) in &out.tables {
             let mut buf = new_page();
             crate::page::encode_page(&mut buf, None, KIND_ADDRESS_TABLE, e, content);
             self.storage
                 .write_at(&buf[..], *p as u64 * PAGE_SIZE as u64)?;
-            let len = content.len() as f64;
-            let drain = Drain::start(len, leaf_rate, len, e);
+            let drain = Drain::start(leaf_prior, 1.0, e);
             held.insert(*p, (content.len() as u16, drain));
             self.table_pages.insert(*p, buf);
             self.stats.table_pages_written += 1;
@@ -1185,12 +1186,19 @@ impl Inner {
             }
         }
         self.stats.flushes += 1;
-        // What the next flush's fold takes from these pages is what fresh
-        // pages lose; the cursor looks for its next page among the data pages.
-        self.cons.just_written = fresh
-            .iter()
-            .map(|&(p, data)| (p, data, self.state.live(p).coverage))
-            .collect();
+        // What these pages lose in their first epochs teaches the file's
+        // empirical prior; the cursor looks for its next page among the data
+        // pages.
+        self.cons.just_written = fresh.iter().map(|&(p, _)| p).collect();
+        self.cons
+            .young
+            .extend(fresh.iter().map(|&(page, data)| crate::consolidate::Young {
+                page,
+                epoch: e,
+                data,
+                events: 0.0,
+                exposure: 0.0,
+            }));
         let data_pages: Vec<u32> = fresh
             .iter()
             .filter(|&&(_, data)| data)

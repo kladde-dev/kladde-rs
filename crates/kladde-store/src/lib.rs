@@ -46,7 +46,7 @@ mod store;
 pub use backend::{Backend, ReadBackend, WriteBackend};
 pub use consts::{MAX_PAGE_CONTENT, PAGE_SIZE};
 pub use error::{Error, Result};
-pub use options::Options;
+pub use options::{Options, RipenessRule};
 pub use pointer::{
     decode_option, decode_option_slice, encode_option, Pointer, PointerRepr, UniquePointer, Word,
 };
