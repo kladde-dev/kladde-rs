@@ -1,14 +1,16 @@
 //! Benchmarks a drawing editor's edits on an SVG drawing stored in kladde.
 //!
 //! ```text
-//! svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--journal-budget PAGES] [--shift-decay FACTOR]
+//! svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--focus SHARE] [--focus-moves N] [--journal-budget PAGES] [--shift-decay FACTOR] [--churn-floor λ] [--target-fill τ]
 //! ```
 //!
 //! `--only Restack`, say, makes every edit a restack where the drawing allows
 //! one, to measure what one kind of edit costs. `--journal-budget` sets the
 //! store's [`Options::journal_budget_pages`], so that the store also flushes
-//! by itself whenever the journal outgrows that many pages, and
-//! `--shift-decay` its [`Options::shift_decay`].
+//! by itself whenever the journal outgrows that many pages, `--shift-decay`
+//! its [`Options::shift_decay`], `--churn-floor` its
+//! [`Options::churn_floor`], and `--target-fill` its
+//! [`Options::target_fill`].
 //!
 //! The drawing is converted into a kladde file, which is not measured, and
 //! then edited by a seeded mix of what a drawing editor does — dragging shapes,
@@ -21,6 +23,14 @@
 //! `svg-<variant>.csv` in the output directory, so that `plot-evaluation.py`
 //! in kladde-docs reads it like kladde-bench's tables. The variant is the
 //! drawing's file name unless `--variant` says otherwise.
+//!
+//! The edits keep to one part of the drawing at a time, as a person working on
+//! it does: nine in ten pick their shape or path from a window of a tenth of
+//! the drawing's, in document order, and the window jumps to a random place
+//! every 3000 edits; the tenth edit picks from the whole drawing. `--focus`
+//! sets the window's share of the drawing and `--focus-moves` the edits
+//! between jumps. `--focus 0` picks every edit from the whole drawing instead,
+//! except that nine drags in ten move one of the first tenth of the shapes.
 //!
 //! `app_bytes` counts what each edit stores: the bytes of the numbers it sets,
 //! or the encoding of a value it stores, in the place it stores it, plus
@@ -48,6 +58,12 @@ use kladde_svg::{parse, write, DeepCopy, Document, Number};
 
 /// Edits between two explicit flushes, as in kladde-bench.
 const OPS_PER_FLUSH: u64 = 1000;
+/// The share of the drawing the edits keep to, by default.
+const FOCUS: f64 = 0.1;
+/// The share of the edits that keep to it.
+const FOCUS_HITS: f64 = 0.9;
+/// The edits between two jumps of the focus, by default.
+const FOCUS_MOVES: u64 = 3000;
 const NUMBER: u64 = std::mem::size_of::<Number>() as u64;
 
 /// The kinds of edit, with their share of the mix in percent.
@@ -252,6 +268,13 @@ struct Bench {
     counts: Vec<(Edit, u64)>,
     /// The one kind of edit to make, if `--only` names one.
     only: Option<Edit>,
+    /// The share of every list of candidates that the edits keep to, 0 for
+    /// none.
+    focus: f64,
+    /// The edits between two jumps of the focus.
+    focus_moves: u64,
+    /// Where the focus starts, as a share of each list of candidates.
+    focus_at: f64,
 }
 
 impl Bench {
@@ -259,8 +282,17 @@ impl Bench {
         (self.rng.range(0, 40) as Number - 20.0) / 4.0
     }
 
+    /// A candidate from `list`: from the focus, the window of the list that
+    /// starts at `focus_at`, wrapping around, unless this edit is one of
+    /// those that pick from the whole list.
     fn pick<T: Clone>(&mut self, list: &[T]) -> T {
-        list[self.rng.below(list.len() as u64) as usize].clone()
+        let n = list.len() as u64;
+        if self.focus > 0.0 && self.rng.chance(FOCUS_HITS) {
+            let window = ((n as f64 * self.focus) as u64).max(1);
+            let start = (self.focus_at * n as f64) as u64;
+            return list[((start + self.rng.below(window)) % n) as usize].clone();
+        }
+        list[self.rng.below(n) as usize].clone()
     }
 
     /// One edit, chosen from the mix.
@@ -268,6 +300,9 @@ impl Bench {
         if self.stale {
             self.index = Index::of(self.drawing.get());
             self.stale = false;
+        }
+        if self.focus > 0.0 && self.ops.is_multiple_of(self.focus_moves) {
+            self.focus_at = self.rng.below(1 << 20) as f64 / (1 << 20) as f64;
         }
         let mut r = self.rng.below(100);
         let mut edit = MIX[0].0;
@@ -308,16 +343,21 @@ impl Bench {
         self.ops += 1;
     }
 
-    /// Moves a shape by a few units, mostly one of the first tenth of the
-    /// shapes: a drag sets the translation that leads its transform list.
+    /// Moves a shape by a few units: a drag sets the translation that leads
+    /// its transform list. Without a focus, mostly one of the first tenth of
+    /// the shapes.
     fn drag(&mut self) {
-        let n = self.index.movable.len() as u64;
-        let i = if self.rng.chance(0.9) {
-            self.rng.below((n / 10).max(1))
+        let path = if self.focus > 0.0 {
+            self.pick(&self.index.movable.clone())
         } else {
-            self.rng.below(n)
+            let n = self.index.movable.len() as u64;
+            let i = if self.rng.chance(0.9) {
+                self.rng.below((n / 10).max(1))
+            } else {
+                self.rng.below(n)
+            };
+            self.index.movable[i as usize].clone()
         };
-        let path = self.index.movable[i as usize].clone();
         let (dx, dy) = (self.delta(), self.delta());
         let first = element(&self.drawing.get().root, &path)
             .transform
@@ -575,8 +615,35 @@ fn main() {
     let (mut positional, mut quick, mut seed, mut variant) = (Vec::new(), false, 1u64, None);
     let (mut edits, mut only): (Option<u64>, Option<String>) = (None, None);
     let mut opts = Options::default();
+    let (mut focus, mut focus_moves) = (FOCUS, FOCUS_MOVES);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--focus" => {
+                focus = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|f| (0.0..=1.0).contains(f))
+                    .expect("--focus SHARE, from 0 to 1")
+            }
+            "--focus-moves" => {
+                focus_moves = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&n| n > 0)
+                    .expect("--focus-moves N, at least 1")
+            }
+            "--churn-floor" => {
+                opts.churn_floor = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .expect("--churn-floor λ")
+            }
+            "--target-fill" => {
+                opts.target_fill = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .expect("--target-fill τ")
+            }
             "--quick" => quick = true,
             "--seed" => seed = args.next().and_then(|s| s.parse().ok()).expect("--seed N"),
             "--edits" => edits = Some(args.next().and_then(|s| s.parse().ok()).expect("--edits N")),
@@ -599,7 +666,7 @@ fn main() {
     }
     let [input, out] = positional.as_slice() else {
         eprintln!(
-            "usage: svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--journal-budget PAGES] [--shift-decay FACTOR]"
+            "usage: svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--focus SHARE] [--focus-moves N] [--journal-budget PAGES] [--shift-decay FACTOR] [--churn-floor λ] [--target-fill τ]"
         );
         std::process::exit(2);
     };
@@ -651,6 +718,9 @@ fn main() {
                 .find(|e| format!("{e:?}").eq_ignore_ascii_case(&name))
                 .unwrap_or_else(|| panic!("--only takes one of {:?}", MIX.map(|(e, _)| e)))
         }),
+        focus,
+        focus_moves,
+        focus_at: 0.0,
     };
     let target = if quick { live } else { 8 * live };
     let started = Instant::now();
