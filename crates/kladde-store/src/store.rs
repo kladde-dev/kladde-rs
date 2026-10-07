@@ -991,7 +991,7 @@ impl Inner {
             Fragment::Bytes { page, offset, .. } => {
                 self.read_page_bytes(page, offset as usize + rel as usize, out)
             }
-            Fragment::ZeroExplicitly { .. } | Fragment::ZeroByDefault => {
+            Fragment::Zero { .. } => {
                 out.fill(0);
                 Ok(())
             }

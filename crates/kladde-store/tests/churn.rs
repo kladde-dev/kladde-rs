@@ -2,10 +2,9 @@
 //! through recycling: an id is re-minted soon after its tombstone was stated.
 //! Every flush must reopen to the same content.
 //!
-//! This caught an id re-allocated in the flush that rewrote the page holding
-//! its tombstone: the tombstone was released as "the last mention", the new
-//! incarnation had nothing to anchor on, and the old incarnation's content
-//! resurfaced after reopening.
+//! This covers an id re-allocated in the flush that rewrites the page holding
+//! its tombstone, where nothing of the old incarnation may resurface after
+//! reopening.
 
 use kladde_store::{MemoryStorage, Options, Store, UniquePointer, WriteBackend};
 

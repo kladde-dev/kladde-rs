@@ -181,53 +181,49 @@ impl Sink {
         s
     }
 
+    /// Emits `[start, end)` of `id`, won by the content statement `entries[idx]`.
     fn emit(
         &mut self,
         id: u32,
         start: u32,
         end: u32,
-        winner: Option<usize>,
+        idx: usize,
         entries: &mut [Entry],
         stmt_bytes: &mut u32,
     ) {
-        let f = match winner {
-            None => Fragment::ZeroByDefault,
-            Some(idx) => {
-                let fresh = entries[idx].slot.is_none();
-                let s = self.slot_of(entries, idx);
-                if fresh {
-                    *stmt_bytes += entries[idx].item.framing as u32;
-                }
-                self.state.pin(s);
-                let it = entries[idx].item;
-                let d = start - it.stmt.offset;
-                match it.stmt.kind {
-                    Kind::Ref => {
-                        let (page, off) = split_address(it.stmt.address + d as u64);
-                        self.state.ensure_page(page);
-                        self.state.pages[page as usize].coverage += end - start;
-                        self.data_pages.insert(page);
-                        self.state.note_reverse(page, id, start, end);
-                        let y = self.youngest.entry(id).or_default();
-                        *y = (*y).max(u64::from(page) << 32);
-                        Fragment::Bytes {
-                            page,
-                            offset: off,
-                            stmt: s,
-                        }
-                    }
-                    Kind::Inline => {
-                        let (_, off) = split_address(it.stmt.address + d as u64);
-                        self.state.pages[it.page as usize].coverage += end - start;
-                        Fragment::Bytes {
-                            page: it.page,
-                            offset: off,
-                            stmt: s,
-                        }
-                    }
-                    _ => Fragment::ZeroExplicitly { stmt: s },
+        let fresh = entries[idx].slot.is_none();
+        let s = self.slot_of(entries, idx);
+        if fresh {
+            *stmt_bytes += entries[idx].item.framing as u32;
+        }
+        self.state.pin(s);
+        let it = entries[idx].item;
+        let d = start - it.stmt.offset;
+        let f = match it.stmt.kind {
+            Kind::Ref => {
+                let (page, off) = split_address(it.stmt.address + d as u64);
+                self.state.ensure_page(page);
+                self.state.pages[page as usize].coverage += end - start;
+                self.data_pages.insert(page);
+                self.state.note_reverse(page, id, start, end);
+                let y = self.youngest.entry(id).or_default();
+                *y = (*y).max(u64::from(page) << 32);
+                Fragment::Bytes {
+                    page,
+                    offset: off,
+                    stmt: s,
                 }
             }
+            Kind::Inline => {
+                let (_, off) = split_address(it.stmt.address + d as u64);
+                self.state.pages[it.page as usize].coverage += end - start;
+                Fragment::Bytes {
+                    page: it.page,
+                    offset: off,
+                    stmt: s,
+                }
+            }
+            _ => Fragment::Zero { stmt: s },
         };
         self.emitted.push((key(id, start), f));
     }
@@ -239,13 +235,14 @@ fn resolve_id(sink: &mut Sink, merge: &mut Merge) -> Result<(), Error> {
     let mut entries: Vec<Entry> = Vec::new();
     let mut open: BinaryHeap<Open> = BinaryHeap::new();
     let mut newest: Option<usize> = None;
-    let mut grow: Option<usize> = None;
+    let mut sizing: Option<usize> = None;
     let mut mentions = 0u32;
+    // The envelope: where each run starts, and the content statement that
+    // wins it, if any.
+    let mut runs: Vec<(u64, Option<usize>)> = Vec::new();
     let mut pos: u64 = 0;
     let mut current: Option<usize> = None;
     let mut run_start: u64 = 0;
-    let mut stmt_bytes = 0u32;
-    let first_fragment = sink.emitted.len();
 
     loop {
         while open.peek().is_some_and(|e| e.end <= pos) {
@@ -262,29 +259,29 @@ fn resolve_id(sink: &mut Sink, merge: &mut Merge) -> Result<(), Error> {
             if newest.is_none_or(|n| item.epoch > entries[n].item.epoch) {
                 newest = Some(idx);
             }
-            if item.stmt.end() > pos {
+            if item.stmt.states_size() {
+                match sizing.map(|z| entries[z].item.epoch) {
+                    Some(e) if e == item.epoch => {
+                        return Err(corrupt(format!(
+                            "two statements of epoch {e} state the size of allocation {id}"
+                        )))
+                    }
+                    Some(e) if e > item.epoch => {}
+                    _ => sizing = Some(idx),
+                }
+            }
+            if item.stmt.kind.is_content() && item.stmt.end() > pos {
                 open.push(Open {
                     epoch: item.epoch,
                     end: item.stmt.end(),
                     idx,
                 });
-            } else if item.stmt.kind == Kind::Grow
-                && open.peek().is_none_or(|t| item.epoch > t.epoch)
-            {
-                grow = Some(idx);
             }
         }
         let winner = open.peek().map(|e| e.idx);
         if winner != current {
             if pos > run_start {
-                sink.emit(
-                    id,
-                    run_start as u32,
-                    pos as u32,
-                    current,
-                    &mut entries,
-                    &mut stmt_bytes,
-                );
+                runs.push((run_start, current));
             }
             current = winner;
             run_start = pos;
@@ -293,7 +290,7 @@ fn resolve_id(sink: &mut Sink, merge: &mut Merge) -> Result<(), Error> {
             .peek()
             .filter(|s| s.stmt.id == id)
             .map(|s| s.stmt.start() as u64);
-        if next_start.is_none() && winner.is_none_or(|w| entries[w].item.stmt.kind.is_unbounded()) {
+        if next_start.is_none() && winner.is_none() {
             break;
         }
         pos = next_start
@@ -303,26 +300,37 @@ fn resolve_id(sink: &mut Sink, merge: &mut Merge) -> Result<(), Error> {
             return Err(corrupt("an allocation reaches past 2^32 - 1"));
         }
     }
+    runs.push((run_start, None));
 
-    let grow_n = grow.map_or(0, |g| entries[g].item.stmt.offset as u64);
-    let size = run_start.max(grow_n);
-    if size > u32::MAX as u64 {
-        return Err(corrupt("an allocation is larger than 2^32 - 1 bytes"));
-    }
-    if run_start < size {
+    // The size is known only now, so the envelope is clipped to it here: runs
+    // at or past it go, and every run below it must have a winner.
+    let size = sizing.map_or(0, |z| entries[z].item.stmt.stated_size());
+    let mut stmt_bytes = 0u32;
+    let first_fragment = sink.emitted.len();
+    for (i, &(start, winner)) in runs.iter().enumerate() {
+        if start >= size as u64 {
+            break;
+        }
+        let end = runs
+            .get(i + 1)
+            .map_or(size as u64, |r| r.0)
+            .min(size as u64);
+        let Some(w) = winner else {
+            return Err(corrupt(format!(
+                "byte {start} of allocation {id} is matched by no statement"
+            )));
+        };
         sink.emit(
             id,
-            run_start as u32,
-            size as u32,
-            current,
+            start as u32,
+            end as u32,
+            w,
             &mut entries,
             &mut stmt_bytes,
         );
     }
-    let size = size as u32;
     let newest = newest.unwrap();
     let exists = entries[newest].item.stmt.kind != Kind::Tombstone;
-    let anchor = current.filter(|&c| entries[c].item.stmt.kind.is_unbounded());
     let fragment_count = (sink.emitted.len() - first_fragment) as u32;
 
     if exists {
@@ -332,36 +340,23 @@ fn resolve_id(sink: &mut Sink, merge: &mut Merge) -> Result<(), Error> {
             mentions,
             ..Default::default()
         };
-        if let Some(a) = anchor {
-            let fresh = entries[a].slot.is_none();
-            let s = sink.slot_of(&mut entries, a);
+        if let Some(z) = sizing {
+            let fresh = entries[z].slot.is_none();
+            let s = sink.slot_of(&mut entries, z);
             if fresh {
-                stmt_bytes += entries[a].item.framing as u32;
+                stmt_bytes += entries[z].item.framing as u32;
             }
             sink.state.pin(s);
-            meta.anchor = Some(s);
-            meta.anchor_n = entries[a].item.stmt.offset;
-        }
-        if let Some(g) = grow {
-            let n = entries[g].item.stmt.offset;
-            if n as u64 > run_start || size == 0 {
-                let fresh = entries[g].slot.is_none();
-                let s = sink.slot_of(&mut entries, g);
-                if fresh {
-                    stmt_bytes += entries[g].item.framing as u32;
-                }
-                sink.state.pin(s);
-                meta.grow = Some(s);
-                meta.grow_n = n;
-            }
+            meta.size_statement = Some(s);
         }
         meta.statement_bytes = stmt_bytes;
         sink.state.allocs.insert(id, meta);
     } else {
         debug_assert_eq!(size, 0);
+        // The tombstone is the newest statement, so it holds `S` while
+        // anything older still names the id.
         let tombstone = if mentions > 1 {
-            let a = anchor.expect("a non-existent id is anchored by its tombstone");
-            let s = sink.slot_of(&mut entries, a);
+            let s = sink.slot_of(&mut entries, newest);
             sink.state.pin(s);
             Some(s)
         } else {
@@ -529,4 +524,121 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
         children,
         file_pages,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::page::encode_page;
+    use crate::statement::TableWriter;
+    use crate::storage::MemoryStorage;
+
+    /// A file of two table pages: the leaf at page 3, holding `older` at
+    /// epoch 1, and the header, holding `newer` at epoch 2. `Inline`
+    /// payloads are 7s.
+    fn file(older: &[Stmt], newer: &[Stmt]) -> MemoryStorage {
+        let encode = |stmts: &[Stmt], children: &[u32]| {
+            let mut w = TableWriter::new();
+            for &c in children {
+                w.child(c);
+            }
+            w.end_children();
+            for s in stmts {
+                let len = if s.kind == Kind::Inline { s.size } else { 0 };
+                w.push(s, &vec![7; len as usize]);
+            }
+            w.into_content()
+        };
+        let mut storage = MemoryStorage::new();
+        storage.set_len(4 * PAGE_SIZE as u64).unwrap();
+        let mut page = new_page();
+        encode_page(&mut page, None, KIND_ADDRESS_TABLE, 1, &encode(older, &[]));
+        storage.write_at(&page[..], 3 * PAGE_SIZE as u64).unwrap();
+        let header = HeaderFields {
+            journal_pointer: 2,
+            ..Default::default()
+        };
+        encode_page(
+            &mut page,
+            Some(&header),
+            KIND_ADDRESS_TABLE,
+            2,
+            &encode(newer, &[3]),
+        );
+        storage.write_at(&page[..], 0).unwrap();
+        storage
+    }
+
+    fn open(storage: &MemoryStorage) -> Result<State, Error> {
+        Ok(load(storage, pick_header(storage)?)?.state)
+    }
+
+    #[test]
+    fn the_newest_statement_of_the_size_wins_over_older_extents() {
+        let state = open(&file(
+            &[Stmt::inline(5, 0, 100).sized()],
+            &[Stmt::size_to(5, 30)],
+        ))
+        .unwrap();
+        state.check();
+        let m = &state.allocs[&5];
+        assert_eq!(m.size, 30);
+        assert_eq!(m.fragment_count, 1);
+        // The older `Inline*` still wins `[0, 30)`, from the leaf, and the
+        // `Size`, which owns nothing, holds its pin all the same.
+        let (_, f, end) = state.resolve(5, 0).unwrap();
+        assert!(matches!(f, Fragment::Bytes { page: 3, .. }));
+        assert_eq!(end, 30);
+        let s = m.size_statement.unwrap();
+        assert_eq!(state.slab.kinds[s.idx()], Kind::Size);
+        assert_eq!(state.slab.pins[s.idx()], 1);
+    }
+
+    #[test]
+    fn a_newer_sizing_statement_grows_past_an_older_size() {
+        let state = open(&file(
+            &[Stmt::inline(5, 0, 10), Stmt::size_to(5, 10)],
+            &[Stmt::zero(5, 10, 40).sized()],
+        ))
+        .unwrap();
+        state.check();
+        assert_eq!(state.allocs[&5].size, 50);
+        assert!(matches!(
+            state.resolve(5, 20).unwrap().1,
+            Fragment::Zero { .. }
+        ));
+        // The older `Size` decides nothing any more, and gets no slot.
+        assert_eq!(state.slab.live, 2);
+    }
+
+    #[test]
+    fn a_byte_below_the_size_that_nothing_matches_is_an_error() {
+        let err = open(&file(&[], &[Stmt::inline(5, 0, 10), Stmt::size_to(5, 20)]));
+        assert!(matches!(err, Err(Error::Corrupt(_))), "{:?}", err.err());
+    }
+
+    #[test]
+    fn two_statements_of_one_epoch_that_state_the_size_are_an_error() {
+        let err = open(&file(
+            &[],
+            &[Stmt::inline(5, 0, 10).sized(), Stmt::size_to(5, 10)],
+        ));
+        assert!(matches!(err, Err(Error::Corrupt(_))), "{:?}", err.err());
+    }
+
+    #[test]
+    fn a_tombstone_holds_its_pin_while_older_statements_name_its_id() {
+        let state = open(&file(
+            &[Stmt::inline(6, 0, 10).sized()],
+            &[Stmt::tombstone(6)],
+        ))
+        .unwrap();
+        state.check();
+        assert!(!state.allocs.contains_key(&6));
+        let r = state.recyclable[&6];
+        assert_eq!(r.mentions, 2);
+        let t = r.tombstone.unwrap();
+        assert_eq!(state.slab.kinds[t.idx()], Kind::Tombstone);
+        assert_eq!(state.slab.live, 1);
+    }
 }

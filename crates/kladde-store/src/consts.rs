@@ -38,6 +38,6 @@ pub const MIN_READER_VERSION: u16 = 0;
 pub const READER_VERSION: u16 = 0;
 
 /// The format's ceiling on an `Inline` payload.
-pub const MAX_INLINE: usize = 251;
+pub const MAX_INLINE: usize = 125;
 /// The largest allocation size, `2^32 - 1`.
 pub const MAX_ALLOCATION_SIZE: u64 = u32::MAX as u64;

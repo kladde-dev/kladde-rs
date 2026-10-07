@@ -19,7 +19,8 @@ pub struct Options {
     pub journal_budget_pages: u32,
     /// Bytes a batch may hold back before it appends them as one transaction.
     pub batch_bytes: usize,
-    /// Content runs up to this many bytes are stated `Inline`.
+    /// Content runs up to this many bytes are stated `Inline`, up to the
+    /// format's ceiling of 125 bytes, which caps any larger value.
     pub inline_threshold: u32,
     /// Whether flushes consolidate at all.
     pub consolidate: bool,

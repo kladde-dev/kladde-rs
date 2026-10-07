@@ -4,16 +4,16 @@
 use crate::consts::{MAX_INLINE, PAGE_SIZE};
 use crate::error::{corrupt, Error};
 
-/// The six statement types.
+/// The five statement types; `Ref`, `Zero`, and `Inline` come in a plain and
+/// a sizing variant, told apart by [`Stmt::sizing`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Kind {
     Ref = 0,
     Zero = 1,
-    Shrink = 2,
-    Grow = 3,
-    Tombstone = 4,
-    Inline = 5,
+    Size = 2,
+    Tombstone = 3,
+    Inline = 4,
 }
 
 impl Kind {
@@ -21,18 +21,15 @@ impl Kind {
     pub fn is_content(self) -> bool {
         matches!(self, Kind::Ref | Kind::Zero | Kind::Inline)
     }
-
-    /// `Shrink` and `Tombstone` match every probe from their bound upward.
-    pub fn is_unbounded(self) -> bool {
-        matches!(self, Kind::Shrink | Kind::Tombstone)
-    }
 }
 
 /// A statement, without an inline payload's bytes.
 ///
-/// `offset` is the statement's offset for `Ref`, `Zero` and `Inline`, the bound
-/// `n` for `Shrink` and `Grow`, and 0 for `Tombstone`. `size` is 0 for the
-/// three that carry none. `address` is the file address of a `Ref`'s bytes.
+/// `offset` is the statement's offset for `Ref`, `Zero` and `Inline`, the size
+/// `n` for `Size`, and 0 for `Tombstone`. `size` is 0 for the two that carry
+/// none. `address` is the file address of a `Ref`'s bytes. `sizing` marks the
+/// sizing variant of a content statement, which also states that the
+/// allocation ends where its content ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stmt {
     pub id: u32,
@@ -40,6 +37,7 @@ pub struct Stmt {
     pub offset: u32,
     pub size: u32,
     pub address: u64,
+    pub sizing: bool,
 }
 
 impl Stmt {
@@ -50,24 +48,18 @@ impl Stmt {
             offset: 0,
             size: 0,
             address: 0,
+            sizing: false,
         }
     }
-    pub fn shrink(id: u32, n: u32) -> Stmt {
+    /// `Size(id, n)`.
+    pub fn size_to(id: u32, n: u32) -> Stmt {
         Stmt {
             id,
-            kind: Kind::Shrink,
+            kind: Kind::Size,
             offset: n,
             size: 0,
             address: 0,
-        }
-    }
-    pub fn grow(id: u32, n: u32) -> Stmt {
-        Stmt {
-            id,
-            kind: Kind::Grow,
-            offset: n,
-            size: 0,
-            address: 0,
+            sizing: false,
         }
     }
     pub fn zero(id: u32, offset: u32, size: u32) -> Stmt {
@@ -77,6 +69,7 @@ impl Stmt {
             offset,
             size,
             address: 0,
+            sizing: false,
         }
     }
     pub fn reference(id: u32, offset: u32, size: u32, address: u64) -> Stmt {
@@ -86,6 +79,7 @@ impl Stmt {
             offset,
             size,
             address,
+            sizing: false,
         }
     }
     pub fn inline(id: u32, offset: u32, size: u32) -> Stmt {
@@ -95,6 +89,31 @@ impl Stmt {
             offset,
             size,
             address: 0,
+            sizing: false,
+        }
+    }
+
+    /// The sizing variant of a content statement.
+    pub fn sized(self) -> Stmt {
+        debug_assert!(self.kind.is_content());
+        Stmt {
+            sizing: true,
+            ..self
+        }
+    }
+
+    /// Whether it states its allocation's size: a `Size`, a `Tombstone`, or
+    /// a sizing content statement.
+    pub fn states_size(&self) -> bool {
+        self.sizing || matches!(self.kind, Kind::Size | Kind::Tombstone)
+    }
+
+    /// The size it states, if [`Stmt::states_size`].
+    pub fn stated_size(&self) -> u32 {
+        match self.kind {
+            Kind::Size => self.offset,
+            Kind::Tombstone => 0,
+            _ => self.offset + self.size,
         }
     }
 
@@ -103,14 +122,10 @@ impl Stmt {
         self.offset
     }
 
-    /// Where its match range ends: `offset + size` for content, `n` for a
-    /// `Grow` (an empty range), and unbounded for `Shrink` and `Tombstone`.
+    /// Where its match range ends: `offset + size` for content, and `offset`
+    /// (an empty range) for `Size` and `Tombstone`, which match nothing.
     pub fn end(&self) -> u64 {
-        match self.kind {
-            Kind::Ref | Kind::Zero | Kind::Inline => self.offset as u64 + self.size as u64,
-            Kind::Grow => self.offset as u64,
-            Kind::Shrink | Kind::Tombstone => u64::MAX,
-        }
+        self.offset as u64 + self.size as u64
     }
 
     /// The sort key within a page.
@@ -204,7 +219,7 @@ impl TableWriter {
                     + varint_len(s.address)
             }
             Kind::Zero => len += varint_len((s.offset - oc) as u64) + varint_len(s.size as u64),
-            Kind::Shrink | Kind::Grow => len += varint_len((s.offset - oc) as u64),
+            Kind::Size => len += varint_len((s.offset - oc) as u64),
             Kind::Tombstone => {}
             Kind::Inline => len += varint_len((s.offset - oc) as u64) + s.size as usize,
         }
@@ -237,10 +252,12 @@ impl TableWriter {
         put_varint(&mut self.buf, id_delta as u64);
         let oc = self.offset_cursor;
         let mut payload_pos = 0;
+        let sizing = u8::from(s.sizing);
+        debug_assert!(!s.sizing || s.kind.is_content());
         match s.kind {
             Kind::Ref => {
                 assert!(s.offset >= oc, "offset cursor moves backwards");
-                self.buf.push(0);
+                self.buf.push(sizing);
                 put_varint(&mut self.buf, (s.offset - oc) as u64);
                 put_varint(&mut self.buf, s.size as u64);
                 put_varint(&mut self.buf, s.address);
@@ -248,25 +265,25 @@ impl TableWriter {
             }
             Kind::Zero => {
                 assert!(s.offset >= oc, "offset cursor moves backwards");
-                self.buf.push(1);
+                self.buf.push(2 | sizing);
                 put_varint(&mut self.buf, (s.offset - oc) as u64);
                 put_varint(&mut self.buf, s.size as u64);
                 self.offset_cursor = s.offset + s.size;
             }
-            Kind::Shrink | Kind::Grow => {
-                assert!(s.offset >= oc, "offset cursor moves backwards");
-                self.buf.push(if s.kind == Kind::Shrink { 2 } else { 3 });
-                put_varint(&mut self.buf, (s.offset - oc) as u64);
-                self.offset_cursor = s.offset;
-            }
             Kind::Tombstone => {
                 self.buf.push(4);
+            }
+            Kind::Size => {
+                assert!(s.offset >= oc, "offset cursor moves backwards");
+                self.buf.push(5);
+                put_varint(&mut self.buf, (s.offset - oc) as u64);
+                self.offset_cursor = s.offset;
             }
             Kind::Inline => {
                 assert!(s.offset >= oc, "offset cursor moves backwards");
                 assert!(s.size >= 1 && s.size as usize <= MAX_INLINE);
                 assert_eq!(payload.len(), s.size as usize);
-                self.buf.push((s.size + 4) as u8);
+                self.buf.push((4 + 2 * s.size) as u8 | sizing);
                 put_varint(&mut self.buf, (s.offset - oc) as u64);
                 payload_pos = self.buf.len();
                 self.buf.extend_from_slice(payload);
@@ -380,35 +397,27 @@ impl<'a> TableReader<'a> {
                 Ok(v as u32)
             }
         };
-        let (stmt, payload) = match tag {
-            0 | 1 => {
+        let (mut stmt, payload) = match tag {
+            0..=3 => {
                 self.offset_cursor += get_varint(page, &mut self.pos, end)?;
                 let offset = bound(self.offset_cursor)?;
                 let size = get_varint(page, &mut self.pos, end)?;
                 self.offset_cursor += size;
                 bound(self.offset_cursor)?;
-                if tag == 0 {
+                if tag < 2 {
                     let address = get_varint(page, &mut self.pos, end)?;
                     (Stmt::reference(id, offset, size as u32, address), 0)
                 } else {
                     (Stmt::zero(id, offset, size as u32), 0)
                 }
             }
-            2 | 3 => {
-                self.offset_cursor += get_varint(page, &mut self.pos, end)?;
-                let n = bound(self.offset_cursor)?;
-                (
-                    if tag == 2 {
-                        Stmt::shrink(id, n)
-                    } else {
-                        Stmt::grow(id, n)
-                    },
-                    0,
-                )
-            }
             4 => (Stmt::tombstone(id), 0),
+            5 => {
+                self.offset_cursor += get_varint(page, &mut self.pos, end)?;
+                (Stmt::size_to(id, bound(self.offset_cursor)?), 0)
+            }
             _ => {
-                let size = (tag - 4) as u32;
+                let size = ((tag - 4) >> 1) as u32;
                 self.offset_cursor += get_varint(page, &mut self.pos, end)?;
                 let offset = bound(self.offset_cursor)?;
                 if self.pos + size as usize > end {
@@ -422,6 +431,8 @@ impl<'a> TableReader<'a> {
                 (s, size as usize)
             }
         };
+        // Bit 0 of a content statement's tag is its sizing bit.
+        stmt.sizing = stmt.kind.is_content() && tag & 1 == 1;
         if stmt.kind == Kind::Ref {
             let in_page = (stmt.address % PAGE_SIZE as u64) as usize;
             if in_page + stmt.size as usize > PAGE_SIZE {
@@ -444,11 +455,14 @@ mod tests {
         let stmts = [
             (Stmt::reference(3, 0, 100, 4096 * 5 + 11), vec![]),
             (Stmt::zero(3, 100, 20), vec![]),
-            (Stmt::shrink(3, 120), vec![]),
+            (Stmt::size_to(3, 120), vec![]),
             (Stmt::tombstone(7), vec![]),
             (Stmt::inline(9, 0, 3), vec![1, 2, 3]),
-            (Stmt::grow(9, 50), vec![]),
-            (Stmt::reference(1000, 7, 1, 11), vec![]),
+            (Stmt::zero(9, 3, 47).sized(), vec![]),
+            (Stmt::reference(1000, 7, 1, 11).sized(), vec![]),
+            (Stmt::inline(1001, 0, 1).sized(), vec![9]),
+            (Stmt::inline(1002, 0, 125), vec![7; 125]),
+            (Stmt::inline(1003, 0, 125).sized(), vec![8; 125]),
         ];
         let mut w = TableWriter::new();
         w.child(4);

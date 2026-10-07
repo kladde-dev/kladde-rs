@@ -45,10 +45,8 @@ pub enum Fragment {
         offset: u16,
         stmt: StmtRef,
     },
-    /// Zeros stated by a `Zero`, `Shrink`, or `Tombstone`.
-    ZeroExplicitly { stmt: StmtRef },
-    /// Zeros because no statement matches.
-    ZeroByDefault,
+    /// Zeros stated by a `Zero`.
+    Zero { stmt: StmtRef },
     /// Taken by the flush in progress; an index into its pending table.
     Pending(u32),
 }
@@ -57,8 +55,8 @@ impl Fragment {
     #[inline]
     pub fn stmt(&self) -> Option<StmtRef> {
         match *self {
-            Fragment::Bytes { stmt, .. } | Fragment::ZeroExplicitly { stmt } => Some(stmt),
-            _ => None,
+            Fragment::Bytes { stmt, .. } | Fragment::Zero { stmt } => Some(stmt),
+            Fragment::Pending(_) => None,
         }
     }
 }
@@ -191,12 +189,10 @@ pub struct AllocationMeta {
     pub mentions: u32,
     /// The epoch of the flush that last wrote the id.
     pub last_written: u64,
-    /// The newest `Shrink` or `Tombstone`, and its bound.
-    pub anchor: Option<StmtRef>,
-    pub anchor_n: u32,
-    /// A `Grow` with `n == size` that may be the size's sole witness.
-    pub grow: Option<StmtRef>,
-    pub grow_n: u32,
+    /// The newest statement that states the size, holding its `S` pin; for
+    /// an id allocated again, its old tombstone until the cut binds the new
+    /// incarnation's.
+    pub size_statement: Option<StmtRef>,
 }
 
 /// What a non-existent id still carries.
@@ -296,14 +292,22 @@ pub struct IdRecord {
     pub freed: bool,
     /// It exists now after not existing, or after being freed.
     pub allocated: bool,
-    /// Its size went down.
-    pub shrank: bool,
-    /// A page the flush retires held its anchor.
-    pub replace_anchor: bool,
-    /// A page the flush retires held its grow witness.
-    pub replace_grow: bool,
+    /// A page the flush retires held its size statement, or, for an id that
+    /// does not exist, its tombstone.
+    pub replace: bool,
     /// The application wrote it.
     pub written: bool,
+}
+
+impl IdRecord {
+    /// Folds in what another source recorded for the same id; the earlier
+    /// size stays, since it is the size the id had when the flush began.
+    pub fn merge(&mut self, other: IdRecord) {
+        self.freed |= other.freed;
+        self.allocated |= other.allocated;
+        self.replace |= other.replace;
+        self.written |= other.written;
+    }
 }
 
 impl Dirty {
@@ -526,8 +530,7 @@ impl State {
                 self.uncover(page, len);
                 self.unpin(stmt);
             }
-            Fragment::ZeroExplicitly { stmt } => self.unpin(stmt),
-            Fragment::ZeroByDefault => {}
+            Fragment::Zero { stmt } => self.unpin(stmt),
             Fragment::Pending(p) => {
                 if let Place::Data(a) = self.pending[p as usize].place {
                     self.uncover(split_address(a).0, len);
@@ -542,8 +545,7 @@ impl State {
                 self.cover(page, len);
                 self.pin(stmt);
             }
-            Fragment::ZeroExplicitly { stmt } => self.pin(stmt),
-            Fragment::ZeroByDefault => {}
+            Fragment::Zero { stmt } => self.pin(stmt),
             Fragment::Pending(p) => {
                 if let Place::Data(a) = self.pending[p as usize].place {
                     self.cover(split_address(a).0, len);
@@ -616,8 +618,7 @@ impl State {
     /// Whether `b`, starting where `a` (of length `a_len`) ends, continues it.
     fn continues(&self, a: Fragment, a_len: u32, b: Fragment) -> bool {
         match (a, b) {
-            (Fragment::ZeroByDefault, Fragment::ZeroByDefault) => true,
-            (Fragment::ZeroExplicitly { stmt: s }, Fragment::ZeroExplicitly { stmt: t }) => s == t,
+            (Fragment::Zero { stmt: s }, Fragment::Zero { stmt: t }) => s == t,
             (
                 Fragment::Bytes {
                     page: p,
@@ -660,102 +661,37 @@ impl State {
 
     // ------------------------------------------------------------ sizes
 
-    /// Anchors the id at `s`, a `Shrink` or `Tombstone` with bound `n`.
-    pub fn set_anchor(&mut self, id: u32, s: StmtRef, n: u32) {
-        let old = {
-            let m = self.allocs.get_mut(&id).unwrap();
-            let old = m.anchor.replace(s);
-            m.anchor_n = n;
-            old
-        };
+    /// Makes `s` the id's size statement, which takes its `S` pin from the
+    /// statement that held it before.
+    pub fn set_size_statement(&mut self, id: u32, s: StmtRef) {
         self.pin(s);
+        let old = self.allocs.get_mut(&id).unwrap().size_statement.replace(s);
         if let Some(o) = old {
             self.unpin(o);
         }
-        self.retire_dead_grows(id);
     }
 
-    /// Records `s`, a `Grow` with bound `n`, as a possible sole witness.
-    pub fn set_grow_witness(&mut self, id: u32, s: StmtRef, n: u32) {
+    /// Raises `id`'s size to `n`. The range the growth exposes is taken for
+    /// the flush as `p`, zeros unless the flush writes over them, since every
+    /// byte an allocation gains is stated in the epoch that gains it.
+    pub fn grow_size_to(&mut self, id: u32, n: u32, p: Pending, dirty: &mut Dirty) {
         let old = {
-            let m = self.allocs.get_mut(&id).unwrap();
-            let old = m.grow.replace(s);
-            m.grow_n = n;
-            old
-        };
-        self.pin(s);
-        if let Some(o) = old {
-            self.unpin(o);
-        }
-        self.retire_dead_grows(id);
-    }
-
-    /// The death tests of `impl/liveness.md` for the grow witness.
-    pub fn retire_dead_grows(&mut self, id: u32) {
-        let Some(m) = self.allocs.get(&id) else {
-            return;
-        };
-        let Some(g) = m.grow else { return };
-        let mut dead = m.size > m.grow_n;
-        if let Some(a) = m.anchor {
-            let anchor_is_shrink = self.slab.kinds[a.idx()] == Kind::Shrink;
-            // A tombstone anchor asserts no existence, so a `Grow` it bounds
-            // may still be the only statement that does.
-            if anchor_is_shrink && m.grow_n <= m.anchor_n {
-                dead = true;
-            }
-            let ga = self.pages[self.slab.page(g) as usize].epoch;
-            let aa = self.pages[self.slab.page(a) as usize].epoch;
-            if ga < aa {
-                dead = true;
-            }
-        }
-        if dead {
-            self.allocs.get_mut(&id).unwrap().grow = None;
-            self.unpin(g);
-        }
-    }
-
-    /// Inserts `f` over `[from, to)` at the end of `id`, extending its last
-    /// fragment when that already resolves the same way.
-    fn append_range(&mut self, id: u32, from: u32, to: u32, f: Fragment) {
-        if from >= to {
-            return;
-        }
-        if from > 0 {
-            if let Some((&pk, &last)) = self.frags.range(..key(id, from)).next_back() {
-                if kid(pk) == id && last == f && !matches!(f, Fragment::Pending(_)) {
-                    // Extending: the fragment now reaches further, which for a
-                    // statement-owned zero needs no new pin.
-                    return;
-                }
-            }
-        }
-        self.frags.insert(key(id, from), f);
-        if let Some(s) = f.stmt() {
-            self.pin(s);
-        }
-        self.allocs.get_mut(&id).unwrap().fragment_count += 1;
-    }
-
-    /// Raises `id`'s size to `n`: the exposed range resolves through the
-    /// anchor if there is one, else by default.
-    pub fn grow_size_to(&mut self, id: u32, n: u32) {
-        let (old, anchor) = {
             let m = self.allocs.get_mut(&id).unwrap();
             if n <= m.size {
                 return;
             }
             let old = m.size;
             m.size = n;
-            (old, m.anchor)
+            m.fragment_count += 1;
+            old
         };
-        let f = match anchor {
-            Some(a) => Fragment::ZeroExplicitly { stmt: a },
-            None => Fragment::ZeroByDefault,
-        };
-        self.append_range(id, old, n, f);
-        self.retire_dead_grows(id);
+        // Past the old end there is nothing to release, so this take only
+        // appends.
+        self.pending.push(p);
+        let idx = self.pending.len() as u32 - 1;
+        self.frags.insert(key(id, old), Fragment::Pending(idx));
+        self.charge_fragment(Fragment::Pending(idx), n - old);
+        dirty.add(id, old, n);
     }
 
     /// Lowers `id`'s size to `n`, dropping everything at or past it.
@@ -778,7 +714,6 @@ impl State {
         let m = self.allocs.get_mut(&id).unwrap();
         m.fragment_count -= olds.len() as u32;
         m.size = n;
-        self.retire_dead_grows(id);
     }
 
     /// Re-owns `[start, end)` of `id` for the flush in progress.
@@ -792,15 +727,13 @@ impl State {
         dirty.add(id, start, end);
     }
 
-    /// A statement naming `id`, in table page `page`, stopped being
-    /// physically present.
+    /// A statement naming `id` stopped being physically present.
     ///
-    /// When only the tombstone is left naming a non-existent id, nothing is
-    /// left for it to deny, so it is released. But when the statement leaving
-    /// *is* the tombstone -- its page is being rewritten -- what remains are
-    /// the statements it denies, and it stays, for the cut to restate: an id
-    /// re-allocated in the same flush anchors on it.
-    pub fn drop_physically(&mut self, id: u32, page: u32) {
+    /// When at most the tombstone is left naming a non-existent id, nothing
+    /// is left for it to deny, so it is released. When the statement leaving
+    /// is the tombstone itself, its page's rewrite has asked the cut to state
+    /// it again while anything still names the id.
+    pub fn drop_physically(&mut self, id: u32) {
         if let Some(m) = self.allocs.get_mut(&id) {
             m.mentions = m.mentions.saturating_sub(1);
             return;
@@ -809,8 +742,7 @@ impl State {
             return;
         };
         r.mentions = r.mentions.saturating_sub(1);
-        let leaving = r.tombstone.is_some_and(|t| self.slab.page(t) == page);
-        if r.mentions <= 1 && !leaving {
+        if r.mentions <= 1 {
             if let Some(t) = r.tombstone.take() {
                 self.unpin(t);
             }
@@ -895,11 +827,8 @@ impl State {
                     m.size
                 );
             }
-            if let Some(a) = m.anchor {
-                pins[a.idx()] += 1;
-            }
-            if let Some(g) = m.grow {
-                pins[g.idx()] += 1;
+            if let Some(s) = m.size_statement {
+                pins[s.idx()] += 1;
             }
         }
         for r in self.recyclable.values() {

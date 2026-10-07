@@ -706,9 +706,9 @@ impl Inner {
             let heat = self.heat_of(id);
             self.take_in_place(id, off, end, f, heat, fillers);
         }
-        // An anchor or grow witness in a page the window restates from is
-        // stated again too, where the flush has not touched the id already,
-        // so that the page can empty.
+        // A size statement in a page the window restates from is stated again
+        // too, where the flush has not touched the id already, so that the
+        // page can empty.
         for id in ids {
             if main.records.contains_key(&id) {
                 continue;
@@ -716,13 +716,10 @@ impl Inner {
             let Some(m) = self.state.allocs.get(&id) else {
                 continue;
             };
-            let in_touched =
-                |s: Option<StmtRef>| s.is_some_and(|s| touched.contains(&self.state.slab.page(s)));
-            let (ra, rg) = (in_touched(m.anchor), in_touched(m.grow));
-            if ra || rg {
-                let rec = self.touch(id, false, fillers);
-                rec.replace_anchor |= ra;
-                rec.replace_grow |= rg;
+            if m.size_statement
+                .is_some_and(|s| touched.contains(&self.state.slab.page(s)))
+            {
+                self.touch(id, false, fillers).replace = true;
             }
         }
         self.stats.window_restated += take.len() as u64;

@@ -145,13 +145,13 @@ impl Inner {
                     }
                 }
             }
-            Fragment::ZeroExplicitly { .. } => Pending {
+            Fragment::Zero { .. } => Pending {
                 origin: Origin::None,
                 place: Place::Zero,
                 heat,
                 rewrite: false,
             },
-            _ => return,
+            Fragment::Pending(_) => return,
         };
         self.state.take(id, start, end, p, dirty);
     }
@@ -217,33 +217,21 @@ impl Inner {
             let s = dec.stmt;
             let id = s.id;
             let heat = self.heat_of(id);
-            let (start, end) = match s.kind {
-                Kind::Ref | Kind::Zero | Kind::Inline => {
-                    (s.offset, s.offset.saturating_add(s.size))
+            if s.kind.is_content() {
+                let (start, end) = (s.offset, s.offset.saturating_add(s.size));
+                for (a, b, f) in self.owned_in(id, start, end, page) {
+                    self.take_in_place(id, a, b, f, heat, dirty);
                 }
-                Kind::Shrink => (s.offset, u32::MAX),
-                Kind::Tombstone => (0, u32::MAX),
-                Kind::Grow => (0, 0),
+            }
+            // A size statement or tombstone that lived here is stated again.
+            let held = match self.state.allocs.get(&id) {
+                Some(m) => m.size_statement,
+                None => self.state.recyclable.get(&id).and_then(|r| r.tombstone),
             };
-            for (a, b, f) in self.owned_in(id, start, end, page) {
-                self.take_in_place(id, a, b, f, heat, dirty);
+            if held.is_some_and(|h| self.state.slab.page(h) == page) {
+                self.touch(id, false, dirty).replace = true;
             }
-            let in_page =
-                |s: Option<StmtRef>, st: &State| s.is_some_and(|s| st.slab.page(s) == page);
-            if let Some(m) = self.state.allocs.get(&id) {
-                let (ra, rg) = (in_page(m.anchor, &self.state), in_page(m.grow, &self.state));
-                if ra || rg {
-                    let rec = self.touch(id, false, dirty);
-                    rec.replace_anchor |= ra;
-                    rec.replace_grow |= rg;
-                }
-            } else if let Some(r) = self.state.recyclable.get(&id) {
-                if in_page(r.tombstone, &self.state) {
-                    let rec = self.touch(id, false, dirty);
-                    rec.replace_anchor = true;
-                }
-            }
-            self.state.drop_physically(id, page);
+            self.state.drop_physically(id);
         }
         Ok(())
     }
@@ -350,7 +338,8 @@ impl Inner {
                         j += 1;
                         run_end = keys.get(j + 1).map_or(table.size, |n| n.0);
                     }
-                    let place = if run_end - k <= self.opts.inline_threshold {
+                    let place = if run_end - k <= self.opts.inline_threshold.min(MAX_INLINE as u32)
+                    {
                         Place::Inline
                     } else {
                         Place::Unplaced
@@ -375,22 +364,18 @@ impl Inner {
         }
     }
 
-    /// Grows `id` to `new`. The range a growth exposes resolves through the
-    /// anchor, unless the anchor lives in a page this flush retires: the
-    /// statement the cut restates in its place anchors at the new size and
-    /// covers none of that range, so the range is taken and stated as zeros.
-    pub(crate) fn grow(&mut self, id: u32, old: u32, new: u32, dirty: &mut Dirty) {
-        self.state.grow_size_to(id, new);
-        let retired_anchor = dirty.records.get(&id).is_some_and(|r| r.replace_anchor);
-        if retired_anchor && self.state.allocs[&id].anchor.is_some() {
-            let p = Pending {
-                origin: Origin::None,
-                place: Place::Zero,
-                heat: 0,
-                rewrite: false,
-            };
-            self.state.take(id, old, new, p, dirty);
-        }
+    /// Grows `id` to `new`. The range the growth exposes is taken as zeros,
+    /// which whatever the flush writes there replaces: every byte an
+    /// allocation gains is stated in the epoch that gains it
+    /// (`spec/address-table.md#the-coverage-rule`).
+    pub(crate) fn grow(&mut self, id: u32, new: u32, dirty: &mut Dirty) {
+        let p = Pending {
+            origin: Origin::None,
+            place: Place::Zero,
+            heat: 0,
+            rewrite: false,
+        };
+        self.state.grow_size_to(id, new, p, dirty);
     }
 
     fn apply_fold(&mut self, f: Fold, dirty: &mut Dirty) -> Result<(), Error> {
@@ -402,9 +387,8 @@ impl Inner {
                     let new = e.table.size;
                     if new < old {
                         self.state.shrink_size_to(id, new);
-                        dirty.records.get_mut(&id).unwrap().shrank = true;
                     } else if new > old {
-                        self.grow(id, old, new, dirty);
+                        self.grow(id, new, dirty);
                     }
                     self.take_pieces(id, &e.table, true, old.min(new), dirty);
                 }
@@ -417,9 +401,8 @@ impl Inner {
                     let new = e.table.size;
                     if new < old {
                         self.state.shrink_size_to(id, new);
-                        dirty.records.get_mut(&id).unwrap().shrank = true;
                     } else if new > old {
-                        self.grow(id, old, new, dirty);
+                        self.grow(id, new, dirty);
                     }
                     self.take_pieces(id, &e.table, false, old.min(new), dirty);
                 }
@@ -448,17 +431,14 @@ impl Inner {
         };
         if let Some(r) = self.state.recyclable.remove(&id) {
             meta.mentions = r.mentions;
-            // A live tombstone becomes the new incarnation's anchor; its pin
-            // moves with it.
-            if let Some(t) = r.tombstone {
-                meta.anchor = Some(t);
-                meta.anchor_n = 0;
-            }
+            // A live tombstone stays the size statement, with its pin, until
+            // the cut binds the new incarnation's.
+            meta.size_statement = r.tombstone;
         }
         self.state.allocs.insert(id, meta);
         let rec = self.touch(id, true, dirty);
         rec.allocated = true;
-        self.grow(id, 0, n, dirty);
+        self.grow(id, n, dirty);
     }
 
     fn free(&mut self, id: u32, dirty: &mut Dirty) {
@@ -473,11 +453,8 @@ impl Inner {
                 tombstone: None,
             },
         );
-        if let Some(a) = meta.anchor {
-            self.state.unpin(a);
-        }
-        if let Some(g) = meta.grow {
-            self.state.unpin(g);
+        if let Some(s) = meta.size_statement {
+            self.state.unpin(s);
         }
     }
 

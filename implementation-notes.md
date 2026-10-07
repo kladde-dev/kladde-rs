@@ -25,13 +25,6 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 
 ## In-memory state and loading
 
-- **A `Grow` above a `Tombstone` anchor must survive `n <= anchor.n` — a gap in `impl/liveness.md`.**
-  The second of the three death tests in `impl/liveness.md#grow-is-locally-decidable-and-shrink-is-not` kills a `Grow` whose bound is at most the anchor's, "since the anchor's own term" then achieves the size.
-  That is true of the size, but for a `Tombstone` anchor the `Grow` may also be the only statement asserting existence: `Tombstone`@3 followed by `Grow(0)`@5 is an id re-allocated at size 0, and dropping the `Grow` deletes it.
-  The implementation applies the second test only to a `Shrink` anchor.
-- **A `Grow` stays the grow witness at load whenever the size is 0 — the same gap, seen from the sweep.**
-  `impl/address-table-operations.md#what-the-sweep-leaves-behind` makes the admitted `Grow` the witness exactly when its bound exceeds `run_start`, which a `Grow(0)` never does.
-  For a zero-sized allocation, the `Grow` can be the only proof of existence, so the loader keeps it as the witness whenever the size is 0, at worst one pinned statement too many.
 - **`last_written` is the epoch of the flush that last wrote the id, a `u64`.**
   `impl/in-memory-state.md#3-the-allocation-map` sketches a `u32`; epochs are 64-bit in the format, and ages are computed as epoch differences, so the wider field needs no wrap-around rule.
 - **`Origin::Arena` holds a `u64`.**
@@ -40,21 +33,11 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 - **A page whose coverage reaches zero leaves its bucket at once.**
   It is retired at the next commit either way, and keeping it would waste the samples that victim selection draws from the sparsest bucket, which is exactly where such pages collect.
 - **The statement slab also keeps each statement's id and kind: 14 bytes per slot, where `rust/store.md#the-statement-slab` has 9.**
-  Releasing a statement charges its framing to its allocation's `statement_bytes`, the page rewrite and the window ask which ids a page names, and several paths ask whether a statement is an `Inline` or a `Shrink`.
+  Releasing a statement charges its framing to its allocation's `statement_bytes`, the page rewrite and the window ask which ids a page names, and several paths ask whether a statement is an `Inline`.
   Without the two arrays, each of those would decode the statement from its page again.
 
 ## Flush
 
-- **A growth in the fold must not resolve through an anchor that the header's take retires — a gap in `impl/`.**
-  The flush takes the header's content before the fold, and marks the anchors it held for replacement.
-  When the fold then grows such an id, `grow_size_to` resolves the exposed range through the old anchor, and the replacement `Shrink(id, size)` the cut states anchors at the new size, so it covers none of that range.
-  After the commit, the old anchor is gone from the governing world, and the exposed range resolves through whatever older statement matches it, which can be stale bytes the old anchor had denied.
-  The flush therefore takes the exposed range as a pending zero whenever the id's anchor is being replaced, and the cut states it as a `Zero`.
-  `impl/address-table-operations.md#grow_size_ton-and-shrink_size_ton` should say so; the differential oracle found it within a few hundred random operations.
-- **A grow witness in a retired page must be released when another statement now witnesses the size — a gap in `impl/`.**
-  `impl/address-table-operations.md#what-the-cut-states-for-a-touched-id` restates a retired page's grow witness "unless a row above already states one", and says nothing about the old witness in that case.
-  It then stays pinned in a page that is no longer in the governing world, and in the header's case, in the slot the flush after next overwrites.
-  The cut unpins it.
 - **Every piece the fold sources from elsewhere is read and written afresh.**
   That covers `Copy` and `Move` sources and the tail a `Splice` shifts, which the flush writes as new bytes rather than restating existing ones at new offsets.
   So the flush has no ordering phase (`impl/flush.md#phase-c--ordering`) and no content-blind fast path; the fold's output is only ever new bytes or bytes left where they are.
@@ -68,12 +51,6 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 - **`Store::open` folds a recovered journal before it returns.**
   `spec/journal.md#the-start-of-a-session` asks only that a non-empty recovered journal be folded before anything is appended.
   Folding at open is simpler, and it lets reads, which see flushed state only, see every recovered transaction at once.
-- **The last-tombstone rule must not fire when the tombstone itself is what leaves — a gap in `impl/`.**
-  `drop_physically` in `impl/address-table-operations.md#drop_physicallystmt` releases a non-existent id's tombstone once the id's mentions fall to 1, assuming the one mention left is the tombstone.
-  When the statement dropped *is* the tombstone -- the header's take, or a page rewrite, drops every statement of its page -- the mention left is a dead statement of the id's previous incarnation, which the tombstone was denying.
-  If the id is then re-allocated in the same flush, which recycling makes likely, `allocate` finds no tombstone to anchor the new incarnation on, the cut states no replacement, and after reopening the old incarnation's content resurfaces past the new size.
-  The rule is skipped when the tombstone lives in the page being dropped: the cut restates it, or, for a re-allocated id, replaces it as the anchor with a `Shrink`; and it is released at the cut if nothing names the id any more.
-  The randomized oracle never hit it; a benchmark replacing values in a key-value population did within two flushes, and `tests/churn.rs` now does too.
 - **Ids a recovered journal allocates must be withheld from the id allocator.**
   The allocator is rebuilt at open from the loaded state, which knows nothing of the ids the unfolded journal brings into existence; before the fix, the first `alloc` after a recovery could hand one of them out again.
   `impl/id-recycling.md` should say that recovery counts the journal's ids as used; the consolidator state, whose allocation the recovery flush creates, exposed it.
@@ -148,7 +125,7 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
   A state that does not parse is overwritten in place, keeping its allocation.
 - **An age record is current if no *live* statement naming its allocation is newer than `up_to_date`.**
   `impl/consolidator-state.md#checking-it` asks about every statement naming it; statements that are physically present but dead are not in memory after a load.
-  A dead statement newer than every live one is rare (a `Grow` below the size, from another writer), and the cost of missing it is an age that errs toward old.
+  A dead statement newer than every live one is rare (content past the size, from another writer), and the cost of missing it is an age that errs toward old.
 - **The consolidator state's allocation is hidden from `Store::allocations` and the statistics**, since the application never allocated it.
 - **`close` truncates after the last live page, and a new file's free pages lie below it.**
   `rust/tutorial/durability.md` said that `close()` "flushes and then shrinks the file to its live pages"; it now says that it does not, and that calling `flush()` a few times before `close()` reclaims more.

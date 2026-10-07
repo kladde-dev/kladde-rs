@@ -64,11 +64,10 @@ impl Inner {
                 let (share, age) = owned(stmt);
                 (share, 0.0, age)
             }
-            Fragment::ZeroExplicitly { stmt } => {
+            Fragment::Zero { stmt } => {
                 let (share, age) = owned(stmt);
                 (share, -1.0, age)
             }
-            Fragment::ZeroByDefault => (0.0, -1.0, None),
             Fragment::Pending(p) => match self.state.pending[p as usize].place {
                 Place::Zero => (PENDING_ZERO, -1.0, Some(0)),
                 Place::Inline => (PENDING_INLINE, 0.0, Some(0)),

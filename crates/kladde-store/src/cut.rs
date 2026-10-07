@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use crate::consts::*;
 use crate::error::{corrupt, Error};
 use crate::flush::Output;
-use crate::hash::IdMap;
+use crate::hash::{IdMap, IdSet};
 use crate::page::decode_page;
 use crate::state::*;
 use crate::statement::{Kind, Stmt, TableReader, TableWriter};
@@ -38,8 +38,8 @@ struct Layout {
     leaves: Vec<Vec<usize>>,
 }
 
-/// The size statements a set of records calls for, and the ids whose old
-/// grow witness, or tombstone, they make redundant.
+/// The `Size` and `Tombstone` statements a set of records calls for, and the
+/// ids whose old tombstone leaves with its page, having nothing left to deny.
 struct Sizes {
     stmts: Vec<Derived>,
     retire: Vec<u32>,
@@ -258,7 +258,7 @@ impl Inner {
     /// Drops every statement of table page `p` physically.
     pub(crate) fn drop_page_statements(&mut self, p: u32) -> Result<(), Error> {
         for id in self.page_ids(p)? {
-            self.state.drop_physically(id, p);
+            self.state.drop_physically(id);
         }
         Ok(())
     }
@@ -366,17 +366,26 @@ impl Inner {
         Ok(out)
     }
 
-    /// The statements the touched ids in `records` need for their size and
-    /// existence (`impl/address-table-operations.md#what-the-cut-states-for-a-touched-id`).
-    /// `content` holds every content statement of the flush.
-    fn size_statements(&self, records: &IdMap<IdRecord>, content: &[&[Derived]]) -> Sizes {
-        let mut reach: IdMap<u32> = IdMap::default();
-        for d in content.iter().flat_map(|c| c.iter()) {
-            if d.stmt.kind.is_content() {
-                let e = reach.entry(d.stmt.id).or_default();
-                *e = (*e).max(d.stmt.offset + d.stmt.size);
-            }
-        }
+    /// The `Size` and `Tombstone` statements the touched ids in `records`
+    /// need (`impl/address-table-operations.md#what-the-cut-states-for-a-touched-id`).
+    /// `content` holds every content statement of the flush; an id one of
+    /// which ends at its size needs no `Size`, since that statement is made
+    /// sizing at the end of the cut. Ids in `sized` have a `Size` already.
+    fn size_statements(
+        &self,
+        records: &IdMap<IdRecord>,
+        content: &[&[Derived]],
+        sized: &IdSet,
+    ) -> Sizes {
+        let ends: IdSet = content
+            .iter()
+            .flat_map(|c| c.iter())
+            .filter(|d| {
+                d.stmt.kind.is_content()
+                    && d.stmt.offset + d.stmt.size == self.state.size_of(d.stmt.id)
+            })
+            .map(|d| d.stmt.id)
+            .collect();
         let mut ids: Vec<u32> = records.keys().copied().collect();
         ids.sort_unstable();
         let mut sizes = Sizes {
@@ -393,41 +402,41 @@ impl Inner {
                 heat,
             };
             let Some(m) = self.state.allocs.get(&id) else {
-                if (rec.freed || rec.replace_anchor) && self.state.mentions(id) > 0 {
+                if (rec.freed || rec.replace) && self.state.mentions(id) > 0 {
                     sizes.stmts.push(mk(Stmt::tombstone(id)));
-                } else if rec.replace_anchor {
+                } else if rec.replace {
                     // Nothing names the id any more, so its tombstone, which
                     // leaves with its page, has nothing left to deny.
                     sizes.retire.push(id);
                 }
                 continue;
             };
-            let size = m.size;
-            let reaches = reach.get(&id).is_some_and(|&r| r >= size);
-            let mut anchored = false;
-            let mut grown = false;
-            if rec.shrank {
-                sizes.stmts.push(mk(Stmt::shrink(id, size)));
-                anchored = true;
-            } else if (rec.allocated || size > rec.size_before) && !reaches {
-                sizes.stmts.push(mk(Stmt::grow(id, size)));
-                grown = true;
-            }
-            if rec.replace_anchor && !anchored && m.anchor.is_some() {
-                sizes.stmts.push(mk(Stmt::shrink(id, size)));
-                anchored = true;
-            }
-            if rec.replace_grow && m.grow.is_some() {
-                if !anchored && !grown && !reaches {
-                    sizes.stmts.push(mk(Stmt::grow(id, size)));
-                } else {
-                    // Something else witnesses the size now; the old witness
-                    // lives in a page the flush retires or restates, so it goes.
-                    sizes.retire.push(id);
-                }
+            let needs = rec.allocated || m.size != rec.size_before || rec.replace;
+            if needs && !ends.contains(&id) && !sized.contains(&id) {
+                sizes.stmts.push(mk(Stmt::size_to(id, m.size)));
             }
         }
         sizes
+    }
+
+    /// Makes every content statement that ends at its id's size sizing,
+    /// unless the id has a `Size` among `derived`, which then states it. The
+    /// sizing bit changes no statement's encoded length, so this runs after
+    /// the layout, once the fillers are known too.
+    fn mark_sizing(&self, derived: &mut [Derived]) {
+        let sized: IdSet = derived
+            .iter()
+            .filter(|d| d.stmt.kind == Kind::Size)
+            .map(|d| d.stmt.id)
+            .collect();
+        for d in derived {
+            if d.stmt.kind.is_content()
+                && d.stmt.offset + d.stmt.size == self.state.size_of(d.stmt.id)
+                && !sized.contains(&d.stmt.id)
+            {
+                d.stmt = d.stmt.sized();
+            }
+        }
     }
 
     /// The room the last page of `lay` has left, in encoded bytes.
@@ -443,7 +452,7 @@ impl Inner {
     pub(crate) fn cut(&mut self, dirty: &mut Dirty, out: &mut Output) -> Result<(), Error> {
         let mut kept = self.unlink_leaves(out)?;
         let mut derived = self.derive(&dirty.ranges)?;
-        let sizes = self.size_statements(&dirty.records, &[&derived]);
+        let sizes = self.size_statements(&dirty.records, &[&derived], &IdSet::default());
         derived.extend(sizes.stmts);
         let mut retire = sizes.retire;
         derived.sort_by_key(|d| d.stmt.sort_key());
@@ -462,14 +471,22 @@ impl Inner {
                 out.dropped_tables.extend(victims);
             }
             let mut extra = self.derive(&fillers.ranges)?;
-            let sizes = self.size_statements(&fillers.records, &[&derived, &extra]);
+            let sized: IdSet = derived
+                .iter()
+                .filter(|d| d.stmt.kind == Kind::Size)
+                .map(|d| d.stmt.id)
+                .collect();
+            let sizes = self.size_statements(&fillers.records, &[&derived, &extra], &sized);
             extra.extend(sizes.stmts);
             retire.extend(sizes.retire);
-            dirty.records.extend(fillers.records);
+            for (id, rec) in fillers.records {
+                dirty.records.entry(id).or_insert(rec).merge(rec);
+            }
             let base = derived.len();
             derived.extend(extra);
             add_to_last(&mut lay, (base..derived.len()).collect(), &derived, &kept);
         }
+        self.mark_sizing(&mut derived);
 
         // Pages for the leaves, then the tree above them.
         let mut leaf_pages = Vec::with_capacity(lay.leaves.len());
@@ -547,9 +564,7 @@ impl Inner {
 
         // Bind: every statement gets its slot, its fragments, and its pins.
         for id in retire {
-            if let Some(g) = self.state.allocs.get_mut(&id).and_then(|m| m.grow.take()) {
-                self.state.unpin(g);
-            } else if let Some(t) = self
+            if let Some(t) = self
                 .state
                 .recyclable
                 .get_mut(&id)
@@ -624,7 +639,7 @@ impl Inner {
                             stmt: s,
                         }
                     }
-                    _ => Fragment::ZeroExplicitly { stmt: s },
+                    _ => Fragment::Zero { stmt: s },
                 };
                 for &k in &d.keys[1..] {
                     self.state.frags.remove(&k);
@@ -637,9 +652,11 @@ impl Inner {
                     self.state
                         .note_reverse(dp, id, d.stmt.offset, d.stmt.offset + d.stmt.size);
                 }
+                if d.stmt.sizing {
+                    self.state.set_size_statement(id, s);
+                }
             }
-            Kind::Shrink => self.state.set_anchor(id, s, d.stmt.offset),
-            Kind::Grow => self.state.set_grow_witness(id, s, d.stmt.offset),
+            Kind::Size => self.state.set_size_statement(id, s),
             Kind::Tombstone => {
                 self.state.pin(s);
                 let r = self.state.recyclable.get_mut(&id).unwrap();

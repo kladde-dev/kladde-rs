@@ -19,6 +19,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::consts::MAX_INLINE;
 use crate::error::Error;
 use crate::hash::IdMap;
 use crate::state::*;
@@ -124,16 +125,16 @@ impl Inner {
                     raise(&mut content, id, epoch_of(page));
                     raise(&mut statements, id, epoch_of(self.state.slab.page(stmt)));
                 }
-                Fragment::ZeroExplicitly { stmt } => {
+                Fragment::Zero { stmt } => {
                     let e = epoch_of(self.state.slab.page(stmt));
                     raise(&mut content, id, e);
                     raise(&mut statements, id, e);
                 }
-                _ => {}
+                Fragment::Pending(_) => {}
             }
         }
         for (&id, m) in &self.state.allocs {
-            for s in [m.anchor, m.grow].into_iter().flatten() {
+            if let Some(s) = m.size_statement {
                 let e = epoch_of(self.state.slab.page(s));
                 raise(&mut statements, id, e);
                 content.entry(id).or_insert(e);
@@ -266,7 +267,6 @@ impl Inner {
                 let old = self.state.size_of(id);
                 if (fixed.len() as u32) < old {
                     self.state.shrink_size_to(id, fixed.len() as u32);
-                    dirty.records.get_mut(&id).unwrap().shrank = true;
                 }
             }
             self.put_bytes(id, 0, &fixed, dirty);
@@ -300,13 +300,12 @@ impl Inner {
         for (&k, &f) in &self.state.frags {
             let page = match f {
                 Fragment::Bytes { page, .. } => Some(page),
-                Fragment::ZeroExplicitly { stmt } => Some(self.state.slab.page(stmt)),
+                Fragment::Zero { stmt } => Some(self.state.slab.page(stmt)),
                 Fragment::Pending(p) => match self.state.pending[p as usize].place {
                     Place::Data(a) => Some(split_address(a).0)
                         .filter(|&pg| self.state.pages[pg as usize].state != PageState::Claimed),
                     _ => None,
                 },
-                Fragment::ZeroByDefault => continue,
             };
             // Anything this flush states lands in a page of this epoch.
             let epoch = page.map_or(e, |pg| self.state.pages[pg as usize].epoch);
@@ -333,11 +332,11 @@ impl Inner {
         let end = offset + bytes.len() as u32;
         let old = self.state.size_of(id);
         if end > old {
-            self.grow(id, old, end, dirty);
+            self.grow(id, end, dirty);
         }
         let pos = self.segment_records.arena.len() as u64;
         self.segment_records.arena.extend_from_slice(bytes);
-        let place = if bytes.len() as u32 <= self.opts.inline_threshold {
+        let place = if bytes.len() as u32 <= self.opts.inline_threshold.min(MAX_INLINE as u32) {
             Place::Inline
         } else {
             Place::Unplaced
