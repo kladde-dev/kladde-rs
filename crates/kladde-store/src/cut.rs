@@ -370,7 +370,8 @@ impl Inner {
     /// need (`impl/address-table-operations.md#what-the-cut-states-for-a-touched-id`).
     /// `content` holds every content statement of the flush; an id one of
     /// which ends at its size needs no `Size`, since that statement is made
-    /// sizing at the end of the cut. Ids in `sized` have a `Size` already.
+    /// sizing at the end of the cut. Ids in `sized` have a `Size` or
+    /// `Tombstone` already.
     fn size_statements(
         &self,
         records: &IdMap<IdRecord>,
@@ -402,6 +403,9 @@ impl Inner {
                 heat,
             };
             let Some(m) = self.state.allocs.get(&id) else {
+                if sized.contains(&id) {
+                    continue;
+                }
                 if (rec.freed || rec.replace) && self.state.mentions(id) > 0 {
                     sizes.stmts.push(mk(Stmt::tombstone(id)));
                 } else if rec.replace {
@@ -459,13 +463,14 @@ impl Inner {
         let mut lay = layout(&derived, &kept);
 
         // The fillers: whole table victims that fit the last page's room,
-        // then the rotating window. They state only ids the flush has not
-        // touched otherwise, so their statements merge into the last page
-        // without conflicting with anything laid out already.
+        // then the rotating window. What they restate merges into the last
+        // page: their content cannot conflict with the flush's own, since
+        // they take only fragments the flush has not taken, and which
+        // statement states an id's size is settled only once they are known.
         if self.opts.consolidate {
             let room = self.last_room(&lay, &derived, &kept);
             let mut fillers = Dirty::default();
-            let victims = self.cut_fillers(room, dirty, &mut fillers)?;
+            let victims = self.cut_fillers(room, &mut fillers)?;
             if !victims.is_empty() {
                 kept.retain(|p| !victims.contains(p));
                 out.dropped_tables.extend(victims);
@@ -473,7 +478,7 @@ impl Inner {
             let mut extra = self.derive(&fillers.ranges)?;
             let sized: IdSet = derived
                 .iter()
-                .filter(|d| d.stmt.kind == Kind::Size)
+                .filter(|d| matches!(d.stmt.kind, Kind::Size | Kind::Tombstone))
                 .map(|d| d.stmt.id)
                 .collect();
             let sizes = self.size_statements(&fillers.records, &[&derived, &extra], &sized);

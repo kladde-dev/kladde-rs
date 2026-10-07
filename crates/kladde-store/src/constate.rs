@@ -207,7 +207,7 @@ impl Inner {
             // The walk at open: read-only, it finds the candidates the
             // previous session's last walk found and no flush executed.
             self.state.flush_epoch = self.epoch + 1;
-            self.window(0, &Dirty::default(), &mut Dirty::default());
+            self.window(0, &mut Dirty::default());
         }
         Ok(())
     }

@@ -591,41 +591,30 @@ impl Inner {
 
     // ------------------------------------------------------------ at the cut
 
-    /// Whether the cut's fillers may rewrite table page `p`: its statements
-    /// must name only ids the flush has not touched, so that what they
-    /// restate cannot conflict with the statements laid out already.
-    fn filler_eligible(&self, p: u32, main: &Dirty) -> bool {
-        !self.flush_rewritten.contains(&p)
-            && self
-                .page_ids(p)
-                .is_ok_and(|ids| ids.iter().all(|id| !main.records.contains_key(id)))
-    }
-
     /// The fillers of the cut's last page: whole table victims that fit its
     /// `room`, then the rotating window. Takes into `fillers`, and returns
     /// the victims.
     pub(crate) fn cut_fillers(
         &mut self,
         room: usize,
-        main: &Dirty,
         fillers: &mut Dirty,
     ) -> Result<Vec<u32>, Error> {
         let mut room = room as f64;
         let mut victims = Vec::new();
         while let Some(b) = self.state.table_buckets.lowest_non_empty() {
             let limit = (room / RESTATE) as u32;
-            let tail = self.compaction_victim(false).filter(|&t| {
-                self.state.pages[t as usize].coverage <= limit && self.filler_eligible(t, main)
-            });
-            let eligible = |i: &Inner, p: u32| i.filler_eligible(p, main);
-            let Some(v) = tail.or_else(|| self.pick_victim(false, b, limit, &eligible)) else {
+            let fresh = |i: &Inner, p: u32| !i.flush_rewritten.contains(&p);
+            let tail = self
+                .compaction_victim(false)
+                .filter(|&t| self.state.pages[t as usize].coverage <= limit && fresh(self, t));
+            let Some(v) = tail.or_else(|| self.pick_victim(false, b, limit, &fresh)) else {
                 break;
             };
             room -= self.state.pages[v as usize].coverage as f64 * RESTATE;
             self.rewrite_table_victims(&[v], fillers)?;
             victims.push(v);
         }
-        self.window(room.max(0.0) as usize, main, fillers);
+        self.window(room.max(0.0) as usize, fillers);
         Ok(victims)
     }
 
@@ -633,7 +622,7 @@ impl Inner {
     /// restates live fragments from the cursor on, in place, until `room`
     /// bytes of encoding are used, and moves the cursor past `walk`
     /// fragments either way.
-    pub(crate) fn window(&mut self, room: usize, main: &Dirty, fillers: &mut Dirty) {
+    pub(crate) fn window(&mut self, room: usize, fillers: &mut Dirty) {
         let n = self.opts.walk.min(self.state.frags.len());
         if n == 0 {
             return;
@@ -707,12 +696,8 @@ impl Inner {
             self.take_in_place(id, off, end, f, heat, fillers);
         }
         // A size statement in a page the window restates from is stated again
-        // too, where the flush has not touched the id already, so that the
-        // page can empty.
+        // too, so that the page can empty.
         for id in ids {
-            if main.records.contains_key(&id) {
-                continue;
-            }
             let Some(m) = self.state.allocs.get(&id) else {
                 continue;
             };
