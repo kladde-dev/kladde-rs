@@ -92,10 +92,11 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 - **The budget loop never continues the last page of `pack`.**
   The design lets that page cut a victim's survivor whenever the loop opens another page, so that only the flush's very last data page can close short.
   Here, `pack`'s last page is filled by free filling alone, and can close short even when the loop goes on.
-- **A table victim's restatements are estimated at 1.25 times its coverage.**
-  Fragments split by shadowing need a statement each, and restated statements lose the delta encoding of their old neighbours; `impl/consolidation.md#the-page-rewrite` prices the rewrite by coverage alone, as `(C − written) / written`.
-  With the estimate as `written`, a victim passes the churn floor at coverage up to `C / (1.25 · (1 + λ))`, and an offer of table victims costs the budget `written / C` pages.
-  If the estimate is too low for a filler, what does not fit the last page spills into another leaf.
+- **The cut takes a filler only if what its restatements take, computed before it takes it, fits the room of its last page.**
+  `impl/consolidation.md#the-page-rewrite` takes a table victim only where all of its restatements fit, and estimates them from its coverage while it is only being offered; at the cut, an estimate too low would spill the excess into a leaf of its own.
+  So the cut computes them from the fragment map, as a run of their own: a statement per run of the fragments the victim's live statements own, merged as the cut merges a run, and a `Size` or `Tombstone` for each id whose size statement or tombstone the victim holds; a victim they would not fit is passed over for the rest of the flush.
+  Merged into the last page, they take at most that much, with no slack: each statement's delta to its neighbour there is no larger than in the run, whose first statement already pays its whole id and offset, and merging with neighbours only drops statements.
+  On kladde-svg's drawings and text-bench's texts, the restatements take 0.94 to 1.05 times the victim's coverage, which is what the budget prices them at.
 - **The header keeps its hottest statements one by one, not the coldest key-contiguous run.**
   `impl/flush.md#the-header-as-write-buffer` recommends evicting the coldest run in key order, so that leaves cover coherent id ranges.
   The cut fills the header with the hottest statements that fit and cuts the rest into leaves in key order, which gets the leaves' key order but not the runs.
