@@ -643,9 +643,9 @@ impl Inner {
     }
 
     /// One step of the rotating window (`impl/consolidation.md#the-rotating-window`):
-    /// restates live fragments from the cursor on, in place, until `room`
-    /// bytes of encoding are used, and moves the cursor past `walk`
-    /// fragments either way.
+    /// restates live fragments from the cursor on, in place, while they fit
+    /// `room` bytes of encoding together with the `Size` statements they call
+    /// for, and moves the cursor past `walk` fragments either way.
     pub(crate) fn window(&mut self, room: usize, fillers: &mut Dirty) {
         let n = self.opts.walk.min(self.state.frags.len());
         if n == 0 {
@@ -663,6 +663,22 @@ impl Inner {
         let zeros = [0u8; crate::consts::MAX_INLINE];
         let mut w = crate::statement::TableWriter::new();
         w.end_children();
+        // The bytes encoded before the walk last wrapped around.
+        let mut done = 0usize;
+        // Per fragment taken, the bytes the window takes up to it, and the
+        // bytes of the `Size` statements those fragments call for: one for
+        // each id taken whose size statement lies in a page they restate
+        // from, as the take below marks them, encoded alone.
+        let mut used: Vec<(usize, usize)> = Vec::new();
+        let (mut touched, mut charged) = (IdSet::default(), IdSet::default());
+        let mut waiting: IdMap<Vec<u32>> = IdMap::default();
+        let mut size_bytes = 0usize;
+        let size_len = |i: &Inner, id: u32| {
+            crate::statement::TableWriter::standalone_len(&crate::statement::Stmt::size_to(
+                id,
+                i.state.size_of(id),
+            ))
+        };
         let mut prev: Option<Key> = None;
         let mut full = false;
         let mut take: Vec<(u32, u32, u32, Fragment)> = Vec::new();
@@ -678,7 +694,8 @@ impl Inner {
                 run.clear();
             }
             if wrapped {
-                // The encoding starts afresh.
+                // The encoding starts afresh, after what came before.
+                done += w.len();
                 w = crate::statement::TableWriter::new();
                 w.end_children();
             }
@@ -697,13 +714,47 @@ impl Inner {
                 }
                 _ => crate::statement::Stmt::zero(id, off, len),
             };
-            if w.len() + w.statement_len(&stmt) > room {
+            if done + w.len() + w.statement_len(&stmt) > room {
                 full = true;
                 continue;
             }
             w.push(&stmt, &zeros[..if inline { len as usize } else { 0 }]);
             take.push((id, off, end, f));
+            // A page the window now restates from calls for the size
+            // statements it holds of ids already taken, and this id's size
+            // statement is called for once its page is restated from.
+            let page = self.state.slab.page(s);
+            if touched.insert(page) {
+                for other in waiting.remove(&page).unwrap_or_default() {
+                    if charged.insert(other) {
+                        size_bytes += size_len(self, other);
+                    }
+                }
+            }
+            if let Some(sp) = self
+                .state
+                .allocs
+                .get(&id)
+                .and_then(|m| m.size_statement)
+                .map(|h| self.state.slab.page(h))
+            {
+                if touched.contains(&sp) {
+                    if charged.insert(id) {
+                        size_bytes += size_len(self, id);
+                    }
+                } else {
+                    waiting.entry(sp).or_default().push(id);
+                }
+            }
+            used.push((done + w.len(), size_bytes));
         }
+        // The fragments that fit together with the size statements they call
+        // for; both only grow along the walk.
+        let fit = used
+            .iter()
+            .rposition(|&(bytes, sizes)| bytes + sizes <= room)
+            .map_or(0, |i| i + 1);
+        take.truncate(fit);
         self.candidates_of(prev.map_or(0, kid), &run, &mut found);
         self.cons.candidates = found;
         self.cons.cursor = items.last().map_or(start, |&(k, _)| k.wrapping_add(1));
