@@ -487,7 +487,11 @@ impl Inner {
             }
             let base = derived.len();
             derived.extend(extra);
+            let leaves = lay.leaves.len();
             add_to_last(&mut lay, (base..derived.len()).collect(), &derived, &kept);
+            // The fillers and the window bound what they add, so the last
+            // page never spills into a leaf of its own.
+            debug_assert_eq!(lay.leaves.len(), leaves, "the cut's last page spilled");
         }
         self.mark_sizing(&mut derived);
 
