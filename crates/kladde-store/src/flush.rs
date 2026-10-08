@@ -7,10 +7,10 @@ use std::collections::VecDeque;
 use crate::consts::*;
 use crate::error::{corrupt, Error};
 use crate::fold::{fold, Fold, Source};
-use crate::hash::IdMap;
+use crate::hash::{IdMap, IdSet};
 use crate::page::{decode_page, new_page, seal_page, PageBuf};
 use crate::state::*;
-use crate::statement::{Kind, TableReader};
+use crate::statement::{Kind, Stmt, TableReader, TableWriter};
 use crate::store::{take_page, Inner, Tx};
 
 /// A data page the flush fills.
@@ -58,6 +58,24 @@ fn zero_pending() -> Pending {
         heat: 0,
         rewrite: false,
     }
+}
+
+/// Whether the cut's `derive` states `next` in one statement with `prev`,
+/// which it directly follows: the same id and kind, adjacent, and for a
+/// `Ref` adjacent bytes in one data page, for an `Inline` no longer than
+/// `threshold` together.
+fn continues(prev: &Stmt, next: &Stmt, threshold: u32) -> bool {
+    prev.id == next.id
+        && prev.kind == next.kind
+        && prev.offset + prev.size == next.offset
+        && match next.kind {
+            Kind::Ref => {
+                prev.address + prev.size as u64 == next.address
+                    && split_address(prev.address).0 == split_address(next.address).0
+            }
+            Kind::Inline => prev.size + next.size <= threshold,
+            _ => true,
+        }
 }
 
 /// Splits the pieces of `table` that name `id`'s committed bytes where those
@@ -344,6 +362,88 @@ impl Inner {
             self.state.drop_physically(id);
         }
         Ok(())
+    }
+
+    /// The bytes that stating again what table page `page` holds would take,
+    /// computed from the fragment map without taking anything: a statement
+    /// per run of the fragments its live statements own, merged as the cut
+    /// merges a run, and a `Size` or `Tombstone` for each id whose size
+    /// statement or tombstone it holds, encoded as one run of their own.
+    ///
+    /// Merged into a page among other statements, they add at most this
+    /// much to it: each statement's delta to its neighbour there is no
+    /// larger than in the run, whose first statement already pays its whole
+    /// id and offset, and merging with neighbours only drops statements.
+    pub(crate) fn restatement_len(&self, page: u32) -> Result<usize, Error> {
+        let buf = self
+            .table_pages
+            .get(&page)
+            .ok_or_else(|| corrupt("a table page is not resident"))?;
+        let d = decode_page(buf, page < 2)
+            .map_err(|_| corrupt("a resident table page does not decode"))?;
+        let (_, mut r) = TableReader::open(&buf[..], d.content)?;
+        let threshold = self.opts.inline_threshold.clamp(1, MAX_INLINE as u32);
+        let mut stmts: Vec<Stmt> = Vec::new();
+        let mut held: Vec<u32> = Vec::new();
+        while let Some(dec) = r.next_stmt()? {
+            let s = dec.stmt;
+            let id = s.id;
+            if s.kind.is_content() {
+                let (start, end) = (s.offset, s.offset.saturating_add(s.size));
+                for (a, b, f) in self.owned_in(id, start, end, page) {
+                    let next = match f {
+                        Fragment::Bytes { stmt, .. }
+                            if self.state.slab.kinds[stmt.idx()] == Kind::Inline =>
+                        {
+                            Stmt::inline(id, a, b - a)
+                        }
+                        Fragment::Bytes { page, offset, .. } => {
+                            Stmt::reference(id, a, b - a, address(page, offset))
+                        }
+                        Fragment::Zero { .. } => Stmt::zero(id, a, b - a),
+                        Fragment::Pending(_) => continue,
+                    };
+                    match stmts.last_mut() {
+                        Some(prev) if continues(prev, &next, threshold) => prev.size += next.size,
+                        _ => stmts.push(next),
+                    }
+                }
+            }
+            let h = match self.state.allocs.get(&id) {
+                Some(m) => m.size_statement,
+                None => self.state.recyclable.get(&id).and_then(|r| r.tombstone),
+            };
+            if h.is_some_and(|h| self.state.slab.page(h) == page) && held.last() != Some(&id) {
+                held.push(id);
+            }
+        }
+        // As the cut states them: a `Size` only where no content statement
+        // ends at the size, and a tombstone wherever one may be needed.
+        let ends: IdSet = stmts
+            .iter()
+            .filter(|s| s.offset + s.size == self.state.size_of(s.id))
+            .map(|s| s.id)
+            .collect();
+        for id in held {
+            match self.state.allocs.get(&id) {
+                Some(m) if !ends.contains(&id) => stmts.push(Stmt::size_to(id, m.size)),
+                Some(_) => {}
+                None => stmts.push(Stmt::tombstone(id)),
+            }
+        }
+        stmts.sort_by_key(Stmt::sort_key);
+        let zeros = [0u8; MAX_INLINE];
+        let mut w = TableWriter::new();
+        w.end_children();
+        for s in &stmts {
+            let payload = if s.kind == Kind::Inline {
+                &zeros[..s.size as usize]
+            } else {
+                &[][..]
+            };
+            w.push(s, payload);
+        }
+        Ok(w.len() - 1)
     }
 
     fn take_header(&mut self, dirty: &mut Dirty) -> Result<(), Error> {
