@@ -10,7 +10,7 @@ use crate::fold::{fold, Fold, Source};
 use crate::hash::{IdMap, IdSet};
 use crate::page::{decode_page, new_page, seal_page, PageBuf};
 use crate::state::*;
-use crate::statement::{Kind, Stmt, TableReader, TableWriter};
+use crate::statement::{Kind, Stmt, TableLen, TableReader};
 use crate::store::{take_page, Inner, Tx};
 
 /// A data page the flush fills.
@@ -432,16 +432,10 @@ impl Inner {
             }
         }
         stmts.sort_by_key(Stmt::sort_key);
-        let zeros = [0u8; MAX_INLINE];
-        let mut w = TableWriter::new();
+        let mut w = TableLen::new();
         w.end_children();
         for s in &stmts {
-            let payload = if s.kind == Kind::Inline {
-                &zeros[..s.size as usize]
-            } else {
-                &[][..]
-            };
-            w.push(s, payload);
+            w.push(s);
         }
         Ok(w.len() - 1)
     }
