@@ -11,7 +11,7 @@ use crate::flush::Output;
 use crate::hash::{IdMap, IdSet};
 use crate::page::decode_page;
 use crate::state::*;
-use crate::statement::{Kind, Stmt, TableReader, TableWriter};
+use crate::statement::{Kind, Stmt, TableLen, TableReader, TableWriter};
 use crate::store::{take_page, Inner};
 
 /// A statement the cut derived, and what it states.
@@ -47,10 +47,10 @@ struct Sizes {
 
 /// The encoded length of the statements `set`, without a child list.
 fn statements_len(set: &[usize], derived: &[Derived]) -> usize {
-    let mut w = TableWriter::new();
+    let mut w = TableLen::new();
     w.end_children();
     for &i in set {
-        w.push(&derived[i].stmt, &derived[i].payload);
+        w.push(&derived[i].stmt);
     }
     w.len() - 1
 }
@@ -78,17 +78,17 @@ fn sort_by_key(set: &mut [usize], derived: &[Derived]) {
 /// statement does not fit.
 fn split_leaves(order: &[usize], derived: &[Derived]) -> Vec<Vec<usize>> {
     let mut out = Vec::new();
-    let mut w = TableWriter::new();
+    let mut w = TableLen::new();
     w.end_children();
     let mut cur: Vec<usize> = Vec::new();
     for &i in order {
         let l = w.statement_len(&derived[i].stmt);
         if w.len() + l > MAX_PAGE_CONTENT && !cur.is_empty() {
             out.push(std::mem::take(&mut cur));
-            w = TableWriter::new();
+            w = TableLen::new();
             w.end_children();
         }
-        w.push(&derived[i].stmt, &derived[i].payload);
+        w.push(&derived[i].stmt);
         cur.push(i);
     }
     if !cur.is_empty() {

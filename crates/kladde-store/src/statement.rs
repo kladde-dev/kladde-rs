@@ -151,14 +151,120 @@ fn put_varint(buf: &mut Vec<u8>, v: u64) {
     kladde_varint::encode(v, buf);
 }
 
+/// Where the statements of a page stand in its delta encoding: whether the
+/// child list is closed, and the cursors the next statement is encoded
+/// against. [`TableWriter`] and [`TableLen`] share it, so that what one
+/// encodes and the other counts cannot disagree.
+#[derive(Clone, Copy, Debug, Default)]
+struct Cursors {
+    children_closed: bool,
+    id_cursor: u32,
+    offset_cursor: u32,
+}
+
+impl Cursors {
+    /// The offset cursor `s` is delta-encoded against: the current one if
+    /// `s` names the same id, else 0.
+    #[inline]
+    fn offset_base(&self, s: &Stmt) -> u32 {
+        if s.id != self.id_cursor {
+            0
+        } else {
+            self.offset_cursor
+        }
+    }
+
+    /// The encoded length `s` adds, inline payload included, and the child
+    /// list's delimiter if `s` is the first statement.
+    #[inline]
+    fn statement_len(&self, s: &Stmt) -> usize {
+        let id_delta = s.id - self.id_cursor;
+        let oc = self.offset_base(s);
+        let mut len = varint_len(id_delta as u64) + 1 + usize::from(!self.children_closed);
+        match s.kind {
+            Kind::Ref => {
+                len += varint_len((s.offset - oc) as u64)
+                    + varint_len(s.size as u64)
+                    + varint_len(s.address)
+            }
+            Kind::Zero => len += varint_len((s.offset - oc) as u64) + varint_len(s.size as u64),
+            Kind::Size => len += varint_len((s.offset - oc) as u64),
+            Kind::Tombstone => {}
+            Kind::Inline => len += varint_len((s.offset - oc) as u64) + s.size as usize,
+        }
+        len
+    }
+
+    /// Moves past `s`, as its encoding leaves the cursors.
+    #[inline]
+    fn advance(&mut self, s: &Stmt) {
+        self.children_closed = true;
+        if s.id != self.id_cursor {
+            self.offset_cursor = 0;
+        }
+        match s.kind {
+            Kind::Ref | Kind::Zero | Kind::Inline => self.offset_cursor = s.offset + s.size,
+            Kind::Size => self.offset_cursor = s.offset,
+            Kind::Tombstone => {}
+        }
+        self.id_cursor = s.id;
+    }
+}
+
 /// Encodes the `content` of an address-table page, child references first.
 #[derive(Clone, Debug, Default)]
 pub struct TableWriter {
     buf: Vec<u8>,
     page_cursor: u32,
-    children_closed: bool,
-    id_cursor: u32,
-    offset_cursor: u32,
+    cur: Cursors,
+}
+
+/// Measures the `content` of an address-table page without a child list as
+/// [`TableWriter`] would encode it, without encoding anything: for a layout
+/// that needs to know what statements take before it writes a page.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TableLen {
+    len: usize,
+    cur: Cursors,
+}
+
+impl TableLen {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Counts the empty child list's delimiter, as
+    /// [`TableWriter::end_children`] writes it. A first statement counts it
+    /// too, if this was not called.
+    pub fn end_children(&mut self) {
+        debug_assert!(!self.cur.children_closed);
+        self.len += 1;
+        self.cur.children_closed = true;
+    }
+
+    /// The content length so far.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The encoded length `s` would add, inline payload included, given what
+    /// was counted before it.
+    #[inline]
+    pub fn statement_len(&self, s: &Stmt) -> usize {
+        self.cur.statement_len(s)
+    }
+
+    /// Counts `s`, under the order [`TableWriter::push`] requires.
+    #[inline]
+    pub fn push(&mut self, s: &Stmt) {
+        debug_assert!(s.id >= self.cur.id_cursor, "statements out of id order");
+        debug_assert!(
+            s.kind == Kind::Tombstone || s.offset >= self.cur.offset_base(s),
+            "offset cursor moves backwards"
+        );
+        self.len += self.cur.statement_len(s);
+        self.cur.advance(s);
+    }
 }
 
 /// Where a pushed statement landed.
@@ -188,48 +294,28 @@ impl TableWriter {
 
     /// Appends a child reference; children must ascend.
     pub fn child(&mut self, page: u32) {
-        assert!(!self.children_closed && page > self.page_cursor && page >= 2);
+        assert!(!self.cur.children_closed && page > self.page_cursor && page >= 2);
         put_varint(&mut self.buf, (page - self.page_cursor) as u64);
         self.page_cursor = page;
     }
 
     /// Ends the child list. Called once, before the first statement.
     pub fn end_children(&mut self) {
-        assert!(!self.children_closed);
+        assert!(!self.cur.children_closed);
         self.buf.push(0);
-        self.children_closed = true;
+        self.cur.children_closed = true;
     }
 
     /// The content length so far.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.buf.len()
-    }
-
-    /// The encoded length `s` would add, inline payload included, given what
-    /// was pushed before it.
-    pub fn statement_len(&self, s: &Stmt) -> usize {
-        let id_delta = s.id - self.id_cursor;
-        let oc = if id_delta != 0 { 0 } else { self.offset_cursor };
-        // A first statement also closes the child list.
-        let mut len = varint_len(id_delta as u64) + 1 + usize::from(!self.children_closed);
-        match s.kind {
-            Kind::Ref => {
-                len += varint_len((s.offset - oc) as u64)
-                    + varint_len(s.size as u64)
-                    + varint_len(s.address)
-            }
-            Kind::Zero => len += varint_len((s.offset - oc) as u64) + varint_len(s.size as u64),
-            Kind::Size => len += varint_len((s.offset - oc) as u64),
-            Kind::Tombstone => {}
-            Kind::Inline => len += varint_len((s.offset - oc) as u64) + s.size as usize,
-        }
-        len
     }
 
     /// The length `s` would take as the first statement of a page, which by
     /// subadditivity bounds what it adds anywhere.
     pub fn standalone_len(s: &Stmt) -> usize {
-        TableWriter {
+        Cursors {
             children_closed: true,
             ..Default::default()
         }
@@ -240,17 +326,14 @@ impl TableWriter {
     /// must be pushed in `(id, offset)` order and must never move the offset
     /// cursor backwards.
     pub fn push(&mut self, s: &Stmt, payload: &[u8]) -> Pushed {
-        if !self.children_closed {
+        if !self.cur.children_closed {
             self.end_children();
         }
-        assert!(s.id >= self.id_cursor, "statements out of id order");
-        let id_delta = s.id - self.id_cursor;
-        if id_delta != 0 {
-            self.offset_cursor = 0;
-        }
+        assert!(s.id >= self.cur.id_cursor, "statements out of id order");
+        let id_delta = s.id - self.cur.id_cursor;
         let start = self.buf.len();
         put_varint(&mut self.buf, id_delta as u64);
-        let oc = self.offset_cursor;
+        let oc = self.cur.offset_base(s);
         let mut payload_pos = 0;
         let sizing = u8::from(s.sizing);
         debug_assert!(!s.sizing || s.kind.is_content());
@@ -261,14 +344,12 @@ impl TableWriter {
                 put_varint(&mut self.buf, (s.offset - oc) as u64);
                 put_varint(&mut self.buf, s.size as u64);
                 put_varint(&mut self.buf, s.address);
-                self.offset_cursor = s.offset + s.size;
             }
             Kind::Zero => {
                 assert!(s.offset >= oc, "offset cursor moves backwards");
                 self.buf.push(2 | sizing);
                 put_varint(&mut self.buf, (s.offset - oc) as u64);
                 put_varint(&mut self.buf, s.size as u64);
-                self.offset_cursor = s.offset + s.size;
             }
             Kind::Tombstone => {
                 self.buf.push(4);
@@ -277,7 +358,6 @@ impl TableWriter {
                 assert!(s.offset >= oc, "offset cursor moves backwards");
                 self.buf.push(5);
                 put_varint(&mut self.buf, (s.offset - oc) as u64);
-                self.offset_cursor = s.offset;
             }
             Kind::Inline => {
                 assert!(s.offset >= oc, "offset cursor moves backwards");
@@ -287,10 +367,9 @@ impl TableWriter {
                 put_varint(&mut self.buf, (s.offset - oc) as u64);
                 payload_pos = self.buf.len();
                 self.buf.extend_from_slice(payload);
-                self.offset_cursor = s.offset + s.size;
             }
         }
-        self.id_cursor = s.id;
+        self.cur.advance(s);
         let framing = (self.buf.len()
             - start
             - if s.kind == Kind::Inline {
@@ -306,7 +385,7 @@ impl TableWriter {
 
     /// The finished content.
     pub fn into_content(mut self) -> Vec<u8> {
-        if !self.children_closed {
+        if !self.cur.children_closed {
             self.end_children();
         }
         self.buf
@@ -467,14 +546,22 @@ mod tests {
         let mut w = TableWriter::new();
         w.child(4);
         w.child(9);
+        // Measured from after the child list, which the first statement
+        // closes in both.
+        let mut measure = TableLen::new();
         let mut lens = Vec::new();
         for (s, p) in &stmts {
-            let predicted = w.statement_len(s);
+            let predicted = measure.statement_len(s);
             let before = w.len();
             let pushed = w.push(s, p);
+            measure.push(s);
             lens.push(pushed.framing);
             assert_eq!(w.len() - before, predicted);
         }
+        assert_eq!(
+            w.len(),
+            TableWriter::children_len(&[4, 9]) - 1 + measure.len()
+        );
         let content = w.into_content();
         let mut page = new_page();
         encode_page(&mut page, None, KIND_ADDRESS_TABLE, 4, &content);
@@ -494,6 +581,106 @@ mod tests {
         }
         assert!(r.next_stmt().unwrap().is_none());
         let _ = CONTENT_OFFSET;
+    }
+
+    /// A page's statements in the order a writer pushes them, chosen by a
+    /// fixed xorshift sequence from `seed`: every kind, both variants, and
+    /// deltas, sizes and addresses of every varint width.
+    fn random_page(seed: u64) -> Vec<(Stmt, Vec<u8>)> {
+        let mut x = seed | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        // A number below 2^bits, for a bit count up to `max_bits`.
+        let below = |max_bits: u64, next: &mut dyn FnMut() -> u64| {
+            let bits = next() % (max_bits + 1);
+            if bits == 0 {
+                0
+            } else {
+                next() >> (64 - bits)
+            }
+        };
+        let mut out = Vec::new();
+        let mut id = below(8, &mut next) as u32;
+        for i in 0..(next() % 300) {
+            if i > 0 {
+                let Some(n) = id.checked_add(1 + below(31, &mut next) as u32) else {
+                    break;
+                };
+                id = n;
+            }
+            if next() % 8 == 0 {
+                out.push((Stmt::tombstone(id), vec![]));
+                continue;
+            }
+            let mut cursor = 0u64;
+            for _ in 0..(1 + next() % 6) {
+                let offset = cursor + below(24, &mut next);
+                let (stmt, payload) = match next() % 3 {
+                    0 => {
+                        let size = 1 + next() % MAX_INLINE as u64;
+                        let s = Stmt::inline(id, offset as u32, size as u32);
+                        (s, vec![0xa5; size as usize])
+                    }
+                    1 => {
+                        let size = 1 + below(16, &mut next);
+                        (Stmt::zero(id, offset as u32, size as u32), vec![])
+                    }
+                    _ => {
+                        let size = 1 + below(16, &mut next);
+                        let address = below(49, &mut next);
+                        (
+                            Stmt::reference(id, offset as u32, size as u32, address),
+                            vec![],
+                        )
+                    }
+                };
+                if stmt.end() > u32::MAX as u64 {
+                    break;
+                }
+                cursor = stmt.end();
+                out.push((stmt, payload));
+            }
+            if next() % 2 == 0 {
+                let last = out.len() - 1;
+                out[last].0 = out[last].0.sized();
+            } else if cursor + 1 < u32::MAX as u64 {
+                out.push((
+                    Stmt::size_to(id, (cursor + below(8, &mut next)) as u32),
+                    vec![],
+                ));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn table_len_counts_what_table_writer_encodes() {
+        for seed in 0..500u64 {
+            let stmts = random_page(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            // With the child list closed first, and closed by the first
+            // statement.
+            for close_first in [true, false] {
+                let mut w = TableWriter::new();
+                let mut measure = TableLen::new();
+                if close_first {
+                    w.end_children();
+                    measure.end_children();
+                }
+                for (s, p) in &stmts {
+                    let predicted = measure.statement_len(s);
+                    let before = w.len();
+                    w.push(s, p);
+                    measure.push(s);
+                    assert_eq!(w.len() - before, predicted, "seed {seed}: {s:?}");
+                    assert_eq!(w.len(), measure.len(), "seed {seed}: {s:?}");
+                }
+                assert_eq!(w.into_content().len(), measure.len().max(1), "seed {seed}");
+            }
+        }
     }
 
     #[test]
