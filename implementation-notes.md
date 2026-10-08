@@ -106,13 +106,15 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 - **The budget loop never continues the last page of `pack`.**
   The design lets that page cut a victim's survivor whenever the loop opens another page, so that only the flush's very last data page can close short.
   Here, `pack`'s last page is filled by free filling alone, and can close short even when the loop goes on.
-- **A table victim's restatements are estimated at 1.25 times its coverage.**
-  Fragments split by shadowing need a statement each, and restated statements lose the delta encoding of their old neighbours; `impl/consolidation.md#the-page-rewrite` prices the rewrite by coverage alone.
-  If the estimate is too low for a filler, what does not fit the last page spills into another leaf.
 - **A budgeted page rewrite opens no page of its own.**
   It takes its victims before the cut, whose layout then needs about one more leaf per offer; the budget counts it as a page all the same, and holds it to the fill floor like a data offer.
   Since its restatements join leaves the cut packs full anyway, the fill floor could be dropped for table offers, with the budget charged their estimated restatements in fractions of a page.
   That was tried and not kept: with 64 MiB of uniform overwrites it raised the fill of table pages from 0.59 to 0.70 but shrank the file only from 1.53 to 1.51 times its live size, and made the median flush 38 % slower; at 1 MiB the file came out larger.
+- **The cut takes a filler only if what its restatements take, computed before it takes it, fits the room of its last page.**
+  `impl/consolidation.md#the-page-rewrite` takes a table victim only where all of its restatements fit, and estimates them from its coverage while it is only being offered; at the cut, an estimate too low would spill the excess into a leaf of its own.
+  So the cut computes them from the fragment map, as a run of their own: a statement per run of the fragments the victim's live statements own, merged as the cut merges a run, and a `Size` or `Tombstone` for each id whose size statement or tombstone the victim holds; a victim they would not fit is passed over for the rest of the flush.
+  Merged into the last page, they take at most that much, with no slack: each statement's delta to its neighbour there is no larger than in the run, whose first statement already pays its whole id and offset, and merging with neighbours only drops statements.
+  On kladde-svg's drawings and text-bench's texts, the restatements take 0.94 to 1.05 times the victim's coverage, which is what the budget prices them at.
 - **The header keeps its hottest statements one by one, not the coldest key-contiguous run.**
   `impl/flush.md#the-header-as-write-buffer` recommends evicting the coldest run in key order, so that leaves cover coherent id ranges.
   The cut fills the header with the hottest statements that fit and cuts the rest into leaves in key order, which gets the leaves' key order but not the runs.
@@ -160,11 +162,11 @@ The notes below say what the draft leaves open, and where the implementation dep
   Because the measure differs, so does the meaning of `τ`, and its default: 0.75 of the live pages, where the main branch's 0.8 of the whole file is out of reach.
 - **The price holds where moving it could change nothing**: it does not fall after a flush that cleaned nothing, nor rise after one that spent its whole budget.
   Without this, a file that starts full drove the price to its floor within the first flushes, and it took one to two live sizes of writes to climb back.
-- **The budget is a fixed cap on the pages a flush writes for cleaning**, `budget_pages`, 256 by default; a table offer costs it the pages its restatements are estimated to take, at 1.25 times the leaves' coverage.
+- **The budget is a fixed cap on the pages a flush writes for cleaning**, `budget_pages`, 256 by default; a table offer costs it the pages its restatements take, priced at the leaves' coverage.
   A flush whose budget is too spent for another data page counts as one that spent its whole budget.
 - **Offers take ripe pages in index order.**
   A data offer takes them whole while they fit, and cuts the first that does not, as the main branch cuts its victims; on the budget's last page, which may not cut, it passes over the ones that do not fit.
-  A table offer takes ripe leaves while their estimated restatements fit a leaf and the budget left.
+  A table offer takes ripe leaves while their coverage fits a leaf and the budget left.
   The kind of the highest ripe page decides which offer goes first.
 - **Natural losses are what the fold and the consolidator state's own rewrite release**, recorded per page with its coverage before the first of them and applied once per flush.
 - **What fresh pages lose is estimated per kind**, data pages and leaves: the share of their coverage the pages of the previous flush lose in the next fold, averaged over flushes with weight `1 − e^(−β)`.
