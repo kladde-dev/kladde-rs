@@ -160,9 +160,7 @@ The notes below say what the draft leaves open, and where the implementation dep
   Because the measure differs, so does the meaning of `τ`, and its default: 0.75 of the live pages, where the main branch's 0.8 of the whole file is out of reach.
 - **The price holds where moving it could change nothing**: it does not fall after a flush that cleaned nothing, nor rise after one that spent its whole budget.
   Without this, a file that starts full drove the price to its floor within the first flushes, and it took one to two live sizes of writes to climb back.
-- **The budget is a fixed cap on the pages a flush writes for cleaning**, `budget_pages`, 256 by default, and the fill floor `1 − θ` still holds every data offer, as the draft says of every offer.
-  A table offer opens no page, since what its leaves restate joins the leaves the cut packs anyway, so it is held to no fill floor, and costs the budget the pages its restatements are estimated to take, at 1.25 times the leaves' coverage.
-  Held to the floor, a table offer had to restate 95 % of a leaf, which ripe leaves less than half full could do only in threes or more, so that they stayed: on kladde-svg's drawings at a target fill of 0.9, in the base and packed layouts, the leaves stayed 46 to 72 % full, where the data pages came out 82 to 97 % full (`evaluation/cleaning-edits.md` in kladde-docs).
+- **The budget is a fixed cap on the pages a flush writes for cleaning**, `budget_pages`, 256 by default; a table offer costs it the pages its restatements are estimated to take, at 1.25 times the leaves' coverage.
   A flush whose budget is too spent for another data page counts as one that spent its whole budget.
 - **Offers take ripe pages in index order.**
   A data offer takes them whole while they fit, and cuts the first that does not, as the main branch cuts its victims; on the budget's last page, which may not cut, it passes over the ones that do not fit.
