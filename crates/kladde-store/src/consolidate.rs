@@ -16,11 +16,6 @@ use crate::store::Inner;
 /// A page's content capacity.
 const C: u32 = MAX_PAGE_CONTENT as u32;
 
-/// How much more encoding restating a table page's live content takes than
-/// its coverage: fragments that shadowing split need a statement each, and
-/// statements lose the dense delta encoding of their old neighbours.
-const RESTATE: f64 = 1.25;
-
 /// The most ripe pages one offer considers.
 const CANDIDATES: usize = 64;
 
@@ -616,11 +611,11 @@ impl Inner {
         Ok(())
     }
 
-    /// What rewriting table victims would restate, their restatements
-    /// estimated from coverage, without taking anything: the tail first in
-    /// compaction mode, whatever its size, then ripe leaves, highest index
-    /// first, while their restatements fit a leaf and the `pages` of budget
-    /// left.
+    /// What rewriting table victims would restate, without taking anything:
+    /// the tail first in compaction mode, whatever its size, then ripe
+    /// leaves, highest index first, while their restatements fit a leaf and
+    /// the `pages` of budget left. A victim's restatements are priced at its
+    /// coverage, which they take to within a few percent.
     fn table_offer(&mut self, pages: f64) -> Option<Offer> {
         let mut room = pages.min(1.0) * C as f64;
         let mut offer = Offer::default();
@@ -630,13 +625,13 @@ impl Inner {
             chosen.insert(t);
             offer.whole.push(t);
             offer.tail = true;
-            offer.written += cov as f64 * RESTATE;
-            room -= cov as f64 * RESTATE;
+            offer.written += cov as f64;
+            room -= cov as f64;
         }
         if room > 0.0 {
-            let limit = (room / RESTATE) as u32;
+            let limit = room as u32;
             for v in self.ripe_pages(Some(PageKind::Table), limit, &chosen, CANDIDATES) {
-                let w = self.state.live(v).coverage as f64 * RESTATE;
+                let w = self.state.live(v).coverage as f64;
                 if w <= room {
                     offer.whole.push(v);
                     offer.written += w;
@@ -665,39 +660,50 @@ impl Inner {
     // ------------------------------------------------------------ at the cut
 
     /// The fillers of the cut's last page: in compaction mode the tail,
-    /// whenever it fits its `room`, then ripe leaves that fit, highest index
-    /// first, then the rotating window. Takes into `fillers`, and returns the
-    /// victims.
+    /// whenever its restatements fit its `room`, then ripe leaves whose
+    /// restatements fit, highest index first, then the rotating window.
+    /// Takes into `fillers`, and returns the victims.
+    ///
+    /// A victim's coverage is the first test; what its restatements take is
+    /// then computed before it is taken, and a victim they would overflow the
+    /// room with is passed over, so that the last page never spills for a
+    /// filler's sake.
     pub(crate) fn cut_fillers(
         &mut self,
         room: usize,
         fillers: &mut Dirty,
     ) -> Result<Vec<u32>, Error> {
-        let mut room = room as f64;
+        let mut room = room;
         let mut victims = Vec::new();
         let fresh = |i: &Inner, p: u32| !i.flush_rewritten.contains(&p);
         loop {
-            let limit = (room / RESTATE) as u32;
+            let limit = room as u32;
             let tail = self
                 .compaction_victim(false)
                 .filter(|&t| self.state.live(t).coverage <= limit && fresh(self, t));
             let Some(v) = tail else { break };
-            room -= self.state.live(v).coverage as f64 * RESTATE;
+            let len = self.restatement_len(v)?;
+            if len > room {
+                break;
+            }
+            room -= len;
             self.rewrite_table_victims(&[v], fillers)?;
             victims.push(v);
         }
-        let limit = (room / RESTATE) as u32;
         let none = IdSet::default();
-        for v in self.ripe_pages(Some(PageKind::Table), limit, &none, CANDIDATES) {
-            let w = self.state.live(v).coverage as f64 * RESTATE;
-            if w > room || !fresh(self, v) {
+        for v in self.ripe_pages(Some(PageKind::Table), room as u32, &none, CANDIDATES) {
+            if self.state.live(v).coverage as usize > room || !fresh(self, v) {
                 continue;
             }
-            room -= w;
+            let len = self.restatement_len(v)?;
+            if len > room {
+                continue;
+            }
+            room -= len;
             self.rewrite_table_victims(&[v], fillers)?;
             victims.push(v);
         }
-        self.window(room.max(0.0) as usize, fillers);
+        self.window(room, fillers);
         Ok(victims)
     }
 
