@@ -70,21 +70,26 @@ pub fn encode(value: u64, out: &mut impl Extend<u8>) {
 }
 
 /// The number of bytes [`encode`] would produce for `value` (always at
-/// least 1).
+/// least 1, and at most 10), computed without encoding anything and in
+/// constant time.
+///
+/// ```
+/// assert_eq!(kladde_varint::encoded_len(0), 1);
+/// assert_eq!(kladde_varint::encoded_len(300), 2);
+/// assert_eq!(kladde_varint::encoded_len(u64::MAX), 10);
+/// ```
+#[inline]
 pub fn encoded_len(value: u64) -> usize {
-    let mut len = 1;
-    let mut value = value >> 7;
-    while value != 0 {
-        len += 1;
-        value >>= 7;
-    }
-    len
+    // The highest set bit lies in 7-bit group `bit / 7`, and every group up
+    // to it takes a byte; zero takes one byte too.
+    value.checked_ilog2().unwrap_or(0) as usize / 7 + 1
 }
 
 /// Decodes one LEB128 value from the front of `input`, returning the value
 /// and the bytes that follow it. Fails if `input` ends mid-value
 /// ([`Error::Truncated`]) or encodes a number too large for `u64`
 /// ([`Error::Overflow`]).
+#[inline]
 pub fn decode(input: &[u8]) -> Result<(u64, &[u8]), Error> {
     let mut result = 0u64;
     let mut shift = 0u32;
@@ -120,6 +125,7 @@ pub fn decode(input: &[u8]) -> Result<(u64, &[u8]), Error> {
 ///     Err(kladde_varint::Error::Overlong)
 /// );
 /// ```
+#[inline]
 pub fn decode_minimal(input: &[u8]) -> Result<(u64, &[u8]), Error> {
     let (value, rest) = decode(input)?;
     if input.len() - rest.len() != encoded_len(value) {
@@ -137,6 +143,7 @@ pub fn decode_minimal(input: &[u8]) -> Result<(u64, &[u8]), Error> {
 /// assert_eq!(kladde_varint::zigzag(1), 2);
 /// assert_eq!(kladde_varint::unzigzag(kladde_varint::zigzag(i64::MIN)), i64::MIN);
 /// ```
+#[inline]
 pub fn zigzag(value: i64) -> u64 {
     ((value << 1) ^ (value >> 63)) as u64
 }
@@ -146,6 +153,7 @@ pub fn zigzag(value: i64) -> u64 {
 /// ```
 /// assert_eq!(kladde_varint::unzigzag(3), -2);
 /// ```
+#[inline]
 pub fn unzigzag(value: u64) -> i64 {
     ((value >> 1) as i64) ^ -((value & 1) as i64)
 }
@@ -189,6 +197,48 @@ mod tests {
             round_trip(v);
             round_trip(v - 1);
             v = v.wrapping_mul(3).wrapping_add(7);
+        }
+    }
+
+    #[test]
+    fn encoded_len_at_the_group_boundaries() {
+        // A byte holds 7 bits, so the length steps up at 2^(7k).
+        let mut expected = Vec::new();
+        for k in 1..10u32 {
+            expected.push(((1u64 << (7 * k)) - 1, k as usize));
+            expected.push((1u64 << (7 * k), k as usize + 1));
+        }
+        expected.extend([(0, 1), (1, 1), (u64::MAX, 10)]);
+        for (value, len) in expected {
+            assert_eq!(encoded_len(value), len, "encoded_len({value})");
+        }
+    }
+
+    #[test]
+    fn encoded_len_matches_the_encoding_around_every_power_of_two() {
+        for bit in 0..64 {
+            let p = 1u64 << bit;
+            for value in [p - 1, p, p | 1, p | (p - 1)] {
+                let mut buf = Vec::new();
+                encode(value, &mut buf);
+                assert_eq!(encoded_len(value), buf.len(), "encoded_len({value})");
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_len_matches_the_encoding_for_spread_values() {
+        // A fixed xorshift sequence, so that every bit length is covered
+        // many times by values with arbitrary lower bits.
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..100_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let value = x >> (x % 64);
+            let mut buf = Vec::new();
+            encode(value, &mut buf);
+            assert_eq!(encoded_len(value), buf.len(), "encoded_len({value})");
         }
     }
 

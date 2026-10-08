@@ -725,8 +725,7 @@ impl Inner {
             .take(n)
             .map(|(&k, &f)| (k, f))
             .collect();
-        let zeros = [0u8; crate::consts::MAX_INLINE];
-        let mut w = crate::statement::TableWriter::new();
+        let mut w = crate::statement::TableLen::new();
         w.end_children();
         // The bytes encoded before the walk last wrapped around.
         let mut done = 0usize;
@@ -761,7 +760,7 @@ impl Inner {
             if wrapped {
                 // The encoding starts afresh, after what came before.
                 done += w.len();
-                w = crate::statement::TableWriter::new();
+                w = crate::statement::TableLen::new();
                 w.end_children();
             }
             prev = Some(k);
@@ -783,7 +782,7 @@ impl Inner {
                 full = true;
                 continue;
             }
-            w.push(&stmt, &zeros[..if inline { len as usize } else { 0 }]);
+            w.push(&stmt);
             take.push((id, off, end, f));
             // A page the window now restates from calls for the size
             // statements it holds of ids already taken, and this id's size
