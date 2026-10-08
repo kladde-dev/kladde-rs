@@ -14,11 +14,6 @@ use crate::store::Inner;
 /// A page's content capacity.
 const C: u32 = MAX_PAGE_CONTENT as u32;
 
-/// How much more encoding restating a table page's live content takes than
-/// its coverage: fragments that shadowing split need a statement each, and
-/// statements lose the dense delta encoding of their old neighbours.
-const RESTATE: f64 = 1.25;
-
 /// What consolidation carries from flush to flush.
 #[derive(Debug, Default)]
 pub struct ConsState {
@@ -551,14 +546,14 @@ impl Inner {
         Ok(())
     }
 
-    /// What rewriting table victims would restate and reclaim, their
-    /// restatements estimated from coverage, without taking anything: the
-    /// tail first in compaction mode, whatever its size, then whole victims
-    /// within the churn floor, best score first, while their restatements
-    /// fit a leaf and the `pages` of budget left. A victim reclaims its page
-    /// less the room its restatements take.
+    /// What rewriting table victims would restate and reclaim, without
+    /// taking anything: the tail first in compaction mode, whatever its
+    /// size, then whole victims within the churn floor, best score first,
+    /// while their restatements fit a leaf and the `pages` of budget left.
+    /// A victim's restatements are priced at its coverage, which they take
+    /// to within a few percent, and it reclaims its page less that.
     fn table_offer(&mut self, pages: f64) -> Option<Offer> {
-        let max = (C as f64 / (RESTATE * (1.0 + self.opts.churn_floor))) as u32;
+        let max = (C as f64 / (1.0 + self.opts.churn_floor)) as u32;
         let mut room = pages.min(1.0) * C as f64;
         let mut offer = Offer::default();
         let mut chosen = IdSet::default();
@@ -568,21 +563,21 @@ impl Inner {
             offer.whole.push(t);
             offer.tail = true;
             offer.reclaimed += C as f64;
-            offer.written += cov as f64 * RESTATE;
-            room -= cov as f64 * RESTATE;
+            offer.written += cov as f64;
+            room -= cov as f64;
         }
         while let Some(b) = self.state.table_buckets.lowest_non_empty() {
             let fresh = |i: &Inner, p: u32| !chosen.contains(&p) && !i.flush_rewritten.contains(&p);
-            let limit = ((room.max(0.0) / RESTATE) as u32).min(max);
+            let limit = (room.max(0.0) as u32).min(max);
             let Some(v) = self.pick_victim(false, b, limit, &fresh) else {
                 break;
             };
-            let written = self.state.live(v).coverage as f64 * RESTATE;
+            let cov = self.state.live(v).coverage;
             chosen.insert(v);
             offer.whole.push(v);
-            offer.reclaimed += C as f64 - written;
-            offer.written += written;
-            room -= written;
+            offer.reclaimed += (C - cov) as f64;
+            offer.written += cov as f64;
+            room -= cov as f64;
         }
         if offer.whole.is_empty() {
             return None;
@@ -603,30 +598,42 @@ impl Inner {
 
     // ------------------------------------------------------------ at the cut
 
-    /// The fillers of the cut's last page: whole table victims that fit its
-    /// `room`, then the rotating window. Takes into `fillers`, and returns
-    /// the victims.
+    /// The fillers of the cut's last page: whole table victims whose
+    /// restatements fit its `room`, then the rotating window. Takes into
+    /// `fillers`, and returns the victims.
+    ///
+    /// A victim's coverage is the first test; what its restatements take is
+    /// then computed before it is taken, and a victim they would overflow the
+    /// room with is passed over for the rest of the flush, so that the last
+    /// page never spills for a filler's sake.
     pub(crate) fn cut_fillers(
         &mut self,
         room: usize,
         fillers: &mut Dirty,
     ) -> Result<Vec<u32>, Error> {
-        let mut room = room as f64;
+        let mut room = room;
         let mut victims = Vec::new();
+        let mut refused = IdSet::default();
         while let Some(b) = self.state.table_buckets.lowest_non_empty() {
-            let limit = (room / RESTATE) as u32;
-            let fresh = |i: &Inner, p: u32| !i.flush_rewritten.contains(&p);
+            let limit = room as u32;
+            let fresh =
+                |i: &Inner, p: u32| !i.flush_rewritten.contains(&p) && !refused.contains(&p);
             let tail = self
                 .compaction_victim(false)
                 .filter(|&t| self.state.live(t).coverage <= limit && fresh(self, t));
             let Some(v) = tail.or_else(|| self.pick_victim(false, b, limit, &fresh)) else {
                 break;
             };
-            room -= self.state.live(v).coverage as f64 * RESTATE;
+            let len = self.restatement_len(v)?;
+            if len > room {
+                refused.insert(v);
+                continue;
+            }
+            room -= len;
             self.rewrite_table_victims(&[v], fillers)?;
             victims.push(v);
         }
-        self.window(room.max(0.0) as usize, fillers);
+        self.window(room, fillers);
         Ok(victims)
     }
 
