@@ -46,6 +46,7 @@ There is no save call.
 ```sh
 cargo test --workspace
 cargo run --release -p kladde-bench -- <output directory> [scenario ...]
+cargo run --release -p kladde-bench --bin text-bench -- <output directory>
 ```
 
 ## Documentation and tutorial

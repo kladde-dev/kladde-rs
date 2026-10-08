@@ -4,11 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+default-run = "kladde-bench"
 
 # Realistic workloads on real files, measured flush by flush: the numbers
-# behind kladde-docs' `content/evaluation/`. Run in release mode:
+# behind kladde-docs' `content/evaluation/`. `text-bench` types into one
+# long text, as a text editor would. Run in release mode:
 #
 #     cargo run --release -p kladde-bench -- <output directory> [scenario ...]
+#     cargo run --release -p kladde-bench --bin text-bench -- <output directory>
 
 [dependencies]
 kladde = { workspace = true }
