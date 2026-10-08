@@ -62,7 +62,8 @@ impl Survivor {
     }
 }
 
-/// What one budgeted page would hold, and what it would reclaim.
+/// What one budgeted data page would hold, or what table victims would
+/// restate, and what either would reclaim.
 #[derive(Debug, Default)]
 struct Offer {
     /// Victims evacuated, or rewritten, whole.
@@ -72,9 +73,11 @@ struct Offer {
     /// Whether the offer holds compaction mode's tail, which the budget
     /// takes whatever the offer's ratio and fill.
     tail: bool,
+    /// The space it frees, net of the room its writes take.
     reclaimed: f64,
     written: f64,
-    /// How full the page would close, as a fraction of its capacity.
+    /// How full a data offer's page would close, as a fraction of its
+    /// capacity.
     fill: f64,
 }
 
@@ -489,31 +492,43 @@ impl Inner {
         Some(offer)
     }
 
-    /// Spends the flush's budget: pages opened only to reclaim, one at a
-    /// time, each only if its offer passes the churn floor and fills it. A
-    /// survivor cut at one page's end leads the next, which is opened
-    /// whatever its own offer, so the budget's last page cuts nothing. An
-    /// offer holding compaction mode's tail passes whatever its ratio and
-    /// fill, and goes first, since the budget alone paces the mode.
+    /// Spends the flush's budget, in pages written. Data pages are opened
+    /// only to reclaim, one at a time, each only if its offer passes the
+    /// churn floor and fills it. Table victims open no page of their own,
+    /// since their restatements join the leaves the cut packs anyway: their
+    /// offer passes on the churn floor alone, and costs the budget the pages
+    /// its restatements are estimated to take. A survivor cut at one page's
+    /// end leads the next, which is opened whatever its own offer, so the
+    /// budget's last page cuts nothing. An offer holding compaction mode's
+    /// tail passes whatever its ratio and fill, and goes first, since the
+    /// budget alone paces the mode.
     pub(crate) fn budget_loop(&mut self, dirty: &mut Dirty, out: &mut Output) -> Result<(), Error> {
-        let pages = self.cons.budget.round().max(0.0) as u32;
+        let budget = self.cons.budget.round().max(0.0);
         let (lambda, theta) = (self.opts.churn_floor, self.opts.theta);
-        let good =
-            |o: &Offer| o.tail || (o.reclaimed >= lambda * o.written && o.fill >= 1.0 - theta);
+        let pays = |o: &Offer| o.tail || o.reclaimed >= lambda * o.written;
+        let fills = |o: &Offer| o.tail || o.fill >= 1.0 - theta;
         let ratio = |o: &Offer| o.reclaimed / o.written.max(1.0);
+        let mut spent = 0.0;
         let mut carry: Vec<Survivor> = Vec::new();
-        for i in 0..pages {
+        while spent < budget {
             let carry_len: u32 = carry.iter().map(Survivor::len).sum();
-            let data = self.data_offer(carry_len, i + 1 < pages);
+            // A data page takes a whole page of the budget, and may cut a
+            // survivor only if the page its tail leads fits too.
+            let data = if spent + 1.0 <= budget {
+                self.data_offer(carry_len, spent + 2.0 <= budget)
+            } else {
+                None
+            };
             // A carried tail opens a data page whatever the offers.
             let offer = if !carry.is_empty() {
                 data
             } else {
-                let data = data.filter(good);
-                let table = self.table_offer().filter(good);
+                let data = data.filter(|o| pays(o) && fills(o));
+                let table = self.table_offer(budget - spent).filter(pays);
                 match (data, table) {
                     (Some(d), Some(t)) if d.tail || (!t.tail && ratio(&d) >= ratio(&t)) => Some(d),
                     (_, Some(t)) => {
+                        spent += t.written / C as f64;
                         self.rewrite_table_victims(&t.whole, dirty)?;
                         continue;
                     }
@@ -521,6 +536,7 @@ impl Inner {
                     (None, None) => break,
                 }
             };
+            spent += 1.0;
             let mut dp = self.new_data_page()?;
             for s in std::mem::take(&mut carry) {
                 self.place(&mut dp, key(s.id, s.start), s.len())?;
@@ -540,13 +556,15 @@ impl Inner {
         Ok(())
     }
 
-    /// What rewriting table victims onto one budgeted leaf would hold and
-    /// reclaim, their restatements estimated from coverage, without taking
-    /// anything: the tail first in compaction mode, whatever its size, then
-    /// whole victims within the churn floor, best score first.
-    fn table_offer(&mut self) -> Option<Offer> {
-        let max = (C as f64 / (1.0 + self.opts.churn_floor)) as u32;
-        let mut room = C as f64;
+    /// What rewriting table victims would restate and reclaim, their
+    /// restatements estimated from coverage, without taking anything: the
+    /// tail first in compaction mode, whatever its size, then whole victims
+    /// within the churn floor, best score first, while their restatements
+    /// fit a leaf and the `pages` of budget left. A victim reclaims its page
+    /// less the room its restatements take.
+    fn table_offer(&mut self, pages: f64) -> Option<Offer> {
+        let max = (C as f64 / (RESTATE * (1.0 + self.opts.churn_floor))) as u32;
+        let mut room = pages.min(1.0) * C as f64;
         let mut offer = Offer::default();
         let mut chosen = IdSet::default();
         if let Some(t) = self.compaction_victim(false) {
@@ -564,17 +582,16 @@ impl Inner {
             let Some(v) = self.pick_victim(false, b, limit, &fresh) else {
                 break;
             };
-            let cov = self.state.pages[v as usize].coverage;
+            let written = self.state.pages[v as usize].coverage as f64 * RESTATE;
             chosen.insert(v);
             offer.whole.push(v);
-            offer.reclaimed += (C - cov) as f64;
-            offer.written += cov as f64 * RESTATE;
-            room -= cov as f64 * RESTATE;
+            offer.reclaimed += C as f64 - written;
+            offer.written += written;
+            room -= written;
         }
         if offer.whole.is_empty() {
             return None;
         }
-        offer.fill = offer.written / C as f64;
         Some(offer)
     }
 

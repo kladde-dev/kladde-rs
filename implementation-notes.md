@@ -92,13 +92,17 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 - **The budget loop never continues the last page of `pack`.**
   The design lets that page cut a victim's survivor whenever the loop opens another page, so that only the flush's very last data page can close short.
   Here, `pack`'s last page is filled by free filling alone, and can close short even when the loop goes on.
-- **A table victim's restatements are estimated at 1.25 times its coverage.**
-  Fragments split by shadowing need a statement each, and restated statements lose the delta encoding of their old neighbours; `impl/consolidation.md#the-page-rewrite` prices the rewrite by coverage alone.
+- **A table victim's restatements are estimated at 1.25 times its coverage, and a victim reclaims its page less the room they take.**
+  Fragments split by shadowing need a statement each, and restated statements lose the delta encoding of their old neighbours; `impl/consolidation.md#the-page-rewrite` prices the rewrite by coverage alone, as `(C − written) / written`.
+  With the estimate as `written`, a victim passes the churn floor at coverage up to `C / (1.25 · (1 + λ))`.
   If the estimate is too low for a filler, what does not fit the last page spills into another leaf.
-- **A budgeted page rewrite opens no page of its own.**
-  It takes its victims before the cut, whose layout then needs about one more leaf per offer; the budget counts it as a page all the same, and holds it to the fill floor like a data offer.
-  Since its restatements join leaves the cut packs full anyway, the fill floor could be dropped for table offers, with the budget charged their estimated restatements in fractions of a page.
-  That was tried and not kept: with 64 MiB of uniform overwrites it raised the fill of table pages from 0.59 to 0.70 but shrank the file only from 1.53 to 1.51 times its live size, and made the median flush 38 % slower; at 1 MiB the file came out larger.
+- **A table offer opens no page of its own, so it is held to the churn floor alone, and costs the budget the pages its restatements are estimated to take.**
+  `impl/consolidation.md#the-budget-loop` holds every offer to the fill floor `1 − θ`, and counts each as a page of the budget.
+  But a table offer's victims are taken before the cut, and what they restate joins the leaves the cut packs full anyway, so there is no page the floor could keep from closing short, and a page of budget overstates what the offer writes.
+  Held to the floor, an offer had to restate 95 % of a leaf, which leaves less than half full can do only three or more at a time, so the leaves stayed half empty: on kladde-svg's drawings at the default churn floor, measured on the branch `defrag-shifts` in the base and packed layouts, they were 42 to 62 % full where the data pages were 71 to 80 %, and on the world map in its base layout they took 37 % of the live pages (`evaluation/cleaning-edits.md` in kladde-docs).
+  Without the floor, the leaves there come out 62 to 71 % full, and the drawings take 1 to 12 % fewer live pages for 2 to 8 % more writes.
+  On kladde-bench's uniform overwrites, whose leaves were fuller to begin with, it gains less: at 64 MiB the leaves' fill rises from 0.60 to 0.68 and the file shrinks from 1.53 to 1.51 times its live size, and the median flush takes 22 % longer, at 8 MiB too; an earlier trial on that workload alone was not kept for that reason.
+  An offer still gathers victims only while their restatements fit one leaf and the budget left.
 - **The header keeps its hottest statements one by one, not the coldest key-contiguous run.**
   `impl/flush.md#the-header-as-write-buffer` recommends evicting the coldest run in key order, so that leaves cover coherent id ranges.
   The cut fills the header with the hottest statements that fit and cuts the rest into leaves in key order, which gets the leaves' key order but not the runs.
