@@ -145,18 +145,19 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 
 ## Cleaning by ripeness (branch `ripeness`)
 
-This branch implements `drafts/ripeness.md`, as of kladde-docs commit `b33a836`, in place of data-page scoring, the churn floor, and the budget controller, so the notes above about buckets, sampling, offers within the churn floor, and the budget controller describe the main branch.
+This branch implements `drafts/ripeness.md`, as of kladde-docs commit `b33a836`, in place of data-page scoring for the budget, the churn floor, and the budget controller, so the notes above about offers within the churn floor and the budget controller describe the main branch; buckets and sampling choose only free filling's victims here.
 The notes below say what the draft leaves open, and where the implementation departs from it.
 
-- **The constants the draft leaves open**: `β = 0.1` per epoch, `R_MIN = 10⁻⁴` and a starting `κ = 0.01` (the draft's own examples), `W = 8` epochs for the cursor, `κ` within `[10⁻⁶, 1]`, and at most 64 ripe pages considered per offer.
+- **The constants the draft leaves open**: `β = 0.1` per epoch, `R_MIN = 10⁻⁴` and a starting `κ = 0.01` (the draft's own examples), `κ` within `[10⁻⁶, 1]`, and at most 64 ripe pages considered per offer.
 - **The controller measures the fill of data pages and leaves, not of the whole file, and aims them at `τ = 0.75` by default.**
   A first version measured the whole file, as the main branch's budget controller does, and its price swung by two to three decades, a swing per one to two live sizes of writes, at 8 MiB and targets of 0.5 to 0.6.
   The whole file answers a change of price only as new writes reuse the pages cleaning frees, long after the flush that freed them, and an integral controller on a lagging measure cycles.
   The pages cleaning acts on answer within the flush: measured there, the price held within a few percent in every run, and landed on the curve that fixed prices trace.
   Holes are compaction mode's to return, as they are anyway.
   Because the measure differs, so does the meaning of `τ`, and its default: 0.75 of the live pages, where the main branch's 0.8 of the whole file is out of reach.
-- **The price holds where moving it could change nothing**: it does not fall after a flush that cleaned nothing, nor rise after one that spent its whole budget.
+- **The price holds where moving it could change nothing**: it does not fall after a flush that cleaned nothing at the price, nor rise after one that spent its whole budget.
   Without this, a file that starts full drove the price to its floor within the first flushes, and it took one to two live sizes of writes to climb back.
+  Free filling's victims do not count as cleaned, since it takes them whatever the price: it takes some in nearly every flush, and counting them would let the price fall in every flush while the pages are fuller than the target.
 - **The budget is a fixed cap on the pages a flush writes for cleaning**, `budget_pages`, 256 by default; a table offer costs it the pages its restatements take, priced at the leaves' coverage.
   A flush whose budget is too spent for another data page counts as one that spent its whole budget.
 - **Offers take ripe pages in index order.**
@@ -169,7 +170,10 @@ The notes below say what the draft leaves open, and where the implementation dep
   Only a new file has no estimate yet, and its first pages start at the floor.
 - **A new leaf starts from the leaves' fresh rate**, not from the rates of the statements it restates, whose sources the cut does not track.
 - **A description defragmentation's rewrite starts at the floor**, as content cold by selection: its bytes pass through the arena, so its source pages are unknown when it is placed.
-- **Free filling no longer takes spare defragmentation candidates**, following the draft's two sources, small ripe victims and the cursor; on the main branch they added nothing measurable, since the reserved share takes nearly all candidates.
+- **Free filling is the main branch's, not the draft's.**
+  The room of a page the flush writes anyway takes, in compaction mode, the tail first, then whole data victims that fit, the sparsest first, then description defragmentation's candidates beyond its share, then as many of one victim's statements as fit, whether ripe or not.
+  The draft's two sources, ripe victims whose survivors take at most `θ` of a page and the cursor, which hands out the previous flush's least-filled data page a whole statement at a time, are gone; the data victims' buckets are kept for free filling, wherever the ranking marks a page or drops it.
+  The draft keeps survivors, cold by selection, from settling among fresh content, at the price of the victims main's free filling cleans at no page's cost; `evaluation/ripeness-free-filling.md` in kladde-docs measures the trade on kladde-svg's drawings and text-bench's texts.
 - **The ranking is refreshed lazily**: a page whose coverage, state, or estimate changes is marked, and marked pages are ranked again before the next query, once however many of its fragments changed.
 - **The consolidator state's layout here is tagged `kladrip2`**: the price takes the budget's place, the rates fresh content starts from follow it, and its records are typed, age records and drain records.
   A flush records the estimates it changed and those of the pages the previous flush wrote; the snapshot holds every page emptier than `u₀ = 1 − θ`, which is every page that could be ripe, so a fuller page's estimate is seeded again at open once a snapshot has dropped it.

@@ -244,19 +244,12 @@ impl Inner {
     /// Seeds consolidation after a load: content ages and page estimates
     /// from the consolidator state where they are current, and from the
     /// pages elsewhere; the price of space, the rates fresh content starts
-    /// from, and the window from the state; the cursor's pages from the
-    /// governing header's epoch; and then a read-only walk that finds again
-    /// the candidates the latest walk found.
+    /// from, and the window from the state; and then a read-only walk that
+    /// finds again the candidates the latest walk found.
     pub(crate) fn seed_after_load(&mut self) -> Result<(), Error> {
         self.cons.kappa = self.opts.kappa;
         self.measure_statements();
         self.seed_drains();
-        self.cons.prev_data_pages = (2..self.file_pages)
-            .filter(|&p| {
-                matches!(self.state.pages[p as usize],
-                    Page::Live(l) if l.kind == PageKind::Data && l.epoch == self.epoch)
-            })
-            .collect();
         let (content, statements) = self.youngest_pages();
         for (&id, m) in self.state.allocs.iter_mut() {
             m.last_written = content.get(&id).copied().unwrap_or(self.epoch);

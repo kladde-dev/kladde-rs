@@ -401,6 +401,7 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
             kind: PageKind::Header,
             written,
             drain: Drain::default(),
+            slot: None,
         });
         seen.insert(header.slot);
     }
@@ -429,6 +430,7 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
             kind: PageKind::Table,
             written: d.content.len() as u16,
             drain: Drain::default(),
+            slot: None,
         });
         queue.extend(&kids);
         contents.push((p, d.epoch, d.content));
@@ -502,6 +504,7 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
             kind: PageKind::Data,
             written: d.content.len() as u16,
             drain: Drain::default(),
+            slot: None,
         });
     }
     for p in 2..file_pages {

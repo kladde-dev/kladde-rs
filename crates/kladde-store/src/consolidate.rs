@@ -19,10 +19,6 @@ const C: u32 = MAX_PAGE_CONTENT as u32;
 /// The most ripe pages one offer considers.
 const CANDIDATES: usize = 64;
 
-/// The cursor gives up a page older than this many epochs, and leaves the
-/// rest of it to ripeness.
-const W: u64 = 8;
-
 /// The bounds of the price of space.
 const KAPPA_MIN: f64 = 1e-6;
 const KAPPA_MAX: f64 = 1.0;
@@ -35,22 +31,22 @@ pub struct ConsState {
     /// The price of space, as the controller moved it: the page writes that
     /// a page of garbage kept for one flush is worth.
     pub kappa: f64,
+    /// Where free filling's sampling starts within a bucket; rotates so that
+    /// no prefix of a bucket is examined forever.
+    pub rot: usize,
     /// Victims this flush found unusable, so that it does not pick them again.
     pub skip: IdSet,
     /// Description defragmentation's candidates from the latest walk, for
     /// the next flush.
     pub candidates: Vec<Candidate>,
+    /// This flush's candidates beyond its share, for free filling.
+    pub spare: Vec<Candidate>,
     /// Whether this flush runs in compaction mode.
     pub compaction: bool,
     /// Where the search for the highest live page resumes.
     pub tail: u32,
     /// Where the consolidator state is kept.
     pub kept: crate::constate::Kept,
-    /// The data page whose survivors fill the room of the flush's own pages.
-    pub cursor_page: Option<u32>,
-    /// The data pages of the latest flush that wrote any, where the cursor
-    /// finds its next page.
-    pub prev_data_pages: Vec<u32>,
     /// The pages the latest flush wrote, whether data, and their coverage
     /// then: what they lose next is what fresh pages lose.
     pub just_written: Vec<(u32, bool, u32)>,
@@ -64,7 +60,9 @@ pub struct ConsState {
     /// recorded estimates, for its next record: this flush's, and those the
     /// previous flush's own state rewrite changed after its record.
     pub drained: Vec<u32>,
-    /// Victims this flush took, anywhere.
+    /// Victims this flush took at the price of space: the budget's and the
+    /// cut's fillers', but not free filling's, which it takes whatever the
+    /// price.
     pub cleaned: u32,
     /// Whether this flush spent its whole budget.
     pub exhausted: bool,
@@ -204,35 +202,51 @@ impl Inner {
             .ripe(now, self.cons.kappa, &mut ok, limit)
     }
 
-    /// The cursor page, which the room of the flush's own pages takes
-    /// survivors from: the current one while it has content and is at most
-    /// `W` epochs old, else the least-filled data page of the latest earlier
-    /// flush that wrote any.
-    fn cursor_page(&mut self) -> Option<u32> {
-        let now = self.state.flush_epoch;
-        // A truncation may have taken the page away since.
-        let usable = |p: u32, i: &Inner| match i.state.pages.get(p as usize) {
-            Some(Page::Live(info)) => {
-                info.kind == PageKind::Data
-                    && info.coverage > 0
-                    && info.epoch < now
-                    && now - info.epoch <= W
-                    && !i.cons.skip.contains(&p)
-            }
-            _ => false,
-        };
-        if let Some(p) = self.cons.cursor_page.filter(|&p| usable(p, self)) {
-            return Some(p);
+    /// LFS's cost-benefit score, by which free filling picks among the
+    /// sparsest data victims, as main does: sparse and long untouched first.
+    fn score(&self, p: u32) -> f64 {
+        let live = self.state.live(p);
+        let u = live.coverage as f64 / C as f64;
+        let age = self.state.flush_epoch.saturating_sub(live.epoch) as f64;
+        (1.0 - u) * age / (1.0 + u)
+    }
+
+    /// Up to `sample` data victims of a bucket, from a rotating start.
+    fn sample(&mut self, bucket: usize) -> Vec<u32> {
+        let k = self.opts.sample.max(1);
+        let list = &self.state.data_buckets.lists[bucket];
+        let n = list.len();
+        if n == 0 {
+            return Vec::new();
         }
-        let next = self
-            .cons
-            .prev_data_pages
-            .iter()
-            .copied()
-            .filter(|&p| usable(p, self))
-            .min_by_key(|&p| self.state.live(p).coverage);
-        self.cons.cursor_page = next;
-        next
+        let start = self.cons.rot % n;
+        self.cons.rot = self.cons.rot.wrapping_add(1);
+        (0..k.min(n)).map(|i| list[(start + i) % n]).collect()
+    }
+
+    /// The best-scoring of the data victims sampled from buckets `from..`,
+    /// stopping at the first bucket that yields one, or at a bucket whose
+    /// pages all hold more than `max` bytes. A page the flush has taken or
+    /// found unusable already is passed over.
+    fn pick_victim(&mut self, from: usize, max: u32) -> Option<u32> {
+        for b in from..BUCKETS {
+            let lower = (b as u64 * (C as u64 + 1)).div_ceil(BUCKETS as u64) as u32;
+            if lower > max {
+                return None;
+            }
+            let best = self
+                .sample(b)
+                .into_iter()
+                .filter(|&p| {
+                    let cov = self.state.live(p).coverage;
+                    cov > 0 && cov <= max && !self.cons.skip.contains(&p)
+                })
+                .max_by(|&x, &y| self.score(x).total_cmp(&self.score(y)));
+            if best.is_some() {
+                return best;
+            }
+        }
+        None
     }
 
     /// The live fragments pointing into data page `v`, in key order. Narrows
@@ -344,7 +358,6 @@ impl Inner {
         self.relocate(&surv, dp, dirty)?;
         self.stats.evacuated_pages += 1;
         self.stats.evacuated_bytes += total as u64;
-        self.cons.cleaned += 1;
         Ok(true)
     }
 
@@ -385,48 +398,53 @@ impl Inner {
 
     // ------------------------------------------------------------ free filling
 
-    /// Fills the room of `open`, a page the flush writes anyway: in
-    /// compaction mode with the tail first, whenever it fits and `open` lies
-    /// below it; then with whole ripe victims whose survivors take at most
-    /// `θ` of a page, highest index first; then with the cursor page's
-    /// survivors, a whole statement's at a time.
+    /// Fills the room of `open`, a page the flush writes anyway, as main
+    /// does, with what costs nothing to move there, ripe or not: in
+    /// compaction mode the tail first, whenever it fits and `open` lies below
+    /// it; then whole data victims that fit, the sparsest first; then
+    /// description defragmentation's candidates beyond its share; then as
+    /// many of one victim's statements as fit, a whole statement's survivors
+    /// at a time.
     pub(crate) fn free_fill(
         &mut self,
         open: &mut DataPage,
         dirty: &mut Dirty,
     ) -> Result<(), Error> {
-        loop {
+        while let Some(b) = self.state.data_buckets.lowest_non_empty() {
             let room = open.room() as u32;
+            if room == 0 {
+                return Ok(());
+            }
             let tail = self
                 .compaction_tail(true)
                 .filter(|&t| open.page < t && self.state.live(t).coverage <= room);
-            let Some(t) = tail else { break };
-            if self.evacuate_into(t, open, dirty)? {
+            let Some(v) = tail.or_else(|| self.pick_victim(b, room)) else {
+                break;
+            };
+            if self.evacuate_into(v, open, dirty)? {
                 self.stats.free_filled_pages += 1;
             }
         }
-        let small = ((self.opts.theta * C as f64) as u32).min(open.room() as u32);
-        if small > 0 {
-            let none = IdSet::default();
-            for v in self.ripe_pages(Some(PageKind::Data), small, &none, CANDIDATES) {
-                let cov = self.state.live(v).coverage;
-                if cov as usize <= open.room() && self.evacuate_into(v, open, dirty)? {
-                    self.stats.free_filled_pages += 1;
-                }
-            }
+        self.fill_with_candidates(open, dirty)?;
+        match self.state.data_buckets.lowest_non_empty() {
+            Some(b) if open.room() > 0 => self.fill_with_part(b, open, dirty),
+            _ => Ok(()),
         }
-        if open.room() > 0 {
-            if let Some(c) = self.cursor_page() {
-                self.fill_from(c, open, dirty)?;
-            }
-        }
-        Ok(())
     }
 
-    /// Moves the survivors of as many of `v`'s statements as fit into
-    /// `open`, each statement's all or none. What stays behind is left to
-    /// later flushes.
-    fn fill_from(&mut self, v: u32, open: &mut DataPage, dirty: &mut Dirty) -> Result<(), Error> {
+    /// Moves the survivors of as many of one victim's statements as fit into
+    /// `open`, each statement's all or none; the victim is the best-scoring
+    /// sample of bucket `b`, the sparsest. It stays a victim, only a sparser
+    /// one.
+    fn fill_with_part(
+        &mut self,
+        b: usize,
+        open: &mut DataPage,
+        dirty: &mut Dirty,
+    ) -> Result<(), Error> {
+        let Some(v) = self.pick_victim(b, C) else {
+            return Ok(());
+        };
         let Some(surv) = self.all_survivors(v) else {
             return Ok(());
         };
@@ -573,7 +591,9 @@ impl Inner {
             }
             if let Some(o) = offer {
                 for v in o.whole {
-                    self.evacuate_into(v, &mut dp, dirty)?;
+                    if self.evacuate_into(v, &mut dp, dirty)? {
+                        self.cons.cleaned += 1;
+                    }
                 }
                 if let Some(v) = o.cut {
                     carry = self.evacuate_across(v, &mut dp, dirty)?;
@@ -831,8 +851,8 @@ impl Inner {
     /// freed pages stay free until new writes reuse them, would answer it
     /// only much later; holes are compaction mode's to return. The price
     /// holds where moving it could change nothing: it does not fall after a
-    /// flush that cleaned nothing, nor rise after one that spent its whole
-    /// budget.
+    /// flush that cleaned nothing at the price, whatever free filling took,
+    /// nor rise after one that spent its whole budget.
     pub(crate) fn after_commit(&mut self) -> Result<(), Error> {
         if !self.opts.consolidate {
             return Ok(());

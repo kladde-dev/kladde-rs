@@ -1280,19 +1280,11 @@ impl Inner {
         }
         self.stats.flushes += 1;
         // What the next flush's fold takes from these pages is what fresh
-        // pages lose; the cursor looks for its next page among the data pages.
+        // pages lose.
         self.cons.just_written = fresh
             .iter()
             .map(|&(p, data)| (p, data, self.state.live(p).coverage))
             .collect();
-        let data_pages: Vec<u32> = fresh
-            .iter()
-            .filter(|&&(_, data)| data)
-            .map(|&(p, _)| p)
-            .collect();
-        if !data_pages.is_empty() {
-            self.cons.prev_data_pages = data_pages;
-        }
         self.after_commit()?;
         self.truncate(false)
     }
