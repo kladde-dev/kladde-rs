@@ -68,7 +68,9 @@ pub struct ConsState {
     /// Per kind: the prior on the rate that the pages a flush writes start
     /// from, the file's empirical prior once it has one.
     pub prior: [Prior; 2],
-    /// Pages whose estimate this flush changed, for the consolidator state.
+    /// Pages whose estimate changed since the consolidator state last
+    /// recorded estimates, for its next record: this flush's, and those the
+    /// previous flush's own state rewrite changed after its record.
     pub drained: Vec<u32>,
     /// Victims this flush took, anywhere.
     pub cleaned: u32,
@@ -896,8 +898,13 @@ impl Inner {
         if first {
             self.learn_prior(&losses, sigma);
             // The estimates the pages of the previous flush started from are
-            // recorded too.
-            self.cons.drained = std::mem::take(&mut self.cons.just_written);
+            // recorded too, beside those the previous flush's own state
+            // rewrite changed after its record was written.
+            if !(self.opts.consolidate && self.opts.consolidator_state) {
+                self.cons.drained.clear();
+            }
+            let just_written = std::mem::take(&mut self.cons.just_written);
+            self.cons.drained.extend(just_written);
         }
         for (p, loss) in losses {
             let Some(info) = self.state.data_or_leaf_mut(p) else {
