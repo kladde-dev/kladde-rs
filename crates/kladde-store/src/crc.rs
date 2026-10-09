@@ -36,7 +36,7 @@ static TABLES: [[u32; 256]; 8] = make_tables();
 ///
 /// [`value`](Crc32c::value) is the CRC of everything fed so far, and feeding
 /// more afterwards continues the same computation, which is what the journal's
-/// chain needs: every checksum in a segment is a value of one running CRC.
+/// chain needs: every checksum in the journal is a value of one running CRC.
 #[derive(Clone, Copy, Debug)]
 pub struct Crc32c {
     state: u32,
