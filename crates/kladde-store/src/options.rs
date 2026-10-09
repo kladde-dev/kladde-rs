@@ -15,10 +15,12 @@
 /// ```
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// Flush once the journal segment outgrows this many pages.
+    /// The journal pages the journal is kept within: a transaction that
+    /// would not fit in what is left of them is preceded by a flush, and a
+    /// batch is cut where its next operation would not fit. Only a single
+    /// transaction too large for them on its own takes more, and a flush
+    /// follows it at once.
     pub journal_budget_pages: u32,
-    /// Bytes a batch may hold back before it appends them as one transaction.
-    pub batch_bytes: usize,
     /// Content runs up to this many bytes are stated `Inline`, up to the
     /// format's ceiling of 125 bytes, which caps any larger value.
     pub inline_threshold: u32,
@@ -63,7 +65,6 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             journal_budget_pages: 256,
-            batch_bytes: 64 * 1024,
             inline_threshold: 64,
             consolidate: true,
             budget_pages: 8,

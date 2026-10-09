@@ -8,7 +8,7 @@ use crate::backend::{Backend, ReadBackend, WriteBackend};
 use crate::consts::*;
 use crate::error::{corrupt, Error};
 use crate::hash::IdMap;
-use crate::journal::{recover, Record, Records, SegmentWriter};
+use crate::journal::{recover, Cursor, JournalWriter, Record, Records};
 use crate::load::{load, pick_header};
 use crate::options::Options;
 use crate::page::{encode_page, new_page, HeaderFields, PageBuf};
@@ -17,7 +17,7 @@ use crate::state::*;
 use crate::stats::Stats;
 use crate::storage::Storage;
 
-/// Write-phase geometry of an id this segment touched.
+/// Write-phase geometry of an id an operation since the last flush touched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Geo {
     Live(u32),
@@ -59,23 +59,59 @@ impl IdAllocator {
 }
 
 /// The transaction and batch state machine of
-/// `impl/transactions-and-batches.md`. `ops` holds what is not appended yet;
-/// in `InTxInBatch`, `ops[..ready]` is the batch's ready run.
+/// `impl/transactions-and-batches.md`, with the cursors into `ops` that a
+/// state does not imply: `ops[..committed]` is in the journal pages,
+/// `ops[committed..ready]` is a batch's ready run, and `ops[ready..]` is the
+/// open transaction. `Immediate` implies `committed == ready == end`,
+/// `InBatch` implies `ready == end`, and `InTransaction` implies
+/// `ready == committed`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tx {
     Immediate,
     InBatch {
         batch: u32,
+        committed: Cursor,
     },
     InTransaction {
         depth: u32,
         batch: u32,
+        committed: Cursor,
     },
     InTxInBatch {
         depth: u32,
         batch: u32,
-        ready: usize,
+        committed: Cursor,
+        ready: Cursor,
     },
+}
+
+impl Tx {
+    /// The same state with its committed cursor at `c`.
+    pub(crate) fn with_committed(self, c: Cursor) -> Tx {
+        match self {
+            Tx::Immediate => Tx::Immediate,
+            Tx::InBatch { batch, .. } => Tx::InBatch {
+                batch,
+                committed: c,
+            },
+            Tx::InTransaction { depth, batch, .. } => Tx::InTransaction {
+                depth,
+                batch,
+                committed: c,
+            },
+            Tx::InTxInBatch {
+                depth,
+                batch,
+                ready,
+                ..
+            } => Tx::InTxInBatch {
+                depth,
+                batch,
+                committed: c,
+                ready,
+            },
+        }
+    }
 }
 
 pub(crate) struct Inner {
@@ -92,14 +128,14 @@ pub(crate) struct Inner {
     pub retiring: Vec<u32>,
     pub file_pages: u32,
     // The write phase.
-    pub segment: SegmentWriter,
-    pub segment_records: Records,
+    pub journal: JournalWriter,
+    /// Every operation since the last flush, appended to the journal pages
+    /// or not.
     pub ops: Records,
     pub tx: Tx,
     pub geometry: IdMap<Geo>,
     pub ids: IdAllocator,
     pub first_flush: bool,
-    pub must_flush_first: bool,
     /// Data pages read since the last flush or load.
     pub cache: IdMap<Box<PageBuf>>,
     /// Table pages whose statements this flush already dropped physically.
@@ -192,7 +228,7 @@ impl Store {
         state.ensure_page(file_pages.saturating_sub(1).max(1));
         let mut ready = BTreeSet::new();
         // The page the header names for the journal is in its world, written
-        // to or not, and so is every page the segment went on to.
+        // to or not, and so is every page the journal went on to.
         let jp = loaded.header.fields.journal_pointer;
         let named = (jp >= 2 && jp < file_pages).then_some(jp);
         for &p in recovered.pages.iter().chain(&named) {
@@ -217,7 +253,7 @@ impl Store {
         }
         // Ids the recovered journal names are in use too, or will be once it
         // is folded: none of them may be handed out again.
-        for r in &recovered.records.records {
+        for r in recovered.records.iter() {
             for id in r.ids() {
                 max_id = max_id.max(id);
                 ids.free_dead.remove(&id);
@@ -225,14 +261,14 @@ impl Store {
             }
         }
         ids.next_fresh = max_id.checked_add(1).unwrap_or(0).max(1);
-        let journal_pointer = loaded.header.fields.journal_pointer;
-        let mut segment = SegmentWriter::new(epoch + 1, journal_pointer);
-        segment.pages = if recovered.pages.is_empty() {
-            vec![journal_pointer]
+        // A non-empty recovered journal is folded below, before anything can
+        // be appended to it; an empty one is appended to from its start.
+        let fold_recovered = recovered.transactions > 0;
+        let journal = if fold_recovered {
+            JournalWriter::recovered(epoch + 1, recovered.pages, recovered.transactions as u64)
         } else {
-            recovered.pages.clone()
+            JournalWriter::new(epoch + 1, loaded.header.fields.journal_pointer)
         };
-        let must_flush_first = recovered.transactions > 0;
         let mut inner = Inner {
             storage,
             opts,
@@ -245,14 +281,13 @@ impl Store {
             ready,
             retiring: Vec::new(),
             file_pages,
-            segment,
-            segment_records: recovered.records,
-            ops: Records::new(),
+            journal,
+            // All of it in the journal pages already, as `Immediate` implies.
+            ops: recovered.records,
             tx: Tx::Immediate,
             geometry: IdMap::default(),
             ids,
             first_flush: true,
-            must_flush_first,
             cache: IdMap::default(),
             flush_rewritten: Default::default(),
             cons: Default::default(),
@@ -260,8 +295,9 @@ impl Store {
         };
         inner.seed_after_load()?;
         // Replay: a recovered journal is folded now, so that what the
-        // application loads is the state at its last transaction.
-        if inner.must_flush_first {
+        // application loads, and every read, sees the state at its last
+        // transaction.
+        if fold_recovered {
             inner.flush_now()?;
         }
         Ok(Store {
@@ -541,23 +577,35 @@ impl Store {
     pub fn begin_transaction(&self) -> Result<(), Error> {
         self.with(|i| {
             i.tx = match i.tx {
-                Tx::Immediate => Tx::InTransaction { depth: 1, batch: 0 },
-                Tx::InBatch { batch } => Tx::InTxInBatch {
+                Tx::Immediate => Tx::InTransaction {
+                    depth: 1,
+                    batch: 0,
+                    committed: i.ops.end(),
+                },
+                Tx::InBatch { batch, committed } => Tx::InTxInBatch {
                     depth: 1,
                     batch,
-                    ready: i.ops.len(),
+                    committed,
+                    ready: i.ops.end(),
                 },
-                Tx::InTransaction { depth, batch } => Tx::InTransaction {
+                Tx::InTransaction {
+                    depth,
+                    batch,
+                    committed,
+                } => Tx::InTransaction {
                     depth: depth + 1,
                     batch,
+                    committed,
                 },
                 Tx::InTxInBatch {
                     depth,
                     batch,
+                    committed,
                     ready,
                 } => Tx::InTxInBatch {
                     depth: depth + 1,
                     batch,
+                    committed,
                     ready,
                 },
             };
@@ -574,36 +622,49 @@ impl Store {
     pub fn end_transaction(&self) -> Result<(), Error> {
         self.with(|i| {
             match i.tx {
-                Tx::InTransaction { depth: 1, batch: 0 } => {
+                Tx::InTransaction {
+                    depth: 1,
+                    batch: 0,
+                    committed,
+                } => {
+                    i.close(committed, committed, false)?;
                     i.tx = Tx::Immediate;
-                    i.append_ops(i.ops.len())?;
-                    i.maybe_auto_flush()?;
                 }
                 Tx::InTransaction { depth: 1, .. } => {
                     return Err(Error::Corrupt(
                         "a batch opened inside a transaction is still open".into(),
                     ))
                 }
-                Tx::InTransaction { depth, batch } => {
+                Tx::InTransaction {
+                    depth,
+                    batch,
+                    committed,
+                } => {
                     i.tx = Tx::InTransaction {
                         depth: depth - 1,
                         batch,
+                        committed,
                     }
                 }
                 Tx::InTxInBatch {
-                    depth: 1, batch, ..
+                    depth: 1,
+                    batch,
+                    committed,
+                    ready,
                 } => {
-                    i.tx = Tx::InBatch { batch };
-                    i.maybe_append_batch()?;
+                    let committed = i.close(committed, ready, true)?;
+                    i.tx = Tx::InBatch { batch, committed };
                 }
                 Tx::InTxInBatch {
                     depth,
                     batch,
+                    committed,
                     ready,
                 } => {
                     i.tx = Tx::InTxInBatch {
                         depth: depth - 1,
                         batch,
+                        committed,
                         ready,
                     }
                 }
@@ -638,25 +699,28 @@ impl Store {
         let mut i = self.inner.borrow_mut();
         let keep = match i.tx {
             Tx::InTxInBatch { ready, .. } => ready,
-            Tx::InTransaction { .. } => 0,
-            _ => i.ops.len(),
+            Tx::InTransaction { committed, .. } => committed,
+            _ => i.ops.end(),
         };
-        i.ops.records.truncate(keep);
+        i.ops.truncate(keep);
         i.poisoned = true;
     }
 
     /// Opens a batch: the operations recorded until the matching
     /// [`end_batch`](Self::end_batch) are held back and appended to the
-    /// journal in few, large pieces.
+    /// journal in as few pieces as its page budget allows.
     ///
-    /// A piece is appended when the batch ends, or whenever what it holds
-    /// outgrows [`Options::batch_bytes`]. A batch saves journal writes and is
-    /// no transaction: a crash may keep some of its pieces and lose the rest,
-    /// though never part of a transaction inside it. Batches nest, and only
-    /// the outermost end appends.
+    /// The batch holds its operations in memory until the next would no
+    /// longer fit, together with them, in what is left of
+    /// [`Options::journal_budget_pages`]; then it appends them as one
+    /// transaction, and the journal is folded. Its end appends what it holds
+    /// still. A batch is cut only between operations, and never inside a
+    /// transaction opened in it. It saves journal writes and is no
+    /// transaction: a crash may keep some of its pieces and lose the rest.
+    /// Batches nest, and only the outermost end appends.
     ///
     /// ```
-    /// use kladde_store::{MemoryStorage, Store, WriteBackend};
+    /// use kladde_store::{MemoryStorage, Options, Store, WriteBackend};
     ///
     /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
     /// let p = store.alloc(1000)?;
@@ -666,24 +730,49 @@ impl Store {
     /// }
     /// store.end_batch()?;
     /// assert_eq!(store.stats().transactions, 2);
+    ///
+    /// // With a budget of one journal page, the batch is cut into pieces of
+    /// // a page each, and the journal is folded after each piece.
+    /// let opts = Options { journal_budget_pages: 1, ..Default::default() };
+    /// let store = Store::create(Box::new(MemoryStorage::new()), opts)?;
+    /// let p = store.alloc(100)?;
+    /// store.begin_batch()?;
+    /// for _ in 0..100 {
+    ///     store.write(p.raw(), 0, &[7; 100])?;
+    /// }
+    /// store.end_batch()?;
+    /// assert!(store.stats().transactions > 2);
     /// # Ok::<(), kladde_store::Error>(())
     /// ```
     pub fn begin_batch(&self) -> Result<(), Error> {
         self.with(|i| {
             i.tx = match i.tx {
-                Tx::Immediate => Tx::InBatch { batch: 1 },
-                Tx::InBatch { batch } => Tx::InBatch { batch: batch + 1 },
-                Tx::InTransaction { depth, batch } => Tx::InTransaction {
+                Tx::Immediate => Tx::InBatch {
+                    batch: 1,
+                    committed: i.ops.end(),
+                },
+                Tx::InBatch { batch, committed } => Tx::InBatch {
+                    batch: batch + 1,
+                    committed,
+                },
+                Tx::InTransaction {
+                    depth,
+                    batch,
+                    committed,
+                } => Tx::InTransaction {
                     depth,
                     batch: batch + 1,
+                    committed,
                 },
                 Tx::InTxInBatch {
                     depth,
                     batch,
+                    committed,
                     ready,
                 } => Tx::InTxInBatch {
                     depth,
                     batch: batch + 1,
+                    committed,
                     ready,
                 },
             };
@@ -699,26 +788,43 @@ impl Store {
     pub fn end_batch(&self) -> Result<(), Error> {
         self.with(|i| {
             match i.tx {
-                Tx::InBatch { batch: 1 } => {
+                Tx::InBatch {
+                    batch: 1,
+                    committed,
+                } => {
+                    // The ready run fits, as it always does, so no flush
+                    // follows.
+                    i.append(committed, i.ops.end())?;
+                    debug_assert!(!i.journal.over_budget(i.opts.journal_budget_pages));
                     i.tx = Tx::Immediate;
-                    i.append_ops(i.ops.len())?;
-                    i.maybe_auto_flush()?;
                 }
-                Tx::InBatch { batch } => i.tx = Tx::InBatch { batch: batch - 1 },
-                Tx::InTransaction { depth, batch } if batch > 0 => {
+                Tx::InBatch { batch, committed } => {
+                    i.tx = Tx::InBatch {
+                        batch: batch - 1,
+                        committed,
+                    }
+                }
+                Tx::InTransaction {
+                    depth,
+                    batch,
+                    committed,
+                } if batch > 0 => {
                     i.tx = Tx::InTransaction {
                         depth,
                         batch: batch - 1,
+                        committed,
                     }
                 }
                 Tx::InTxInBatch {
                     depth,
                     batch,
+                    committed,
                     ready,
                 } if batch > 1 => {
                     i.tx = Tx::InTxInBatch {
                         depth,
                         batch: batch - 1,
+                        committed,
                         ready,
                     }
                 }
@@ -824,57 +930,80 @@ impl Inner {
     /// Recomputes the write-phase geometry from the operations still buffered.
     /// Recomputes the write-phase geometry from the operations recorded since
     /// the last flush: those appended already, then those still buffered.
+    /// Recomputes the write-phase geometry from every operation the buffer
+    /// holds: those in the journal pages, then those not appended yet.
     pub fn repopulate_geometry(&mut self) {
         self.geometry.clear();
-        let appended = std::mem::take(&mut self.segment_records.records);
-        let buffered = std::mem::take(&mut self.ops.records);
-        for r in appended.iter().chain(&buffered) {
+        let ops = std::mem::take(&mut self.ops);
+        for r in ops.iter() {
             self.apply_geometry(r);
         }
-        self.segment_records.records = appended;
-        self.ops.records = buffered;
+        self.ops = ops;
     }
 
     // ------------------------------------------------------------ recording
 
-    /// Records one operation, appending it when the state machine says so.
+    /// Records one operation; a bare one closes at once.
     fn record(&mut self, r: Record) -> Result<(), Error> {
         self.apply_geometry(&r);
-        self.ops.records.push(r);
+        let start = self.ops.end();
+        self.ops.push(r);
         match self.tx {
-            Tx::Immediate => {
-                self.append_ops(self.ops.len())?;
-                self.maybe_auto_flush()
+            Tx::Immediate => self.close(start, start, false).map(|_| ()),
+            Tx::InBatch { batch, committed } => {
+                let committed = self.close(committed, start, true)?;
+                self.tx = Tx::InBatch { batch, committed };
+                Ok(())
             }
-            Tx::InBatch { .. } => self.maybe_append_batch(),
             _ => Ok(()),
         }
     }
 
-    fn maybe_append_batch(&mut self) -> Result<(), Error> {
-        if self.ops.arena.len() + self.ops.len() * 8 >= self.opts.batch_bytes {
-            self.append_ops(self.ops.len())?;
-            self.maybe_auto_flush()?;
+    /// Appends, holds back, and flushes as
+    /// `impl/transactions-and-batches.md#flush-triggers` has it, now that the
+    /// operations `ops[ready..]` have closed, a bare operation or a whole
+    /// transaction, and `ops[committed..ready]` is a batch's ready run, or
+    /// empty outside a batch. Returns the committed cursor after.
+    fn close(&mut self, committed: Cursor, ready: Cursor, in_batch: bool) -> Result<Cursor, Error> {
+        let (budget, end) = (self.opts.journal_budget_pages, self.ops.end());
+        if ready == end {
+            return Ok(committed);
         }
-        Ok(())
+        // The candidate is `ops[committed..]`; if it does not fit, the batch
+        // is cut before what closed: the ready run, which always fits, is
+        // appended, and the journal folded unless it is empty.
+        let mut committed = committed;
+        if !self.journal.fits(end.bytes - committed.bytes, budget) {
+            committed = self.append(committed, ready)?;
+            if !self.journal.is_empty() {
+                self.fold_journal(committed)?;
+            }
+        }
+        // A batch holds back a candidate that fits.
+        if in_batch && self.journal.fits(end.bytes - committed.bytes, budget) {
+            return Ok(committed);
+        }
+        // Otherwise it is appended, and only an overlong transaction, which
+        // the journal had to itself, can take it past the budget.
+        committed = self.append(committed, end)?;
+        if self.journal.over_budget(budget) {
+            self.fold_journal(committed)?;
+        }
+        Ok(committed)
     }
 
-    /// Appends `ops[..n]` as one transaction.
-    pub fn append_ops(&mut self, n: usize) -> Result<(), Error> {
-        if n == 0 {
-            return Ok(());
+    /// Appends `ops[from..to]` to the journal pages as one transaction, if it
+    /// is not empty, and returns `to`, the committed cursor after.
+    pub fn append(&mut self, from: Cursor, to: Cursor) -> Result<Cursor, Error> {
+        if from == to {
+            return Ok(to);
         }
-        if self.must_flush_first {
-            // A recovered, non-empty journal is folded before anything is
-            // appended to it (`spec/journal.md#the-start-of-a-session`).
-            self.flush_now()?;
-        }
-        let mut payload = Vec::new();
-        self.ops.encode(0..n, &mut payload);
-        self.ensure_segment_page()?;
+        let mut payload = Vec::with_capacity((to.bytes - from.bytes) as usize);
+        self.ops.encode(from, to, &mut payload);
+        self.ensure_journal_page()?;
         let Inner {
             storage,
-            segment,
+            journal,
             ready,
             state,
             file_pages,
@@ -884,47 +1013,19 @@ impl Inner {
         let mut alloc = |s: &mut dyn Storage| -> Result<u32, Error> {
             take_page(ready, state, file_pages, s, stats, Page::Journal)
         };
-        let before = segment.bytes;
-        if let Err(e) = segment.append(&payload, &mut **storage, &mut alloc) {
+        let before = journal.bytes;
+        if let Err(e) = journal.append(&payload, &mut **storage, &mut alloc) {
             self.poisoned = true;
             return Err(e);
         }
-        self.stats.journal_bytes += segment_delta(before, self.segment.bytes);
+        self.stats.journal_bytes += journal_delta(before, self.journal.bytes);
         self.stats.transactions += 1;
-        // Move the appended records into the segment the next flush folds.
-        let appended = Records {
-            records: self.ops.records[..n].to_vec(),
-            arena: Vec::new(),
-        };
-        let mut moved = Records::new();
-        for r in &appended.records {
-            moved.push_from(*r, &self.ops);
-        }
-        self.segment_records.extend_from(&moved);
-        let rest: Vec<Record> = self.ops.records[n..].to_vec();
-        let mut kept = Records::new();
-        for r in rest {
-            kept.push_from(r, &self.ops);
-        }
-        self.ops = kept;
-        if let Tx::InTxInBatch {
-            depth,
-            batch,
-            ready,
-        } = self.tx
-        {
-            self.tx = Tx::InTxInBatch {
-                depth,
-                batch,
-                ready: ready.saturating_sub(n),
-            };
-        }
-        Ok(())
+        Ok(to)
     }
 
-    /// Makes sure the page the segment appends to exists in the file.
-    fn ensure_segment_page(&mut self) -> Result<(), Error> {
-        let p = self.segment.current_page();
+    /// Makes sure the page the journal appends to exists in the file.
+    fn ensure_journal_page(&mut self) -> Result<(), Error> {
+        let p = self.journal.current_page();
         if p >= self.file_pages {
             let len = (p as u64 + 1) * PAGE_SIZE as u64;
             self.storage.set_len(len)?;
@@ -939,18 +1040,6 @@ impl Inner {
         }
         self.ready.remove(&p);
         self.state.pages[p as usize] = Page::Journal;
-        Ok(())
-    }
-
-    pub fn maybe_auto_flush(&mut self) -> Result<(), Error> {
-        if self.segment.pages.len() as u32 > self.opts.journal_budget_pages
-            && self.tx == Tx::Immediate
-            || (self.segment.pages.len() as u32 > self.opts.journal_budget_pages
-                && matches!(self.tx, Tx::InBatch { .. })
-                && self.ops.is_empty())
-        {
-            self.flush_now()?;
-        }
         Ok(())
     }
 
@@ -995,9 +1084,7 @@ impl Inner {
                 let pe = self.state.pending[p as usize].advanced(rel);
                 match pe.origin {
                     crate::state::Origin::Arena(a) => {
-                        out.copy_from_slice(
-                            &self.segment_records.arena[a as usize..a as usize + out.len()],
-                        );
+                        self.ops.copy_bytes(a, out);
                         Ok(())
                     }
                     crate::state::Origin::File(addr) => {
@@ -1038,7 +1125,7 @@ impl Inner {
     }
 }
 
-fn segment_delta(before: u64, after: u64) -> u64 {
+fn journal_delta(before: u64, after: u64) -> u64 {
     after - before
 }
 
@@ -1173,7 +1260,7 @@ impl WriteBackend for Store {
     }
 
     fn atomically<R>(&self, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
-        let (mark, tx) = self.with(|i| Ok((i.ops.len(), i.tx)))?;
+        let (mark, tx) = self.with(|i| Ok((i.ops.end(), i.tx)))?;
         self.begin_transaction()?;
         match f() {
             Ok(r) => {
@@ -1181,13 +1268,21 @@ impl WriteBackend for Store {
                 Ok(r)
             }
             Err(e) => {
-                // Inside a transaction nothing is appended, so what `f`
-                // recorded is still buffered past `mark`, and dropping it
-                // undoes `f` as far as the file is concerned.
+                // Inside a transaction nothing past `mark` is appended, so
+                // moving the buffer's end back to it undoes `f` as far as the
+                // file is concerned. An explicit flush inside `f` may have
+                // appended a batch's ready run, which the committed cursor
+                // keeps.
                 let mut i = self.inner.borrow_mut();
                 if !i.poisoned {
-                    i.ops.records.truncate(mark);
-                    i.tx = tx;
+                    i.ops.truncate(mark);
+                    let committed = match i.tx {
+                        Tx::Immediate => mark,
+                        Tx::InBatch { committed, .. }
+                        | Tx::InTransaction { committed, .. }
+                        | Tx::InTxInBatch { committed, .. } => committed,
+                    };
+                    i.tx = tx.with_committed(committed);
                     i.repopulate_geometry();
                 }
                 Err(e)
@@ -1314,5 +1409,305 @@ impl ReadBackend for Store {
             pos: offset as u64,
             size: size as u64,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The flush triggers of `impl/transactions-and-batches.md`, checked
+    //! against a model of them after every operation.
+
+    use super::*;
+    use crate::journal::{framed_len, record_len, Bytes};
+    use crate::storage::MemoryStorage;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n.max(1)
+        }
+    }
+
+    fn store(budget: u32) -> (Store, MemoryStorage) {
+        let storage = MemoryStorage::new();
+        let opts = Options {
+            journal_budget_pages: budget,
+            ..Default::default()
+        };
+        (
+            Store::create(Box::new(storage.clone()), opts).unwrap(),
+            storage,
+        )
+    }
+
+    /// The journal's stream bytes, and whether it is empty.
+    fn journal(s: &Store) -> (u64, bool) {
+        let i = s.inner.borrow();
+        assert!(!i.journal.over_budget(i.opts.journal_budget_pages));
+        (i.journal.bytes, i.journal.is_empty())
+    }
+
+    /// The model: a journal of `bytes` stream bytes, `empty` or not, a
+    /// budget of `cap` stream bytes, and the flushes and transactions so far.
+    struct Model {
+        bytes: u64,
+        empty: bool,
+        cap: u64,
+        flushes: u64,
+        transactions: u64,
+    }
+
+    impl Model {
+        fn of(s: &Store) -> Model {
+            let (bytes, empty) = journal(s);
+            let stats = s.stats();
+            Model {
+                bytes,
+                empty,
+                cap: s.inner.borrow().opts.journal_budget_pages as u64 * JOURNAL_STREAM as u64,
+                flushes: stats.flushes,
+                transactions: stats.transactions,
+            }
+        }
+
+        fn fits(&self, n: u64) -> bool {
+            self.bytes + framed_len(n) <= self.cap
+        }
+
+        fn append(&mut self, n: u64) {
+            self.bytes += framed_len(n);
+            self.empty = false;
+            self.transactions += 1;
+        }
+
+        fn flush(&mut self) {
+            self.bytes = 0;
+            self.empty = true;
+            self.flushes += 1;
+        }
+
+        /// What the rules do once operations of `n` record bytes close,
+        /// with `ready` record bytes held back by a batch, if `in_batch`;
+        /// returns what the batch holds back after.
+        fn close(&mut self, ready: u64, n: u64, in_batch: bool) -> u64 {
+            let mut ready = ready;
+            if !self.fits(ready + n) {
+                if ready > 0 {
+                    self.append(ready);
+                }
+                if !self.empty {
+                    self.flush();
+                }
+                ready = 0;
+            }
+            if in_batch && self.fits(ready + n) {
+                return ready + n;
+            }
+            self.append(ready + n);
+            if self.bytes > self.cap {
+                self.flush();
+            }
+            0
+        }
+
+        fn check(&self, s: &Store, what: &str) {
+            let stats = s.stats();
+            assert_eq!(journal(s), (self.bytes, self.empty), "{what}: the journal");
+            assert_eq!(stats.flushes, self.flushes, "{what}: flushes");
+            assert_eq!(
+                stats.transactions, self.transactions,
+                "{what}: transactions"
+            );
+        }
+    }
+
+    /// Writes `len` bytes at a random offset of `p`, mirrored in `model`,
+    /// and returns the record bytes the write encodes to.
+    fn write(s: &Store, p: Pointer, len: usize, rng: &mut Rng, model: &mut Vec<u8>) -> u64 {
+        let offset = rng.below(2000) as u32;
+        let fill = rng.below(255) as u8 + 1;
+        s.write(p, offset, &vec![fill; len]).unwrap();
+        let end = offset as usize + len;
+        if model.len() < end {
+            model.resize(end, 0);
+        }
+        model[offset as usize..end].fill(fill);
+        let r = Record::Write {
+            id: p.raw(),
+            offset,
+            bytes: Bytes {
+                start: 0,
+                len: len as u32,
+            },
+        };
+        record_len(&r) as u64
+    }
+
+    /// Mostly short, now and then longer than a budget of `cap` stream
+    /// bytes.
+    fn length(rng: &mut Rng, cap: u64) -> usize {
+        if rng.below(25) == 0 {
+            rng.below(3 * cap) as usize
+        } else {
+            rng.below(300) as usize
+        }
+    }
+
+    #[test]
+    fn a_transaction_that_does_not_fit_is_preceded_by_a_flush_and_an_overlong_one_followed_by_one()
+    {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for budget in 1..4u32 {
+            let (s, _) = store(budget);
+            let p = s.alloc(1).unwrap();
+            let mut bytes = vec![0u8];
+            s.flush().unwrap();
+            for step in 0..300 {
+                let mut m = Model::of(&s);
+                let what = format!("budget {budget}, step {step}");
+                if rng.below(3) == 0 {
+                    // A transaction of a few writes, nested now and then.
+                    let nested = rng.below(2) == 0;
+                    let mut inner_open = false;
+                    s.begin_transaction().unwrap();
+                    let mut n = 0;
+                    for k in 0..rng.below(5) + 1 {
+                        if nested && k == 1 {
+                            s.begin_transaction().unwrap();
+                            inner_open = true;
+                        }
+                        n += write(&s, p.raw(), length(&mut rng, m.cap), &mut rng, &mut bytes);
+                        m.check(&s, &what);
+                    }
+                    if inner_open {
+                        s.end_transaction().unwrap();
+                        m.check(&s, &what);
+                    }
+                    s.end_transaction().unwrap();
+                    m.close(0, n, false);
+                } else {
+                    let n = write(&s, p.raw(), length(&mut rng, m.cap), &mut rng, &mut bytes);
+                    m.close(0, n, false);
+                }
+                m.check(&s, &what);
+            }
+            s.flush().unwrap();
+            assert_eq!(s.read_all(p.raw()).unwrap(), bytes, "budget {budget}");
+        }
+    }
+
+    #[test]
+    fn a_batch_is_cut_at_the_last_boundary_at_which_it_still_fits() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        for budget in 1..4u32 {
+            let (s, storage) = store(budget);
+            let p = s.alloc(1).unwrap();
+            let mut bytes = vec![0u8];
+            s.flush().unwrap();
+            for round in 0..25 {
+                let mut m = Model::of(&s);
+                let mut ready = 0;
+                s.begin_batch().unwrap();
+                for item in 0..rng.below(80) {
+                    let what = format!("budget {budget}, round {round}, item {item}");
+                    let len = length(&mut rng, m.cap);
+                    if rng.below(4) == 0 {
+                        // A transaction inside the batch: never cut.
+                        s.begin_transaction().unwrap();
+                        let mut n = write(&s, p.raw(), len, &mut rng, &mut bytes);
+                        for _ in 0..rng.below(4) {
+                            n += write(&s, p.raw(), rng.below(100) as usize, &mut rng, &mut bytes);
+                            m.check(&s, &what);
+                        }
+                        s.end_transaction().unwrap();
+                        ready = m.close(ready, n, true);
+                    } else {
+                        let n = write(&s, p.raw(), len, &mut rng, &mut bytes);
+                        ready = m.close(ready, n, true);
+                    }
+                    m.check(&s, &what);
+                }
+                s.end_batch().unwrap();
+                if ready > 0 {
+                    m.append(ready);
+                }
+                m.check(&s, &format!("budget {budget}, end of round {round}"));
+            }
+            // What the batches appended reads back, after a flush and after
+            // reopening.
+            s.flush().unwrap();
+            assert_eq!(s.read_all(p.raw()).unwrap(), bytes, "budget {budget}");
+            drop(s);
+            let s = Store::open(
+                Box::new(MemoryStorage::from_image(storage.image())),
+                Options::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                s.read_all(p.raw()).unwrap(),
+                bytes,
+                "budget {budget}, reopened"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_flush_folds_even_an_empty_journal() {
+        let (s, _) = store(4);
+        s.flush().unwrap();
+        let before = s.stats().flushes;
+        s.flush().unwrap();
+        assert_eq!(s.stats().flushes, before + 1);
+    }
+
+    #[test]
+    fn an_explicit_flush_in_a_batch_appends_its_ready_run_and_keeps_the_open_transaction() {
+        let (s, storage) = store(4);
+        let p = s.alloc(4).unwrap();
+        s.flush().unwrap();
+        let before = s.stats();
+        s.begin_batch().unwrap();
+        s.write(p.raw(), 0, b"ab").unwrap();
+        s.begin_transaction().unwrap();
+        s.write(p.raw(), 2, b"cd").unwrap();
+        s.flush().unwrap();
+        let after = s.stats();
+        assert_eq!(after.transactions, before.transactions + 1);
+        assert_eq!(after.flushes, before.flushes + 1);
+        assert_eq!(s.read_all(p.raw()).unwrap(), b"ab\0\0");
+        s.end_transaction().unwrap();
+        s.end_batch().unwrap();
+        assert_eq!(s.stats().transactions, before.transactions + 2);
+        // No flush since: the transaction is in the journal pages only, and
+        // reopening replays it.
+        drop(s);
+        let s = Store::open(
+            Box::new(MemoryStorage::from_image(storage.image())),
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(s.read_all(p.raw()).unwrap(), b"abcd");
+    }
+
+    #[test]
+    fn a_failed_atomic_mutation_in_a_batch_leaves_the_ready_run() {
+        let (s, _) = store(4);
+        let p = s.alloc(4).unwrap();
+        s.flush().unwrap();
+        s.begin_batch().unwrap();
+        s.write(p.raw(), 0, b"ab").unwrap();
+        let r: Result<(), Error> = s.atomically(|| {
+            s.write(p.raw(), 2, b"cd")?;
+            Err(Error::OutOfBounds)
+        });
+        assert!(r.is_err());
+        s.write(p.raw(), 3, b"e").unwrap();
+        s.end_batch().unwrap();
+        s.flush().unwrap();
+        assert_eq!(s.read_all(p.raw()).unwrap(), b"ab\0e");
     }
 }

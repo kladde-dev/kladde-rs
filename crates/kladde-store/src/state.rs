@@ -233,8 +233,8 @@ pub enum Page {
     Reusable,
     /// In the world of the older header only; reusable after the next commit.
     Fallback,
-    /// Part of the current journal segment, or named by the header for it.
-    /// Live in the sense of the spec, but the segment keeps what it holds.
+    /// One of the current journal's pages, or named by the header for it.
+    /// Live in the sense of the spec, but the journal keeps what it holds.
     Journal,
     /// Taken by the flush in progress, which writes it at its commit: its
     /// epoch is that flush's. The spec counts it reusable until the commit;

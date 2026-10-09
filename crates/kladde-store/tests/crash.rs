@@ -43,6 +43,12 @@ fn plus_one_alloc(got: &Model, want: &Model, size: usize) -> bool {
 }
 
 fn run(seed: u64, opts: &Options) {
+    run_mixed(seed, opts, false)
+}
+
+/// As `run`, and with `mixed`, also with batches, transactions of a few
+/// writes, and writes of up to two pages.
+fn run_mixed(seed: u64, opts: &Options, mixed: bool) {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let storage = MemoryStorage::with_crash_tracking();
     let store = Store::create(Box::new(storage.clone()), opts.clone()).unwrap();
@@ -53,11 +59,48 @@ fn run(seed: u64, opts: &Options) {
     let mut history: Vec<Model> = vec![model.clone()];
     let mut flushed = 0usize;
     let mut failed_alloc: Option<usize> = None;
+    let mut in_batch = false;
     storage.fail_after(rng.below(400) + 1);
     for _ in 0..300 {
         let ids: Vec<u32> = model.keys().copied().collect();
         let pick = |rng: &mut Rng| ids[rng.below(ids.len() as u64) as usize];
-        let r = match rng.below(8) {
+        let kind = rng.below(if mixed { 10 } else { 8 });
+        let r = match kind {
+            8 => {
+                // A batch begins or ends; every operation in it is still a
+                // boundary, since a crash keeps a prefix of its pieces.
+                in_batch = !in_batch;
+                if in_batch {
+                    store.begin_batch()
+                } else {
+                    store.end_batch()
+                }
+            }
+            9 if !ids.is_empty() => {
+                // A transaction of a few writes, all or none of them.
+                let writes: Vec<(u32, u32, Vec<u8>)> = (0..rng.below(3) + 2)
+                    .map(|_| {
+                        let id = pick(&mut rng);
+                        let off = rng.below(model[&id].len() as u64 + 1) as u32;
+                        let fill = (rng.below(250) + 1) as u8;
+                        (id, off, vec![fill; rng.below(900) as usize])
+                    })
+                    .collect();
+                for (id, off, bytes) in &writes {
+                    let v = model.get_mut(id).unwrap();
+                    let end = *off as usize + bytes.len();
+                    if v.len() < end {
+                        v.resize(end, 0);
+                    }
+                    v[*off as usize..end].copy_from_slice(bytes);
+                }
+                store.atomically(|| {
+                    for (id, off, bytes) in &writes {
+                        store.write(Pointer::from_raw(*id).unwrap(), *off, bytes)?;
+                    }
+                    Ok(())
+                })
+            }
             0 | 1 => {
                 let size = rng.below(3000) as u32;
                 store
@@ -84,7 +127,13 @@ fn run(seed: u64, opts: &Options) {
                 let v = model.get_mut(&id).unwrap();
                 let off = rng.below(v.len() as u64 + 1) as u32;
                 let fill = (rng.below(250) + 1) as u8;
-                let bytes = vec![fill; rng.below(900) as usize];
+                // Now and then two pages, more than a tiny journal holds.
+                let len = if mixed && rng.below(10) == 0 {
+                    8192
+                } else {
+                    900
+                };
+                let bytes = vec![fill; rng.below(len) as usize];
                 let end = off as usize + bytes.len();
                 if v.len() < end {
                     v.resize(end, 0);
@@ -184,5 +233,18 @@ fn power_cuts_with_a_tiny_journal() {
     };
     for seed in 1..150 {
         run(seed, &opts);
+    }
+}
+
+/// With a journal of one page, batches are cut and flushed often, and a
+/// write of two pages is flushed before and after.
+#[test]
+fn power_cuts_with_batches_transactions_and_overlong_writes_in_a_tiny_journal() {
+    let opts = Options {
+        journal_budget_pages: 1,
+        ..Default::default()
+    };
+    for seed in 1..150 {
+        run_mixed(seed, &opts, true);
     }
 }

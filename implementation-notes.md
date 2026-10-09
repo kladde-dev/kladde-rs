@@ -29,14 +29,14 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
   `impl/in-memory-state.md#3-the-allocation-map` sketches a `u32`; epochs are 64-bit in the format, and ages are computed as epoch differences, so the wider field needs no wrap-around rule.
 - **`Origin::Arena` holds a `u64`.**
   `impl/consolidation.md#how-a-flush-and-consolidation-compose` halves `Origin` with a 32-bit arena position and a flush forced before the arena outgrows it.
-  The implementation keeps 64 bits and relies on the journal budget to keep the arena small; a single transaction is still capped at `2^32 - 1` bytes by the journal's length prefix.
+  The implementation keeps 64 bits, since arena positions count from the start of the session, as `impl/transactions-and-batches.md#one-buffer-and-three-cursors` has them; the journal budget keeps the arena itself small, and a single transaction is still capped at `2^32 - 1` bytes by the journal's length prefix.
 - **A page's record holds what its state has, and nothing else.**
   It is an enum over the states of `spec/durability.md#page-states`, where `impl/in-memory-state.md#4-the-page-table` lists an epoch, a kind and coverage for every page.
   Kept as leftovers in reusable and fallback pages, those fields once let a flush read a reused page's old epoch.
   A page a flush takes is in a state of the implementation's own, filling, which the spec counts as reusable: it has a kind and coverage but no epoch, since its epoch is the flush's, and no place among the victims, so no rule can mistake it for a committed page.
   The commit turns every page it wrote into a live one; a failed flush poisons the store, so nothing reads the pages it left filling.
   Only a live page has an epoch and a victim bucket.
-  Journal pages are a state of their own, although the spec counts them live, since the segment keeps what they hold.
+  Journal pages are a state of their own, although the spec counts them live, since the journal keeps what they hold.
   The other header slot is fallback after a commit and reusable after a load, as the spec has it, and joins the ready pool in neither case.
   A table page records no parent; see the interior layer under Flush.
 - **A page whose coverage reaches zero leaves its bucket at once.**
@@ -49,7 +49,7 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 
 - **Bytes an allocation shifts within itself are restated; bytes from another allocation, and copies, are read and written afresh.**
   A piece that the fold sources from the same id's committed bytes at another offset — the tail a `Splice` shifts, or a range a `Move` within the id relocates — becomes the fragments those bytes lie in, each taken at its new offset where it lies: a `Ref` keeps its address, an `Inline` payload is copied into the new table page as the cut copies every payload, and zeros become a `Zero` below the old size.
-  That is the shift of `impl/flush.md#per-record-rules`, applied only where it is a transfer: a piece is restated only if no other piece of the id names the same committed bytes, so every data byte stays referenced by at most one live statement, and the bytes a segment copied within an id are written afresh, in both places, at piece granularity.
+  That is the shift of `impl/flush.md#per-record-rules`, applied only where it is a transfer: a piece is restated only if no other piece of the id names the same committed bytes, so every data byte stays referenced by at most one live statement, and the bytes the journal copied within an id are written afresh, in both places, at piece granularity.
   Runs of a piece's fragments are written afresh, as one chunk each, where describing them would cost more than their bytes over the shifts still to come, as `impl/flush.md#shifted-bytes-restated-or-merged` describes: about 9 bytes per `Ref`, a payload and 4 per `Inline`, 4 per `Zero`, against the bytes and a `Ref` per page they fill, both paid again at every later shift, of which an allocation's decayed count of past shifts (`Options::shift_decay`, in memory only) is the prediction.
   Pieces from another id — `Copy` and `Move` between allocations — are still read and written afresh, so the flush needs no ordering phase (`impl/flush.md#phase-c--ordering`): a restated fragment moves no bytes, and the only care it needs is the reverse index's rule 1, widening the window of the page it lies in to its new offsets.
 - **The header's eviction ranks by allocation, not by fragment.**
@@ -62,9 +62,6 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
   A file in which a non-header page holds both child references and statements opens correctly, but its first flush drops those statements, and the next open misses their allocations: found with a hand-built file, with consolidation off; with it on, the same test passed only because compaction moved the data and restated it.
   A page with children further down is neither kept nor dropped, and stays allocated in memory until the file is reopened.
   Open; the path copy of `impl/` fixes both.
-- **`Store::open` folds a recovered journal before it returns.**
-  `spec/journal.md#the-start-of-a-session` asks only that a non-empty recovered journal be folded before anything is appended.
-  Folding at open is simpler, and it lets reads, which see flushed state only, see every recovered transaction at once.
 - **Ids a recovered journal allocates must be withheld from the id allocator.**
   The allocator is rebuilt at open from the loaded state, which knows nothing of the ids the unfolded journal brings into existence; before the fix, the first `alloc` after a recovery could hand one of them out again.
   `impl/id-recycling.md` should say that recovery counts the journal's ids as used; the consolidator state, whose allocation the recovery flush creates, exposed it.
