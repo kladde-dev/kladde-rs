@@ -402,7 +402,8 @@ impl Inner {
         if !written.is_empty() {
             age_record(&mut rec, e, &written);
         }
-        let drained = self.drain_entries(self.cons.drained.iter().copied());
+        let pages = std::mem::take(&mut self.cons.drained);
+        let drained = self.drain_entries(pages);
         if !drained.is_empty() {
             drain_record(&mut rec, &drained);
         }

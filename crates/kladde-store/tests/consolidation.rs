@@ -232,12 +232,17 @@ fn the_price_of_space_survives_a_reopen() {
 
 #[test]
 fn estimates_survive_a_reopen() {
-    // Half of every page's content is overwritten, so pages drain; their
+    // Part of every page's content is overwritten, so pages drain; their
     // estimates must come back from the consolidator state, not from the
     // seed that assumes one rate since each page was written. Nothing is
-    // ripe at this price, and the window walks nothing, so few pages lose
-    // content to consolidation after their estimates are recorded, which a
-    // reopen takes for a loss in the gap.
+    // ripe at this price, the window walks nothing, and each flush writes
+    // two parts, whose page leaves free filling too little room for any
+    // page's content or statement, so few pages lose content to
+    // consolidation after their estimates are recorded, which a reopen
+    // takes for a loss in the gap. The pages the flushes write stay emptier
+    // than the snapshot's bound, so their estimates are kept too; each also
+    // holds part of the consolidator state, whose next rewrite drains it
+    // after the next flush's record, so the record after that holds it.
     let opts = Options {
         kappa: 1e-6,
         target_fill: 0.0,
@@ -256,9 +261,11 @@ fn estimates_survive_a_reopen() {
     store.flush().unwrap();
     for (i, p) in ptrs.iter().enumerate() {
         store
-            .write(p.raw(), (i % 2) as u32 * 2000, &[2; 2000])
+            .write(p.raw(), (i % 2) as u32 * 2500, &[2; 1500])
             .unwrap();
-        store.flush().unwrap();
+        if i % 2 == 1 {
+            store.flush().unwrap();
+        }
     }
     let now = store.stats().flushes + 1;
     let before = store.describe_drains();
