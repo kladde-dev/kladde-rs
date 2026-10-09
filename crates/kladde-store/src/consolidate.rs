@@ -57,7 +57,9 @@ pub struct ConsState {
     /// What pages lose in the flush after they are written, for data pages
     /// and for leaves: the rate fresh content starts from.
     pub fresh: [Option<f64>; 2],
-    /// Pages whose estimate this flush changed, for the consolidator state.
+    /// Pages whose estimate changed since the consolidator state last
+    /// recorded estimates, for its next record: this flush's, and those the
+    /// previous flush's own state rewrite changed after its record.
     pub drained: Vec<u32>,
     /// Victims this flush took, anywhere.
     pub cleaned: u32,
@@ -875,9 +877,16 @@ impl Inner {
                     *fresh = Some(fresh.map_or(seen, |f| f + alpha * (seen - f)));
                 }
             }
-            // The estimates those pages started from are recorded too.
+            // The estimates those pages started from are recorded too, beside
+            // those the previous flush's own state rewrite changed after its
+            // record was written.
+            if !(self.opts.consolidate && self.opts.consolidator_state) {
+                self.cons.drained.clear();
+            }
             let just_written = std::mem::take(&mut self.cons.just_written);
-            self.cons.drained = just_written.into_iter().map(|(p, ..)| p).collect();
+            self.cons
+                .drained
+                .extend(just_written.into_iter().map(|(p, ..)| p));
         }
         for (p, (lost, live)) in losses {
             let Some(info) = self.state.data_or_leaf_mut(p) else {
