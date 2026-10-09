@@ -209,8 +209,7 @@ impl Inner {
     ) -> Result<(), Error> {
         let mut bytes = vec![0u8; c.len() as usize];
         self.read_committed(c.id, c.start, &mut bytes)?;
-        let pos = self.segment_records.arena.len() as u64;
-        self.segment_records.arena.extend_from_slice(&bytes);
+        let pos = self.ops.scratch(&bytes);
         let inline = !chunk && c.len() <= self.opts.inline_threshold.min(MAX_INLINE as u32);
         let place = if inline {
             Place::Inline

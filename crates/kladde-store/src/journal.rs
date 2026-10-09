@@ -1,5 +1,8 @@
-//! The journal (`spec/journal.md`): records, their encoding, transactions,
-//! the chain of pages a segment occupies, the CRC chain, and recovery.
+//! The journal (`spec/journal.md`): records, their encoding, the buffer that
+//! holds them between flushes, transactions, the chain of journal pages, the
+//! CRC chain, and recovery.
+
+use std::collections::VecDeque;
 
 use crate::consts::{JOURNAL_STREAM, PAGE_SIZE};
 use crate::crc::Crc32c;
@@ -7,7 +10,8 @@ use crate::error::{corrupt, Error};
 use crate::page::{new_page, PageBuf};
 use crate::storage::Storage;
 
-/// A byte range of a [`Records`] arena.
+/// A byte range of a [`Records`] arena, at a position counted from the start
+/// of the session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bytes {
     pub start: u64,
@@ -65,78 +69,198 @@ impl Record {
     }
 }
 
-/// A sequence of records with their payloads in one arena.
+/// A position in a [`Records`] buffer, counted from the start of the
+/// session: the records before it, the arena bytes they stash, and the bytes
+/// they encode to. Discarding a prefix of the buffer moves its front and
+/// leaves every cursor into the rest valid.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cursor {
+    /// Records before the position.
+    pub at: u64,
+    /// Arena bytes before the position.
+    pub arena: u64,
+    /// Encoded record bytes before the position.
+    pub bytes: u64,
+}
+
+/// The one buffer of every record since the last flush, with their payloads
+/// in an arena beside them (`impl/transactions-and-batches.md`).
+///
+/// Records are appended at the end and discarded from the front, so both the
+/// records and the arena are deques, and positions count from the start of
+/// the session: cursors, and the `Bytes` of a record, stay valid however much
+/// of the front goes. A flush may also store bytes of its own past the end of
+/// the arena, with [`scratch`](Self::scratch), which
+/// [`drop_scratch`](Self::drop_scratch) drops again.
 #[derive(Clone, Debug, Default)]
 pub struct Records {
-    pub records: Vec<Record>,
-    pub arena: Vec<u8>,
+    records: VecDeque<Record>,
+    arena: VecDeque<u8>,
+    front: Cursor,
+    end: Cursor,
 }
 
 impl Records {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+    /// The position of the first record held.
+    pub fn front(&self) -> Cursor {
+        self.front
     }
 
-    pub fn len(&self) -> usize {
-        self.records.len()
+    /// The position past the last record held.
+    pub fn end(&self) -> Cursor {
+        self.end
     }
 
-    /// Stores `bytes` in the arena.
+    /// Stores `bytes` in the arena, as the payload of the record pushed next.
     pub fn stash(&mut self, bytes: &[u8]) -> Bytes {
-        let start = self.arena.len() as u64;
-        self.arena.extend_from_slice(bytes);
+        let start = self.front.arena + self.arena.len() as u64;
+        self.arena.extend(bytes);
         Bytes {
             start,
             len: bytes.len() as u32,
         }
     }
 
-    /// The bytes of `b`.
-    pub fn bytes(&self, b: Bytes) -> &[u8] {
-        &self.arena[b.start as usize..b.start as usize + b.len as usize]
+    /// Appends `r`, whose payload, if any, [`stash`](Self::stash) stored.
+    pub fn push(&mut self, r: Record) {
+        self.end.at += 1;
+        self.end.bytes += record_len(&r) as u64;
+        self.end.arena = self.front.arena + self.arena.len() as u64;
+        self.records.push_back(r);
     }
 
-    /// Appends `r`, whose payload, if any, lives in `from`'s arena.
-    pub fn push_from(&mut self, r: Record, from: &Records) {
-        let r = match r {
-            Record::Write { id, offset, bytes } => Record::Write {
-                id,
-                offset,
-                bytes: self.stash(from.bytes(bytes)),
-            },
-            Record::Splice {
-                id,
-                offset,
-                old_len,
-                bytes,
-            } => Record::Splice {
-                id,
-                offset,
-                old_len,
-                bytes: self.stash(from.bytes(bytes)),
-            },
-            other => other,
-        };
-        self.records.push(r);
+    /// The records in `[from, to)`.
+    pub fn range(&self, from: Cursor, to: Cursor) -> impl Iterator<Item = &Record> {
+        let base = self.front.at;
+        self.records
+            .range((from.at - base) as usize..(to.at - base) as usize)
     }
 
-    /// Appends every record of `other`.
-    pub fn extend_from(&mut self, other: &Records) {
-        for r in &other.records {
-            self.push_from(*r, other);
+    /// Every record held.
+    pub fn iter(&self) -> impl Iterator<Item = &Record> {
+        self.records.iter()
+    }
+
+    /// The arena's bytes `[start, start + len)`, in at most two slices.
+    fn slices(&self, start: u64, len: usize) -> (&[u8], &[u8]) {
+        let i = (start - self.front.arena) as usize;
+        let (a, b) = self.arena.as_slices();
+        if i >= a.len() {
+            (&b[i - a.len()..i - a.len() + len], &[])
+        } else if i + len <= a.len() {
+            (&a[i..i + len], &[])
+        } else {
+            (&a[i..], &b[..i + len - a.len()])
         }
     }
 
-    /// Encodes records `range` as a transaction's record bytes.
-    pub fn encode(&self, range: std::ops::Range<usize>, out: &mut Vec<u8>) {
-        for r in &self.records[range] {
+    /// Copies the arena's bytes from position `start` into `out`.
+    pub fn copy_bytes(&self, start: u64, out: &mut [u8]) {
+        let (a, b) = self.slices(start, out.len());
+        out[..a.len()].copy_from_slice(a);
+        out[a.len()..].copy_from_slice(b);
+    }
+
+    /// Appends the bytes of `b` to `out`.
+    pub fn extend_bytes(&self, b: Bytes, out: &mut Vec<u8>) {
+        let (x, y) = self.slices(b.start, b.len as usize);
+        out.extend_from_slice(x);
+        out.extend_from_slice(y);
+    }
+
+    /// Encodes the records in `[from, to)` as a transaction's record bytes.
+    pub fn encode(&self, from: Cursor, to: Cursor, out: &mut Vec<u8>) {
+        for r in self.range(from, to) {
             encode_record(r, self, out);
         }
     }
+
+    /// Stores `bytes` past the end, for the flush, and returns their
+    /// position.
+    pub fn scratch(&mut self, bytes: &[u8]) -> u64 {
+        let pos = self.front.arena + self.arena.len() as u64;
+        self.arena.extend(bytes);
+        pos
+    }
+
+    /// Drops what [`scratch`](Self::scratch) stored.
+    pub fn drop_scratch(&mut self) {
+        self.arena
+            .truncate((self.end.arena - self.front.arena) as usize);
+    }
+
+    /// Discards the records from `to` on: the end moves back to `to`.
+    pub fn truncate(&mut self, to: Cursor) {
+        debug_assert!(self.front.at <= to.at && to.at <= self.end.at);
+        self.records.truncate((to.at - self.front.at) as usize);
+        self.arena.truncate((to.arena - self.front.arena) as usize);
+        self.end = to;
+    }
+
+    /// Discards the records before `to`: the front moves up to `to`.
+    pub fn discard_to(&mut self, to: Cursor) {
+        debug_assert!(self.front.at <= to.at && to.at <= self.end.at);
+        self.records.drain(..(to.at - self.front.at) as usize);
+        self.arena.drain(..(to.arena - self.front.arena) as usize);
+        self.front = to;
+    }
+
+    /// The byte at arena position `pos`.
+    #[cfg(test)]
+    pub fn byte(&self, pos: u64) -> u8 {
+        self.arena[(pos - self.front.arena) as usize]
+    }
+
+    /// The bytes of `b`, copied.
+    #[cfg(test)]
+    pub fn to_vec(&self, b: Bytes) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.extend_bytes(b, &mut out);
+        out
+    }
+}
+
+/// The bytes the encoding of `r` takes, computed without encoding it.
+pub fn record_len(r: &Record) -> usize {
+    let v = |x: u32| kladde_varint::encoded_len(x as u64);
+    1 + match *r {
+        Record::Free { id } => v(id),
+        Record::Resize { id, size } => v(id) + v(size),
+        Record::Write { id, offset, bytes } => {
+            v(id) + v(offset) + v(bytes.len) + bytes.len as usize
+        }
+        Record::Splice {
+            id,
+            offset,
+            old_len,
+            bytes,
+        } => v(id) + v(offset) + v(old_len) + v(bytes.len) + bytes.len as usize,
+        Record::Copy {
+            src,
+            src_offset,
+            len,
+            dst,
+            dst_offset,
+        }
+        | Record::Move {
+            src,
+            src_offset,
+            len,
+            dst,
+            dst_offset,
+        } => v(src) + v(src_offset) + v(len) + v(dst) + v(dst_offset),
+    }
+}
+
+/// The stream bytes a transaction of `n` record bytes takes: its length
+/// prefix, its records, and its `crc` (`spec/journal.md#framing`).
+pub fn framed_len(n: u64) -> u64 {
+    kladde_varint::encoded_len(n) as u64 + n + 4
 }
 
 fn put(out: &mut Vec<u8>, v: u64) {
@@ -159,7 +283,7 @@ fn encode_record(r: &Record, recs: &Records, out: &mut Vec<u8>) {
             put(out, id as u64);
             put(out, offset as u64);
             put(out, bytes.len as u64);
-            out.extend_from_slice(recs.bytes(bytes));
+            recs.extend_bytes(bytes, out);
         }
         Record::Splice {
             id,
@@ -172,7 +296,7 @@ fn encode_record(r: &Record, recs: &Records, out: &mut Vec<u8>) {
             put(out, offset as u64);
             put(out, old_len as u64);
             put(out, bytes.len as u64);
-            out.extend_from_slice(recs.bytes(bytes));
+            recs.extend_bytes(bytes, out);
         }
         Record::Copy {
             src,
@@ -291,21 +415,21 @@ pub fn decode_records(input: &[u8], into: &mut Records) -> Result<(), Error> {
             }
             _ => return Err(corrupt("a journal record has a reserved tag")),
         };
-        into.records.push(rec);
+        into.push(rec);
     }
     Ok(())
 }
 
-/// The CRC chain of a segment, seeded with its epoch.
+/// The CRC chain of the journal, seeded with its epoch.
 fn seeded_chain(epoch: u64) -> Crc32c {
     let mut c = Crc32c::new();
     c.update(&epoch.to_le_bytes());
     c
 }
 
-/// Appends transactions to one segment's chain of pages.
-pub struct SegmentWriter {
-    /// The segment's pages in chain order; the first is the header's
+/// Appends transactions to the journal's chain of pages.
+pub struct JournalWriter {
+    /// The journal pages in chain order; the first is the header's
     /// `journal_pointer`.
     pub pages: Vec<u32>,
     buf: Box<PageBuf>,
@@ -316,12 +440,17 @@ pub struct SegmentWriter {
     pub bytes: u64,
     /// Transactions appended so far.
     pub transactions: u64,
+    /// The journal of an earlier session, which nothing may be appended to
+    /// (`spec/journal.md#the-start-of-a-session`): it names the pages that
+    /// the flush folding it retires, and counts as full, so that the flush
+    /// rules fold it before anything is appended.
+    recovered: bool,
 }
 
-impl SegmentWriter {
-    /// An empty segment of epoch `epoch`, starting at `first_page`.
+impl JournalWriter {
+    /// An empty journal of epoch `epoch`, starting at `first_page`.
     pub fn new(epoch: u64, first_page: u32) -> Self {
-        SegmentWriter {
+        JournalWriter {
             pages: vec![first_page],
             buf: new_page(),
             pos: 0,
@@ -329,7 +458,39 @@ impl SegmentWriter {
             chain: seeded_chain(epoch),
             bytes: 0,
             transactions: 0,
+            recovered: false,
         }
+    }
+
+    /// The non-empty journal that recovery found: `transactions` complete
+    /// transactions in `pages`.
+    pub fn recovered(epoch: u64, pages: Vec<u32>, transactions: u64) -> Self {
+        JournalWriter {
+            pages,
+            transactions,
+            recovered: true,
+            ..JournalWriter::new(epoch, 0)
+        }
+    }
+
+    /// Whether no transaction has been appended.
+    pub fn is_empty(&self) -> bool {
+        self.transactions == 0
+    }
+
+    /// Whether a transaction of `n` record bytes, appended now, would keep
+    /// the journal within `budget` pages. The next page is taken only once
+    /// the stream continues past the current one, so a stream that ends
+    /// within `budget` pages' worth of stream bytes takes at most `budget`
+    /// pages.
+    pub fn fits(&self, n: u64, budget: u32) -> bool {
+        !self.recovered && self.bytes + framed_len(n) <= budget as u64 * JOURNAL_STREAM as u64
+    }
+
+    /// Whether the journal has outgrown `budget` pages, which only a
+    /// transaction too large for them on its own makes it do.
+    pub fn over_budget(&self, budget: u32) -> bool {
+        self.bytes > budget as u64 * JOURNAL_STREAM as u64
     }
 
     /// The page being appended to.
@@ -346,6 +507,7 @@ impl SegmentWriter {
         storage: &mut dyn Storage,
         next_page: &mut dyn FnMut(&mut dyn Storage) -> Result<u32, Error>,
     ) -> Result<(), Error> {
+        debug_assert!(!self.recovered, "appending to a recovered journal");
         if payload.len() as u64 > u32::MAX as u64 {
             return Err(Error::OutOfBounds);
         }
@@ -401,14 +563,14 @@ impl SegmentWriter {
     }
 }
 
-/// What recovery found in a segment.
+/// What recovery found in the journal.
 #[derive(Debug, Default)]
 pub struct Recovered {
     /// The records of the complete transactions, in order.
     pub records: Records,
     /// How many complete transactions there were.
     pub transactions: usize,
-    /// The pages the valid part of the segment occupies.
+    /// The pages the valid part of the journal occupies.
     pub pages: Vec<u32>,
 }
 
@@ -460,7 +622,7 @@ impl StreamReader<'_> {
     }
 }
 
-/// Reads the valid prefix of the segment of epoch `epoch` starting at
+/// Reads the valid prefix of the journal of epoch `epoch` starting at
 /// `first_page`.
 pub fn recover(storage: &dyn Storage, epoch: u64, first_page: u32) -> Result<Recovered, Error> {
     let file_pages = storage.len()? / PAGE_SIZE as u64;
@@ -537,27 +699,183 @@ mod tests {
         let mut r = Records::new();
         for i in 0..n {
             let bytes = r.stash(&vec![i as u8; size]);
-            r.records.push(Record::Write {
+            r.push(Record::Write {
                 id: 1 + i as u32,
                 offset: i as u32,
                 bytes,
             });
         }
-        r.records.push(Record::Copy {
+        r.push(Record::Copy {
             src: 1,
             src_offset: 0,
             len: 3,
             dst: 2,
             dst_offset: 7,
         });
-        r.records.push(Record::Free { id: 9 });
+        r.push(Record::Free { id: 9 });
         r
+    }
+
+    fn encoded(recs: &Records) -> Vec<u8> {
+        let mut payload = Vec::new();
+        recs.encode(recs.front(), recs.end(), &mut payload);
+        payload
+    }
+
+    /// Each record with its payload, for comparing buffers, the payload's
+    /// position in the arena left out.
+    fn contents(recs: &Records) -> Vec<(Record, Vec<u8>)> {
+        recs.iter()
+            .map(|&r| match r {
+                Record::Write { id, offset, bytes } => (
+                    Record::Write {
+                        id,
+                        offset,
+                        bytes: Bytes { start: 0, ..bytes },
+                    },
+                    recs.to_vec(bytes),
+                ),
+                Record::Splice {
+                    id,
+                    offset,
+                    old_len,
+                    bytes,
+                } => (
+                    Record::Splice {
+                        id,
+                        offset,
+                        old_len,
+                        bytes: Bytes { start: 0, ..bytes },
+                    },
+                    recs.to_vec(bytes),
+                ),
+                _ => (r, Vec::new()),
+            })
+            .collect()
+    }
+
+    /// A record of every kind, with fields and payloads of random sizes.
+    fn random_record(rng: &mut u64, recs: &mut Records) -> Record {
+        let mut next = |bits: u32| {
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            (*rng % (1u64 << bits.min(32))) as u32
+        };
+        let bits = next(5);
+        let id = next(bits).max(1);
+        match next(3) {
+            0 => Record::Free { id },
+            1 => Record::Resize {
+                id,
+                size: next(bits),
+            },
+            2 | 3 => {
+                let len = next(9) as usize;
+                let bytes = recs.stash(&vec![next(8) as u8; len]);
+                if next(1) == 0 {
+                    Record::Write {
+                        id,
+                        offset: next(bits),
+                        bytes,
+                    }
+                } else {
+                    Record::Splice {
+                        id,
+                        offset: next(bits),
+                        old_len: next(bits),
+                        bytes,
+                    }
+                }
+            }
+            k => {
+                let (src, src_offset, len, dst_offset) =
+                    (next(bits).max(1), next(bits), next(bits), next(bits));
+                if k < 6 {
+                    Record::Copy {
+                        src,
+                        src_offset,
+                        len,
+                        dst: id,
+                        dst_offset,
+                    }
+                } else {
+                    Record::Move {
+                        src,
+                        src_offset,
+                        len,
+                        dst: id,
+                        dst_offset,
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn record_len_counts_what_the_encoding_writes() {
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut recs = Records::new();
+        for _ in 0..2000 {
+            let r = random_record(&mut rng, &mut recs);
+            recs.push(r);
+            let mut out = Vec::new();
+            encode_record(&r, &recs, &mut out);
+            assert_eq!(record_len(&r), out.len(), "{r:?}");
+        }
+        assert_eq!(recs.end().bytes, encoded(&recs).len() as u64);
+    }
+
+    #[test]
+    fn the_buffer_keeps_positions_as_its_front_moves_and_its_deques_wrap() {
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut recs = Records::new();
+        let mut want: Vec<(Record, Vec<u8>)> = Vec::new();
+        for round in 0..50 {
+            for _ in 0..(round % 7) * 5 + 1 {
+                let r = random_record(&mut rng, &mut recs);
+                recs.push(r);
+                want.extend(contents(&recs).pop());
+            }
+            // Scratch bytes past the end change nothing that is held.
+            let pos = recs.scratch(&[0xAB; 300]);
+            assert_eq!(pos, recs.end().arena);
+            let mut got = [0u8; 300];
+            recs.copy_bytes(pos, &mut got);
+            assert_eq!(got, [0xAB; 300]);
+            recs.drop_scratch();
+            assert_eq!(contents(&recs), want);
+            // Drop a prefix, and every cursor into the rest still holds.
+            let keep = want.len() / 3;
+            let mut cut = recs.front();
+            for r in recs.iter().take(want.len() - keep) {
+                cut.at += 1;
+                cut.bytes += record_len(r) as u64;
+                if let Record::Write { bytes, .. } | Record::Splice { bytes, .. } = r {
+                    cut.arena = bytes.start + bytes.len as u64;
+                }
+            }
+            recs.discard_to(cut);
+            want.drain(..want.len() - keep);
+            assert_eq!(contents(&recs), want);
+            assert_eq!(
+                recs.end().bytes - recs.front().bytes,
+                encoded(&recs).len() as u64
+            );
+        }
+        // Truncating drops the records and their payloads from the end.
+        let mark = recs.end();
+        let r = random_record(&mut rng, &mut recs);
+        recs.push(r);
+        recs.truncate(mark);
+        assert_eq!(contents(&recs), want);
+        assert_eq!(recs.stash(&[1]).start, mark.arena);
     }
 
     #[test]
     fn transactions_across_many_pages_round_trip() {
         let mut storage = setup(3);
-        let mut w = SegmentWriter::new(8, 2);
+        let mut w = JournalWriter::new(8, 2);
         let mut next = 3u32;
         let mut alloc = |s: &mut dyn Storage| -> Result<u32, Error> {
             let p = next;
@@ -565,40 +883,57 @@ mod tests {
             s.set_len((p as u64 + 1) * PAGE_SIZE as u64)?;
             Ok(p)
         };
-        let mut all = Records::new();
+        let mut all = Vec::new();
         for t in 0..20 {
             let recs = records(t % 5 + 1, 700 + t * 37);
-            let mut payload = Vec::new();
-            recs.encode(0..recs.len(), &mut payload);
-            w.append(&payload, &mut storage, &mut alloc).unwrap();
-            all.extend_from(&recs);
+            w.append(&encoded(&recs), &mut storage, &mut alloc).unwrap();
+            all.extend(contents(&recs));
         }
         assert!(w.pages.len() > 3);
         let got = recover(&storage, 8, 2).unwrap();
         assert_eq!(got.transactions, 20);
-        assert_eq!(got.records.records.len(), all.records.len());
-        for (a, b) in got.records.records.iter().zip(&all.records) {
-            match (a, b) {
-                (
-                    Record::Write {
-                        id: i1,
-                        offset: o1,
-                        bytes: b1,
-                    },
-                    Record::Write {
-                        id: i2,
-                        offset: o2,
-                        bytes: b2,
-                    },
-                ) => {
-                    assert_eq!((i1, o1), (i2, o2));
-                    assert_eq!(got.records.bytes(*b1), all.bytes(*b2));
-                }
-                (x, y) => assert_eq!(x, y),
-            }
-        }
+        assert_eq!(contents(&got.records), all);
         // A different epoch salt validates nothing.
         assert_eq!(recover(&storage, 9, 2).unwrap().transactions, 0);
+    }
+
+    #[test]
+    fn a_transaction_fits_exactly_when_it_ends_within_the_budget() {
+        let mut rng = 0x5851_F42D_4C95_7F2Du64;
+        for budget in 1..5u32 {
+            for _ in 0..50 {
+                let mut storage = setup(3);
+                let mut w = JournalWriter::new(1, 2);
+                let mut next = 3u32;
+                let mut alloc = |s: &mut dyn Storage| -> Result<u32, Error> {
+                    let p = next;
+                    next += 1;
+                    s.set_len((p as u64 + 1) * PAGE_SIZE as u64)?;
+                    Ok(p)
+                };
+                loop {
+                    let mut recs = Records::new();
+                    for _ in 0..rng % 40 + 1 {
+                        let r = random_record(&mut rng, &mut recs);
+                        recs.push(r);
+                    }
+                    let fits = w.fits(recs.end().bytes, budget);
+                    w.append(&encoded(&recs), &mut storage, &mut alloc).unwrap();
+                    assert_eq!(w.pages.len() as u32 <= budget, fits);
+                    assert_eq!(w.over_budget(budget), !fits);
+                    if !fits {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_recovered_journal_never_fits_anything() {
+        let w = JournalWriter::recovered(1, vec![2, 3], 4);
+        assert!(!w.is_empty());
+        assert!(!w.fits(0, u32::MAX));
     }
 
     #[test]
@@ -606,7 +941,7 @@ mod tests {
         let mut storage = MemoryStorage::with_crash_tracking();
         storage.set_len(6 * PAGE_SIZE as u64).unwrap();
         storage.sync().unwrap();
-        let mut w = SegmentWriter::new(3, 2);
+        let mut w = JournalWriter::new(3, 2);
         let mut next = 3u32;
         let mut alloc = |_: &mut dyn Storage| -> Result<u32, Error> {
             let p = next;
@@ -615,9 +950,7 @@ mod tests {
         };
         for t in 0..8 {
             let recs = records(2, 1000 + t);
-            let mut payload = Vec::new();
-            recs.encode(0..recs.len(), &mut payload);
-            w.append(&payload, &mut storage, &mut alloc).unwrap();
+            w.append(&encoded(&recs), &mut storage, &mut alloc).unwrap();
         }
         let ops = storage.unsynced_ops();
         // Losing any single write leaves exactly the transactions before it.
