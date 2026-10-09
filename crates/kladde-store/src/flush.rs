@@ -8,6 +8,7 @@ use crate::consts::*;
 use crate::error::{corrupt, Error};
 use crate::fold::{fold, Fold, Source};
 use crate::hash::IdSet;
+use crate::journal::Cursor;
 use crate::page::{decode_page, new_page, seal_page, PageBuf};
 use crate::state::*;
 use crate::statement::{Kind, Stmt, TableLen, TableReader};
@@ -64,23 +65,38 @@ pub(crate) struct Output {
 }
 
 impl Inner {
-    /// Appends what a batch holds back outside any open transaction, then
-    /// flushes. Poisons the store if the flush fails.
+    /// Appends a batch's ready run, which lies outside any open transaction,
+    /// then folds the journal, even an empty one. Poisons the store if the
+    /// flush fails.
     pub fn flush_now(&mut self) -> Result<(), Error> {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        self.must_flush_first = false;
-        let ready = match self.tx {
-            Tx::InBatch { .. } => self.ops.len(),
-            Tx::InTxInBatch { ready, .. } => ready,
-            _ => 0,
+        let end = self.ops.end();
+        let (committed, ready) = match self.tx {
+            Tx::Immediate => (end, end),
+            Tx::InBatch { committed, .. } => (committed, end),
+            Tx::InTransaction { committed, .. } => (committed, committed),
+            Tx::InTxInBatch {
+                committed, ready, ..
+            } => (committed, ready),
         };
-        if ready > 0 {
-            self.append_ops(ready)?;
+        let committed = self.append(committed, ready)?;
+        self.tx = self.tx.with_committed(committed);
+        self.fold_journal(committed)
+    }
+
+    /// Folds the operations the journal pages hold, `ops[..committed]`, and
+    /// drops them from the buffer, rebuilding the write-phase geometry from
+    /// what it still holds. Poisons the store if the flush fails.
+    pub(crate) fn fold_journal(&mut self, committed: Cursor) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
         }
-        match self.flush_inner() {
+        match self.flush_inner(committed) {
             Ok(()) => {
+                self.ops.drop_scratch();
+                self.ops.discard_to(committed);
                 self.repopulate_geometry();
                 Ok(())
             }
@@ -91,7 +107,7 @@ impl Inner {
         }
     }
 
-    fn flush_inner(&mut self) -> Result<(), Error> {
+    fn flush_inner(&mut self, committed: Cursor) -> Result<(), Error> {
         let e = self.epoch + 1;
         self.state.flush_epoch = e;
         self.state.pending.clear();
@@ -104,7 +120,7 @@ impl Inner {
         self.take_header(&mut dirty)?;
 
         // 2. The fold, with every read from elsewhere hoisted into the arena.
-        let mut f = fold(&self.segment_records, |id| {
+        let mut f = fold(self.ops.range(self.ops.front(), committed), |id| {
             self.state.allocs.get(&id).map(|m| m.size)
         });
         self.hoist(&mut f)?;
@@ -381,8 +397,7 @@ impl Inner {
         for (id, k, src, so, len) in reads {
             let mut bytes = vec![0u8; len as usize];
             self.read_committed(src, so, &mut bytes)?;
-            let pos = self.segment_records.arena.len() as u64;
-            self.segment_records.arena.extend_from_slice(&bytes);
+            let pos = self.ops.scratch(&bytes);
             f.ids
                 .get_mut(&id)
                 .unwrap()
@@ -705,7 +720,7 @@ impl Inner {
     // ------------------------------------------------------------ commit
 
     fn commit(&mut self, e: u64, dirty: &Dirty, out: Output) -> Result<(), Error> {
-        // The next segment starts in the lowest reusable page, or past the end.
+        // The next journal starts in the lowest reusable page, or past the end.
         let jp = match self.ready.pop_first() {
             Some(p) => p,
             None => self.file_pages,
@@ -739,7 +754,7 @@ impl Inner {
             self.state.rebucket(*p);
         }
         // A session's first flush clears the page it names for the next
-        // segment (`spec/journal.md#the-start-of-a-session`).
+        // journal (`spec/journal.md#the-start-of-a-session`).
         if self.first_flush && jp < self.file_pages {
             self.storage
                 .write_at(&new_page()[..], jp as u64 * PAGE_SIZE as u64)?;
@@ -792,7 +807,7 @@ impl Inner {
             self.children.remove(&p);
             retiring.push(p);
         }
-        for &p in &self.segment.pages {
+        for &p in &self.journal.pages {
             if p < self.file_pages && self.state.pages[p as usize].state == PageState::Journal {
                 self.state.pages[p as usize].state = PageState::Retiring;
                 retiring.push(p);
@@ -806,8 +821,7 @@ impl Inner {
         if jp < self.file_pages {
             self.state.pages[jp as usize].state = PageState::Journal;
         }
-        self.segment = crate::journal::SegmentWriter::new(e + 1, jp);
-        self.segment_records = crate::journal::Records::new();
+        self.journal = crate::journal::JournalWriter::new(e + 1, jp);
         debug_assert!(self
             .state
             .frags
@@ -838,9 +852,8 @@ impl Inner {
         while top > 2 {
             let p = top - 1;
             let st = self.state.pages[p as usize].state;
-            let empty_journal = st == PageState::Journal
-                && self.segment.transactions == 0
-                && self.segment.pages == [p];
+            let empty_journal =
+                st == PageState::Journal && self.journal.is_empty() && self.journal.pages == [p];
             if st == PageState::Free || (force && empty_journal) {
                 top -= 1;
             } else {

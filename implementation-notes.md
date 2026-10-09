@@ -29,7 +29,7 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
   `impl/in-memory-state.md#3-the-allocation-map` sketches a `u32`; epochs are 64-bit in the format, and ages are computed as epoch differences, so the wider field needs no wrap-around rule.
 - **`Origin::Arena` holds a `u64`.**
   `impl/consolidation.md#how-a-flush-and-consolidation-compose` halves `Origin` with a 32-bit arena position and a flush forced before the arena outgrows it.
-  The implementation keeps 64 bits and relies on the journal budget to keep the arena small; a single transaction is still capped at `2^32 - 1` bytes by the journal's length prefix.
+  The implementation keeps 64 bits, since arena positions count from the start of the session, as `impl/transactions-and-batches.md#one-buffer-and-three-cursors` has them; the journal budget keeps the arena itself small, and a single transaction is still capped at `2^32 - 1` bytes by the journal's length prefix.
 - **A page whose coverage reaches zero leaves its bucket at once.**
   It is retired at the next commit either way, and keeping it would waste the samples that victim selection draws from the sparsest bucket, which is exactly where such pages collect.
 - **The statement slab also keeps each statement's id and kind: 14 bytes per slot, where `rust/store.md#the-statement-slab` has 9.**
@@ -48,9 +48,6 @@ Paths like `spec/journal.md` are relative to kladde-docs' `content/`.
 - **The interior layer is rebuilt by every cut that needs one.**
   `impl/flush.md#the-shape-of-the-tree` path-copies from the changed leaves up.
   With the header naming up to 600 leaves directly, a file needs an interior layer only past that, and rebuilding it costs one page per 800 leaves per flush.
-- **`Store::open` folds a recovered journal before it returns.**
-  `spec/journal.md#the-start-of-a-session` asks only that a non-empty recovered journal be folded before anything is appended.
-  Folding at open is simpler, and it lets reads, which see flushed state only, see every recovered transaction at once.
 - **Ids a recovered journal allocates must be withheld from the id allocator.**
   The allocator is rebuilt at open from the loaded state, which knows nothing of the ids the unfolded journal brings into existence; before the fix, the first `alloc` after a recovery could hand one of them out again.
   `impl/id-recycling.md` should say that recovery counts the journal's ids as used; the consolidator state, whose allocation the recovery flush creates, exposed it.

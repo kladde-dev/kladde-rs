@@ -228,7 +228,7 @@ impl Inner {
     }
 
     /// Brings the consolidator state up to date with this flush, which has
-    /// just folded its segment: appends the flush's age record and rewrites
+    /// just folded the journal: appends the flush's age record and rewrites
     /// the fixed fields, or writes a fresh snapshot when one is due.
     pub(crate) fn write_consolidator_state(&mut self, dirty: &mut Dirty) -> Result<(), Error> {
         let e = self.state.flush_epoch;
@@ -334,8 +334,7 @@ impl Inner {
         if end > old {
             self.grow(id, end, dirty);
         }
-        let pos = self.segment_records.arena.len() as u64;
-        self.segment_records.arena.extend_from_slice(bytes);
+        let pos = self.ops.scratch(bytes);
         let place = if bytes.len() as u32 <= self.opts.inline_threshold.min(MAX_INLINE as u32) {
             Place::Inline
         } else {

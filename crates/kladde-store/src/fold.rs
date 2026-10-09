@@ -1,9 +1,11 @@
 //! Phase A of the flush (`impl/flush.md#phase-a--the-fold`): the net effect
-//! of a journal segment, per id, as a piece table over the id's final bytes.
+//! of the journal, per id, as a piece table over the id's final bytes.
 
 use std::collections::BTreeMap;
 
-use crate::journal::{Record, Records};
+use crate::journal::Record;
+#[cfg(test)]
+use crate::journal::Records;
 
 /// Where a piece's bytes come from, offset-relative so that it can advance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,14 +194,14 @@ impl Table {
     }
 }
 
-/// The net effect of the segment on one id.
+/// The net effect of the journal on one id.
 #[derive(Clone, Debug, Default)]
 pub struct IdFold {
-    /// It existed at the start of the segment.
+    /// It existed before the journal.
     pub existed: bool,
-    /// Its committed incarnation ended during the segment.
+    /// Its committed incarnation ended during the journal.
     pub ended: bool,
-    /// It exists at the end of the segment.
+    /// It exists after the journal.
     pub exists: bool,
     /// Its bytes at the end, when it exists.
     pub table: Table,
@@ -209,7 +211,7 @@ pub struct IdFold {
     pub written: bool,
 }
 
-/// The fold of one segment.
+/// The fold of the journal.
 #[derive(Debug, Default)]
 pub struct Fold {
     pub ids: BTreeMap<u32, IdFold>,
@@ -262,9 +264,12 @@ impl Fold {
 
 /// Folds `records` against the committed state, which `committed` describes:
 /// the size of each existing id.
-pub fn fold(records: &Records, committed: impl Fn(u32) -> Option<u32>) -> Fold {
+pub fn fold<'a>(
+    records: impl IntoIterator<Item = &'a Record>,
+    committed: impl Fn(u32) -> Option<u32>,
+) -> Fold {
     let mut f = Fold::default();
-    for r in &records.records {
+    for r in records {
         match *r {
             Record::Free { id } => {
                 let e = f.entry(id, &committed);
@@ -373,7 +378,7 @@ pub(crate) mod tests {
 
     /// Replays records naively over byte vectors: the oracle.
     pub fn naive(records: &Records, mut state: HashMap<u32, Vec<u8>>) -> HashMap<u32, Vec<u8>> {
-        for r in &records.records {
+        for r in records.iter() {
             match *r {
                 Record::Free { id } => {
                     state.remove(&id);
@@ -387,7 +392,7 @@ pub(crate) mod tests {
                     if v.len() < end {
                         v.resize(end, 0);
                     }
-                    v[offset as usize..end].copy_from_slice(records.bytes(bytes));
+                    v[offset as usize..end].copy_from_slice(&records.to_vec(bytes));
                 }
                 Record::Splice {
                     id,
@@ -400,7 +405,7 @@ pub(crate) mod tests {
                     if v.len() < end {
                         v.resize(end, 0);
                     }
-                    v.splice(offset as usize..end, records.bytes(bytes).iter().copied());
+                    v.splice(offset as usize..end, records.to_vec(bytes));
                 }
                 Record::Copy {
                     src,
@@ -465,7 +470,7 @@ pub(crate) mod tests {
                 let end = keys.get(i + 1).map_or(e.table.size, |n| n.0);
                 for j in k..end {
                     v[j as usize] = match s.advanced(j - k) {
-                        Source::Literal(p) => records.arena[p as usize],
+                        Source::Literal(p) => records.byte(p),
                         Source::Storage(src, o) => committed
                             .get(&src)
                             .and_then(|b| b.get(o as usize).copied())
@@ -547,12 +552,17 @@ pub(crate) mod tests {
                         dst_offset: rng.below(40) as u32,
                     },
                 };
-                recs.records.push(rec);
+                recs.push(rec);
             }
             let want = naive(&recs, committed.clone());
-            let f = fold(&recs, |id| committed.get(&id).map(|v| v.len() as u32));
+            let f = fold(recs.iter(), |id| committed.get(&id).map(|v| v.len() as u32));
             let got = materialize(&f, &recs, &committed);
-            assert_eq!(got, want, "seed {seed}: {:?}", recs.records);
+            assert_eq!(
+                got,
+                want,
+                "seed {seed}: {:?}",
+                recs.iter().collect::<Vec<_>>()
+            );
         }
     }
 }

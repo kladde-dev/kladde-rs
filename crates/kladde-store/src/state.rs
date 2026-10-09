@@ -215,7 +215,7 @@ pub enum PageState {
     Table,
     /// A live interior address-table page, holding child references only.
     Interior,
-    /// Part of the current journal segment.
+    /// One of the current journal's pages.
     Journal,
     /// Page 0 or 1.
     Header,

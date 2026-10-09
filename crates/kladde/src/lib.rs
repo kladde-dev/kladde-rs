@@ -286,9 +286,13 @@ impl<T: Persistable + 'static> Kladde<T> {
     }
 
     /// Opens a batch: the mutations made through it are appended to the
-    /// journal in few, large pieces rather than one by one.
+    /// journal in as few pieces as its page budget allows, rather than one by
+    /// one.
     ///
-    /// A batch saves journal writes and is no transaction: a crash may keep
+    /// The batch holds its mutations back until the next would no longer fit
+    /// in what is left of [`Options::journal_budget_pages`], and its end
+    /// appends what it holds still. A batch saves journal writes and is no
+    /// transaction: a crash may keep
     /// some of its pieces and lose the rest, though never part of one
     /// mutation, nor of a transaction opened inside it with
     /// [`Batch::transaction`].
