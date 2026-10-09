@@ -8,6 +8,7 @@ use crate::consts::*;
 use crate::error::{corrupt, Error};
 use crate::fold::{fold, Fold, Source};
 use crate::hash::{IdMap, IdSet};
+use crate::journal::Cursor;
 use crate::page::{decode_page, new_page, seal_page, PageBuf};
 use crate::state::*;
 use crate::statement::{Kind, Stmt, TableLen, TableReader};
@@ -111,7 +112,7 @@ fn split_at_copies(id: u32, table: &mut crate::fold::Table) -> Vec<(u32, u32)> {
 }
 
 /// The ranges of `id`'s committed bytes that more than one piece of its
-/// table names, merged: what the segment copied rather than moved.
+/// table names, merged: what the journal copied rather than moved.
 fn copied_ranges(id: u32, keys: &[(u32, Source)], size: u32) -> Vec<(u32, u32)> {
     let mut sources: Vec<(u32, u32)> = keys
         .iter()
@@ -160,23 +161,38 @@ pub(crate) struct Output {
 }
 
 impl Inner {
-    /// Appends what a batch holds back outside any open transaction, then
-    /// flushes. Poisons the store if the flush fails.
+    /// Appends a batch's ready run, which lies outside any open transaction,
+    /// then folds the journal, even an empty one. Poisons the store if the
+    /// flush fails.
     pub fn flush_now(&mut self) -> Result<(), Error> {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        self.must_flush_first = false;
-        let ready = match self.tx {
-            Tx::InBatch { .. } => self.ops.len(),
-            Tx::InTxInBatch { ready, .. } => ready,
-            _ => 0,
+        let end = self.ops.end();
+        let (committed, ready) = match self.tx {
+            Tx::Immediate => (end, end),
+            Tx::InBatch { committed, .. } => (committed, end),
+            Tx::InTransaction { committed, .. } => (committed, committed),
+            Tx::InTxInBatch {
+                committed, ready, ..
+            } => (committed, ready),
         };
-        if ready > 0 {
-            self.append_ops(ready)?;
+        let committed = self.append(committed, ready)?;
+        self.tx = self.tx.with_committed(committed);
+        self.fold_journal(committed)
+    }
+
+    /// Folds the operations the journal pages hold, `ops[..committed]`, and
+    /// drops them from the buffer, rebuilding the write-phase geometry from
+    /// what it still holds. Poisons the store if the flush fails.
+    pub(crate) fn fold_journal(&mut self, committed: Cursor) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
         }
-        match self.flush_inner() {
+        match self.flush_inner(committed) {
             Ok(()) => {
+                self.ops.drop_scratch();
+                self.ops.discard_to(committed);
                 self.repopulate_geometry();
                 Ok(())
             }
@@ -187,7 +203,7 @@ impl Inner {
         }
     }
 
-    fn flush_inner(&mut self) -> Result<(), Error> {
+    fn flush_inner(&mut self, committed: Cursor) -> Result<(), Error> {
         let e = self.epoch + 1;
         self.state.flush_epoch = e;
         self.state.pending.clear();
@@ -205,7 +221,7 @@ impl Inner {
         //    the consolidator state's own rewrite supersedes; bytes restated
         //    where they lie are charged to their page again, and so are no
         //    loss.
-        let mut f = fold(&self.segment_records, |id| {
+        let mut f = fold(self.ops.range(self.ops.front(), committed), |id| {
             self.state.allocs.get(&id).map(|m| m.size)
         });
         let restated = self.hoist(&mut f)?;
@@ -549,8 +565,7 @@ impl Inner {
         for (id, a, b, from) in merges {
             let mut bytes = vec![0u8; (b - a) as usize];
             self.read_committed(id, from, &mut bytes)?;
-            let pos = self.segment_records.arena.len() as u64;
-            self.segment_records.arena.extend_from_slice(&bytes);
+            let pos = self.ops.scratch(&bytes);
             let p = Pending {
                 origin: Origin::Arena(pos),
                 place: Place::Unplaced,
@@ -562,8 +577,7 @@ impl Inner {
         for (id, k, src, so, len) in reads {
             let mut bytes = vec![0u8; len as usize];
             self.read_committed(src, so, &mut bytes)?;
-            let pos = self.segment_records.arena.len() as u64;
-            self.segment_records.arena.extend_from_slice(&bytes);
+            let pos = self.ops.scratch(&bytes);
             f.ids
                 .get_mut(&id)
                 .unwrap()
@@ -1106,7 +1120,7 @@ impl Inner {
     // ------------------------------------------------------------ commit
 
     fn commit(&mut self, e: u64, dirty: &Dirty, out: Output) -> Result<(), Error> {
-        // The next segment starts in the lowest reusable page, or past the end.
+        // The next journal starts in the lowest reusable page, or past the end.
         let jp = match self.ready.pop_first() {
             Some(p) => p,
             None => self.file_pages,
@@ -1161,7 +1175,7 @@ impl Inner {
         }
         held.insert(slot, (out.header_content.len() as u16, Drain::default()));
         // A session's first flush clears the page it names for the next
-        // segment (`spec/journal.md#the-start-of-a-session`).
+        // journal (`spec/journal.md#the-start-of-a-session`).
         if self.first_flush && jp < self.file_pages {
             self.storage
                 .write_at(&new_page()[..], jp as u64 * PAGE_SIZE as u64)?;
@@ -1228,7 +1242,7 @@ impl Inner {
             self.state.children.remove(&p);
             retiring.push(p);
         }
-        for &p in &self.segment.pages {
+        for &p in &self.journal.pages {
             if p < self.file_pages && self.state.pages[p as usize] == Page::Journal {
                 self.state.pages[p as usize] = Page::Fallback;
                 retiring.push(p);
@@ -1258,8 +1272,7 @@ impl Inner {
             debug_assert_eq!(self.state.pages[jp as usize], Page::Reusable);
             self.state.pages[jp as usize] = Page::Journal;
         }
-        self.segment = crate::journal::SegmentWriter::new(e + 1, jp);
-        self.segment_records = crate::journal::Records::new();
+        self.journal = crate::journal::JournalWriter::new(e + 1, jp);
         debug_assert!(self
             .state
             .frags
@@ -1296,9 +1309,8 @@ impl Inner {
         while top > 2 {
             let p = top - 1;
             let page = self.state.pages[p as usize];
-            let empty_journal = page == Page::Journal
-                && self.segment.transactions == 0
-                && self.segment.pages == [p];
+            let empty_journal =
+                page == Page::Journal && self.journal.is_empty() && self.journal.pages == [p];
             if page == Page::Reusable || (force && empty_journal) {
                 top -= 1;
             } else {
