@@ -50,6 +50,8 @@ pub struct Options {
     pub myopic_ripeness: bool,
     /// How far `pack` looks ahead for a chunk that fits.
     pub lookahead: usize,
+    /// Victims sampled from the sparsest bucket.
+    pub sample: usize,
     /// Fragments the rotating window walks per flush.
     pub walk: usize,
     /// Pages per flush reserved for description defragmentation.
@@ -84,6 +86,7 @@ impl Default for Options {
             theta: 0.05,
             myopic_ripeness: false,
             lookahead: 16,
+            sample: 8,
             walk: 512,
             defrag_share: 1,
             mu: 0.02,
