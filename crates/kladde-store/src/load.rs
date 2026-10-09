@@ -410,6 +410,7 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
             drain: Drain::default(),
             untouched: 0,
             untouched_bytes: 0,
+            slot: None,
         });
         seen.insert(header.slot);
     }
@@ -440,6 +441,7 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
             drain: Drain::default(),
             untouched: 0,
             untouched_bytes: 0,
+            slot: None,
         });
         queue.extend(&kids);
         contents.push((p, d.epoch, d.content));
@@ -515,6 +517,7 @@ pub fn load(storage: &dyn Storage, header: PickedHeader) -> Result<Loaded, Error
             drain: Drain::default(),
             untouched: 0,
             untouched_bytes: 0,
+            slot: None,
         });
     }
     // A `Ref` whose payload is whole is one of its data page's untouched

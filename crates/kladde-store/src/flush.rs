@@ -1281,8 +1281,7 @@ impl Inner {
         }
         self.stats.flushes += 1;
         // What these pages lose in their first epochs teaches the file's
-        // empirical prior; the cursor looks for its next page among the data
-        // pages.
+        // empirical prior.
         self.cons.just_written = fresh.iter().map(|&(p, _)| p).collect();
         self.cons
             .young
@@ -1293,14 +1292,6 @@ impl Inner {
                 events: 0.0,
                 exposure: 0.0,
             }));
-        let data_pages: Vec<u32> = fresh
-            .iter()
-            .filter(|&&(_, data)| data)
-            .map(|&(p, _)| p)
-            .collect();
-        if !data_pages.is_empty() {
-            self.cons.prev_data_pages = data_pages;
-        }
         self.after_commit()?;
         self.truncate(false)
     }
