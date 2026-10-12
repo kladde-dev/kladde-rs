@@ -281,22 +281,31 @@ fn statistics_count_precision_and_coverage() {
     );
 }
 
-// With `small-attrs`, an element holds small lists and has no fixed encoding.
-#[cfg(not(any(feature = "f64", feature = "small-attrs")))]
+#[cfg(not(feature = "f64"))]
 #[test]
-fn slot_sizes_are_what_the_plan_estimated() {
-    assert_eq!(<PathSegment as kladde::Persistable>::SLOTTED_SIZE, Some(26));
-    assert_eq!(<Length as kladde::Persistable>::SLOTTED_SIZE, Some(5));
+fn sizes_are_what_the_plan_estimated() {
+    use kladde::Persistable;
+    // Path segments differ in size, by their number of coordinates; their
+    // fixed form is the largest, a curve's six, with `abs` and the
+    // discriminant.
+    assert_eq!(<PathSegment as Persistable>::FIXED_SIZE, None);
+    assert_eq!(<PathSegment as Persistable>::FIXED_FORM_SIZE, Some(26));
+    assert_eq!(<Length as Persistable>::FIXED_SIZE, Some(5));
     assert_eq!(
-        <kladde_svg::model::Element as kladde::Persistable>::SLOTTED_SIZE,
-        Some(1 + 20 + 4 * 4)
+        <kladde_svg::model::Point as Persistable>::FIXED_SIZE,
+        Some(8)
     );
-    assert_eq!(<Node as kladde::Persistable>::SLOTTED_SIZE, Some(1 + 37));
+    assert_eq!(
+        <kladde_svg::model::Element as Persistable>::FIXED_SIZE,
+        None
+    );
+    assert_eq!(<Node as Persistable>::FIXED_SIZE, None);
 }
 
 #[cfg(feature = "f64")]
 #[test]
-fn slot_sizes_with_f64() {
-    assert_eq!(<PathSegment as kladde::Persistable>::SLOTTED_SIZE, Some(50));
-    assert_eq!(<Length as kladde::Persistable>::SLOTTED_SIZE, Some(9));
+fn sizes_with_f64() {
+    use kladde::Persistable;
+    assert_eq!(<PathSegment as Persistable>::FIXED_FORM_SIZE, Some(50));
+    assert_eq!(<Length as Persistable>::FIXED_SIZE, Some(9));
 }

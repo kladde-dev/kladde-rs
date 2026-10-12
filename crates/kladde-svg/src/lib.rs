@@ -20,13 +20,10 @@
 //! # Ok::<(), kladde_svg::ParseError>(())
 //! ```
 
-pub mod copy;
 pub mod model;
 pub mod parse;
-pub mod size;
 pub mod write;
 
-pub use copy::DeepCopy;
 pub use model::Document;
 pub use parse::{parse, parse_with_stats, ParseError, ParseStats};
 pub use write::{write, write_indented};

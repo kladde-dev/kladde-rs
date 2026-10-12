@@ -1,24 +1,24 @@
 //! Benchmarks a drawing editor's edits on an SVG drawing stored in kladde.
 //!
 //! ```text
-//! svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--focus SHARE] [--focus-moves N] [--journal-budget PAGES] [--shift-decay FACTOR] [--churn-floor λ] [--target-fill τ]
+//! svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--focus SHARE] [--focus-moves N] [--journal-budget PAGES] [--churn-floor λ] [--target-fill τ] [--span-min BYTES] [--rewrite-below BYTES]
 //! ```
 //!
 //! `--only Restack`, say, makes every edit a restack where the drawing allows
 //! one, to measure what one kind of edit costs. `--journal-budget` sets the
 //! store's [`Options::journal_budget_pages`], so that the store also flushes
-//! by itself whenever the journal outgrows that many pages, `--shift-decay`
-//! its [`Options::shift_decay`], `--churn-floor` its
-//! [`Options::churn_floor`], and `--target-fill` its
-//! [`Options::target_fill`].
+//! by itself whenever the journal outgrows that many pages, `--churn-floor`
+//! its [`Options::churn_floor`], `--target-fill` its
+//! [`Options::target_fill`], `--span-min` its [`Options::span_min`], and
+//! `--rewrite-below` its [`Options::rewrite_below`].
 //!
 //! The drawing is converted into a kladde file, which is not measured, and
 //! then edited by a seeded mix of what a drawing editor does — dragging shapes,
 //! moving, inserting and deleting path nodes, recoloring, duplicating,
 //! deleting and restacking shapes, editing text — until the edits have stored
 //! eight times the drawing's live size (once with `--quick`), or for exactly
-//! `N` edits with `--edits`, which makes runs of the model's layouts (see
-//! `kladde_svg::model`) make the same edits. Every 1000 edits
+//! `N` edits with `--edits`, which makes runs with different options make the
+//! same edits. Every 1000 edits
 //! the file is flushed and one row is recorded in kladde-bench's format, to
 //! `svg-<variant>.csv` in the output directory, so that `plot-evaluation.py`
 //! in kladde-docs reads it like kladde-bench's tables. The variant is the
@@ -33,9 +33,9 @@
 //! except that nine drags in ten move one of the first tenth of the shapes.
 //!
 //! `app_bytes` counts what each edit stores: the bytes of the numbers it sets,
-//! or the encoding of a value it stores, in the place it stores it, plus
-//! everything that value owns; deletions count nothing. `ops_us` counts the time spent in kladde's calls
-//! only, not choosing the edits.
+//! or the encoding of a value it stores, and of a restacked shape; deletions
+//! count nothing. `ops_us` counts the time spent in kladde's calls only, not
+//! choosing the edits.
 //!
 //! At the end, the file is closed and reopened, and the drawing must write the
 //! same canonical SVG as before. A summary on stderr gives the closed file's
@@ -46,15 +46,13 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use kladde::{Encoding, FileStorage, Kladde, Options, Persistable, Pointer, WriteBackend};
+use kladde::{Backend, FileStorage, Kladde, Options, Persistable};
 use kladde_bench::{row, save, Rng};
 use kladde_svg::model::{
-    Attr, AttrParts, Color, Element, ElementGuard, ElementKind, ElementKindParts, ListEncoding,
-    Node, NodeParts, Paint, PaintParts, PathSegment, PathSegmentParts, TransformOp,
-    TransformOpParts,
+    Attr, AttrParts, Color, Element, ElementGuard, ElementKind, ElementKindParts, Node, NodeParts,
+    Paint, PaintParts, PathSegment, PathSegmentParts, TransformOp, TransformOpParts,
 };
-use kladde_svg::size::Payload;
-use kladde_svg::{parse, write, DeepCopy, Document, Number};
+use kladde_svg::{parse, write, Document, Number};
 
 /// Edits between two explicit flushes, as in kladde-bench.
 const OPS_PER_FLUSH: u64 = 1000;
@@ -175,18 +173,13 @@ fn element<'a>(root: &'a Element, path: &[usize]) -> &'a Element {
 }
 
 /// Runs `f` on the guard of the element at `rest` below child `i` of the
-/// element `g` guards. Every element below the root stands in a list of
-/// children, so its guard takes the lists' encoding, whatever `g`'s is.
-fn below<B, E, R>(
-    g: &mut ElementGuard<'_, B, E>,
+/// element `g` guards.
+fn below<B: Backend, R>(
+    g: &mut ElementGuard<'_, B>,
     i: usize,
     rest: &[usize],
-    f: impl FnOnce(&mut ElementGuard<'_, B, ListEncoding>) -> R,
-) -> R
-where
-    B: WriteBackend<Pointer = Pointer>,
-    E: Encoding,
-{
+    f: impl FnOnce(&mut ElementGuard<'_, B>) -> R,
+) -> R {
     let mut children = g.children_mut();
     let mut node = children
         .get_mut(i)
@@ -201,15 +194,13 @@ where
 }
 
 /// Evaluates `$body` with `$e` bound to the guard of the element at `$path`
-/// below the root element guarded by `$root`. A macro rather than a
-/// function: the root element's guard and those below it take different
-/// encodings in some layouts, and the body is type-checked against each.
+/// below the root element guarded by `$root`.
 macro_rules! on_element {
     ($root:expr, $path:expr, |$e:ident| $body:expr) => {{
         let root = $root;
         let path: &[usize] = $path;
         match path.split_first() {
-            None => (|$e: &mut ElementGuard<'_, _, _>| $body)(root),
+            None => (|$e: &mut ElementGuard<'_, _>| $body)(root),
             Some((&i, rest)) => below(root, i, rest, |$e| $body),
         }
     }};
@@ -384,11 +375,11 @@ impl Bench {
             }
             Some(_) => {
                 mutate!(self, &path, |e| e.transform_mut().insert(0, new));
-                self.app_bytes += new.payload_bytes::<ListEncoding>();
+                self.app_bytes += new.encoded_len() as u64;
             }
             None => {
                 mutate!(self, &path, |e| e.transform_mut().push(new));
-                self.app_bytes += new.payload_bytes::<ListEncoding>();
+                self.app_bytes += new.encoded_len() as u64;
             }
         }
     }
@@ -455,7 +446,7 @@ impl Bench {
             };
             d.insert(i, segment)
         });
-        self.app_bytes += segment.payload_bytes::<ListEncoding>();
+        self.app_bytes += segment.encoded_len() as u64;
     }
 
     /// Deletes a node of a path, never its first, and never below two.
@@ -531,14 +522,14 @@ impl Bench {
                     }
                 });
                 self.app_bytes += if is_color {
-                    color.payload_bytes::<ListEncoding>()
+                    color.encoded_len() as u64
                 } else {
-                    Paint::Color(color).payload_bytes::<ListEncoding>()
+                    Paint::Color(color).encoded_len() as u64
                 };
             }
             Fill::Unset => {
                 let attr = Attr::Fill(Paint::Color(color));
-                self.app_bytes += attr.payload_bytes::<ListEncoding>();
+                self.app_bytes += attr.encoded_len() as u64;
                 mutate!(self, &path, |e| e.attrs_mut().push(attr));
             }
         }
@@ -548,8 +539,8 @@ impl Bench {
     fn duplicate(&mut self) {
         let path = self.pick(&self.index.leaves.clone());
         let (&i, parent) = path.split_last().unwrap();
-        let copy = Node::Element(element(&self.drawing.get().root, &path).deep_copy());
-        self.app_bytes += copy.payload_bytes::<ListEncoding>();
+        let copy = Node::Element(element(&self.drawing.get().root, &path).clone());
+        self.app_bytes += copy.encoded_len() as u64;
         mutate!(self, parent, |p| p.children_mut().insert(i + 1, copy));
         self.stale = true;
     }
@@ -563,17 +554,14 @@ impl Bench {
     }
 
     /// Moves a shape to another place among its siblings, which the child
-    /// list does in one transaction, taking the shape's bytes from where they
-    /// lie.
+    /// list does with one `Move`, writing none of the shape's bytes.
     fn restack(&mut self) {
         let path = self.pick(&self.index.movable.clone());
         let (&i, parent) = path.split_last().unwrap();
         let siblings = element(&self.drawing.get().root, parent).children.len() as u64;
         let j = self.rng.below(siblings) as usize;
-        let moved =
-            element(&self.drawing.get().root, parent).children[i].encoded_size::<ListEncoding>();
+        let moved = element(&self.drawing.get().root, parent).children[i].encoded_len();
         mutate!(self, parent, |p| p.children_mut().move_element(i, j));
-        // The node's encoding moves; what it owns stays where it is.
         self.app_bytes += moved as u64;
         self.stale = true;
     }
@@ -655,18 +643,24 @@ fn main() {
                     .and_then(|s| s.parse().ok())
                     .expect("--journal-budget PAGES")
             }
-            "--shift-decay" => {
-                opts.shift_decay = args
+            "--span-min" => {
+                opts.span_min = args
                     .next()
                     .and_then(|s| s.parse().ok())
-                    .expect("--shift-decay FACTOR")
+                    .expect("--span-min BYTES")
+            }
+            "--rewrite-below" => {
+                opts.rewrite_below = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .expect("--rewrite-below BYTES")
             }
             _ => positional.push(PathBuf::from(arg)),
         }
     }
     let [input, out] = positional.as_slice() else {
         eprintln!(
-            "usage: svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--focus SHARE] [--focus-moves N] [--journal-budget PAGES] [--shift-decay FACTOR] [--churn-floor λ] [--target-fill τ]"
+            "usage: svg-bench <drawing.svg> <output directory> [--quick] [--edits N] [--only KIND] [--seed N] [--variant NAME] [--focus SHARE] [--focus-moves N] [--journal-budget PAGES] [--churn-floor λ] [--target-fill τ] [--span-min BYTES] [--rewrite-below BYTES]"
         );
         std::process::exit(2);
     };
@@ -690,7 +684,7 @@ fn main() {
         .expect("create the kladde file");
     drawing.flush().expect("flush");
     let base = drawing.stats();
-    let live = base.allocation_bytes;
+    let live = base.sequence_bytes + base.schema_bytes;
     let index = Index::of(drawing.get());
     let initial = index.leaves.len();
     assert!(initial > 0, "the drawing has nothing to edit");
@@ -808,7 +802,11 @@ fn main() {
         "kladde wrote {written} bytes: {:.0} per edit, {:.2} per byte stored; the file is {file_bytes} bytes, {:.2} times its live size",
         per_op(written as f64),
         written as f64 / bench.app_bytes.max(1) as f64,
-        file_bytes as f64 / s.allocation_bytes.max(1) as f64,
+        file_bytes as f64 / (s.sequence_bytes + s.schema_bytes).max(1) as f64,
+    );
+    eprintln!(
+        "the file holds {} spans for {} bytes of sequence: {} live data pages and {} live table pages",
+        s.spans, s.sequence_bytes, s.data_pages, s.table_pages,
     );
     eprintln!(
         "saving the canonical SVG ({canonical_before} bytes before, {} after) would write per edit: {:.0} after every edit, {:.0} every 100, {:.0} every 1000",
@@ -824,7 +822,7 @@ fn main() {
     );
     eprintln!(
         "closed: the file takes {closed_bytes} bytes, {:.2} times the live size",
-        closed_bytes as f64 / s.allocation_bytes.max(1) as f64,
+        closed_bytes as f64 / (s.sequence_bytes + s.schema_bytes).max(1) as f64,
     );
     eprintln!(
         "opening: parsing the SVG took {:.1} ms, reopening the closed kladde file {:.2} ms at the median of 21; writing the SVG took {:.1} ms",

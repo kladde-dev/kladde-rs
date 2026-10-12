@@ -12,8 +12,10 @@
 //! 2. storing it in a kladde file, closing, reopening and writing it out again
 //!    must reproduce the canonical form byte for byte;
 //! 3. the sizes of the original, the canonical form, both gzipped, and the
-//!    kladde file are recorded, with the store's live allocation bytes,
-//!    allocations and statements, and the closed file's pages by kind. The
+//!    kladde file are recorded, with the store's live bytes, the sequence's
+//!    and the schema chain's, in the column `alloc_bytes`, and its spans in
+//!    `statements` (`allocations` is 0, since there are none), and the
+//!    closed file's pages by kind. The
 //!    kladde file's size is taken twice: as first closed, after one explicit
 //!    flush, and *settled*, once two more sessions have opened and closed it.
 //!    A new file holds free pages ahead of its data, which `close` cannot
@@ -195,9 +197,9 @@ fn check(file: &Path, work: &Path, render: bool, opts: &Options) -> Row {
         Ok((stats, pages, written, open_us, first, settled)) => {
             row.kladde_bytes = first;
             row.settled_bytes = settled;
-            row.alloc_bytes = stats.allocation_bytes;
-            row.allocations = stats.allocations;
-            row.statements = stats.statements;
+            row.alloc_bytes = stats.sequence_bytes + stats.schema_bytes;
+            row.allocations = 0;
+            row.statements = stats.spans;
             row.data_pages = pages.data_pages;
             row.table_pages = pages.table_pages;
             row.free_pages = pages.free_pages;
@@ -322,11 +324,11 @@ fn summarize(rows: &[Row], render: bool) {
         ratio(settled, orig)
     );
     eprintln!(
-        "  kladde allocations  {alloc:>12}  {:>6.3}",
+        "  kladde sequence     {alloc:>12}  {:>6.3}",
         ratio(alloc, orig)
     );
     eprintln!(
-        "  per file, median: settled kladde file / original {:.2}, kladde allocations / canonical {:.2}",
+        "  per file, median: settled kladde file / original {:.2}, kladde sequence / canonical {:.2}",
         median(parsed.iter().map(|r| ratio(r.settled_bytes, r.orig_bytes)).collect()),
         median(parsed.iter().map(|r| ratio(r.alloc_bytes, r.canon_bytes)).collect()),
     );
