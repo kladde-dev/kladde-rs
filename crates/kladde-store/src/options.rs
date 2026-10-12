@@ -29,6 +29,10 @@ pub struct Options {
     pub rewrite_below: u32,
     /// Two neighbouring spans whose entries leave the header for a leaf are
     /// merged into one if they are shorter than this together.
+    ///
+    /// A larger bound keeps the span table smaller and costs more writes:
+    /// every merge writes its spans' bytes again, and leaves the bytes it
+    /// replaced for consolidation to clean.
     pub span_min: u32,
     /// Flushes a span's bytes must have stayed unwritten for it to count as
     /// cold, which lets the rotating walk merge it with its neighbours.
@@ -65,8 +69,8 @@ impl Default for Options {
         Options {
             journal_budget_pages: 256,
             inline_threshold: 64,
-            rewrite_below: 128,
-            span_min: 256,
+            rewrite_below: 64,
+            span_min: 64,
             cold_flushes: 16,
             walk: 256,
             mu: 0.02,
