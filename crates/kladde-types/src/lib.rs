@@ -1,55 +1,48 @@
-//! The built-in backed containers: [`PersistableVec`] and
-//! [`PackedPersistableVec`], [`PersistableString`], [`PersistableHashMap`],
-//! and, with the `serde` feature, `PersistableBlob`.
+//! The built-in containers: [`PersistableVec`], [`PersistableString`],
+//! [`PersistableMap`], and, with the `serde` feature, `PersistableBlob`.
 //!
-//! They are hand-implemented against the same public `Persistable` and `Guard`
-//! surface any crate can use, the way `std`'s collections hand-write their raw
-//! pointer manipulation. This crate is a default library, not a layer of the
-//! system: nothing depends on it, and third-party libraries of backed types can
-//! stand beside it on equal terms.
+//! Every container is inline in its parent, in the one sequence of a kladde
+//! file: a vector and a map state their count and then their elements, and
+//! text ends in the byte `0xFF`. In memory, a container of elements whose
+//! size depends on their value keeps a Fenwick tree of their sizes, so that
+//! an element's guard finds where it starts in `O(log m)`.
+//!
+//! They are hand-implemented against the same public `Persistable` and
+//! `Guard` surface any crate can use. This crate is a default library, not a
+//! layer of the system: nothing depends on it, and third-party libraries of
+//! persistable types can stand beside it on equal terms.
 //!
 //! ```
 //! use kladde::{Kladde, Persistable};
-//! use kladde_types::{PersistableHashMap, PersistableString, PersistableVec};
+//! use kladde_types::{PersistableMap, PersistableString, PersistableVec};
 //!
 //! #[derive(Persistable)]
 //! struct Library {
 //!     titles: PersistableVec<PersistableString>,
-//!     loans: PersistableHashMap<PersistableString, u32>,
+//!     loans: PersistableMap<PersistableString, u32>,
 //! }
 //!
 //! let mut lib = Kladde::new(Library {
 //!     titles: PersistableVec::new(),
-//!     loans: PersistableHashMap::new(),
+//!     loans: PersistableMap::new(),
 //! });
 //! let mut guard = lib.guard();
-//! guard.titles_mut().push(PersistableString::from("Emma"))?;
-//! guard.loans_mut().insert(PersistableString::from("Emma"), 3)?;
+//! guard.titles_mut().push("Emma".into())?;
+//! guard.loans_mut().insert("Emma".into(), 3)?;
 //! assert_eq!(lib.get().titles.len(), 1);
 //! # Ok::<(), kladde::Error>(())
 //! ```
 
 #[cfg(feature = "serde")]
 mod blob;
+mod index;
 mod map;
-mod offsets;
-mod packed;
-mod slot;
-mod small;
 mod string;
 mod vec;
 
-#[cfg(test)]
-mod test_support;
-
 #[cfg(feature = "serde")]
 pub use blob::{PersistableBlob, PersistableBlobGuard};
-pub use map::{PersistableHashMap, PersistableHashMapGuard};
-pub use packed::{PackedPersistableVec, PackedPersistableVecGuard};
-pub use small::{
-    SmallPersistableString, SmallPersistableStringGuard, SmallPersistableVec,
-    SmallPersistableVecGuard, FOLD_BELOW, SPILL_ABOVE,
-};
+pub use map::{PersistableMap, PersistableMapGuard};
 pub use string::{PersistableString, PersistableStringGuard};
 pub use vec::{PersistableVec, PersistableVecGuard};
 

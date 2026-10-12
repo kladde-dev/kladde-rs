@@ -297,10 +297,29 @@ impl<'r, B: Backend> Region<'r, B> {
     /// lengths agree, and as a splice otherwise. What a guard's `set` does
     /// with the new value's encoding.
     pub fn replace(&self, old: u64, bytes: &[u8]) -> Result<(), Error> {
+        self.replace_at(0, old, bytes)
+    }
+
+    /// Writes `bytes` over the `old` bytes at `at`: in place if the lengths
+    /// agree, and as a splice otherwise.
+    ///
+    /// ```
+    /// use kladde_persist::Region;
+    /// use kladde_store::{MemoryStorage, Store, WriteBackend};
+    ///
+    /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
+    /// store.splice(0, 0, b"abc")?;
+    /// let root = Region::root(&store);
+    /// root.replace_at(1, 1, b"B")?; // a write
+    /// root.replace_at(2, 1, b"CC")?; // a splice
+    /// assert_eq!(root.len(), 4);
+    /// # Ok::<(), kladde_store::Error>(())
+    /// ```
+    pub fn replace_at(&self, at: u64, old: u64, bytes: &[u8]) -> Result<(), Error> {
         if old == bytes.len() as u64 {
-            self.write(0, bytes)
+            self.write(at, bytes)
         } else {
-            self.splice(0, old, bytes).map(|_| ())
+            self.splice(at, old, bytes).map(|_| ())
         }
     }
 

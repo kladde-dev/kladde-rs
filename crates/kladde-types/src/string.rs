@@ -1,374 +1,255 @@
-//! [`PersistableString`] -- the backed variant of `String`: a thin wrapper
-//! around [`PersistableVec<u8>`] that keeps its bytes valid UTF-8.
-//!
-//! `PartialEq`, `Eq`, `Hash`, and `Ord` compare the text only, not the
-//! allocation, so a string just loaded equals one freshly constructed with the
-//! same text -- which is also what makes it usable as a `PersistableHashMap`
-//! key.
+//! [`PersistableString`]: text, encoded as UTF-8 and the byte `0xFF`.
 
-use crate::vec::PersistableVec;
-use kladde_persist::{
-    replace, Encoding, Error, Guard, Input, Persistable, Place, Pointer, PointerRepr, ReadBackend,
-    Slottable, Slotted, TypeDescriptor, WriteBackend,
-};
-use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 
-/// Growable text whose contents are persisted.
+use kladde_persist::{
+    Backend, Decoder, Encoder, Error, Guard, Persistable, Region, SchemaBuilder, TypeDescriptor,
+};
+
+/// Text: UTF-8, then the byte `0xFF`, which UTF-8 never contains. In memory,
+/// a `String`.
 ///
-/// Reads go through `Deref<Target = str>`. Mutation goes through a
-/// [`PersistableStringGuard`], which offers [`set`](PersistableStringGuard::set)
-/// and [`push_str`](PersistableStringGuard::push_str), each one write.
+/// Text states no count, so an edit of text is one splice of the file's
+/// sequence, wherever it lands and however long the text is.
 ///
-/// Plain `String` deliberately does not implement `Persistable`: it has
-/// nowhere to remember which allocation holds its bytes, so a struct field
-/// typed `String` fails to compile rather than silently persisting nothing.
-///
-/// ```compile_fail
-/// use kladde::Persistable;
-///
-/// #[derive(Persistable)]
-/// struct Contact {
-///     name: String, // error[E0277]: the trait bound `String: Persistable` is not satisfied
-/// }
-/// ```
+/// Read it as a `str`, through `Deref`; change it through a
+/// [`PersistableStringGuard`].
 ///
 /// ```
 /// use kladde::{Kladde, Persistable};
 /// use kladde_types::PersistableString;
 ///
-/// #[derive(Persistable)]
-/// struct Contact {
-///     name: PersistableString,
-/// }
-///
-/// let mut contact = Kladde::new(Contact { name: PersistableString::from("ada") });
-/// contact.guard().name_mut().push_str(" lovelace")?;
-/// assert_eq!(contact.get().name, "ada lovelace");
+/// let s = PersistableString::from("Map");
+/// assert_eq!(s.to_bytes(), [b'M', b'a', b'p', 0xff]);
+/// let mut title = Kladde::new(s);
+/// title.guard().insert_str(0, "World ")?;
+/// assert_eq!(title.get(), "World Map");
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub struct PersistableString<P = Pointer>(PersistableVec<u8, P>);
+#[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PersistableString(String);
 
-impl<P> std::fmt::Debug for PersistableString<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("PersistableString").field(&&**self).finish()
-    }
-}
-
-impl<P> Default for PersistableString<P> {
-    fn default() -> Self {
-        PersistableString(PersistableVec::new())
-    }
-}
-
-impl<P> PersistableString<P> {
-    /// An empty string, holding no allocation.
+impl PersistableString {
+    /// An empty string.
     ///
     /// ```
-    /// use kladde_types::PersistableString;
-    ///
-    /// assert_eq!(PersistableString::<kladde::Pointer>::new(), "");
+    /// assert!(kladde_types::PersistableString::new().is_empty());
     /// ```
     pub fn new() -> Self {
         Self::default()
     }
-}
 
-impl<P> Deref for PersistableString<P> {
-    type Target = str;
-    fn deref(&self) -> &str {
-        std::str::from_utf8(self.0.as_slice()).expect("a PersistableString holds UTF-8")
+    /// The text, as a `String`.
+    pub fn into_string(self) -> String {
+        self.0
     }
 }
 
-impl<P> std::fmt::Display for PersistableString<P> {
+impl std::fmt::Debug for PersistableString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&**self, f)
+        self.0.fmt(f)
     }
 }
 
-impl<P> From<&str> for PersistableString<P> {
+impl std::fmt::Display for PersistableString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Deref for PersistableString {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for PersistableString {
     fn from(s: &str) -> Self {
-        PersistableString(PersistableVec::from_iter(s.bytes()))
+        PersistableString(s.to_owned())
     }
 }
 
-impl<P> From<String> for PersistableString<P> {
+impl From<String> for PersistableString {
     fn from(s: String) -> Self {
-        PersistableString(PersistableVec::from_iter(s.into_bytes()))
+        PersistableString(s)
     }
 }
 
-impl<P> From<PersistableString<P>> for String {
-    fn from(s: PersistableString<P>) -> Self {
-        String::from_utf8(s.0.into_data()).expect("a PersistableString holds UTF-8")
+impl From<PersistableString> for String {
+    fn from(s: PersistableString) -> Self {
+        s.0
     }
 }
 
-impl<P> PartialEq for PersistableString<P> {
-    fn eq(&self, other: &Self) -> bool {
-        **self == **other
-    }
-}
-impl<P> Eq for PersistableString<P> {}
-
-impl<P> Hash for PersistableString<P> {
+impl Hash for PersistableString {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        (**self).hash(state)
+        self.0.hash(state)
     }
 }
 
-impl<P> PartialOrd for PersistableString<P> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl<P> Ord for PersistableString<P> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        (**self).cmp(&**other)
-    }
-}
-
-impl<P> PartialEq<str> for PersistableString<P> {
+impl PartialEq<str> for PersistableString {
     fn eq(&self, other: &str) -> bool {
-        &**self == other
+        self.0 == other
     }
 }
-impl<P> PartialEq<PersistableString<P>> for str {
-    fn eq(&self, other: &PersistableString<P>) -> bool {
-        self == &**other
-    }
-}
-impl<P> PartialEq<&str> for PersistableString<P> {
+
+impl PartialEq<&str> for PersistableString {
     fn eq(&self, other: &&str) -> bool {
-        &**self == *other
-    }
-}
-impl<P> PartialEq<PersistableString<P>> for &str {
-    fn eq(&self, other: &PersistableString<P>) -> bool {
-        *self == &**other
+        self.0 == *other
     }
 }
 
-impl<P: PointerRepr> Slottable<P> for PersistableString<P> {}
+impl PartialEq<PersistableString> for str {
+    fn eq(&self, other: &PersistableString) -> bool {
+        self == other.0
+    }
+}
 
-impl<P: PointerRepr> Persistable<P> for PersistableString<P> {
-    const SLOTTED_SIZE: Option<usize> = <PersistableVec<u8, P> as Persistable<P>>::SLOTTED_SIZE;
-    const PACKED_SIZE: Option<usize> = <PersistableVec<u8, P> as Persistable<P>>::PACKED_SIZE;
+impl PartialEq<PersistableString> for &str {
+    fn eq(&self, other: &PersistableString) -> bool {
+        *self == other.0
+    }
+}
 
-    type RootEncoding = Slotted;
+impl Persistable for PersistableString {
+    const FIXED_SIZE: Option<usize> = None;
 
-    type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
-        = PersistableStringGuard<'s, B, E>
-    where
-        Self: 's,
-        B: 's;
+    fn encoded_len(&self) -> usize {
+        self.0.len() + 1
+    }
 
-    #[inline]
-    fn guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>(
-        &'s mut self,
-        backend: &'s B,
-        place: Place<'s, B, E>,
-    ) -> Self::Guard<'s, B, E> {
+    fn encode(&self, out: &mut Encoder<'_>) {
+        out.text(&self.0);
+    }
+
+    fn decode(input: &mut Decoder<'_>) -> Result<Self, Error> {
+        input.text().map(PersistableString)
+    }
+
+    type Guard<'r, B: Backend + 'r> = PersistableStringGuard<'r, B>;
+
+    fn guard<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Guard<'r, B> {
         PersistableStringGuard {
             inner: self,
-            backend,
-            place,
+            region,
         }
     }
 
-    fn encoded_size<E: Encoding>(&self) -> usize {
-        self.0.encoded_size::<E>()
-    }
-
-    fn encode<E: Encoding>(&self, out: &mut Vec<u8>) {
-        self.0.encode::<E>(out)
-    }
-
-    fn decode<B: ReadBackend<Pointer = P>, E: Encoding>(
-        backend: &mut B,
-        input: &mut Input<'_>,
-    ) -> Result<Self, Error> {
-        let bytes = PersistableVec::decode::<B, E>(backend, input)?;
-        if std::str::from_utf8(bytes.as_slice()).is_err() {
-            return Err(Error::Corrupt(
-                "a PersistableString holds invalid UTF-8".into(),
-            ));
-        }
-        Ok(PersistableString(bytes))
-    }
-
-    fn prepare<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) -> Result<(), Error> {
-        self.0.prepare_bytes(backend)
-    }
-
-    fn free<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) -> Result<(), Error> {
-        self.0.free(backend)
-    }
-
-    /// `Pointer(Packed(Sequence(char)))`: an allocation of text, whose packed
-    /// `char`s are its UTF-8 bytes.
-    fn describe_local(builder: &mut kladde_persist::SchemaBuilder) -> TypeDescriptor {
-        TypeDescriptor::Pointer(builder.packed_sequence::<P, char>())
+    fn describe_local(_builder: &mut SchemaBuilder) -> TypeDescriptor {
+        TypeDescriptor::Text
     }
 }
 
-/// The mutation-capable view onto a [`PersistableString`]: whole-value
-/// [`set`](Self::set) and appending [`push_str`](Self::push_str), each one
-/// write.
+/// The [`Guard`] of a [`PersistableString`]: every edit is one splice of
+/// the text's bytes, and the terminator stays where the text ends.
 ///
-/// Reads go through `Deref<Target = str>`. There is no mutable access to the
-/// bytes, which could break the UTF-8 the string maintains.
+/// Byte positions must lie on `char` boundaries; one that does not fails
+/// with [`Error::OutOfBounds`], recording nothing.
 ///
 /// ```
 /// use kladde::Kladde;
 /// use kladde_types::PersistableString;
 ///
-/// let mut name = Kladde::new(PersistableString::new());
-/// let mut guard = name.guard();
-/// guard.set("ada")?;
-/// guard.push_str(" lovelace")?;
-/// assert_eq!(&*guard, "ada lovelace");
+/// let mut s = Kladde::new(PersistableString::from("kladde"));
+/// let mut guard = s.guard();
+/// guard.push_str(" file")?;
+/// guard.replace_range(0..6, "Kladde")?;
+/// guard.truncate(6)?;
+/// assert_eq!(s.get(), "Kladde");
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub struct PersistableStringGuard<'s, B: WriteBackend, E: Encoding = Slotted> {
-    inner: &'s mut PersistableString<B::Pointer>,
-    backend: &'s B,
-    place: Place<'s, B, E>,
+pub struct PersistableStringGuard<'r, B> {
+    inner: &'r mut PersistableString,
+    region: Region<'r, B>,
 }
 
-impl<'s, B: WriteBackend, E: Encoding> PersistableStringGuard<'s, B, E> {
-    /// Appends `s` in one write. See [`PersistableStringGuard`] for an
-    /// example.
-    pub fn push_str(&mut self, s: &str) -> Result<(), Error> {
-        self.inner
-            .0
-            .guard(self.backend, self.place)
-            .extend_from_slice(s.as_bytes())
-    }
-
-    /// Replaces the text with `new` in one write, whatever the current
-    /// length. An owned `String` is moved in without copying. See
+impl<B: Backend> PersistableStringGuard<'_, B> {
+    /// Replaces the bytes in `range` with `text`. See
     /// [`PersistableStringGuard`] for an example.
-    pub fn set(&mut self, new: impl Into<String>) -> Result<(), Error> {
-        self.inner
-            .0
-            .guard(self.backend, self.place)
-            .set_bytes(new.into().into_bytes())
+    pub fn replace_range(&mut self, range: Range<usize>, text: &str) -> Result<(), Error> {
+        let s = &self.inner.0;
+        if range.start > range.end
+            || range.end > s.len()
+            || !s.is_char_boundary(range.start)
+            || !s.is_char_boundary(range.end)
+        {
+            return Err(Error::OutOfBounds);
+        }
+        self.region.splice(
+            range.start as u64,
+            (range.end - range.start) as u64,
+            text.as_bytes(),
+        )?;
+        self.inner.0.replace_range(range, text);
+        Ok(())
     }
 
-    /// Replaces the text in byte range `range` with `with`, in one splice,
-    /// as [`String::replace_range`] does. Panics if the range does not lie on
-    /// `char` boundaries.
+    /// Appends `text`. See [`PersistableStringGuard`] for an example.
+    pub fn push_str(&mut self, text: &str) -> Result<(), Error> {
+        let end = self.inner.0.len();
+        self.replace_range(end..end, text)
+    }
+
+    /// Inserts `text` at byte `at`.
     ///
     /// ```
     /// use kladde::Kladde;
     /// use kladde_types::PersistableString;
     ///
-    /// let mut name = Kladde::new(PersistableString::from("ada"));
-    /// name.guard().replace_range(1..2, "nn")?;
-    /// assert_eq!(name.get(), "anna");
+    /// let mut s = Kladde::new(PersistableString::from("ac"));
+    /// s.guard().insert_str(1, "b")?;
+    /// assert_eq!(s.get(), "abc");
     /// # Ok::<(), kladde::Error>(())
     /// ```
-    pub fn replace_range(
-        &mut self,
-        range: std::ops::Range<usize>,
-        with: &str,
-    ) -> Result<(), Error> {
-        let text: &str = self.inner;
-        assert!(
-            text.is_char_boundary(range.start) && text.is_char_boundary(range.end),
-            "PersistableString::replace_range: {range:?} does not lie on char boundaries"
-        );
-        self.inner.0.guard(self.backend, self.place).splice_bytes(
-            range.start,
-            range.end - range.start,
-            with.as_bytes(),
-        )
+    pub fn insert_str(&mut self, at: usize, text: &str) -> Result<(), Error> {
+        self.replace_range(at..at, text)
     }
 
-    /// Replaces the whole value: stores `value`, then frees the old one, in
-    /// one transaction. Unlike [`set`](Self::set), it can move in a string
-    /// that already has an allocation without copying its bytes.
+    /// Removes everything from byte `len` on. See
+    /// [`PersistableStringGuard`] for an example.
+    pub fn truncate(&mut self, len: usize) -> Result<(), Error> {
+        let end = self.inner.0.len();
+        if len >= end {
+            return Ok(());
+        }
+        self.replace_range(len..end, "")
+    }
+
+    /// Replaces the whole text.
     ///
     /// ```
     /// use kladde::Kladde;
     /// use kladde_types::PersistableString;
     ///
-    /// let mut name = Kladde::new(PersistableString::from("a"));
-    /// name.guard().replace(PersistableString::from("b"))?;
-    /// assert_eq!(name.get(), "b");
+    /// let mut s = Kladde::new(PersistableString::from("draft"));
+    /// s.guard().set("final")?;
+    /// assert_eq!(s.get(), "final");
     /// # Ok::<(), kladde::Error>(())
     /// ```
-    pub fn replace(&mut self, value: PersistableString<B::Pointer>) -> Result<(), Error> {
-        replace(self.inner, value, self.backend, &self.place)
+    pub fn set(&mut self, text: impl Into<String>) -> Result<(), Error> {
+        let text = text.into();
+        let end = self.inner.0.len();
+        self.region.replace_at(0, end as u64, text.as_bytes())?;
+        self.inner.0 = text;
+        Ok(())
     }
 }
 
-impl<'s, B: WriteBackend, E: Encoding> Guard for PersistableStringGuard<'s, B, E> {
-    type Persistable = PersistableString<B::Pointer>;
-    type Backend = B;
+impl<B> Guard for PersistableStringGuard<'_, B> {
+    type Persistable = PersistableString;
 
-    fn as_persistable(&self) -> &Self::Persistable {
-        self.inner
-    }
-    fn as_persistable_mut(&mut self) -> &mut Self::Persistable {
-        self.inner
-    }
-    fn backend(&self) -> &B {
-        self.backend
-    }
-}
-
-impl<'s, B: WriteBackend, E: Encoding> Deref for PersistableStringGuard<'s, B, E> {
-    type Target = str;
-    fn deref(&self) -> &str {
+    fn as_persistable(&self) -> &PersistableString {
         self.inner
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::Fixture;
+impl<B> Deref for PersistableStringGuard<'_, B> {
+    type Target = PersistableString;
 
-    #[test]
-    fn conversions_round_trip_through_str_and_string() {
-        let s = PersistableString::<Pointer>::from("hello");
-        assert_eq!(&*s, "hello");
-        assert_eq!(String::from(s), "hello".to_string());
-    }
-
-    #[test]
-    fn push_str_and_set_round_trip() {
-        let mut f = Fixture::for_type::<PersistableString>();
-        let mut value = PersistableString::new();
-        let mut guard = value.guard(&f.store, f.place());
-        guard.push_str("hello").unwrap();
-        guard.push_str(" world").unwrap();
-        assert_eq!(&*value, "hello world");
-        let reloaded: PersistableString = f.reload();
-        assert_eq!(reloaded, value);
-        value.guard(&f.store, f.place()).set("short").unwrap();
-        let reloaded: PersistableString = f.reload();
-        assert_eq!(reloaded, "short");
-        value
-            .guard(&f.store, f.place())
-            .replace_range(0..1, "S")
-            .unwrap();
-        let reloaded: PersistableString = f.reload();
-        assert_eq!(reloaded, "Short");
-    }
-
-    #[test]
-    fn equality_ignores_allocation_state() {
-        let mut f = Fixture::for_type::<PersistableString>();
-        let mut value = PersistableString::new();
-        value.guard(&f.store, f.place()).push_str("same").unwrap();
-        let reloaded: PersistableString = f.reload();
-        assert_eq!(value, reloaded);
-        assert_eq!(value, PersistableString::from("same"));
-        assert_eq!("same", value);
+    fn deref(&self) -> &PersistableString {
+        self.inner
     }
 }

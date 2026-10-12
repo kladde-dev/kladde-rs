@@ -2,28 +2,26 @@
 //! opaque blob.
 //!
 //! The escape hatch for a foreign type that can get neither a derive nor a
-//! hand-written `Persistable`: the value is serialized with `postcard` into a
-//! byte vec of its own, and rewritten in full on every change. Available only
-//! with this crate's `serde` feature.
+//! hand-written `Persistable`: the value is serialized with `postcard`, and
+//! written again in full on every change. Available only with this crate's
+//! `serde` feature.
 
-use crate::vec::PersistableVec;
 use kladde_persist::{
-    replace, Encoding, Error, Guard, Input, Persistable, Place, Pointer, PointerRepr, ReadBackend,
-    Slottable, Slotted, WriteBackend,
+    varint_len, Backend, Decoder, Encoder, Error, Guard, Persistable, Region, SchemaBuilder,
+    TypeDescriptor,
 };
 use std::ops::Deref;
 
-/// Persists an arbitrary `serde`-serializable `T` as an opaque blob.
+/// Persists an arbitrary `serde`-serializable `T` as an opaque blob: its
+/// `postcard` serialization, prefixed with its length.
 ///
 /// Read the value through `Deref<Target = T>`; change it through a
 /// [`PersistableBlobGuard`], with [`set`](PersistableBlobGuard::set) or
-/// [`update`](PersistableBlobGuard::update). `T` must implement
-/// `Serialize + DeserializeOwned + Default`; a blob made with `default()`
-/// stores no bytes at all until it is changed.
+/// [`update`](PersistableBlobGuard::update).
 ///
-/// It is deliberately the least attractive option: rewritten in full on every
-/// change, and opaque to tooling -- every `PersistableBlob<_>` has the same
-/// schema descriptor, whatever `T` is.
+/// It is deliberately the least attractive option: written again in full on
+/// every change, and opaque to tooling -- every `PersistableBlob<_>` has the
+/// same schema descriptor, whatever `T` is.
 ///
 /// ```
 /// use kladde::Kladde;
@@ -41,129 +39,93 @@ use std::ops::Deref;
 /// # Ok::<(), kladde::Error>(())
 /// ```
 #[derive(Debug, PartialEq)]
-pub struct PersistableBlob<T, P = Pointer> {
+pub struct PersistableBlob<T> {
     /// The value, for reading.
     value: T,
-    /// Its `postcard` serialization, which is what is persisted; empty for a
-    /// blob made with `default()`, which stores no bytes at all.
-    serialized: PersistableVec<u8, P>,
+    /// Its `postcard` serialization, which is what is persisted.
+    serialized: Vec<u8>,
 }
 
 fn serialize<T: serde::Serialize>(value: &T) -> Vec<u8> {
     postcard::to_allocvec(value).expect("postcard serializes every in-memory value")
 }
 
-impl<T: serde::Serialize, P> PersistableBlob<T, P> {
-    /// Wraps `value`. Allocates nothing until the blob is stored.
+impl<T: serde::Serialize> PersistableBlob<T> {
+    /// Wraps `value`.
     ///
     /// ```
     /// use kladde_types::PersistableBlob;
     ///
-    /// let blob: PersistableBlob<Vec<u8>> = PersistableBlob::new(vec![1, 2, 3]);
-    /// assert_eq!(*blob, vec![1, 2, 3]);
+    /// let blob = PersistableBlob::new(vec![1u8, 2, 3]);
+    /// assert_eq!(blob.len(), 3);
     /// ```
     pub fn new(value: T) -> Self {
-        let serialized = serialize(&value).into_iter().collect();
+        let serialized = serialize(&value);
         PersistableBlob { value, serialized }
     }
 }
 
-impl<T: Default, P> Default for PersistableBlob<T, P> {
+impl<T: serde::Serialize + Default> Default for PersistableBlob<T> {
     fn default() -> Self {
-        PersistableBlob {
-            value: T::default(),
-            serialized: PersistableVec::new(),
-        }
+        Self::new(T::default())
     }
 }
 
-impl<T, P> Deref for PersistableBlob<T, P> {
+impl<T> Deref for PersistableBlob<T> {
     type Target = T;
+
     fn deref(&self) -> &T {
         &self.value
     }
 }
 
-impl<T, P: PointerRepr> Slottable<P> for PersistableBlob<T, P> where
-    T: serde::Serialize + serde::de::DeserializeOwned + Default
-{
-}
-
-impl<T, P: PointerRepr> Persistable<P> for PersistableBlob<T, P>
+impl<T> Persistable for PersistableBlob<T>
 where
-    T: serde::Serialize + serde::de::DeserializeOwned + Default,
+    T: serde::Serialize + serde::de::DeserializeOwned,
 {
-    /// The byte vec's pointer: a blob *is* that vec, representationally. Its
-    /// descriptor is opaque, so the pointer keeps its fixed width in a packed
-    /// place too.
-    const SLOTTED_SIZE: Option<usize> = Some(P::BYTE_LEN);
-    const PACKED_SIZE: Option<usize> = Some(P::BYTE_LEN);
+    const FIXED_SIZE: Option<usize> = None;
 
-    type RootEncoding = Slotted;
-
-    type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
-        = PersistableBlobGuard<'s, T, B, E>
-    where
-        Self: 's,
-        B: 's;
-
-    #[inline]
-    fn guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>(
-        &'s mut self,
-        backend: &'s B,
-        place: Place<'s, B, E>,
-    ) -> Self::Guard<'s, B, E> {
-        PersistableBlobGuard {
-            inner: self,
-            backend,
-            place,
-        }
+    fn encoded_len(&self) -> usize {
+        varint_len(self.serialized.len() as u64) + self.serialized.len()
     }
 
-    fn encoded_size<E: Encoding>(&self) -> usize {
-        P::BYTE_LEN
+    fn encode(&self, out: &mut Encoder<'_>) {
+        out.varint(self.serialized.len() as u64);
+        out.bytes(&self.serialized);
     }
 
-    fn encode<E: Encoding>(&self, out: &mut Vec<u8>) {
-        self.serialized.encode::<Slotted>(out)
-    }
-
-    fn decode<B: ReadBackend<Pointer = P>, E: Encoding>(
-        backend: &mut B,
-        input: &mut Input<'_>,
-    ) -> Result<Self, Error> {
-        let serialized = PersistableVec::<u8, P>::decode::<B, Slotted>(backend, input)?;
-        let value = if serialized.is_empty() {
-            T::default()
-        } else {
-            postcard::from_bytes(serialized.as_slice()).map_err(|e| {
-                Error::Corrupt(format!("a PersistableBlob does not deserialize: {e}"))
-            })?
-        };
+    fn decode(input: &mut Decoder<'_>) -> Result<Self, Error> {
+        let len = input.varint_as::<usize>()?;
+        let mut serialized = Vec::new();
+        input.bytes_into(len, &mut serialized)?;
+        let value = postcard::from_bytes(&serialized)
+            .map_err(|e| input.corrupt(format!("a blob that does not deserialize: {e}")))?;
         Ok(PersistableBlob { value, serialized })
     }
 
-    fn prepare<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) -> Result<(), Error> {
-        self.serialized.prepare_bytes(backend)
-    }
+    type Guard<'r, B: Backend + 'r>
+        = PersistableBlobGuard<'r, T, B>
+    where
+        Self: 'r;
 
-    fn free<B: WriteBackend<Pointer = P>>(&mut self, backend: &B) -> Result<(), Error> {
-        self.serialized.free(backend)
+    fn guard<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Guard<'r, B> {
+        PersistableBlobGuard {
+            inner: self,
+            region,
+        }
     }
 
     // `T` is a foreign type that is not itself `Persistable`, so its structure
     // cannot be described: every `PersistableBlob<_>` shares one descriptor.
-    fn describe_local(
-        _builder: &mut kladde_persist::SchemaBuilder,
-    ) -> kladde_persist::TypeDescriptor
+    fn describe_local(_builder: &mut SchemaBuilder) -> TypeDescriptor
     where
         Self: 'static,
     {
-        kladde_persist::TypeDescriptor::Opaque {
+        TypeDescriptor::Opaque {
             library_name: "kladde-types".into(),
             type_name: "PersistableBlob".into(),
             version: crate::library_version(),
-            inline_size: P::BYTE_LEN as u64,
+            fixed_size: None,
             parameters: vec![],
         }
     }
@@ -171,8 +133,7 @@ where
 
 /// The mutation-capable view onto a [`PersistableBlob`]: replace the value
 /// with [`set`](Self::set), or change it in place with
-/// [`update`](Self::update). Either rewrites the whole serialization in one
-/// write.
+/// [`update`](Self::update). Either writes the whole serialization again.
 ///
 /// ```
 /// use kladde::Kladde;
@@ -184,140 +145,58 @@ where
 /// assert_eq!(**db.get(), 3);
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub struct PersistableBlobGuard<'s, T, B: WriteBackend, E: Encoding = Slotted> {
-    inner: &'s mut PersistableBlob<T, B::Pointer>,
-    backend: &'s B,
-    place: Place<'s, B, E>,
+pub struct PersistableBlobGuard<'r, T, B> {
+    inner: &'r mut PersistableBlob<T>,
+    region: Region<'r, B>,
 }
 
-impl<'s, T, B, E> PersistableBlobGuard<'s, T, B, E>
+impl<T, B> PersistableBlobGuard<'_, T, B>
 where
-    T: serde::Serialize + serde::de::DeserializeOwned + Default,
-    B: WriteBackend,
-    E: Encoding,
+    T: serde::Serialize + serde::de::DeserializeOwned,
+    B: Backend,
 {
     /// Replaces the value with `value`. See [`PersistableBlobGuard`] for an
     /// example.
     pub fn set(&mut self, value: T) -> Result<(), Error> {
-        let bytes = serialize(&value);
-        self.inner
-            .serialized
-            .guard(self.backend, self.place.cast::<Slotted>())
-            .set_bytes(bytes)?;
-        self.inner.value = value;
-        Ok(())
+        kladde_persist::replace(self.inner, PersistableBlob::new(value), &self.region)
     }
 
-    /// Changes the value in place with `f`, then persists it; if persisting
-    /// fails, the value is restored. See [`PersistableBlobGuard`] for an
-    /// example.
+    /// Changes the value with `f`, then persists it; if persisting fails,
+    /// the value is restored from its old serialization. See
+    /// [`PersistableBlobGuard`] for an example.
     pub fn update(&mut self, f: impl FnOnce(&mut T)) -> Result<(), Error> {
         f(&mut self.inner.value);
-        let bytes = serialize(&self.inner.value);
-        let written = self
-            .inner
-            .serialized
-            .guard(self.backend, self.place.cast::<Slotted>())
-            .set_bytes(bytes);
-        if written.is_err() {
-            // The old serialization is still in memory: recover from it.
-            let old = self.inner.serialized.as_slice();
-            self.inner.value = if old.is_empty() {
-                T::default()
-            } else {
-                postcard::from_bytes(old).unwrap_or_default()
-            };
-        }
-        written
-    }
-
-    /// Replaces the whole blob: stores `value`, then frees the old one, in one
-    /// transaction.
-    ///
-    /// ```
-    /// use kladde::Kladde;
-    /// use kladde_types::PersistableBlob;
-    ///
-    /// let mut db = Kladde::new(PersistableBlob::new(1u8));
-    /// db.guard().replace(PersistableBlob::new(9))?;
-    /// assert_eq!(**db.get(), 9);
-    /// # Ok::<(), kladde::Error>(())
-    /// ```
-    pub fn replace(&mut self, value: PersistableBlob<T, B::Pointer>) -> Result<(), Error> {
-        replace(self.inner, value, self.backend, &self.place)
-    }
-}
-
-impl<'s, T, B: WriteBackend, E: Encoding> Guard for PersistableBlobGuard<'s, T, B, E> {
-    type Persistable = PersistableBlob<T, B::Pointer>;
-    type Backend = B;
-
-    fn as_persistable(&self) -> &Self::Persistable {
-        self.inner
-    }
-    fn as_persistable_mut(&mut self) -> &mut Self::Persistable {
-        self.inner
-    }
-    fn backend(&self) -> &B {
-        self.backend
-    }
-}
-
-impl<'s, T, B: WriteBackend, E: Encoding> Deref for PersistableBlobGuard<'s, T, B, E> {
-    type Target = PersistableBlob<T, B::Pointer>;
-    fn deref(&self) -> &Self::Target {
-        self.inner
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::Fixture;
-
-    #[derive(serde::Serialize, serde::Deserialize, Default, Debug, PartialEq)]
-    struct Rec {
-        a: i32,
-        b: String,
-    }
-
-    #[test]
-    fn values_round_trip_and_reuse_one_allocation() {
-        let mut f = Fixture::for_type::<PersistableBlob<String>>();
-        let mut value = PersistableBlob::new(String::from("hi"));
-        value.store::<_, Slotted>(&f.store, f.location).unwrap();
-        for text in ["a much longer string than before", "x", "medium"] {
-            value.guard(&f.store, f.place()).set(text.into()).unwrap();
-            let reloaded: PersistableBlob<String> = f.reload();
-            assert_eq!(&*reloaded, text);
-            assert_eq!(f.store.allocations().len(), 2);
+        let new = serialize(&self.inner.value);
+        let mut bytes = Vec::with_capacity(new.len() + 10);
+        let mut out = Encoder::new(&mut bytes);
+        out.varint(new.len() as u64);
+        out.bytes(&new);
+        match self.region.replace(self.region.len(), &bytes) {
+            Ok(()) => {
+                self.inner.serialized = new;
+                Ok(())
+            }
+            Err(e) => {
+                self.inner.value = postcard::from_bytes(&self.inner.serialized)
+                    .expect("the old serialization deserializes");
+                Err(e)
+            }
         }
     }
+}
 
-    #[test]
-    fn the_default_value_is_stored_as_nothing() {
-        let mut f = Fixture::for_type::<PersistableBlob<i32>>();
-        let mut value = PersistableBlob::<i32>::default();
-        value.store::<_, Slotted>(&f.store, f.location).unwrap();
-        let reloaded: PersistableBlob<i32> = f.reload();
-        assert_eq!(*reloaded, 0);
-        assert_eq!(f.store.allocations().len(), 1, "just the root");
+impl<T, B> Guard for PersistableBlobGuard<'_, T, B> {
+    type Persistable = PersistableBlob<T>;
+
+    fn as_persistable(&self) -> &PersistableBlob<T> {
+        self.inner
     }
+}
 
-    #[test]
-    fn update_changes_one_field() {
-        let mut f = Fixture::for_type::<PersistableBlob<Rec>>();
-        let mut value = PersistableBlob::new(Rec {
-            a: 1,
-            b: "one".into(),
-        });
-        value.store::<_, Slotted>(&f.store, f.location).unwrap();
-        value
-            .guard(&f.store, f.place())
-            .update(|r| r.a = 2)
-            .unwrap();
-        let reloaded: PersistableBlob<Rec> = f.reload();
-        assert_eq!(reloaded.a, 2);
-        assert_eq!(reloaded.b, "one");
+impl<T, B> Deref for PersistableBlobGuard<'_, T, B> {
+    type Target = PersistableBlob<T>;
+
+    fn deref(&self) -> &PersistableBlob<T> {
+        self.inner
     }
 }

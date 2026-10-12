@@ -1,5 +1,5 @@
 //! A small interactive contact book on a real file: a `#[derive(Persistable)]`
-//! struct and enum, nested in a `PersistableVec` and a `PersistableHashMap`,
+//! struct and enum, nested in a `PersistableVec` and a `PersistableMap`,
 //! mutated through the generated guards.
 //!
 //! Run with `cargo run -p kladde-types --example phonebook -- [path]`. Every
@@ -7,7 +7,7 @@
 //! answer: kill the process at any point, run it again, and the book is there.
 
 use kladde::{Kladde, Persistable};
-use kladde_types::{PersistableHashMap, PersistableString, PersistableVec};
+use kladde_types::{PersistableMap, PersistableString, PersistableVec};
 use std::io::{self, Write};
 
 #[derive(Persistable, Debug)]
@@ -33,7 +33,7 @@ struct Contact {
 
 #[derive(Persistable)]
 struct AddressBook {
-    contacts: PersistableHashMap<PersistableString, Contact>,
+    contacts: PersistableMap<PersistableString, Contact>,
 }
 
 fn main() -> kladde::Result<()> {
@@ -47,7 +47,7 @@ fn main() -> kladde::Result<()> {
         Kladde::create(
             &path,
             AddressBook {
-                contacts: PersistableHashMap::new(),
+                contacts: PersistableMap::new(),
             },
         )?
     };
@@ -140,8 +140,8 @@ fn main() -> kladde::Result<()> {
             ("stats", _) => {
                 let s = book.stats();
                 println!(
-                    "{} pages, {} allocations, {} flushes this session",
-                    s.file_pages, s.allocations, s.flushes
+                    "{} pages, {} bytes in {} spans, {} flushes this session",
+                    s.file_pages, s.sequence_bytes, s.spans, s.flushes
                 );
             }
             (other, _) => println!("unknown command or arguments: {other:?} (try 'help')"),
