@@ -2,6 +2,14 @@
 
 ## High priority
 
+- **⚠️ Data loss, on branch `one-sequence`: a file whose span table outgrows the header's references to leaves can no longer be flushed, and so no longer opened.**
+  The branch writes a span table of two levels, the header and the leaves it names, and no interior table pages, which the format allows (`drafts/one-sequence.md#encoding-of-entries`).
+  The header holds the leaves' page numbers, delta-encoded in one or two bytes each, so beyond some 2,000 to 4,000 leaves, one to two million spans, the references alone outgrow it.
+  The flush then fails with `OutOfBounds` and poisons the store; opening replays the journal with a flush, which fails the same way, so the file's content since its last good flush, and the file itself, are lost to this implementation.
+  Before the commit that added this entry, the cut looped without end instead.
+  No workload measured comes near the bound: the world map's sequence of 942 KiB takes 21 to 26 leaves.
+  Fix: write interior table pages when the leaves' references outgrow the header, and read them at open, which `load.rs` refuses today; test with the header's capacity settable from tests.
+
 - **⚠️ Data loss: a flush drops the statements of a non-header address-table page that also has child references.**
   The spec lets any address-table page hold both `child_ref`s and statements (`spec/address-table.md#physical-format`), and `impl/consolidation.md#unlinking-an-emptied-page` says an implementation must not rely on the tree shape it writes itself.
   kladde-rs writes such a page only as the header, and its cut rebuilds everything above the leaves in every flush: it keeps or rewrites leaves only, and drops the header's children that have children of their own without taking their statements.

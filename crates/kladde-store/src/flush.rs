@@ -1172,6 +1172,12 @@ impl Inner {
                         self.state.pages[p as usize] = Page::Reusable;
                         self.ready.insert(p);
                     }
+                    if head.is_empty() {
+                        // The references to leaves alone outgrow the header,
+                        // which only interior table pages would relieve, and
+                        // this implementation writes none.
+                        return Err(Error::OutOfBounds);
+                    }
                     // The coldest eighth of the header's entries go to leaves.
                     head.sort_by_key(|&id| (Reverse(self.state.span(id).heat), id));
                     let keep = head.len() - head.len().div_ceil(8);
