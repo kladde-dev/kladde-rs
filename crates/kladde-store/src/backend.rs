@@ -127,3 +127,48 @@ pub trait WriteBackend {
     /// the failure.
     fn poison(&self);
 }
+
+/// A shared reference records through what it refers to, so that a guard
+/// can hold `&Store` by value and hand copies of it to whatever outlives
+/// the guard, such as a cut.
+///
+/// ```
+/// use kladde_store::{MemoryStorage, Store, WriteBackend};
+///
+/// fn append(backend: impl WriteBackend, bytes: &[u8]) -> kladde_store::Result<()> {
+///     backend.splice(backend.len(), 0, bytes).map(|_| ())
+/// }
+/// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
+/// append(&store, b"ab")?;
+/// assert_eq!(store.len(), 2);
+/// # Ok::<(), kladde_store::Error>(())
+/// ```
+impl<B: WriteBackend> WriteBackend for &B {
+    fn len(&self) -> u64 {
+        (**self).len()
+    }
+    fn write(&self, pos: u64, bytes: &[u8]) -> Result<(), Error> {
+        (**self).write(pos, bytes)
+    }
+    fn splice(&self, pos: u64, removed: u64, bytes: &[u8]) -> Result<Option<CutId>, Error> {
+        (**self).splice(pos, removed, bytes)
+    }
+    fn move_range(&self, from: u64, len: u64, to: u64) -> Result<(), Error> {
+        (**self).move_range(from, len, to)
+    }
+    fn paste(&self, pos: u64, removed: u64, cut: CutId) -> Result<(), Error> {
+        (**self).paste(pos, removed, cut)
+    }
+    fn atomically<R>(&self, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
+        (**self).atomically(f)
+    }
+    fn begin_transaction(&self) -> Result<(), Error> {
+        (**self).begin_transaction()
+    }
+    fn end_transaction(&self) -> Result<(), Error> {
+        (**self).end_transaction()
+    }
+    fn poison(&self) {
+        (**self).poison()
+    }
+}

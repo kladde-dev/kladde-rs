@@ -1,23 +1,11 @@
 //! Turning live Rust types into a [`TypeTable`]: the build-time bridge between
 //! [`Persistable`](crate::Persistable) and the language-neutral `kladde-schema`
 //! model.
-//!
-//! Both entry points carry the **pointer type** `P` as an explicit parameter,
-//! because `Persistable` is generic over it and a pointer-holding type's
-//! `INLINE_SIZE`, hence its descriptor, depends on the pointer width.
 
-use crate::{Persistable, PointerRepr};
+use crate::Persistable;
 use kladde_schema::{TypeDescriptor, TypeRef, TypeTable};
 use std::any::TypeId;
 use std::collections::HashMap;
-use std::marker::PhantomData;
-
-/// The identity under which a descriptor node that wraps `T`'s is
-/// registered, distinct for each kind `K` of wrapper.
-struct Wrapped<K, T>(PhantomData<fn() -> (K, T)>);
-enum SlottedKey {}
-enum SequenceKey {}
-enum PackedKey {}
 
 /// Accumulates the descriptors of a type graph while
 /// [`Persistable::describe`](crate::Persistable::describe) walks it.
@@ -29,20 +17,20 @@ enum PackedKey {}
 /// by reserving a type's slot *before* recursing into its fields, let recursive
 /// and mutually-recursive types refer back to themselves without looping:
 ///
-/// - [`describe::<P, T>()`][`describe`] is the common case -- register `T` under
+/// - [`describe::<T>()`][`describe`] is the common case -- register `T` under
 ///   its own `TypeId`, building its descriptor from
 ///   [`Persistable::describe_local`]. This is what a field/element/parameter
 ///   reference resolves to (via [`Persistable::describe`]'s default).
 /// - [`describe_with`] is the low-level primitive it's built on: register under
 ///   a caller-supplied `TypeId` with a caller-supplied closure. Reach for it
-///   only for something the generic form can't express -- e.g. a
-///   schema-transparent wrapper, or two Rust types sharing one node.
+///   only for something the generic form can't express -- e.g. two Rust types
+///   sharing one node.
 ///
 /// ```
-/// use kladde_persist::{Pointer, SchemaBuilder, TypeRef};
+/// use kladde_persist::{SchemaBuilder, TypeRef};
 ///
 /// let mut builder = SchemaBuilder::new();
-/// let root = builder.describe::<Pointer, (u8, u8)>();
+/// let root = builder.describe::<(u8, u8)>();
 /// assert_eq!(root, TypeRef(0));
 /// let table = builder.finish(root);
 /// assert_eq!(table.descriptors().len(), 2); // the tuple, and `u8` once
@@ -68,23 +56,16 @@ impl SchemaBuilder {
         SchemaBuilder::default()
     }
 
-    /// Registers `T` (as persisted at pointer type `P`) and returns a reference
-    /// to its descriptor -- the common-case entry point. Deduplicates by
-    /// `TypeId::of::<T>()` and, the first time `T` is seen, builds its
-    /// descriptor from [`Persistable::describe_local`]; later calls (including a
-    /// recursive one made *while* that build is still running) return the
-    /// existing reference, so cycles terminate.
-    ///
-    /// Keying on `T` alone is sound because a type whose layout depends on the
-    /// pointer width carries `P` as one of its own type parameters (so it is
-    /// part of the `TypeId`), while one that does not has the same descriptor at
-    /// every width. See [`SchemaBuilder`] for an example.
+    /// Registers `T` and returns a reference to its descriptor -- the
+    /// common-case entry point. Deduplicates by `TypeId::of::<T>()` and, the
+    /// first time `T` is seen, builds its descriptor from
+    /// [`Persistable::describe_local`]; later calls (including a recursive
+    /// one made *while* that build is still running) return the existing
+    /// reference, so cycles terminate. See [`SchemaBuilder`] for an example.
     ///
     /// [`Persistable::describe_local`]: crate::Persistable::describe_local
-    pub fn describe<P: PointerRepr, T: Persistable<P> + 'static>(&mut self) -> TypeRef {
-        self.describe_with(TypeId::of::<T>(), |builder| {
-            <T as Persistable<P>>::describe_local(builder)
-        })
+    pub fn describe<T: Persistable + 'static>(&mut self) -> TypeRef {
+        self.describe_with(TypeId::of::<T>(), |builder| T::describe_local(builder))
     }
 
     /// The low-level primitive under [`describe`](Self::describe): register the
@@ -93,11 +74,6 @@ impl SchemaBuilder {
     /// including a recursive call made *while* `build` is still running -- the
     /// existing reference is returned and `build` is not called again, so cycles
     /// terminate.
-    ///
-    /// Prefer [`describe`](Self::describe) unless you need something it can't
-    /// express: keying a node under an identity other than a single Rust type's
-    /// (sharing one node across types, a schema-transparent wrapper that returns
-    /// another type's reference instead of building its own, ...).
     ///
     /// ```
     /// use kladde_persist::{Primitive, SchemaBuilder, TypeDescriptor};
@@ -125,60 +101,6 @@ impl SchemaBuilder {
         let descriptor = build(self);
         self.descriptors[reference.0] = Some(descriptor);
         reference
-    }
-
-    /// Registers `Slotted(T)`: a place inside a packed value declared to
-    /// hold `T`'s fixed encoding. What a field declared
-    /// `#[kladde(slotted)]` refers to.
-    ///
-    /// ```
-    /// use kladde_persist::{Pointer, Primitive, SchemaBuilder, TypeDescriptor, TypeRef};
-    ///
-    /// let mut builder = SchemaBuilder::new();
-    /// let slotted = builder.slotted::<Pointer, u32>();
-    /// let table = builder.finish(slotted);
-    /// assert_eq!(table.get(TypeRef(0)), &TypeDescriptor::Slotted(TypeRef(1)));
-    /// assert_eq!(table.get(TypeRef(1)), &TypeDescriptor::Primitive(Primitive::U32));
-    /// ```
-    pub fn slotted<P: PointerRepr, T: Persistable<P> + 'static>(&mut self) -> TypeRef {
-        self.describe_with(TypeId::of::<Wrapped<SlottedKey, T>>(), |builder| {
-            TypeDescriptor::Slotted(<T as Persistable<P>>::describe(builder))
-        })
-    }
-
-    /// Registers `Sequence(T)`: `T`'s values back to back, as an allocation
-    /// or a small value's content holds them.
-    ///
-    /// ```
-    /// use kladde_persist::{Pointer, SchemaBuilder, TypeDescriptor, TypeRef};
-    ///
-    /// let mut builder = SchemaBuilder::new();
-    /// let sequence = builder.sequence::<Pointer, u8>();
-    /// let table = builder.finish(sequence);
-    /// assert_eq!(table.get(TypeRef(0)), &TypeDescriptor::Sequence(TypeRef(1)));
-    /// ```
-    pub fn sequence<P: PointerRepr, T: Persistable<P> + 'static>(&mut self) -> TypeRef {
-        self.describe_with(TypeId::of::<Wrapped<SequenceKey, T>>(), |builder| {
-            TypeDescriptor::Sequence(<T as Persistable<P>>::describe(builder))
-        })
-    }
-
-    /// Registers `Packed(Sequence(T))`: what a pointer to `T`'s values laid
-    /// out packed points to.
-    ///
-    /// ```
-    /// use kladde_persist::{Pointer, SchemaBuilder, TypeDescriptor, TypeRef};
-    ///
-    /// let mut builder = SchemaBuilder::new();
-    /// let text = builder.packed_sequence::<Pointer, char>();
-    /// let table = builder.finish(text);
-    /// assert_eq!(table.get(TypeRef(0)), &TypeDescriptor::Packed(TypeRef(1)));
-    /// assert_eq!(table.get(TypeRef(1)), &TypeDescriptor::Sequence(TypeRef(2)));
-    /// ```
-    pub fn packed_sequence<P: PointerRepr, T: Persistable<P> + 'static>(&mut self) -> TypeRef {
-        self.describe_with(TypeId::of::<Wrapped<PackedKey, T>>(), |builder| {
-            TypeDescriptor::Packed(builder.sequence::<P, T>())
-        })
     }
 
     /// Finalizes the accumulated descriptors into a [`TypeTable`] rooted at

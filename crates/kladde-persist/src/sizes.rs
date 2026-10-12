@@ -1,16 +1,17 @@
-//! Constant arithmetic on encoding sizes, for the `SLOTTED_SIZE` and
-//! `PACKED_SIZE` of composite types: `None` -- no such size -- absorbs
+//! Constant arithmetic on encoding sizes, for the `FIXED_SIZE` and
+//! `FIXED_FORM_SIZE` of composite types: `None` -- no such size -- absorbs
 //! everything it is combined with.
 
-/// The size of fields laid out back to back: the sum of `sizes`, or `None`
-/// if any of them is `None`.
+use crate::codec::varint_len;
+
+/// The sum of `sizes`, or `None` if any is `None`: a struct's or a tuple's
+/// size from its fields'.
 ///
 /// ```
 /// use kladde_persist::sum_sizes;
 ///
-/// assert_eq!(sum_sizes(&[Some(1), Some(4)]), Some(5));
-/// assert_eq!(sum_sizes(&[Some(1), None]), None);
-/// assert_eq!(sum_sizes(&[]), Some(0));
+/// assert_eq!(sum_sizes(&[Some(4), Some(1)]), Some(5));
+/// assert_eq!(sum_sizes(&[Some(4), None]), None);
 /// ```
 pub const fn sum_sizes(sizes: &[Option<usize>]) -> Option<usize> {
     let mut total = 0;
@@ -25,41 +26,17 @@ pub const fn sum_sizes(sizes: &[Option<usize>]) -> Option<usize> {
     Some(total)
 }
 
-/// The slot of an enum: its discriminant's `width` plus its largest variant,
-/// whose fields' slotted sizes add up to `variants[i]`, or `None` if any
-/// variant has no fixed encoding.
+/// An enum's fixed size from its variants': the discriminant's varint and
+/// the variant's fields, if every variant comes to the same.
 ///
 /// ```
-/// use kladde_persist::enum_slotted_size;
+/// use kladde_persist::enum_fixed_size;
 ///
-/// assert_eq!(enum_slotted_size(1, &[Some(0), Some(8), Some(4)]), Some(9));
-/// assert_eq!(enum_slotted_size(1, &[Some(0), None]), None);
+/// assert_eq!(enum_fixed_size(&[0, 1], &[Some(4), Some(4)]), Some(5));
+/// assert_eq!(enum_fixed_size(&[0, 1], &[Some(4), Some(0)]), None);
+/// assert_eq!(enum_fixed_size(&[0, 200], &[Some(0), Some(0)]), None);
 /// ```
-pub const fn enum_slotted_size(width: usize, variants: &[Option<usize>]) -> Option<usize> {
-    let mut largest = 0;
-    let mut i = 0;
-    while i < variants.len() {
-        match variants[i] {
-            Some(size) if size > largest => largest = size,
-            Some(_) => {}
-            None => return None,
-        }
-        i += 1;
-    }
-    Some(width + largest)
-}
-
-/// The packed size of an enum, if every value's is the same: each variant's
-/// discriminant as a varint, plus its fields' packed sizes `variants[i]`.
-///
-/// ```
-/// use kladde_persist::enum_packed_size;
-///
-/// assert_eq!(enum_packed_size(&[0, 1], &[Some(4), Some(4)]), Some(5));
-/// assert_eq!(enum_packed_size(&[0, 1], &[Some(0), Some(4)]), None);
-/// assert_eq!(enum_packed_size(&[0, 300], &[Some(4), Some(4)]), None);
-/// ```
-pub const fn enum_packed_size(discriminants: &[u64], variants: &[Option<usize>]) -> Option<usize> {
+pub const fn enum_fixed_size(discriminants: &[u64], variants: &[Option<usize>]) -> Option<usize> {
     let mut common = None;
     let mut i = 0;
     while i < variants.len() {
@@ -76,30 +53,44 @@ pub const fn enum_packed_size(discriminants: &[u64], variants: &[Option<usize>])
     common
 }
 
-/// Appends the unsigned LEB128 varint of `value` to `out`: how a packed
-/// place writes an integer, a pointer, or an enum's discriminant.
+/// An enum's fixed form size: its discriminant at `width` bytes, and its
+/// largest variant.
 ///
 /// ```
-/// let mut out = Vec::new();
-/// kladde_persist::write_varint(300, &mut out);
-/// assert_eq!(out, [0xac, 0x02]);
+/// use kladde_persist::enum_fixed_form_size;
+///
+/// assert_eq!(enum_fixed_form_size(2, &[Some(4), Some(0)]), Some(6));
+/// assert_eq!(enum_fixed_form_size(1, &[Some(4), None]), None);
 /// ```
-pub fn write_varint(value: u64, out: &mut Vec<u8>) {
-    kladde_varint::encode(value, out);
+pub const fn enum_fixed_form_size(width: usize, variants: &[Option<usize>]) -> Option<usize> {
+    let mut largest = 0;
+    let mut i = 0;
+    while i < variants.len() {
+        match variants[i] {
+            Some(size) if size > largest => largest = size,
+            Some(_) => {}
+            None => return None,
+        }
+        i += 1;
+    }
+    Some(width + largest)
 }
 
-/// How many bytes the LEB128 varint of `value` takes.
+/// The smallest of 1, 2, 4 and 8 bytes that holds `largest`, the width of an
+/// enum's discriminant in its fixed form unless its `repr` says otherwise.
 ///
 /// ```
-/// assert_eq!(kladde_persist::varint_len(127), 1);
-/// assert_eq!(kladde_persist::varint_len(128), 2);
+/// assert_eq!(kladde_persist::discriminant_width(255), 1);
+/// assert_eq!(kladde_persist::discriminant_width(256), 2);
 /// ```
-pub const fn varint_len(value: u64) -> usize {
-    let mut len = 1;
-    let mut rest = value >> 7;
-    while rest != 0 {
-        len += 1;
-        rest >>= 7;
+pub const fn discriminant_width(largest: u64) -> usize {
+    if largest <= u8::MAX as u64 {
+        1
+    } else if largest <= u16::MAX as u64 {
+        2
+    } else if largest <= u32::MAX as u64 {
+        4
+    } else {
+        8
     }
-    len
 }

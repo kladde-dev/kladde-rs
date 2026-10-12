@@ -38,12 +38,10 @@ pub enum Error {
     /// An earlier failure made the store's in-memory state untrustworthy.
     /// Drop it and open the file again.
     Poisoned,
-    /// A pointer names no live allocation.
-    DanglingPointer(u32),
-    /// An allocation would exceed the format's bounds.
+    /// A position or a length lies outside the sequence, or outside the
+    /// region of the value that names it, or the sequence would exceed the
+    /// format's bounds.
     OutOfBounds,
-    /// Every allocation id is in use.
-    IdsExhausted,
 }
 
 /// `Result` with the storage layer's [`Error`].
@@ -78,9 +76,7 @@ impl fmt::Display for Error {
                 f,
                 "the store is poisoned by an earlier failure; reopen the file"
             ),
-            Error::DanglingPointer(id) => write!(f, "pointer {id} names no live allocation"),
-            Error::OutOfBounds => write!(f, "an allocation would exceed 2^32 - 1 bytes"),
-            Error::IdsExhausted => write!(f, "every allocation id is in use"),
+            Error::OutOfBounds => write!(f, "a position or a length is out of bounds"),
         }
     }
 }
