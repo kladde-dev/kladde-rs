@@ -1,5 +1,5 @@
-//! The type-descriptor model of `type-descriptors.md` §2: an in-memory
-//! description of how a value type lays out and interprets its bytes.
+//! The type-descriptor model: an in-memory description of how a value type
+//! encodes into the sequence, and what its bytes mean.
 
 /// A reference from one descriptor to another: an index into the
 /// [`TypeTable`] it belongs to. Indices are an artifact of one particular
@@ -65,14 +65,13 @@ pub struct Variant {
     pub fields: Vec<Field>,
 }
 
-/// A fixed-width scalar primitive — one of the implemented primitive codes
-/// of `type-descriptors.md` §2.1. The `#[repr(u8)]` discriminant *is* the
-/// on-disk code, so [`code`](Primitive::code) / [`from_code`] round-trip to
-/// and from the wire byte.
+/// A scalar primitive. The `#[repr(u8)]` discriminant *is* the descriptor's
+/// code, so [`code`](Primitive::code) / [`from_code`] round-trip to and from
+/// the wire byte.
 ///
-/// Codes the spec reserves but does not yet implement (§2.1.1, e.g. `u128`)
-/// are deliberately absent: a schema that uses one fails to decode here
-/// until a future revision adds the corresponding variant.
+/// Codes the specification reserves but does not yet implement (e.g.
+/// `u128`) are deliberately absent: a schema that uses one fails to decode
+/// here until a future revision adds the corresponding variant.
 ///
 /// [`from_code`]: Primitive::from_code
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -117,109 +116,135 @@ impl Primitive {
             _ => return None,
         })
     }
+
+    /// How many bytes every value of this primitive encodes to, or `None`
+    /// for the varints and `char`, whose size depends on the value.
+    ///
+    /// ```
+    /// use kladde_schema::Primitive;
+    ///
+    /// assert_eq!(Primitive::F32.fixed_size(), Some(4));
+    /// assert_eq!(Primitive::U32.fixed_size(), None);
+    /// ```
+    pub fn fixed_size(self) -> Option<u64> {
+        match self {
+            Primitive::U8 | Primitive::I8 | Primitive::Bool => Some(1),
+            Primitive::F32 => Some(4),
+            Primitive::F64 => Some(8),
+            _ => None,
+        }
+    }
+
+    /// How many bytes this primitive takes inside a
+    /// [`Fixed`](TypeDescriptor::Fixed) value: its full width, and four
+    /// bytes for a `char`.
+    ///
+    /// ```
+    /// use kladde_schema::Primitive;
+    ///
+    /// assert_eq!(Primitive::U16.fixed_form_size(), 2);
+    /// assert_eq!(Primitive::Char.fixed_form_size(), 4);
+    /// ```
+    pub fn fixed_form_size(self) -> u64 {
+        match self {
+            Primitive::U8 | Primitive::I8 | Primitive::Bool => 1,
+            Primitive::U16 | Primitive::I16 => 2,
+            Primitive::U32 | Primitive::I32 | Primitive::F32 | Primitive::Char => 4,
+            Primitive::U64 | Primitive::I64 | Primitive::F64 => 8,
+        }
+    }
 }
 
 /// One node of the type graph: a description of a single value type's
-/// on-disk representation. See `type-descriptors.md` §2 for the model and
-/// each kind's meaning.
+/// encoding. Every type has one encoding, which a reader decodes front to
+/// back from its descriptor.
+///
+/// | kind | encoding |
+/// | --- | --- |
+/// | `u8`, `i8`, `bool` | one byte |
+/// | `u16`, `u32`, `u64` | unsigned LEB128 |
+/// | `i16`, `i32`, `i64` | zigzag, then LEB128 |
+/// | `f32`, `f64` | IEEE-754, little-endian |
+/// | `char` | UTF-8 |
+/// | Struct | its fields' encodings, concatenated |
+/// | Enum | the discriminant as LEB128, then the variant's fields |
+/// | Array | `len` elements |
+/// | Sequence | the number of elements as LEB128, then the elements |
+/// | Text | UTF-8, then the byte `0xFF` |
+/// | Opaque | its bytes, prefixed with their number as LEB128 unless the type declares a fixed size |
+/// | Fixed | the wrapped type's values at a fixed size: see [`TypeTable::fixed_form_size`] |
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeDescriptor {
-    /// A fixed-width scalar (`type-descriptors.md` §2.1).
+    /// A scalar.
     Primitive(Primitive),
-    /// An ordered set of named fields laid out consecutively, no
-    /// discriminant and no header.
+    /// An ordered set of named fields, encoded back to back.
     Struct { name: String, fields: Vec<Field> },
-    /// A discriminated union: a `discriminant_width`-byte discriminant
-    /// followed by the fields of the selected variant.
+    /// A discriminated union: the discriminant, then the fields of the
+    /// variant it selects. `discriminant_width` is the discriminant's width
+    /// in bytes inside a [`Fixed`](TypeDescriptor::Fixed) value.
     Enum {
         name: String,
         discriminant_width: u8,
         variants: Vec<Variant>,
     },
     /// A type whose internal structure this format does not decompose,
-    /// identified nominally by library, name, and version.
+    /// identified nominally by library, name, and version: `fixed_size`
+    /// bytes, or, if it is `None`, a length and that many bytes.
     Opaque {
         library_name: String,
         type_name: String,
         version: Version,
-        inline_size: u64,
+        fixed_size: Option<u64>,
         parameters: Vec<TypeRef>,
     },
-    /// An owning pointer to an allocation whose content is the referenced
-    /// type: a `varint` id in a packed place, a fixed-width id in a slotted
-    /// one, `0` for none.
-    Pointer(TypeRef),
-    /// The referenced type's values back to back, as many as fill the range
-    /// that holds them: a pointer's allocation, or a small value's content.
+    /// `len` values of the element type, back to back.
+    Array { element: TypeRef, len: u64 },
+    /// A count, then that many values of the element type.
     Sequence(TypeRef),
-    /// What a pointer points to, laid out packed.
-    Packed(TypeRef),
-    /// A place declared slotted inside a packed value.
-    Slotted(TypeRef),
-    /// A size tag, then a `content` of that many bytes if the tag is below
-    /// 255, or a `spilled` value if it is 255.
-    Small { content: TypeRef, spilled: TypeRef },
+    /// Text: UTF-8, then the byte `0xFF`, which UTF-8 never contains.
+    Text,
+    /// The wrapped type's values, each encoded at the same size.
+    Fixed(TypeRef),
 }
 
-/// Kind-tag byte for [`TypeDescriptor::Struct`] (`type-descriptors.md` §3.2).
+/// Kind-tag byte for [`TypeDescriptor::Struct`].
 pub const TAG_STRUCT: u8 = 128;
 /// Kind-tag byte for [`TypeDescriptor::Enum`].
 pub const TAG_ENUM: u8 = 129;
 /// Kind-tag byte for [`TypeDescriptor::Opaque`].
 pub const TAG_OPAQUE: u8 = 130;
-/// Reserved kind-tag byte for the not-yet-implemented Array kind.
+/// Kind-tag byte for [`TypeDescriptor::Array`].
 pub const TAG_ARRAY: u8 = 131;
-/// Kind-tag byte for [`TypeDescriptor::Pointer`].
-pub const TAG_POINTER: u8 = 132;
 /// Kind-tag byte for [`TypeDescriptor::Sequence`].
 pub const TAG_SEQUENCE: u8 = 133;
-/// Kind-tag byte for [`TypeDescriptor::Packed`].
-pub const TAG_PACKED: u8 = 134;
-/// Kind-tag byte for [`TypeDescriptor::Slotted`].
-pub const TAG_SLOTTED: u8 = 135;
-/// Kind-tag byte for [`TypeDescriptor::Small`].
-pub const TAG_SMALL: u8 = 136;
+/// Kind-tag byte for [`TypeDescriptor::Text`].
+pub const TAG_TEXT: u8 = 134;
+/// Kind-tag byte for [`TypeDescriptor::Fixed`].
+pub const TAG_FIXED: u8 = 135;
 
 impl TypeDescriptor {
-    /// This descriptor's outgoing references, in canonical
-    /// (`type-descriptors.md` §3.2) order — struct/variant fields in
-    /// declaration order, enum variants in ascending discriminant order,
-    /// Opaque parameters as given, a small value's content before its
-    /// spilled form. Used by both serialization and fingerprinting so they
-    /// always agree on traversal order.
+    /// This descriptor's outgoing references, in canonical order — struct
+    /// and variant fields in declaration order, enum variants in ascending
+    /// discriminant order, Opaque parameters as given. Used by both
+    /// serialization and fingerprinting so they always agree on traversal
+    /// order.
     pub(crate) fn references(&self) -> Vec<TypeRef> {
         match self {
-            TypeDescriptor::Primitive(_) => Vec::new(),
+            TypeDescriptor::Primitive(_) | TypeDescriptor::Text => Vec::new(),
             TypeDescriptor::Struct { fields, .. } => fields.iter().map(|f| f.ty).collect(),
             TypeDescriptor::Enum { variants, .. } => canonical_variants(variants)
                 .into_iter()
                 .flat_map(|v| v.fields.iter().map(|f| f.ty))
                 .collect(),
             TypeDescriptor::Opaque { parameters, .. } => parameters.clone(),
-            TypeDescriptor::Pointer(target)
-            | TypeDescriptor::Sequence(target)
-            | TypeDescriptor::Packed(target)
-            | TypeDescriptor::Slotted(target) => vec![*target],
-            TypeDescriptor::Small { content, spilled } => vec![*content, *spilled],
-        }
-    }
-
-    /// The kind-tag byte this descriptor's [`encode`](TypeTable::encode)
-    /// starts with, for every kind but Primitive, whose code is its tag.
-    pub(crate) fn wrapper_tag(&self) -> Option<u8> {
-        match self {
-            TypeDescriptor::Pointer(_) => Some(TAG_POINTER),
-            TypeDescriptor::Sequence(_) => Some(TAG_SEQUENCE),
-            TypeDescriptor::Packed(_) => Some(TAG_PACKED),
-            TypeDescriptor::Slotted(_) => Some(TAG_SLOTTED),
-            TypeDescriptor::Small { .. } => Some(TAG_SMALL),
-            _ => None,
+            TypeDescriptor::Array { element, .. } => vec![*element],
+            TypeDescriptor::Sequence(target) | TypeDescriptor::Fixed(target) => vec![*target],
         }
     }
 }
 
 /// A type's descriptors plus the convention that **index 0 is the root** —
-/// the type actually being described (`type-descriptors.md` §2.6).
+/// the type actually being described.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeTable {
     descriptors: Vec<TypeDescriptor>,

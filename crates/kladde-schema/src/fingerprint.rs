@@ -131,7 +131,7 @@ impl<'a> Traversal<'a> {
                 library_name,
                 type_name,
                 version,
-                inline_size,
+                fixed_size,
                 parameters,
             } => {
                 hasher.update([crate::descriptor::TAG_OPAQUE]);
@@ -139,21 +139,25 @@ impl<'a> Traversal<'a> {
                 push_string(type_name, hasher);
                 hasher.update([version.stability_flag() as u8]);
                 kladde_varint::encode(version.leading_nonzero(), hasher);
-                kladde_varint::encode(*inline_size, hasher);
+                kladde_varint::encode(crate::serialize::encode_size_mode(*fixed_size), hasher);
                 kladde_varint::encode(parameters.len() as u64, hasher);
                 for parameter in parameters {
                     self.emit_reference(*parameter, depth, hasher);
                 }
             }
-            TypeDescriptor::Pointer(_)
-            | TypeDescriptor::Sequence(_)
-            | TypeDescriptor::Packed(_)
-            | TypeDescriptor::Slotted(_)
-            | TypeDescriptor::Small { .. } => {
-                hasher.update([descriptor.wrapper_tag().expect("a wrapper kind")]);
-                for reference in descriptor.references() {
-                    self.emit_reference(reference, depth, hasher);
-                }
+            TypeDescriptor::Array { element, len } => {
+                hasher.update([crate::descriptor::TAG_ARRAY]);
+                self.emit_reference(*element, depth, hasher);
+                kladde_varint::encode(*len, hasher);
+            }
+            TypeDescriptor::Sequence(element) => {
+                hasher.update([crate::descriptor::TAG_SEQUENCE]);
+                self.emit_reference(*element, depth, hasher);
+            }
+            TypeDescriptor::Text => hasher.update([crate::descriptor::TAG_TEXT]),
+            TypeDescriptor::Fixed(target) => {
+                hasher.update([crate::descriptor::TAG_FIXED]);
+                self.emit_reference(*target, depth, hasher);
             }
         }
     }
@@ -473,7 +477,7 @@ mod tests {
                 minor,
                 patch,
             },
-            inline_size: 8,
+            fixed_size: Some(8),
             parameters: vec![],
         }])
     }
@@ -576,5 +580,5 @@ mod tests {
 
     const GOLDEN_POINT: &str = "0d91791f5827efadfa8150af9812fad6";
     const GOLDEN_LIST: &str = "af12af0167771e03506952fff8a274fd";
-    const GOLDEN_OPAQUE_1_2_3: &str = "11435cae785f4d2027e535f33aa7447a";
+    const GOLDEN_OPAQUE_1_2_3: &str = "81a2a3d8b939f4f216a344cf10758953";
 }

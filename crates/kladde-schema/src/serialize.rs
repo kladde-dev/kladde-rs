@@ -1,12 +1,11 @@
-//! Canonical byte serialization of a [`TypeTable`], per
-//! `type-descriptors.md` §3: a `varint(count)` followed by each descriptor
-//! in index order, every descriptor a kind-tag byte plus kind-specific
-//! content. Byte-for-byte reproducible across implementations.
+//! Canonical byte serialization of a [`TypeTable`]: a `varint(count)`
+//! followed by each descriptor in index order, every descriptor a kind-tag
+//! byte plus kind-specific content. Byte-for-byte reproducible across
+//! implementations.
 
 use crate::descriptor::{
     canonical_variants, Field, Primitive, TypeDescriptor, TypeRef, TypeTable, Variant, Version,
-    TAG_ARRAY, TAG_ENUM, TAG_OPAQUE, TAG_PACKED, TAG_POINTER, TAG_SEQUENCE, TAG_SLOTTED, TAG_SMALL,
-    TAG_STRUCT,
+    TAG_ARRAY, TAG_ENUM, TAG_FIXED, TAG_OPAQUE, TAG_SEQUENCE, TAG_STRUCT, TAG_TEXT,
 };
 
 /// Why a byte string could not be decoded into a [`TypeTable`].
@@ -16,15 +15,12 @@ pub enum DecodeError {
     Truncated,
     /// A string field was not valid UTF-8.
     InvalidUtf8,
-    /// A kind-tag byte names a kind this revision reserves but does not yet
-    /// implement (Array).
-    ReservedKind(u8),
     /// A kind-tag byte names no known kind.
     UnknownKind(u8),
     /// A discriminant width other than 1, 2, 4, or 8.
     InvalidDiscriminantWidth(u8),
     /// A primitive code with no implemented primitive (a reserved or future
-    /// code, `type-descriptors.md` §2.1.1).
+    /// code).
     UnsupportedPrimitive(u8),
     /// A reference points outside the table.
     ReferenceOutOfRange { index: usize, table_len: usize },
@@ -32,10 +28,10 @@ pub enum DecodeError {
     Empty,
     /// Bytes remained after the last descriptor.
     TrailingBytes,
-    /// Descriptor `index` stands where the rules of nesting forbid it: a
-    /// sequence or a `Packed` wrapper away from a pointer or a small value, a
-    /// type without a fixed encoding in a slotted place, or a type that
-    /// contains itself inline.
+    /// Descriptor `index` breaks a rule of nesting: a `Fixed` wrapper around
+    /// a type without a fixed form, or a type that reaches itself without
+    /// passing through an enum or a sequence. See
+    /// [`TypeTable::validate`].
     InvalidNesting { index: usize, reason: &'static str },
 }
 
@@ -44,7 +40,6 @@ impl std::fmt::Display for DecodeError {
         match self {
             DecodeError::Truncated => f.write_str("schema is truncated"),
             DecodeError::InvalidUtf8 => f.write_str("schema string is not valid UTF-8"),
-            DecodeError::ReservedKind(t) => write!(f, "reserved (unimplemented) kind tag {t}"),
             DecodeError::UnknownKind(t) => write!(f, "unknown kind tag {t}"),
             DecodeError::InvalidDiscriminantWidth(w) => {
                 write!(f, "invalid discriminant width {w} (expected 1, 2, 4, or 8)")
@@ -75,10 +70,18 @@ impl From<kladde_varint::Error> for DecodeError {
 }
 
 impl TypeTable {
-    /// The canonical byte serialization of this table (`type-descriptors.md`
-    /// §3). Enum variants are emitted in ascending-discriminant order
-    /// regardless of how they are stored, so two tables that differ only in
-    /// variant order encode identically.
+    /// The canonical byte serialization of this table. Enum variants are
+    /// emitted in ascending-discriminant order regardless of how they are
+    /// stored, so two tables that differ only in variant order encode
+    /// identically.
+    ///
+    /// ```
+    /// use kladde_schema::{TypeDescriptor, TypeRef, TypeTable};
+    ///
+    /// let table = TypeTable::new(vec![TypeDescriptor::Sequence(TypeRef(1)), TypeDescriptor::Text]);
+    /// assert_eq!(table.encode(), [2, 133, 1, 134]);
+    /// assert_eq!(TypeTable::decode(&table.encode()), Ok(table));
+    /// ```
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         kladde_varint::encode(self.descriptors().len() as u64, &mut out);
@@ -90,7 +93,8 @@ impl TypeTable {
 
     /// Decodes a table from bytes produced by [`encode`](TypeTable::encode).
     /// Validates that the table is non-empty, that every reference is
-    /// in range, and that no trailing bytes remain.
+    /// in range, that no trailing bytes remain, and that the table keeps
+    /// the [rules of nesting](TypeTable::validate).
     pub fn decode(input: &[u8]) -> Result<TypeTable, DecodeError> {
         let mut reader = Reader { data: input };
         let count = reader.varint()? as usize;
@@ -167,7 +171,7 @@ fn encode_descriptor(descriptor: &TypeDescriptor, out: &mut Vec<u8>) {
             library_name,
             type_name,
             version,
-            inline_size,
+            fixed_size,
             parameters,
         } => {
             out.push(TAG_OPAQUE);
@@ -176,23 +180,33 @@ fn encode_descriptor(descriptor: &TypeDescriptor, out: &mut Vec<u8>) {
             kladde_varint::encode(version.major, out);
             kladde_varint::encode(version.minor, out);
             kladde_varint::encode(version.patch, out);
-            kladde_varint::encode(*inline_size, out);
+            kladde_varint::encode(encode_size_mode(*fixed_size), out);
             kladde_varint::encode(parameters.len() as u64, out);
             for parameter in parameters {
                 encode_reference(*parameter, out);
             }
         }
-        TypeDescriptor::Pointer(_)
-        | TypeDescriptor::Sequence(_)
-        | TypeDescriptor::Packed(_)
-        | TypeDescriptor::Slotted(_)
-        | TypeDescriptor::Small { .. } => {
-            out.push(descriptor.wrapper_tag().expect("a wrapper kind"));
-            for reference in descriptor.references() {
-                encode_reference(reference, out);
-            }
+        TypeDescriptor::Array { element, len } => {
+            out.push(TAG_ARRAY);
+            encode_reference(*element, out);
+            kladde_varint::encode(*len, out);
+        }
+        TypeDescriptor::Sequence(element) => {
+            out.push(TAG_SEQUENCE);
+            encode_reference(*element, out);
+        }
+        TypeDescriptor::Text => out.push(TAG_TEXT),
+        TypeDescriptor::Fixed(target) => {
+            out.push(TAG_FIXED);
+            encode_reference(*target, out);
         }
     }
+}
+
+/// An opaque type's size mode as one varint: 0 for a length-prefixed value,
+/// and one more than the size for a fixed one.
+pub(crate) fn encode_size_mode(fixed_size: Option<u64>) -> u64 {
+    fixed_size.map_or(0, |n| n + 1)
 }
 
 struct Reader<'a> {
@@ -286,9 +300,9 @@ fn decode_descriptor(reader: &mut Reader) -> Result<TypeDescriptor, DecodeError>
                 minor: reader.varint()?,
                 patch: reader.varint()?,
             };
-            let inline_size = reader.varint()?;
+            let fixed_size = reader.varint()?.checked_sub(1);
             let param_count = reader.varint()? as usize;
-            let mut parameters = Vec::with_capacity(param_count);
+            let mut parameters = Vec::with_capacity(param_count.min(reader.data.len()));
             for _ in 0..param_count {
                 parameters.push(reader.reference()?);
             }
@@ -296,19 +310,17 @@ fn decode_descriptor(reader: &mut Reader) -> Result<TypeDescriptor, DecodeError>
                 library_name,
                 type_name,
                 version,
-                inline_size,
+                fixed_size,
                 parameters,
             })
         }
-        TAG_POINTER => Ok(TypeDescriptor::Pointer(reader.reference()?)),
-        TAG_SEQUENCE => Ok(TypeDescriptor::Sequence(reader.reference()?)),
-        TAG_PACKED => Ok(TypeDescriptor::Packed(reader.reference()?)),
-        TAG_SLOTTED => Ok(TypeDescriptor::Slotted(reader.reference()?)),
-        TAG_SMALL => Ok(TypeDescriptor::Small {
-            content: reader.reference()?,
-            spilled: reader.reference()?,
+        TAG_ARRAY => Ok(TypeDescriptor::Array {
+            element: reader.reference()?,
+            len: reader.varint()?,
         }),
-        TAG_ARRAY => Err(DecodeError::ReservedKind(tag)),
+        TAG_SEQUENCE => Ok(TypeDescriptor::Sequence(reader.reference()?)),
+        TAG_TEXT => Ok(TypeDescriptor::Text),
+        TAG_FIXED => Ok(TypeDescriptor::Fixed(reader.reference()?)),
         other => Err(DecodeError::UnknownKind(other)),
     }
 }
@@ -378,7 +390,7 @@ mod tests {
                     minor: 1,
                     patch: 0,
                 },
-                inline_size: 8,
+                fixed_size: None,
                 parameters: vec![TypeRef(0)],
             },
         ]);
@@ -388,8 +400,8 @@ mod tests {
 
     #[test]
     fn round_trips_the_structural_kinds() {
-        // A struct holding a small string and a slotted count:
-        // `Small(Sequence(char), Pointer(Packed(Sequence(char))))`.
+        // A struct holding a name, a list of counts, a fixed-size count, and
+        // an array of three bytes.
         let table = TypeTable::new(vec![
             TypeDescriptor::Struct {
                 name: "Named".into(),
@@ -399,30 +411,55 @@ mod tests {
                         ty: TypeRef(1),
                     },
                     Field {
-                        name: "count".into(),
-                        ty: TypeRef(6),
+                        name: "counts".into(),
+                        ty: TypeRef(2),
+                    },
+                    Field {
+                        name: "total".into(),
+                        ty: TypeRef(4),
+                    },
+                    Field {
+                        name: "rgb".into(),
+                        ty: TypeRef(5),
                     },
                 ],
             },
-            TypeDescriptor::Small {
-                content: TypeRef(2),
-                spilled: TypeRef(4),
-            },
+            TypeDescriptor::Text,
             TypeDescriptor::Sequence(TypeRef(3)),
-            TypeDescriptor::Primitive(Primitive::Char),
-            TypeDescriptor::Pointer(TypeRef(5)),
-            TypeDescriptor::Packed(TypeRef(2)),
-            TypeDescriptor::Slotted(TypeRef(7)),
             TypeDescriptor::Primitive(Primitive::U32),
+            TypeDescriptor::Fixed(TypeRef(3)),
+            TypeDescriptor::Array {
+                element: TypeRef(6),
+                len: 3,
+            },
+            TypeDescriptor::Primitive(Primitive::U8),
         ]);
         let bytes = table.encode();
-        // Small, Sequence, char, Pointer, Packed, Slotted, u32: each a tag
-        // and its references.
+        // Text, Sequence, u32, Fixed, Array, u8: each a tag and its
+        // references, and the array its length.
         assert_eq!(
-            &bytes[bytes.len() - 13..],
-            [136, 2, 4, 133, 3, 11, 132, 5, 134, 2, 135, 7, 2]
+            &bytes[bytes.len() - 10..],
+            [134, 133, 3, 2, 135, 3, 131, 6, 3, 0]
         );
         assert_eq!(TypeTable::decode(&bytes).unwrap(), table);
+    }
+
+    #[test]
+    fn round_trips_both_size_modes_of_opaque_types() {
+        for fixed_size in [None, Some(0), Some(16)] {
+            let table = TypeTable::new(vec![TypeDescriptor::Opaque {
+                library_name: "lib".into(),
+                type_name: "T".into(),
+                version: Version {
+                    major: 1,
+                    minor: 0,
+                    patch: 0,
+                },
+                fixed_size,
+                parameters: vec![],
+            }]);
+            assert_eq!(TypeTable::decode(&table.encode()).unwrap(), table);
+        }
     }
 
     #[test]
@@ -476,12 +513,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reserved_kinds() {
+    fn rejects_unknown_kinds() {
         assert_eq!(
-            TypeTable::decode(&[1, crate::descriptor::TAG_ARRAY]),
-            Err(super::DecodeError::ReservedKind(
-                crate::descriptor::TAG_ARRAY
-            ))
+            TypeTable::decode(&[1, 132]),
+            Err(super::DecodeError::UnknownKind(132))
         );
     }
 
