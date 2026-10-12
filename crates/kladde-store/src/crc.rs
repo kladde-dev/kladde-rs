@@ -84,6 +84,7 @@ impl Crc32c {
 }
 
 /// The CRC-32C of `bytes`.
+#[cfg(test)]
 pub fn crc32c(bytes: &[u8]) -> u32 {
     let mut c = Crc32c::new();
     c.update(bytes);

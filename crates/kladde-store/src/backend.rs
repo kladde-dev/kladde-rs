@@ -1,144 +1,109 @@
-//! The traits the serialization layer drives a store through.
+//! The trait the serialization layer records mutations through.
 //!
 //! [`WriteBackend`] takes `&self` so that a parent guard can hand one backend
-//! to all of its field guards by reborrow; [`ReadBackend`] takes `&mut self`
-//! so that a load can hold a real cursor, and so that the borrow checker keeps
-//! loads and guards apart.
-
-use std::io::{Read, Seek};
+//! to all of its children's guards by reborrow.
 
 use crate::error::Error;
-use crate::pointer::{PointerRepr, UniquePointer, Word};
 
-/// What both halves share: the pointer and size types, and size queries.
+/// The bytes a splice removed inside a transaction, which a
+/// [`paste`](WriteBackend::paste) of the same transaction can insert
+/// elsewhere, once, without carrying them.
 ///
-/// ```
-/// use kladde_store::{Backend, MemoryStorage, Store, WriteBackend};
-///
-/// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
-/// let p = store.alloc(3)?;
-/// assert_eq!(store.size(p.raw())?, 3);
-/// # Ok::<(), kladde_store::Error>(())
-/// ```
-pub trait Backend {
-    /// The pointer type, whose encoding the serialization layer writes.
-    type Pointer: PointerRepr;
-    /// Offsets and sizes within allocations.
-    type Size: Word;
-
-    /// The size of allocation `p`, including every operation recorded so
-    /// far, or [`Error::DanglingPointer`] if there is no such allocation.
-    fn size(&self, p: Self::Pointer) -> Result<Self::Size, Error>;
-}
-
-/// Reading stored bytes, as a value's `load` does.
-///
-/// Has no write or allocation surface at all, so `&mut impl ReadBackend`
-/// cannot mutate. Reads see the state as of the last flush.
-///
-/// ```
-/// use std::io::Read;
-/// use kladde_store::{MemoryStorage, ReadBackend, Store, WriteBackend};
-///
-/// let mut store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
-/// let p = store.alloc(4)?;
-/// store.write(p.raw(), 0, &7u32.to_le_bytes())?;
-/// store.flush()?;
-/// let mut buf = [0u8; 4];
-/// store.read_at(p.raw(), 0)?.read_exact(&mut buf)?;
-/// assert_eq!(u32::from_le_bytes(buf), 7);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-pub trait ReadBackend: Backend {
-    /// The size of allocation `p` as reads see it: as of the last flush.
-    /// Fails with [`Error::DanglingPointer`] if `p` did not exist then.
-    ///
-    /// ```
-    /// use kladde_store::{Backend, MemoryStorage, ReadBackend, Store, WriteBackend};
-    ///
-    /// let mut store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
-    /// let p = store.alloc(3)?;
-    /// store.flush()?;
-    /// store.resize(&p, 5)?;
-    /// assert_eq!(store.size(p.raw())?, 5); // everything recorded so far
-    /// assert_eq!(store.read_size(p.raw())?, 3); // what reads see
-    /// # Ok::<(), kladde_store::Error>(())
-    /// ```
-    fn read_size(&mut self, p: Self::Pointer) -> Result<Self::Size, Error>;
-
-    /// A reader positioned at `offset` within allocation `anchor`, running to
-    /// the allocation's end, or [`Error::DanglingPointer`] if `anchor` did
-    /// not exist at the last flush.
-    fn read_at(
-        &mut self,
-        anchor: Self::Pointer,
-        offset: Self::Size,
-    ) -> Result<impl Read + Seek + '_, Error>;
-}
-
-/// Recording mutations, as guards do.
-///
-/// Outside a transaction or batch, every method appends to the journal before
-/// it returns, so a mutation that returned `Ok` survives an application
-/// crash; a power cut may still lose it until the next flush. Writes past an
-/// allocation's end grow it, and bytes that growth exposes read as zero.
-/// Reads see none of it until the next flush.
+/// It is neither `Copy` nor `Clone`, so it is pasted at most once.
 ///
 /// ```
 /// use kladde_store::{MemoryStorage, Store, WriteBackend};
 ///
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
-/// let p = store.alloc(0)?;
-/// store.write(p.raw(), 2, b"xy")?; // grows to 4 bytes
-/// store.splice(&p, 0, 2, b"a")?; // replaces the two zeros by one byte
+/// store.splice(0, 0, b"abcdef")?;
+/// store.atomically(|| {
+///     let cut = store.splice(1, 2, b"")?.expect("a cut");
+///     assert_eq!(cut.len(), 2);
+///     store.paste(3, 0, cut)
+/// })?;
 /// store.flush()?;
-/// assert_eq!(store.read_all(p.raw())?, b"axy");
-/// store.free(p)?;
+/// assert_eq!(store.read_all()?, b"adebcf");
 /// # Ok::<(), kladde_store::Error>(())
 /// ```
-pub trait WriteBackend: Backend {
-    /// A new allocation of `size` zero bytes.
-    fn alloc(&self, size: Self::Size) -> Result<UniquePointer<Self::Pointer>, Error>;
-    /// Ends `p`'s existence. Its id may be handed out again after the next
-    /// flush.
-    fn free(&self, p: UniquePointer<Self::Pointer>) -> Result<(), Error>;
-    /// Sets `p`'s size, keeping `min(old, new)` bytes; growth exposes zeros.
-    fn resize(&self, p: &UniquePointer<Self::Pointer>, size: Self::Size) -> Result<(), Error>;
-    /// Overwrites `bytes.len()` bytes at `offset` within `anchor`, growing it
-    /// if they reach past its end.
-    fn write(&self, anchor: Self::Pointer, offset: Self::Size, bytes: &[u8]) -> Result<(), Error>;
-    /// Replaces the `old_len` bytes at `offset` with `new`, shifting the tail
-    /// and resizing.
-    fn splice(
-        &self,
-        p: &UniquePointer<Self::Pointer>,
-        offset: Self::Size,
-        old_len: Self::Size,
-        new: &[u8],
-    ) -> Result<(), Error>;
-    /// Copies `len` bytes from `src` to `dst`, like `memmove` within one
-    /// allocation. Bytes past `src`'s end copy as zeros.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CutId {
+    pub(crate) serial: u64,
+    pub(crate) index: u32,
+    pub(crate) len: u64,
+}
+
+impl CutId {
+    /// The bytes the cut holds.
+    ///
+    /// See [`CutId`] for an example.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the cut holds no bytes, which never happens: a splice that
+    /// removes nothing makes no cut.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Recording mutations of the sequence, as guards do.
+///
+/// Outside a transaction or batch, every method appends to the journal before
+/// it returns, so a mutation that returned `Ok` survives an application
+/// crash; a power cut may still lose it until the next flush. Positions name
+/// bytes of the sequence as every operation recorded so far leaves it; one
+/// outside it fails with [`Error::OutOfBounds`] and records nothing.
+///
+/// ```
+/// use kladde_store::{MemoryStorage, Store, WriteBackend};
+///
+/// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
+/// store.splice(0, 0, b"hello")?;
+/// store.write(0, b"j")?;
+/// store.move_range(0, 1, 4)?;
+/// assert!(store.write(9, b"x").is_err());
+/// store.flush()?;
+/// assert_eq!(store.read_all()?, b"elloj");
+/// # Ok::<(), kladde_store::Error>(())
+/// ```
+pub trait WriteBackend {
+    /// The sequence's length, including every operation recorded so far.
+    fn len(&self) -> u64;
+
+    /// Whether the sequence is empty.
     ///
     /// ```
     /// use kladde_store::{MemoryStorage, Store, WriteBackend};
     ///
     /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
-    /// let a = store.alloc(0)?;
-    /// store.write(a.raw(), 0, b"abcd")?;
-    /// store.copy(a.raw(), 0, 3, a.raw(), 1)?;
-    /// store.move_range(a.raw(), 0, 1, a.raw(), 4)?;
-    /// store.flush()?;
-    /// assert_eq!(store.read_all(a.raw())?, b"\0abca");
+    /// assert!(store.is_empty());
     /// # Ok::<(), kladde_store::Error>(())
     /// ```
-    fn copy(
-        &self,
-        src: Self::Pointer,
-        src_offset: Self::Size,
-        len: Self::Size,
-        dst: Self::Pointer,
-        dst_offset: Self::Size,
-    ) -> Result<(), Error>;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Overwrites `bytes.len()` bytes at `pos`.
+    fn write(&self, pos: u64, bytes: &[u8]) -> Result<(), Error>;
+
+    /// Replaces the `removed` bytes at `pos` with `bytes`, shifting what
+    /// follows. Inside a transaction, what it removes is a cut, which it
+    /// returns for a later [`paste`](Self::paste); otherwise, or if it
+    /// removes nothing, it returns `None`.
+    fn splice(&self, pos: u64, removed: u64, bytes: &[u8]) -> Result<Option<CutId>, Error>;
+
+    /// Cuts `[from, from + len)` and inserts it at `to`, a position in the
+    /// sequence without the cut bytes. Writes none of the moved bytes.
+    fn move_range(&self, from: u64, len: u64, to: u64) -> Result<(), Error>;
+
+    /// Replaces the `removed` bytes at `pos` with the bytes of `cut`, which a
+    /// splice of the open transaction made. See [`CutId`] for an example.
+    ///
+    /// Fails with [`Error::Corrupt`], recording nothing, if `cut` comes from
+    /// another transaction.
+    fn paste(&self, pos: u64, removed: u64, cut: CutId) -> Result<(), Error>;
+
     /// Runs `f` as one transaction: the operations it records reach the
     /// journal together once it returns `Ok`, and a crash keeps all of them
     /// or none.
@@ -146,37 +111,19 @@ pub trait WriteBackend: Backend {
     /// If `f` fails, what it recorded is discarded and the error returned,
     /// as if `f` had never run; if the append at the end fails, the store is
     /// poisoned. Nests inside other transactions and batches.
-    ///
-    /// ```
-    /// use kladde_store::{Error, MemoryStorage, Store, WriteBackend};
-    ///
-    /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
-    /// let p = store.alloc(2)?;
-    /// store.atomically(|| {
-    ///     store.write(p.raw(), 0, b"a")?;
-    ///     store.write(p.raw(), 1, b"b")
-    /// })?;
-    /// // A failure inside discards the whole transaction.
-    /// let failed = store.atomically(|| {
-    ///     store.write(p.raw(), 0, b"x")?;
-    ///     Err::<(), _>(Error::OutOfBounds)
-    /// });
-    /// assert!(failed.is_err());
-    /// store.flush()?;
-    /// assert_eq!(store.read_all(p.raw())?, b"ab");
-    /// # Ok::<(), kladde_store::Error>(())
-    /// ```
     fn atomically<R>(&self, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error>;
 
-    /// Copies like [`copy`](WriteBackend::copy), then zeroes what the
-    /// destination left of the source range. See
-    /// [`copy`](WriteBackend::copy) for an example.
-    fn move_range(
-        &self,
-        src: Self::Pointer,
-        src_offset: Self::Size,
-        len: Self::Size,
-        dst: Self::Pointer,
-        dst_offset: Self::Size,
-    ) -> Result<(), Error>;
+    /// Opens a transaction, as [`atomically`](Self::atomically) does around
+    /// its closure; for a caller that holds one open across calls, such as
+    /// a cut.
+    fn begin_transaction(&self) -> Result<(), Error>;
+
+    /// Ends the transaction [`begin_transaction`](Self::begin_transaction)
+    /// opened.
+    fn end_transaction(&self) -> Result<(), Error>;
+
+    /// Poisons the store, for a caller that can no longer vouch for the
+    /// in-memory values mirroring it, or that failed where it cannot report
+    /// the failure.
+    fn poison(&self);
 }

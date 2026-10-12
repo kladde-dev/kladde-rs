@@ -1,245 +1,194 @@
-//! The in-memory structures of `impl/in-memory-state.md` and the
-//! fragment-map primitives of `impl/address-table-operations.md`.
+//! The committed state of a store in memory: the span table, the rope over
+//! the sequence's spans, the short chains of the schema and the private
+//! state, the page table with its victim buckets, and the reverse lists from
+//! a page to the spans it holds.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroU32;
-
-use crate::consts::{MAX_PAGE_CONTENT, PAGE_SIZE};
+use crate::consts::*;
 use crate::hash::{IdMap, IdSet};
-use crate::statement::{Kind, TableWriter};
+use crate::treap::{Item, Treap, NIL};
 
-/// A fragment-map key: `(id, offset)` packed with the id in the high half, so
-/// that integer order is `(id, offset)` order.
-pub type Key = u64;
+/// No page.
+pub const NONE: u32 = u32::MAX;
 
-#[inline]
-pub fn key(id: u32, offset: u32) -> Key {
-    (id as u64) << 32 | offset as u64
-}
-#[inline]
-pub fn kid(k: Key) -> u32 {
-    (k >> 32) as u32
-}
-#[inline]
-pub fn koff(k: Key) -> u32 {
-    k as u32
+/// Which chain a span belongs to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Chain {
+    /// The span is free.
+    #[default]
+    None,
+    Sequence,
+    Schema,
+    Private,
 }
 
-/// A statement's slab slot. Slot 0 is never handed out.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
-pub struct StmtRef(NonZeroU32);
-
-impl StmtRef {
-    #[inline]
-    pub fn idx(self) -> usize {
-        self.0.get() as usize
-    }
-}
-
-/// The resolved content of `[key.offset, next key or size)` of one id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Fragment {
-    /// Bytes at `offset` within `page`, stated by `stmt` (a `Ref` or `Inline`).
-    Bytes {
-        page: u32,
-        offset: u16,
-        stmt: StmtRef,
-    },
-    /// Zeros stated by a `Zero`.
-    Zero { stmt: StmtRef },
-    /// Taken by the flush in progress; an index into its pending table.
+/// What a span shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Content {
+    /// The span id is free.
+    #[default]
+    Free,
+    /// Bytes in a data page, at a byte offset within the page.
+    Ref { page: u32, offset: u16 },
+    /// The payload of its entry, at a byte offset within the table page that
+    /// holds the entry.
+    Inline { page: u32, offset: u16 },
+    /// Zeros.
+    Zero,
+    /// Bytes the flush in progress holds and has not placed yet: an index
+    /// into its pending table.
     Pending(u32),
 }
 
-impl Fragment {
-    #[inline]
-    pub fn stmt(&self) -> Option<StmtRef> {
-        match *self {
-            Fragment::Bytes { stmt, .. } | Fragment::Zero { stmt } => Some(stmt),
-            Fragment::Pending(_) => None,
-        }
-    }
-}
-
-/// Where a pending fragment's bytes are now.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Origin {
-    /// In the flush's arena, at this position.
-    Arena(u64),
-    /// In the file, at this address.
-    File(u64),
-    /// Zeros: nothing to read.
-    None,
-}
-
-/// Where a pending fragment will be stated from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Place {
-    /// A chunk that `pack` gives a data page.
-    Unplaced,
-    /// In a data page, at this address.
-    Data(u64),
-    /// In the address table, as an `Inline` payload.
-    Inline,
-    /// A `Zero` statement's range.
-    Zero,
-}
-
-/// A fragment the flush in progress has taken.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Pending {
-    pub origin: Origin,
-    pub place: Place,
-    /// Flushes untouched, for the header's split; 0 for what this flush wrote.
-    pub heat: u32,
-    /// Whether it is a description defragmentation rewrite, which `pack` cuts
-    /// only when nothing else is within reach.
-    pub rewrite: bool,
-}
-
-impl Pending {
-    /// The same pending content `d` bytes further in.
-    pub fn advanced(&self, d: u32) -> Pending {
-        let origin = match self.origin {
-            Origin::Arena(p) => Origin::Arena(p + d as u64),
-            Origin::File(a) => Origin::File(a + d as u64),
-            Origin::None => Origin::None,
-        };
-        let place = match self.place {
-            Place::Data(a) => Place::Data(a + d as u64),
-            other => other,
-        };
-        Pending {
-            origin,
-            place,
-            ..*self
-        }
-    }
-}
-
-/// One record per live statement, as parallel arrays.
-#[derive(Debug)]
-pub struct Slab {
-    /// The table page holding the statement, or the next free slot.
-    pub page_or_next: Vec<u32>,
-    pub pins: Vec<u32>,
-    pub framing: Vec<u8>,
-    pub ids: Vec<u32>,
-    pub kinds: Vec<Kind>,
-    free_head: u32,
-    pub live: u32,
-}
-
-impl Default for Slab {
-    fn default() -> Self {
-        Slab {
-            page_or_next: vec![0],
-            pins: vec![0],
-            framing: vec![0],
-            ids: vec![0],
-            kinds: vec![Kind::Tombstone],
-            free_head: 0,
-            live: 0,
-        }
-    }
-}
-
-impl Slab {
-    /// A slot for a statement in `page`, with no pins yet.
-    pub fn alloc(&mut self, page: u32, framing: u8, id: u32, kind: Kind) -> StmtRef {
-        self.live += 1;
-        if self.free_head != 0 {
-            let s = self.free_head as usize;
-            self.free_head = self.page_or_next[s];
-            self.page_or_next[s] = page;
-            self.pins[s] = 0;
-            self.framing[s] = framing;
-            self.ids[s] = id;
-            self.kinds[s] = kind;
-            return StmtRef(NonZeroU32::new(s as u32).unwrap());
-        }
-        let s = self.page_or_next.len();
-        assert!(s < u32::MAX as usize, "more than 2^32 - 1 statements");
-        self.page_or_next.push(page);
-        self.pins.push(0);
-        self.framing.push(framing);
-        self.ids.push(id);
-        self.kinds.push(kind);
-        StmtRef(NonZeroU32::new(s as u32).unwrap())
-    }
-
-    #[inline]
-    pub fn page(&self, s: StmtRef) -> u32 {
-        self.page_or_next[s.idx()]
-    }
-
-    fn release(&mut self, s: StmtRef) {
-        self.live -= 1;
-        self.page_or_next[s.idx()] = self.free_head;
-        self.free_head = s.idx() as u32;
-    }
-}
-
-/// Per-allocation metadata.
-#[derive(Clone, Debug, Default)]
-pub struct AllocationMeta {
-    pub size: u32,
-    pub fragment_count: u32,
-    pub statement_bytes: u32,
-    pub mentions: u32,
-    /// The epoch of the flush that last wrote the id.
-    pub last_written: u64,
-    /// The newest statement that states the size, holding its `S` pin; for
-    /// an id allocated again, its old tombstone until the cut binds the new
-    /// incarnation's.
-    pub size_statement: Option<StmtRef>,
-    /// How often flushes found the id's bytes shifted within it: one for
-    /// each flush that did, decayed by [`Options::shift_decay`] for every
-    /// flush since, as of the flush at `shifted_epoch`. In memory only, so it
-    /// starts at zero when a file is opened.
-    ///
-    /// [`Options::shift_decay`]: crate::Options::shift_decay
-    pub shifts: f32,
-    /// The epoch that `shifts` was last brought up to, truncated: only
-    /// differences of a few flushes matter.
-    pub shifted_epoch: u32,
-}
-
-impl AllocationMeta {
-    /// `shifts` decayed to `epoch`, without counting it.
-    pub fn shifts_at(&self, epoch: u64, decay: f64) -> f64 {
-        let since = (epoch as u32).wrapping_sub(self.shifted_epoch);
-        self.shifts as f64 * decay.powi(since.min(1 << 16) as i32)
-    }
-}
-
-/// What a non-existent id still carries.
+/// A span's record in the span table.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Recyclable {
-    pub mentions: u32,
-    pub tombstone: Option<StmtRef>,
+pub struct Span {
+    pub len: u32,
+    /// The next span of its chain, or 0.
+    pub next: u32,
+    pub content: Content,
+    pub chain: Chain,
+    /// The table page holding its live entry, or [`NONE`] while it has none.
+    pub entry_page: u32,
+    /// The bytes its live entry takes in that page, payload included.
+    pub entry_len: u16,
+    /// Its place in that page's entry list.
+    pub tab: u32,
+    /// Its place in its data page's span list, for a `Ref`.
+    pub rev: u32,
+    /// Its node in the rope, for a span of the sequence.
+    pub node: u32,
+    /// The flush that last wrote its bytes for the application, which ranks
+    /// it for the header.
+    pub heat: u64,
 }
 
-/// A page of the file, in the states of `spec/durability.md#page-states`,
-/// plus one of the implementation's own: filling.
+/// What the rope holds: a span, or during a flush a run of bytes the flush
+/// holds that has no span yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeItem {
+    Span {
+        id: u32,
+        len: u32,
+    },
+    /// `len` bytes of the flush's scratch, from `start`.
+    Lit {
+        start: u32,
+        len: u32,
+    },
+}
+
+impl Default for RopeItem {
+    fn default() -> Self {
+        RopeItem::Span { id: 0, len: 0 }
+    }
+}
+
+impl Item for RopeItem {
+    fn len(&self) -> u64 {
+        match *self {
+            RopeItem::Span { len, .. } | RopeItem::Lit { len, .. } => len as u64,
+        }
+    }
+}
+
+/// Hands out span ids lowest first, from a bitmap of ids in use with a
+/// summary bit per word that is full.
+#[derive(Debug)]
+pub struct Ids {
+    used: Vec<u64>,
+    full: Vec<u64>,
+    count: u32,
+}
+
+impl Default for Ids {
+    fn default() -> Self {
+        let mut ids = Ids {
+            used: Vec::new(),
+            full: Vec::new(),
+            count: 0,
+        };
+        // Id 0 is never a span.
+        ids.mark(0);
+        ids.count = 0;
+        ids
+    }
+}
+
+impl Ids {
+    pub fn is_used(&self, id: u32) -> bool {
+        let w = (id / 64) as usize;
+        w < self.used.len() && self.used[w] & (1 << (id % 64)) != 0
+    }
+
+    /// Marks `id` in use.
+    pub fn mark(&mut self, id: u32) {
+        let w = (id / 64) as usize;
+        if w >= self.used.len() {
+            self.used.resize(w + 1, 0);
+            self.full.resize(self.used.len().div_ceil(64), 0);
+        }
+        debug_assert!(self.used[w] & (1 << (id % 64)) == 0, "span id {id} in use");
+        self.used[w] |= 1 << (id % 64);
+        if self.used[w] == u64::MAX {
+            self.full[w / 64] |= 1 << (w % 64);
+        }
+        self.count += 1;
+    }
+
+    /// Frees `id`.
+    pub fn free(&mut self, id: u32) {
+        let w = (id / 64) as usize;
+        debug_assert!(self.is_used(id), "freeing span id {id}, which is free");
+        self.used[w] &= !(1 << (id % 64));
+        self.full[w / 64] &= !(1 << (w % 64));
+        self.count -= 1;
+    }
+
+    /// The lowest free id, marked in use; or `after + 1` if that is free,
+    /// so that spans made one after another get consecutive ids.
+    pub fn alloc(&mut self, after: u32) -> Option<u32> {
+        if after != 0 && after < u32::MAX && !self.is_used(after + 1) {
+            self.mark(after + 1);
+            return Some(after + 1);
+        }
+        for (i, &f) in self.full.iter().enumerate() {
+            if f != u64::MAX {
+                let w = i * 64 + (!f).trailing_zeros() as usize;
+                if w < self.used.len() {
+                    let id = (w * 64) as u32 + (!self.used[w]).trailing_zeros();
+                    self.mark(id);
+                    return Some(id);
+                }
+                break;
+            }
+        }
+        let id = (self.used.len() * 64) as u32;
+        if id == u32::MAX {
+            return None;
+        }
+        self.mark(id);
+        Some(id)
+    }
+
+    /// Ids in use.
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+}
+
+/// The state of every page of the file.
 ///
 /// Only a filling or live page has a kind and coverage, and only a live page
 /// an epoch and a place among the victims.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
-    /// In neither header's world: the flush may write it. The header slot
-    /// the next commit overwrites is reusable after a load, but never joins
-    /// the ready pool.
+    /// In neither header's world: the flush may write it.
     Reusable,
     /// In the world of the older header only; reusable after the next commit.
     Fallback,
     /// One of the current journal's pages, or named by the header for it.
-    /// Live in the sense of the spec, but the journal keeps what it holds.
     Journal,
-    /// Taken by the flush in progress, which writes it at its commit: its
-    /// epoch is that flush's. The spec counts it reusable until the commit;
-    /// a failed flush poisons the store, so nothing ever reads a page that a
-    /// flush took and did not commit.
+    /// Taken by the flush in progress, which writes it at its commit.
     Filling(Filling),
     /// In the governing header's world.
     Live(Live),
@@ -248,7 +197,6 @@ pub enum Page {
 /// What a page the flush in progress writes holds so far.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Filling {
-    /// As [`Live::coverage`].
     pub coverage: u32,
     pub kind: PageKind,
 }
@@ -258,20 +206,17 @@ pub struct Filling {
 pub struct Live {
     /// The epoch the page was written in.
     pub epoch: u64,
-    /// Bytes current state relies on: data a fragment resolves to, statement
-    /// framing and inline payloads, and a non-header page's child references.
+    /// The bytes current state relies on: for a data page those its spans
+    /// show, for a leaf its live entries' bytes.
     pub coverage: u32,
     pub kind: PageKind,
-    /// Where it sits among the victims of its kind, if it is one.
     pub slot: Option<BucketSlot>,
 }
 
-/// The kind of a filling or live page, as its frame states it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageKind {
     Data,
-    /// A non-header address-table page, with or without children; the tree
-    /// is [`State::children`].
+    /// A leaf of the span table: a table page the header names.
     Table,
     /// The governing header, or the slot the flush in progress writes.
     Header,
@@ -290,8 +235,7 @@ impl Filling {
         Page::Filling(Filling { coverage: 0, kind })
     }
 
-    /// The page once the commit of epoch `epoch` has written it. It joins
-    /// the victims, if it is one, when it is rebucketed.
+    /// The page once the commit of epoch `epoch` has written it.
     pub fn commit(self, epoch: u64) -> Live {
         Live {
             epoch,
@@ -305,7 +249,7 @@ impl Filling {
 /// Buckets per page kind.
 pub const BUCKETS: usize = 16;
 
-/// Pages bucketed by live fraction, for `O(1)` victim selection.
+/// Pages bucketed by coverage, for `O(1)` victim selection.
 #[derive(Debug, Default)]
 pub struct Buckets {
     pub lists: [Vec<u32>; BUCKETS],
@@ -322,133 +266,37 @@ impl Buckets {
     }
 }
 
-/// Every key range the flush has taken, merged and sorted, plus per touched id
-/// what the fragment map cannot say.
-#[derive(Debug, Default)]
-pub struct Dirty {
-    /// `key(id, start) -> end`, with overlapping or touching ranges merged.
-    pub ranges: BTreeMap<Key, u32>,
-    pub records: IdMap<IdRecord>,
-}
-
-/// How an id changed during the flush.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct IdRecord {
-    /// Its size when the flush first touched it.
-    pub size_before: u32,
-    /// It existed and was freed.
-    pub freed: bool,
-    /// It exists now after not existing, or after being freed.
-    pub allocated: bool,
-    /// A page the flush retires held its size statement, or, for an id that
-    /// does not exist, its tombstone.
-    pub replace: bool,
-    /// The application wrote it.
-    pub written: bool,
-}
-
-impl IdRecord {
-    /// Folds in what another source recorded for the same id; the earlier
-    /// size stays, since it is the size the id had when the flush began.
-    pub fn merge(&mut self, other: IdRecord) {
-        self.freed |= other.freed;
-        self.allocated |= other.allocated;
-        self.replace |= other.replace;
-        self.written |= other.written;
-    }
-}
-
-impl Dirty {
-    /// Adds `[start, end)` of `id`.
-    pub fn add(&mut self, id: u32, start: u32, end: u32) {
-        if start >= end {
-            return;
-        }
-        let (mut s, mut e) = (start, end);
-        // Merge with a predecessor that reaches `start`.
-        if let Some((&k, &pe)) = self.ranges.range(..=key(id, start)).next_back() {
-            if kid(k) == id && pe >= start {
-                s = koff(k);
-                e = e.max(pe);
-                self.ranges.remove(&k);
-            }
-        }
-        // Absorb successors that start within `[s, e]`.
-        loop {
-            let next = self
-                .ranges
-                .range(key(id, s)..=key(id, e))
-                .next()
-                .map(|(&k, &v)| (k, v));
-            match next {
-                Some((k, v)) => {
-                    e = e.max(v);
-                    self.ranges.remove(&k);
-                }
-                None => break,
-            }
-        }
-        self.ranges.insert(key(id, s), e);
-    }
-}
-
-/// The store's in-memory state: the committed file, plus what a flush in
-/// progress has taken.
+/// The committed state.
 #[derive(Debug, Default)]
 pub struct State {
-    pub frags: BTreeMap<Key, Fragment>,
-    pub slab: Slab,
-    pub allocs: IdMap<AllocationMeta>,
-    pub recyclable: BTreeMap<u32, Recyclable>,
+    /// Every span, by id; free slots have `Content::Free`.
+    pub spans: Vec<Span>,
+    pub ids: Ids,
+    /// The rope over the sequence's spans, and its root.
+    pub rope: Treap<RopeItem>,
+    pub root: u32,
+    /// The spans of the schema's chain and of the private chain, in order.
+    pub schema: Vec<u32>,
+    pub private: Vec<u32>,
     /// Every page of the file, by page number.
     pub pages: Vec<Page>,
-    /// The address-table tree: each live table page's child references, the
-    /// header's included; empty for a page without children.
-    pub children: IdMap<Vec<u32>>,
     pub data_buckets: Buckets,
     pub table_buckets: Buckets,
-    /// Data page -> `(id, lo, hi)`: ids that may have bytes in it, and the
-    /// window of offsets they may occupy. A superset, pruned on use.
-    pub reverse: IdMap<Vec<(u32, u32, u32)>>,
-    /// The flush's pending table.
-    pub pending: Vec<Pending>,
-    /// Pages whose coverage fell during the flush.
+    /// Data page -> the spans whose bytes lie in it.
+    pub data_spans: IdMap<Vec<u32>>,
+    /// Table page -> the spans whose live entry it holds.
+    pub table_spans: IdMap<Vec<u32>>,
+    /// Pages whose coverage fell since the last commit.
     pub dropped_candidates: IdSet,
     /// The epoch of the flush in progress, and of every page it fills; or
     /// between flushes, the governing header's.
     pub flush_epoch: u64,
 }
 
-/// The bytes of a non-header table page's child list that its coverage
-/// carries: the list with its delimiter, or nothing for a page without
-/// children, whose delimiter alone must not keep it alive.
-pub fn charged_child_bytes(children: &[u32]) -> u32 {
-    if children.is_empty() {
-        0
-    } else {
-        TableWriter::children_len(children) as u32
-    }
-}
-
-/// The data page and in-page offset of a file address.
-#[inline]
-pub fn split_address(addr: u64) -> (u32, u16) {
-    (
-        (addr / PAGE_SIZE as u64) as u32,
-        (addr % PAGE_SIZE as u64) as u16,
-    )
-}
-
-#[inline]
-pub fn address(page: u32, offset: u16) -> u64 {
-    page as u64 * PAGE_SIZE as u64 + offset as u64
-}
-
 impl State {
     // ---------------------------------------------------------------- pages
 
-    /// Makes room for page records up to `page`, which the file now holds:
-    /// a page that comes into existence is reusable.
+    /// Makes room for page records up to `page`, which the file now holds.
     pub fn ensure_page(&mut self, page: u32) {
         if self.pages.len() <= page as usize {
             self.pages.resize(page as usize + 1, Page::Reusable);
@@ -472,18 +320,6 @@ impl State {
         }
     }
 
-    /// The epoch of `page`, which holds content that current state refers
-    /// to: its own if it is live, the flush's if it is filling.
-    #[inline]
-    pub fn epoch_of(&self, page: u32) -> u64 {
-        match &self.pages[page as usize] {
-            Page::Live(l) => l.epoch,
-            Page::Filling(_) => self.flush_epoch,
-            other => panic!("page {page} holds no content but is {other:?}"),
-        }
-    }
-
-    /// The coverage of `page`, which must be filling or live.
     #[inline]
     fn coverage_mut(&mut self, page: u32) -> &mut u32 {
         match &mut self.pages[page as usize] {
@@ -492,36 +328,24 @@ impl State {
         }
     }
 
-    pub fn is_filling(&self, page: u32) -> bool {
-        matches!(self.pages[page as usize], Page::Filling(_))
-    }
-
-    /// Whether table page `page` names other pages.
-    pub fn has_children(&self, page: u32) -> bool {
-        self.children.get(&page).is_some_and(|k| !k.is_empty())
+    pub fn coverage(&self, page: u32) -> u32 {
+        match &self.pages[page as usize] {
+            Page::Live(Live { coverage, .. }) | Page::Filling(Filling { coverage, .. }) => {
+                *coverage
+            }
+            _ => 0,
+        }
     }
 
     /// The record of `page` if it may be a consolidation victim: a live data
-    /// page or leaf with live content. Pages with children are rebuilt by
-    /// every cut that needs them, and so are never victims.
+    /// page or leaf with live content.
     pub fn victim(&self, page: u32) -> Option<&Live> {
         match &self.pages[page as usize] {
-            Page::Live(l)
-                if l.coverage > 0
-                    && match l.kind {
-                        PageKind::Data => true,
-                        PageKind::Table => !self.has_children(page),
-                        PageKind::Header => false,
-                    } =>
-            {
-                Some(l)
-            }
+            Page::Live(l) if l.coverage > 0 && l.kind != PageKind::Header => Some(l),
             _ => None,
         }
     }
 
-    /// The bucket `page` belongs in: victims by coverage, and nothing for
-    /// any other page.
     fn wanted_bucket(&self, page: u32) -> Option<u8> {
         self.victim(page).map(|l| Buckets::bucket_of(l.coverage))
     }
@@ -604,412 +428,253 @@ impl State {
         }
     }
 
-    // ------------------------------------------------------------ allocations
+    // ---------------------------------------------------------------- spans
 
     #[inline]
-    pub fn size_of(&self, id: u32) -> u32 {
-        self.allocs.get(&id).map_or(0, |m| m.size)
+    pub fn span(&self, id: u32) -> &Span {
+        &self.spans[id as usize]
     }
-
-    /// Where the fragment at `k` ends: the next key of its id, or the size.
-    pub fn frag_end(&self, k: Key) -> u32 {
-        let id = kid(k);
-        match self.frags.range(k + 1..).next() {
-            Some((&n, _)) if kid(n) == id => koff(n),
-            _ => self.size_of(id),
-        }
-    }
-
-    /// The fragment covering `(id, probe)` and its range.
-    pub fn resolve(&self, id: u32, probe: u32) -> Option<(Key, Fragment, u32)> {
-        let size = self.size_of(id);
-        if probe >= size {
-            return None;
-        }
-        let (&k, &f) = self.frags.range(..=key(id, probe)).next_back()?;
-        debug_assert_eq!(kid(k), id, "the partition invariant");
-        Some((k, f, self.frag_end(k)))
-    }
-
-    // ------------------------------------------------------------ pins
 
     #[inline]
-    pub fn pin(&mut self, s: StmtRef) {
-        self.slab.pins[s.idx()] += 1;
+    pub fn span_mut(&mut self, id: u32) -> &mut Span {
+        &mut self.spans[id as usize]
     }
 
-    pub fn unpin(&mut self, s: StmtRef) {
-        let i = s.idx();
-        debug_assert!(self.slab.pins[i] > 0, "unpinning a dead statement");
-        self.slab.pins[i] -= 1;
-        if self.slab.pins[i] == 0 {
-            // Read the page before the slot becomes a free-list link.
-            let page = self.slab.page_or_next[i];
-            let framing = self.slab.framing[i] as u32;
-            let id = self.slab.ids[i];
-            self.uncover(page, framing);
-            if let Some(m) = self.allocs.get_mut(&id) {
-                m.statement_bytes -= framing;
-            }
-            self.slab.release(s);
+    /// A new span id, preferably `after + 1`, with a fresh record.
+    pub fn new_span(&mut self, after: u32) -> Option<u32> {
+        let id = self.ids.alloc(after)?;
+        if self.spans.len() <= id as usize {
+            self.spans.resize(id as usize + 1, Span::default());
         }
-    }
-
-    fn release_fragment(&mut self, f: Fragment, len: u32) {
-        match f {
-            Fragment::Bytes { page, stmt, .. } => {
-                self.uncover(page, len);
-                self.unpin(stmt);
-            }
-            Fragment::Zero { stmt } => self.unpin(stmt),
-            Fragment::Pending(p) => {
-                if let Place::Data(a) = self.pending[p as usize].place {
-                    self.uncover(split_address(a).0, len);
-                }
-            }
-        }
-    }
-
-    fn charge_fragment(&mut self, f: Fragment, len: u32) {
-        match f {
-            Fragment::Bytes { page, stmt, .. } => {
-                self.cover(page, len);
-                self.pin(stmt);
-            }
-            Fragment::Zero { stmt } => self.pin(stmt),
-            Fragment::Pending(p) => {
-                if let Place::Data(a) = self.pending[p as usize].place {
-                    self.cover(split_address(a).0, len);
-                }
-            }
-        }
-    }
-
-    // ------------------------------------------------------------ primitives
-
-    /// Ensures a fragment boundary at `at`.
-    pub fn split(&mut self, id: u32, at: u32) {
-        if at >= self.size_of(id) {
-            return;
-        }
-        let Some((&k, &f)) = self.frags.range(..=key(id, at)).next_back() else {
-            return;
+        self.spans[id as usize] = Span {
+            entry_page: NONE,
+            node: NIL,
+            ..Span::default()
         };
-        debug_assert_eq!(kid(k), id);
-        if koff(k) == at {
-            return;
-        }
-        let d = at - koff(k);
-        let shifted = match f {
-            Fragment::Bytes { page, offset, stmt } => Fragment::Bytes {
-                page,
-                offset: offset + d as u16,
-                stmt,
+        Some(id)
+    }
+
+    /// The length of the sequence.
+    pub fn seq_len(&self) -> u64 {
+        self.rope.sum(self.root)
+    }
+
+    /// The first span of the sequence, or 0.
+    pub fn seq_head(&self) -> u32 {
+        match self.rope.first(self.root) {
+            NIL => 0,
+            n => match *self.rope.item(n) {
+                RopeItem::Span { id, .. } => id,
+                RopeItem::Lit { .. } => unreachable!("a literal in the rope between flushes"),
             },
-            Fragment::Pending(p) => {
-                let q = self.pending[p as usize].advanced(d);
-                self.pending.push(q);
-                Fragment::Pending(self.pending.len() as u32 - 1)
-            }
-            other => other,
-        };
-        if let Some(s) = shifted.stmt() {
-            self.pin(s);
-        }
-        self.frags.insert(key(id, at), shifted);
-        self.allocs.get_mut(&id).unwrap().fragment_count += 1;
-    }
-
-    /// Replaces the content of `[start, end)` of `id` with `new`.
-    pub fn overwrite(&mut self, id: u32, start: u32, end: u32, new: Fragment) {
-        debug_assert!(start < end && end <= self.size_of(id));
-        self.split(id, start);
-        self.split(id, end);
-        let olds: Vec<(Key, Fragment)> = self
-            .frags
-            .range(key(id, start)..key(id, end))
-            .map(|(&k, &f)| (k, f))
-            .collect();
-        for (i, &(k, f)) in olds.iter().enumerate() {
-            let e = olds.get(i + 1).map_or(end, |&(n, _)| koff(n));
-            self.release_fragment(f, e - koff(k));
-            self.frags.remove(&k);
-        }
-        let m = self.allocs.get_mut(&id).unwrap();
-        m.fragment_count -= olds.len() as u32;
-        m.fragment_count += 1;
-        self.frags.insert(key(id, start), new);
-        self.charge_fragment(new, end - start);
-        self.coalesce_at(id, start);
-        if end < self.size_of(id) {
-            self.coalesce_at(id, end);
         }
     }
 
-    /// Whether `b`, starting where `a` (of length `a_len`) ends, continues it.
-    fn continues(&self, a: Fragment, a_len: u32, b: Fragment) -> bool {
-        match (a, b) {
-            (Fragment::Zero { stmt: s }, Fragment::Zero { stmt: t }) => s == t,
-            (
-                Fragment::Bytes {
-                    page: p,
-                    offset: o,
-                    stmt: s,
-                },
-                Fragment::Bytes {
-                    page: q,
-                    offset: r,
-                    stmt: t,
-                },
-            ) => s == t && p == q && o as u32 + a_len == r as u32,
-            _ => false,
-        }
-    }
-
-    /// Merges the fragment starting at `(id, at)` into its predecessor if it
-    /// continues it.
-    pub fn coalesce_at(&mut self, id: u32, at: u32) {
-        if at == 0 {
-            return;
-        }
-        let Some(&b) = self.frags.get(&key(id, at)) else {
+    /// Adds span `id`, a `Ref`, to its data page's list.
+    pub fn note_data(&mut self, id: u32) {
+        let Content::Ref { page, .. } = self.spans[id as usize].content else {
             return;
         };
-        let Some((&pk, &a)) = self.frags.range(..key(id, at)).next_back() else {
+        let list = self.data_spans.entry(page).or_default();
+        self.spans[id as usize].rev = list.len() as u32;
+        list.push(id);
+    }
+
+    /// Takes span `id`, a `Ref`, out of its data page's list.
+    pub fn unnote_data(&mut self, id: u32) {
+        let Content::Ref { page, .. } = self.spans[id as usize].content else {
             return;
         };
-        if kid(pk) != id {
+        let rev = self.spans[id as usize].rev as usize;
+        let list = self.data_spans.get_mut(&page).expect("a data page's list");
+        debug_assert_eq!(list[rev], id);
+        list.swap_remove(rev);
+        if rev < list.len() {
+            let moved = list[rev];
+            self.spans[moved as usize].rev = rev as u32;
+        }
+        if list.is_empty() {
+            self.data_spans.remove(&page);
+        }
+    }
+
+    /// Records that span `id`'s live entry now lies in `page`, taking
+    /// `len` bytes.
+    pub fn note_entry(&mut self, id: u32, page: u32, len: u16) {
+        debug_assert_eq!(self.spans[id as usize].entry_page, NONE);
+        let list = self.table_spans.entry(page).or_default();
+        let s = &mut self.spans[id as usize];
+        s.tab = list.len() as u32;
+        s.entry_page = page;
+        s.entry_len = len;
+        list.push(id);
+        self.cover(page, len as u32);
+    }
+
+    /// Ends span `id`'s live entry, if it has one: it no longer counts
+    /// toward its page.
+    pub fn drop_entry(&mut self, id: u32) {
+        let s = self.spans[id as usize];
+        if s.entry_page == NONE {
             return;
         }
-        if self.continues(a, at - koff(pk), b) {
-            self.frags.remove(&key(id, at));
-            if let Some(s) = b.stmt() {
-                self.unpin(s);
-            }
-            self.allocs.get_mut(&id).unwrap().fragment_count -= 1;
+        let list = self
+            .table_spans
+            .get_mut(&s.entry_page)
+            .expect("a table page's list");
+        let tab = s.tab as usize;
+        debug_assert_eq!(list[tab], id);
+        list.swap_remove(tab);
+        if tab < list.len() {
+            let moved = list[tab];
+            self.spans[moved as usize].tab = tab as u32;
         }
+        if list.is_empty() {
+            self.table_spans.remove(&s.entry_page);
+        }
+        self.uncover(s.entry_page, s.entry_len as u32);
+        self.spans[id as usize].entry_page = NONE;
     }
 
-    // ------------------------------------------------------------ sizes
-
-    /// Makes `s` the id's size statement, which takes its `S` pin from the
-    /// statement that held it before.
-    pub fn set_size_statement(&mut self, id: u32, s: StmtRef) {
-        self.pin(s);
-        let old = self.allocs.get_mut(&id).unwrap().size_statement.replace(s);
-        if let Some(o) = old {
-            self.unpin(o);
+    /// Ends span `id`: its entry dies, its bytes stop counting, and its id
+    /// is free.
+    pub fn kill(&mut self, id: u32) {
+        self.drop_entry(id);
+        let s = self.spans[id as usize];
+        if let Content::Ref { page, .. } = s.content {
+            self.unnote_data(id);
+            self.uncover(page, s.len);
         }
+        self.spans[id as usize] = Span::default();
+        self.ids.free(id);
     }
 
-    /// Raises `id`'s size to `n`. The range the growth exposes is taken for
-    /// the flush as `p`, zeros unless the flush writes over them, since every
-    /// byte an allocation gains is stated in the epoch that gains it.
-    pub fn grow_size_to(&mut self, id: u32, n: u32, p: Pending, dirty: &mut Dirty) {
-        let old = {
-            let m = self.allocs.get_mut(&id).unwrap();
-            if n <= m.size {
-                return;
-            }
-            let old = m.size;
-            m.size = n;
-            m.fragment_count += 1;
-            old
-        };
-        // Past the old end there is nothing to release, so this take only
-        // appends.
-        self.pending.push(p);
-        let idx = self.pending.len() as u32 - 1;
-        self.frags.insert(key(id, old), Fragment::Pending(idx));
-        self.charge_fragment(Fragment::Pending(idx), n - old);
-        dirty.add(id, old, n);
+    /// The spans of the sequence, in order.
+    pub fn seq_spans(&self) -> Vec<u32> {
+        self.rope
+            .nodes(self.root)
+            .into_iter()
+            .map(|n| match *self.rope.item(n) {
+                RopeItem::Span { id, .. } => id,
+                RopeItem::Lit { .. } => unreachable!("a literal in the rope between flushes"),
+            })
+            .collect()
     }
 
-    /// Lowers `id`'s size to `n`, dropping everything at or past it.
-    pub fn shrink_size_to(&mut self, id: u32, n: u32) {
-        let size = self.size_of(id);
-        if n >= size {
-            return;
-        }
-        self.split(id, n);
-        let olds: Vec<(Key, Fragment)> = self
-            .frags
-            .range(key(id, n)..=key(id, u32::MAX))
-            .map(|(&k, &f)| (k, f))
-            .collect();
-        for (i, &(k, f)) in olds.iter().enumerate() {
-            let e = olds.get(i + 1).map_or(size, |&(nk, _)| koff(nk));
-            self.release_fragment(f, e - koff(k));
-            self.frags.remove(&k);
-        }
-        let m = self.allocs.get_mut(&id).unwrap();
-        m.fragment_count -= olds.len() as u32;
-        m.size = n;
-    }
-
-    /// Re-owns `[start, end)` of `id` for the flush in progress.
-    pub fn take(&mut self, id: u32, start: u32, end: u32, p: Pending, dirty: &mut Dirty) {
-        if start >= end {
-            return;
-        }
-        self.pending.push(p);
-        let idx = self.pending.len() as u32 - 1;
-        self.overwrite(id, start, end, Fragment::Pending(idx));
-        dirty.add(id, start, end);
-    }
-
-    /// A statement naming `id` stopped being physically present.
-    ///
-    /// When at most the tombstone is left naming a non-existent id, nothing
-    /// is left for it to deny, so it is released. When the statement leaving
-    /// is the tombstone itself, its page's rewrite has asked the cut to state
-    /// it again while anything still names the id.
-    pub fn drop_physically(&mut self, id: u32) {
-        if let Some(m) = self.allocs.get_mut(&id) {
-            m.mentions = m.mentions.saturating_sub(1);
-            return;
-        }
-        let Some(r) = self.recyclable.get_mut(&id) else {
-            return;
-        };
-        r.mentions = r.mentions.saturating_sub(1);
-        if r.mentions <= 1 {
-            if let Some(t) = r.tombstone.take() {
-                self.unpin(t);
-            }
-        }
-    }
-
-    /// `mentions` of an id, existing or not.
-    pub fn mentions(&self, id: u32) -> u32 {
-        self.allocs.get(&id).map_or_else(
-            || self.recyclable.get(&id).map_or(0, |r| r.mentions),
-            |m| m.mentions,
-        )
-    }
-
-    /// Records in the reverse index that `id` may have bytes at `[lo, hi)`
-    /// in data page `page`.
-    pub fn note_reverse(&mut self, page: u32, id: u32, lo: u32, hi: u32) {
-        let v = self.reverse.entry(page).or_default();
-        for e in v.iter_mut() {
-            if e.0 == id {
-                e.1 = e.1.min(lo);
-                e.2 = e.2.max(hi);
-                return;
-            }
-        }
-        v.push((id, lo, hi));
-    }
-
-    /// Checks the invariants tying the structures together. Expensive; for
-    /// tests and debug assertions.
-    pub fn check(&self) {
-        let mut pins = vec![0u32; self.slab.pins.len()];
-        let mut coverage: IdMap<u32> = IdMap::default();
-        let mut per_id: IdMap<u32> = IdMap::default();
-        let mut last: Option<(u32, u32)> = None;
-        let keys: Vec<(Key, Fragment)> = self.frags.iter().map(|(&k, &f)| (k, f)).collect();
-        for (i, &(k, f)) in keys.iter().enumerate() {
-            let id = kid(k);
-            let size = self.size_of(id);
-            assert!(
-                self.allocs.contains_key(&id),
-                "fragment of a non-existent id {id}"
-            );
-            assert!(
-                koff(k) < size,
-                "fragment at {} past size {size} of id {id}",
-                koff(k)
-            );
-            match last {
-                Some((lid, _)) if lid == id => {}
-                _ => assert_eq!(koff(k), 0, "id {id} does not start at 0"),
-            }
-            let end = keys
-                .get(i + 1)
-                .filter(|(n, _)| kid(*n) == id)
-                .map_or(size, |(n, _)| koff(*n));
-            *per_id.entry(id).or_default() += 1;
-            if let Some(s) = f.stmt() {
-                pins[s.idx()] += 1;
-            }
-            match f {
-                Fragment::Bytes { page, .. } => *coverage.entry(page).or_default() += end - koff(k),
-                Fragment::Pending(p) => {
-                    if let Place::Data(a) = self.pending[p as usize].place {
-                        *coverage.entry(split_address(a).0).or_default() += end - koff(k);
-                    }
+    /// Checks every invariant between flushes, panicking at the first
+    /// violation: the rope against the span table, the chains' links, the
+    /// reverse lists, and every page's coverage.
+    pub fn check(&self, header_slot: u32) {
+        self.rope.check(self.root);
+        let mut data_cov: IdMap<u64> = IdMap::default();
+        let mut table_cov: IdMap<u64> = IdMap::default();
+        let mut reached = IdSet::default();
+        let chains = [
+            (Chain::Sequence, self.seq_spans()),
+            (Chain::Schema, self.schema.clone()),
+            (Chain::Private, self.private.clone()),
+        ];
+        for (chain, list) in chains {
+            for (i, &id) in list.iter().enumerate() {
+                assert!(reached.insert(id), "span {id} is reached twice");
+                let s = self.span(id);
+                assert_eq!(s.chain, chain, "span {id} is in another chain");
+                assert!(s.len > 0, "span {id} is empty");
+                let next = list.get(i + 1).copied().unwrap_or(0);
+                assert_eq!(s.next, next, "span {id} links to the wrong span");
+                if chain == Chain::Sequence {
+                    assert_eq!(
+                        *self.rope.item(s.node),
+                        RopeItem::Span { id, len: s.len },
+                        "span {id}'s rope node"
+                    );
                 }
-                _ => {}
-            }
-            last = Some((id, end));
-        }
-        for (&id, m) in &self.allocs {
-            assert_eq!(
-                per_id.get(&id).copied().unwrap_or(0),
-                m.fragment_count,
-                "fragment_count of {id}"
-            );
-            if m.size > 0 {
-                assert!(
-                    per_id.contains_key(&id),
-                    "id {id} of size {} has no fragments",
-                    m.size
+                assert!(s.entry_page != NONE, "span {id} has no entry");
+                *table_cov.entry(s.entry_page).or_default() += s.entry_len as u64;
+                assert_eq!(
+                    self.table_spans[&s.entry_page][s.tab as usize], id,
+                    "span {id} is not in its table page's list"
                 );
-            }
-            if let Some(s) = m.size_statement {
-                pins[s.idx()] += 1;
+                match s.content {
+                    Content::Ref { page, offset } => {
+                        assert!(
+                            offset as usize + s.len as usize <= PAGE_SIZE - 4,
+                            "span {id} reaches past its page"
+                        );
+                        *data_cov.entry(page).or_default() += s.len as u64;
+                        assert_eq!(
+                            self.data_spans[&page][s.rev as usize], id,
+                            "span {id} is not in its data page's list"
+                        );
+                    }
+                    Content::Inline { page, .. } => {
+                        assert_eq!(page, s.entry_page, "span {id}'s payload is elsewhere");
+                        assert!(s.len as usize <= MAX_INLINE);
+                    }
+                    Content::Zero => {}
+                    other => panic!("span {id} shows {other:?} between flushes"),
+                }
             }
         }
-        for r in self.recyclable.values() {
-            if let Some(t) = r.tombstone {
-                pins[t.idx()] += 1;
-            }
-        }
-        // `s` indexes four parallel arrays, the counts here and the slab's
-        // pins, pages and framing, so it stays an index.
-        #[allow(clippy::needless_range_loop)]
-        for s in 1..pins.len() {
-            let live = self.slab.pins[s] > 0;
-            if live {
-                assert_eq!(pins[s], self.slab.pins[s], "pins of statement {s}");
-                *coverage.entry(self.slab.page_or_next[s]).or_default() +=
-                    self.slab.framing[s] as u32;
-            } else {
-                assert_eq!(pins[s], 0, "a dead statement {s} is referenced");
-            }
+        assert_eq!(
+            reached.len() as u32,
+            self.ids.count(),
+            "spans nobody reaches"
+        );
+        for (&page, list) in &self.data_spans {
+            assert_eq!(
+                list.len(),
+                list.iter().filter(|id| reached.contains(id)).count()
+            );
+            let _ = page;
         }
         for (p, page) in self.pages.iter().enumerate() {
             let p = p as u32;
-            let want = coverage.get(&p).copied().unwrap_or(0);
-            match page {
-                Page::Live(l) => {
-                    // A non-header page's child references are charged to
-                    // it; the header's, which every flush rewrites, are not.
-                    let kids = match l.kind {
-                        PageKind::Header => 0,
-                        _ => self.children.get(&p).map_or(0, |k| charged_child_bytes(k)),
-                    };
-                    assert_eq!(l.coverage, want + kids, "coverage of page {p} ({l:?})");
-                    assert_eq!(
-                        l.slot.map(|s| s.bucket),
-                        self.wanted_bucket(p),
-                        "bucket of page {p} ({l:?})"
-                    );
-                    if let Some(s) = l.slot {
-                        let buckets = match l.kind {
-                            PageKind::Data => &self.data_buckets,
-                            _ => &self.table_buckets,
-                        };
-                        let list = &buckets.lists[s.bucket as usize];
-                        assert_eq!(list.get(s.index as usize), Some(&p), "slot of page {p}");
-                    }
+            if let Page::Live(l) = page {
+                match l.kind {
+                    PageKind::Data => assert_eq!(
+                        l.coverage as u64,
+                        data_cov.get(&p).copied().unwrap_or(0),
+                        "coverage of data page {p}"
+                    ),
+                    PageKind::Table => assert_eq!(
+                        l.coverage as u64,
+                        table_cov.get(&p).copied().unwrap_or(0),
+                        "coverage of leaf {p}"
+                    ),
+                    PageKind::Header => assert_eq!(p, header_slot, "a stale header"),
                 }
-                Page::Filling(f) => panic!("page {p} is filling outside a flush: {f:?}"),
-                other => assert_eq!(want, 0, "live content in page {p}, which is {other:?}"),
+                assert_eq!(
+                    l.slot.map(|s| s.bucket),
+                    self.wanted_bucket(p),
+                    "bucket of {p}"
+                );
+            } else {
+                assert!(
+                    !data_cov.contains_key(&p) && !table_cov.contains_key(&p),
+                    "page {p} is {page:?} but holds live content"
+                );
             }
         }
-        let _: BTreeSet<u32> = BTreeSet::new();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_go_lowest_first_and_follow_their_predecessor() {
+        let mut ids = Ids::default();
+        let a: Vec<u32> = (0..200).map(|_| ids.alloc(0).unwrap()).collect();
+        assert_eq!(a, (1..201).collect::<Vec<_>>());
+        for id in [5, 70, 130] {
+            ids.free(id);
+        }
+        assert_eq!(ids.alloc(0), Some(5));
+        assert_eq!(ids.alloc(69), Some(70));
+        assert_eq!(ids.alloc(0), Some(130));
+        assert_eq!(ids.alloc(0), Some(201));
+        assert_eq!(ids.count(), 201);
     }
 }

@@ -21,9 +21,22 @@ pub struct Options {
     /// transaction too large for them on its own takes more, and a flush
     /// follows it at once.
     pub journal_budget_pages: u32,
-    /// Content runs up to this many bytes are stated `Inline`, up to the
-    /// format's ceiling of 125 bytes, which caps any larger value.
+    /// New runs of bytes up to this many bytes are kept inline in their
+    /// span's entry, up to the format's ceiling of 126 bytes.
     pub inline_threshold: u32,
+    /// A span of bytes in a data page shorter than this is written again
+    /// whole where an edit cuts into it, rather than split in two.
+    pub rewrite_below: u32,
+    /// Two neighbouring spans whose entries leave the header for a leaf are
+    /// merged into one if they are shorter than this together.
+    pub span_min: u32,
+    /// Flushes a span's bytes must have stayed unwritten for it to count as
+    /// cold, which lets the rotating walk merge it with its neighbours.
+    pub cold_flushes: u32,
+    /// Spans the rotating walk looks at per flush.
+    pub walk: usize,
+    /// The price per byte a merge writes, in entry bytes it must retire.
+    pub mu: f64,
     /// Whether flushes consolidate at all.
     pub consolidate: bool,
     /// Budgeted consolidation pages per flush to start from.
@@ -37,28 +50,14 @@ pub struct Options {
     pub churn_floor: f64,
     /// The largest share of a page a flush's pages may close empty with.
     pub theta: f64,
-    /// How far `pack` looks ahead for a chunk that fits.
+    /// How far packing looks ahead for a chunk that fits.
     pub lookahead: usize,
     /// Victims sampled from the sparsest bucket.
     pub sample: usize,
-    /// Fragments the rotating window walks per flush.
-    pub walk: usize,
-    /// Pages per flush reserved for description defragmentation.
-    pub defrag_share: u32,
-    /// The price per byte a defragmentation writes.
-    pub mu: f64,
-    /// How much of an allocation's history of shifts each flush keeps: the
-    /// flushes that shifted bytes within an allocation, each decayed by this
-    /// factor per flush since, predict how often its fragments will be
-    /// stated again, and so whether a shifted range is better written again
-    /// to merge its fragments. 0 judges every shift on its own.
-    pub shift_decay: f64,
     /// The share of holes above which compaction mode runs.
     pub hole_share: f64,
     /// Truncate once the reusable tail reaches this many pages.
     pub truncate_tail: u32,
-    /// Keep a consolidator state in the file.
-    pub consolidator_state: bool,
 }
 
 impl Default for Options {
@@ -66,6 +65,11 @@ impl Default for Options {
         Options {
             journal_budget_pages: 256,
             inline_threshold: 64,
+            rewrite_below: 128,
+            span_min: 256,
+            cold_flushes: 16,
+            walk: 256,
+            mu: 0.02,
             consolidate: true,
             budget_pages: 8,
             budget_min: 1,
@@ -75,13 +79,8 @@ impl Default for Options {
             theta: 0.05,
             lookahead: 16,
             sample: 8,
-            walk: 512,
-            defrag_share: 1,
-            mu: 0.02,
-            shift_decay: 0.75,
             hole_share: 0.25,
             truncate_tail: 16,
-            consolidator_state: true,
         }
     }
 }

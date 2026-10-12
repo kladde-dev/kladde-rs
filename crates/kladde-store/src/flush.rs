@@ -1,18 +1,20 @@
-//! The flush (`impl/flush.md`, `impl/consolidation.md`): take the header,
-//! fold the journal, consolidate, pack data pages, cut the address table, and
-//! commit.
+//! The flush: fold the journal, map the new sequence onto spans, choose
+//! which entries the header keeps and merge short spans as theirs leave it,
+//! place new bytes in data pages, encode the span table, and commit.
 
+use std::cmp::Reverse;
 use std::collections::VecDeque;
 
 use crate::consts::*;
+use crate::entries::{children_len, estimate, Body, EntryOut, PageEncoder, Placed};
 use crate::error::{corrupt, Error};
-use crate::fold::{fold, Fold, Source};
-use crate::hash::{IdMap, IdSet};
+use crate::fold::{fold, Piece, Src};
+use crate::hash::IdSet;
 use crate::journal::Cursor;
-use crate::page::{decode_page, new_page, seal_page, PageBuf};
+use crate::page::{encode_page, new_page, seal_page, PageBuf};
 use crate::state::*;
-use crate::statement::{Kind, Stmt, TableLen, TableReader};
 use crate::store::{take_page, Inner, Tx};
+use crate::treap::NIL;
 
 /// A data page the flush fills.
 pub(crate) struct DataPage {
@@ -27,134 +29,37 @@ impl DataPage {
     }
 }
 
-/// Per id, the fragments that the bytes it shifted within itself become:
-/// each a destination range, and the pending content that states it there.
-type Restated = IdMap<Vec<(u32, u32, Pending)>>;
-
-/// What becomes of part of a range an id shifted within itself.
-enum Shifted {
-    /// A fragment, restated over `[a, b)` where its bytes lie.
-    State(u32, u32, Pending),
-    /// A run of fragments, written again over `[a, b)` as one chunk, from
-    /// the committed bytes at `from`.
-    Write { a: u32, b: u32, from: u32 },
-}
-
-/// About what a `Ref` statement's framing takes, in bytes: a tag, an offset,
-/// a size and an address, each a short varint.
-const REF_FRAMING: u64 = 9;
-
-/// About what the framing of an `Inline` or a `Zero` statement takes.
-const SHORT_FRAMING: u64 = 4;
-
-/// Zeros, stated as such.
-fn zero_pending() -> Pending {
-    Pending {
-        origin: Origin::None,
-        place: Place::Zero,
-        heat: 0,
-        rewrite: false,
-    }
-}
-
-/// Whether the cut's `derive` states `next` in one statement with `prev`,
-/// which it directly follows: the same id and kind, adjacent, and for a
-/// `Ref` adjacent bytes in one data page, for an `Inline` no longer than
-/// `threshold` together.
-fn continues(prev: &Stmt, next: &Stmt, threshold: u32) -> bool {
-    prev.id == next.id
-        && prev.kind == next.kind
-        && prev.offset + prev.size == next.offset
-        && match next.kind {
-            Kind::Ref => {
-                prev.address + prev.size as u64 == next.address
-                    && split_address(prev.address).0 == split_address(next.address).0
-            }
-            Kind::Inline => prev.size + next.size <= threshold,
-            _ => true,
-        }
-}
-
-/// Splits the pieces of `table` that name `id`'s committed bytes where those
-/// bytes enter or leave a range that more than one piece names, and returns
-/// those ranges: so that a piece lies wholly inside them, to be written
-/// again, or wholly outside, to be restated.
-fn split_at_copies(id: u32, table: &mut crate::fold::Table) -> Vec<(u32, u32)> {
-    let keys: Vec<(u32, Source)> = table.pieces.iter().map(|(&k, &s)| (k, s)).collect();
-    let copied = copied_ranges(id, &keys, table.size);
-    if copied.is_empty() {
-        return copied;
-    }
-    for (i, &(k, s)) in keys.iter().enumerate() {
-        let Source::Storage(src, so) = s else {
-            continue;
-        };
-        if src != id {
-            continue;
-        }
-        let end = keys.get(i + 1).map_or(table.size, |n| n.0);
-        let se = so + (end - k);
-        for &(a, b) in &copied {
-            for cut in [a, b] {
-                if so < cut && cut < se {
-                    table
-                        .pieces
-                        .insert(k + (cut - so), Source::Storage(id, cut));
-                }
-            }
-        }
-    }
-    copied
-}
-
-/// The ranges of `id`'s committed bytes that more than one piece of its
-/// table names, merged: what the journal copied rather than moved.
-fn copied_ranges(id: u32, keys: &[(u32, Source)], size: u32) -> Vec<(u32, u32)> {
-    let mut sources: Vec<(u32, u32)> = keys
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &(k, s))| match s {
-            Source::Storage(src, so) if src == id => {
-                let end = keys.get(i + 1).map_or(size, |n| n.0);
-                Some((so, so + (end - k)))
-            }
-            _ => None,
-        })
-        .collect();
-    sources.sort_unstable();
-    let mut copied: Vec<(u32, u32)> = Vec::new();
-    let mut reach = 0u32;
-    for &(a, b) in &sources {
-        if a < reach {
-            let overlap = (a, b.min(reach));
-            match copied.last_mut() {
-                Some(last) if last.1 >= overlap.0 => last.1 = last.1.max(overlap.1),
-                _ => copied.push(overlap),
-            }
-        }
-        reach = reach.max(b);
-    }
-    copied
-}
-
-/// A pending fragment waiting for a data page.
+/// What a span the flush made holds until it is placed: its bytes in the
+/// flush's scratch, and whether its entry will hold them inline.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Chunk {
-    pub key: Key,
-    pub len: u32,
-    pub rewrite: bool,
+pub(crate) struct PendingBytes {
+    pub start: u32,
+    pub inline: bool,
+}
+
+/// What one flush keeps while it works.
+#[derive(Default)]
+pub(crate) struct Flush {
+    /// Bytes of new spans and of runs that have no span yet.
+    pub scratch: Vec<u8>,
+    pub pending: Vec<PendingBytes>,
+    /// Spans that get a new entry in this flush.
+    pub stated: IdSet,
+    /// Those of them whose entry goes to the header; the rest go to leaves.
+    pub header: IdSet,
 }
 
 /// What the flush writes, gathered before the commit.
 #[derive(Default)]
 pub(crate) struct Output {
     pub data: Vec<DataPage>,
-    /// Address-table pages other than the header: page and content.
-    pub tables: Vec<(u32, Vec<u8>)>,
+    /// Leaves: page and buffer.
+    pub tables: Vec<(u32, Box<PageBuf>)>,
     pub header_content: Vec<u8>,
-    /// Table pages this flush unlinked or replaced.
-    pub dropped_tables: Vec<u32>,
 }
+
+/// The largest run of bytes a span shows from a data page.
+const C: u32 = MAX_PAGE_CONTENT as u32;
 
 impl Inner {
     /// Appends a batch's ready run, which lies outside any open transaction,
@@ -179,17 +84,14 @@ impl Inner {
     }
 
     /// Folds the operations the journal pages hold, `ops[..committed]`, and
-    /// drops them from the buffer, rebuilding the write-phase geometry from
-    /// what it still holds. Poisons the store if the flush fails.
+    /// drops them from the buffer. Poisons the store if the flush fails.
     pub(crate) fn fold_journal(&mut self, committed: Cursor) -> Result<(), Error> {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
         match self.flush_inner(committed) {
             Ok(()) => {
-                self.ops.drop_scratch();
                 self.ops.discard_to(committed);
-                self.repopulate_geometry();
                 Ok(())
             }
             Err(e) => {
@@ -202,766 +104,756 @@ impl Inner {
     fn flush_inner(&mut self, committed: Cursor) -> Result<(), Error> {
         let e = self.epoch + 1;
         self.state.flush_epoch = e;
-        self.state.pending.clear();
-        self.state.dropped_candidates.clear();
-        self.flush_rewritten.clear();
+        let mut f = Flush::default();
         self.begin_consolidation();
-        let mut dirty = Dirty::default();
 
-        // 1. The header's content, taken whole.
-        self.take_header(&mut dirty)?;
+        // 1. The fold, and the new sequence mapped onto spans.
+        let n0 = self.state.seq_len();
+        let pieces = fold(self.ops.range(self.ops.front(), committed), n0)?;
+        self.apply_pieces(&pieces, &mut f)?;
+        self.write_small_chains(&mut f)?;
 
-        // 2. The fold, with every read from elsewhere hoisted into the arena,
-        //    but for the bytes an id shifted within itself, which it restates.
-        let mut f = fold(self.ops.range(self.ops.front(), committed), |id| {
-            self.state.allocs.get(&id).map(|m| m.size)
-        });
-        let restated = self.hoist(&mut f)?;
-        self.apply_fold(f, restated, &mut dirty)?;
+        // 2. The header's entries, and merges of short spans as theirs leave
+        //    it; then the rotating walk's merges of cold spans.
+        self.choose_header(&mut f);
+        self.merge_evicted(&mut f)?;
         if self.opts.consolidate {
-            if self.opts.consolidator_state {
-                self.write_consolidator_state(&mut dirty)?;
-            }
-            // Description defragmentation's share: rewrites chosen now are
-            // written like the flush's own.
-            self.defrag_share(&mut dirty)?;
+            self.walk(&mut f)?;
         }
 
         // 3. Data pages, with victims riding along, then budgeted pages.
         let mut out = Output::default();
-        self.pack(&mut dirty, &mut out)?;
+        self.pack(&mut f, &mut out)?;
         if self.opts.consolidate {
-            self.budget_loop(&mut dirty, &mut out)?;
+            self.budget_loop(&mut f, &mut out)?;
         }
 
-        // 4. The address table.
-        self.cut(&mut dirty, &mut out)?;
+        // 4. The span table.
+        self.cut(&mut f, &mut out)?;
 
         // 5. Write, fsync, commit.
-        self.commit(e, &dirty, out)
+        self.commit(e, out)
     }
 
-    // ---------------------------------------------------------------- taking
+    // ---------------------------------------------------------------- spans
 
-    /// Takes the content of fragment `f` over `[start, end)` of `id` in
-    /// place: its bytes stay where they are, and the cut states it again.
-    pub(crate) fn take_in_place(
-        &mut self,
-        id: u32,
-        start: u32,
-        end: u32,
-        f: Fragment,
-        heat: u32,
-        dirty: &mut Dirty,
-    ) {
-        let p = match f {
-            Fragment::Bytes { page, offset, stmt } => {
-                let a = address(page, offset);
-                if self.state.slab.kinds[stmt.idx()] == Kind::Inline {
-                    Pending {
-                        origin: Origin::File(a),
-                        place: Place::Inline,
-                        heat,
-                        rewrite: false,
-                    }
-                } else {
-                    Pending {
-                        origin: Origin::File(a),
-                        place: Place::Data(a),
-                        heat,
-                        rewrite: false,
-                    }
-                }
+    /// Ends span `id` within the flush.
+    pub(crate) fn kill_in(&mut self, f: &mut Flush, id: u32) {
+        self.state.kill(id);
+        f.stated.remove(&id);
+        f.header.remove(&id);
+    }
+
+    /// Appends the bytes span `id` shows to the scratch, and returns where
+    /// they start there.
+    pub(crate) fn span_to_scratch(&mut self, f: &mut Flush, id: u32) -> Result<u32, Error> {
+        let start = f.scratch.len() as u32;
+        let s = *self.state.span(id);
+        let n = s.len as usize;
+        match s.content {
+            Content::Ref { page, offset } | Content::Inline { page, offset } => {
+                let buf = self.page_bytes(page)?;
+                f.scratch
+                    .extend_from_slice(&buf[offset as usize..offset as usize + n]);
             }
-            Fragment::Zero { .. } => Pending {
-                origin: Origin::None,
-                place: Place::Zero,
-                heat,
-                rewrite: false,
-            },
-            Fragment::Pending(_) => return,
-        };
-        self.state.take(id, start, end, p, dirty);
+            Content::Zero => f.scratch.resize(f.scratch.len() + n, 0),
+            Content::Pending(i) => {
+                let p = f.pending[i as usize].start as usize;
+                f.scratch.extend_from_within(p..p + n);
+            }
+            Content::Free => return Err(corrupt(format!("reading free span {id}"))),
+        }
+        Ok(start)
     }
 
-    /// The fragments over `[start, end)` of `id` owned by statements in `page`.
-    pub(crate) fn owned_in(
-        &self,
-        id: u32,
+    /// Makes new spans of `len` bytes of the scratch from `start`, of chain
+    /// `chain`, whose bytes the application wrote in flush `heat`: one
+    /// inline span if they are short, else spans of at most a page each,
+    /// and a span of zeros for a run of them. Returns their ids, in order,
+    /// linked to each other but not to what follows.
+    fn new_spans(
+        &mut self,
+        f: &mut Flush,
         start: u32,
-        end: u32,
-        page: u32,
-    ) -> Vec<(u32, u32, Fragment)> {
-        let size = self.state.size_of(id);
-        let end = end.min(size);
+        len: u32,
+        chain: Chain,
+        heat: u64,
+        after: u32,
+    ) -> Result<Vec<u32>, Error> {
+        let inline_max = self.opts.inline_threshold.min(MAX_INLINE as u32);
         let mut out = Vec::new();
-        if start >= end {
-            return out;
-        }
-        let first = self
-            .state
-            .frags
-            .range(..=key(id, start))
-            .next_back()
-            .map(|(&k, _)| k)
-            .filter(|&k| kid(k) == id)
-            .unwrap_or(key(id, start));
-        let mut it = self.state.frags.range(first..key(id, end)).peekable();
-        while let Some((&k, &f)) = it.next() {
-            let fend = match it.peek() {
-                Some((&n, _)) => koff(n),
-                None => self.state.frag_end(k),
+        let mut at = 0u32;
+        let mut prev = after;
+        while at < len {
+            let n = if len <= inline_max {
+                len
+            } else {
+                (len - at).min(C)
             };
-            if let Some(s) = f.stmt() {
-                if self.state.slab.page(s) == page {
-                    out.push((koff(k).max(start), fend.min(end), f));
-                }
-            }
-        }
-        out
-    }
-
-    /// Flushes untouched since `id` was last written: the heat the header's
-    /// split ranks by.
-    pub(crate) fn heat_of(&self, id: u32) -> u32 {
-        let lw = self.state.allocs.get(&id).map_or(0, |m| m.last_written);
-        (self.state.flush_epoch.saturating_sub(lw)).min(u32::MAX as u64) as u32
-    }
-
-    /// Takes the live content of the address-table page `page` in place, and
-    /// drops its statements physically. The header's take and the page
-    /// rewrite are this, for different pages.
-    pub(crate) fn rewrite_table_page(&mut self, page: u32, dirty: &mut Dirty) -> Result<(), Error> {
-        let buf = self
-            .table_pages
-            .get(&page)
-            .ok_or_else(|| corrupt("a table page is not resident"))?
-            .clone();
-        let is_header = page < 2;
-        let d = decode_page(&buf, is_header)
-            .map_err(|_| corrupt("a resident table page does not decode"))?;
-        let (_, mut r) = TableReader::open(&buf[..], d.content)?;
-        while let Some(dec) = r.next_stmt()? {
-            let s = dec.stmt;
-            let id = s.id;
-            let heat = self.heat_of(id);
-            if s.kind.is_content() {
-                let (start, end) = (s.offset, s.offset.saturating_add(s.size));
-                for (a, b, f) in self.owned_in(id, start, end, page) {
-                    self.take_in_place(id, a, b, f, heat, dirty);
-                }
-            }
-            // A size statement or tombstone that lived here is stated again.
-            let held = match self.state.allocs.get(&id) {
-                Some(m) => m.size_statement,
-                None => self.state.recyclable.get(&id).and_then(|r| r.tombstone),
+            let bytes = &f.scratch[(start + at) as usize..(start + at + n) as usize];
+            let zeros = n >= 32 && bytes.iter().all(|&b| b == 0);
+            let content = if zeros {
+                Content::Zero
+            } else {
+                f.pending.push(PendingBytes {
+                    start: start + at,
+                    inline: len <= inline_max,
+                });
+                Content::Pending((f.pending.len() - 1) as u32)
             };
-            if held.is_some_and(|h| self.state.slab.page(h) == page) {
-                self.touch(id, false, dirty).replace = true;
+            let id = self.state.new_span(prev).ok_or(Error::OutOfBounds)?;
+            *self.state.span_mut(id) = Span {
+                len: n,
+                next: 0,
+                content,
+                chain,
+                entry_page: NONE,
+                heat,
+                node: NIL,
+                ..Span::default()
+            };
+            if let Some(&p) = out.last() {
+                self.state.span_mut(p).next = id;
             }
-            self.state.drop_physically(id);
+            f.stated.insert(id);
+            out.push(id);
+            prev = id;
+            at += n;
         }
-        Ok(())
+        Ok(out)
     }
 
-    /// The bytes that stating again what table page `page` holds would take,
-    /// computed from the fragment map without taking anything: a statement
-    /// per run of the fragments its live statements own, merged as the cut
-    /// merges a run, and a `Size` or `Tombstone` for each id whose size
-    /// statement or tombstone it holds, encoded as one run of their own.
-    ///
-    /// Merged into a page among other statements, they add at most this
-    /// much to it: each statement's delta to its neighbour there is no
-    /// larger than in the run, whose first statement already pays its whole
-    /// id and offset, and merging with neighbours only drops statements.
-    pub(crate) fn restatement_len(&self, page: u32) -> Result<usize, Error> {
-        let buf = self
-            .table_pages
-            .get(&page)
-            .ok_or_else(|| corrupt("a table page is not resident"))?;
-        let d = decode_page(buf, page < 2)
-            .map_err(|_| corrupt("a resident table page does not decode"))?;
-        let (_, mut r) = TableReader::open(&buf[..], d.content)?;
-        let threshold = self.opts.inline_threshold.clamp(1, MAX_INLINE as u32);
-        let mut stmts: Vec<Stmt> = Vec::new();
-        let mut held: Vec<u32> = Vec::new();
-        while let Some(dec) = r.next_stmt()? {
-            let s = dec.stmt;
-            let id = s.id;
-            if s.kind.is_content() {
-                let (start, end) = (s.offset, s.offset.saturating_add(s.size));
-                for (a, b, f) in self.owned_in(id, start, end, page) {
-                    let next = match f {
-                        Fragment::Bytes { stmt, .. }
-                            if self.state.slab.kinds[stmt.idx()] == Kind::Inline =>
-                        {
-                            Stmt::inline(id, a, b - a)
-                        }
-                        Fragment::Bytes { page, offset, .. } => {
-                            Stmt::reference(id, a, b - a, address(page, offset))
-                        }
-                        Fragment::Zero { .. } => Stmt::zero(id, a, b - a),
-                        Fragment::Pending(_) => continue,
-                    };
-                    match stmts.last_mut() {
-                        Some(prev) if continues(prev, &next, threshold) => prev.size += next.size,
-                        _ => stmts.push(next),
+    /// The span a rope node holds.
+    fn span_at(&self, node: u32) -> u32 {
+        match *self.state.rope.item(node) {
+            RopeItem::Span { id, .. } => id,
+            RopeItem::Lit { .. } => unreachable!("a literal where a span was expected"),
+        }
+    }
+
+    // ---------------------------------------------------------------- mapping
+
+    /// Maps the new sequence, as the fold's pieces describe it, onto spans:
+    /// committed ranges keep the spans that showed them, split where a range
+    /// ends inside one, and new bytes become new spans; spans no piece
+    /// shows end. Every span whose length or successor changed is stated.
+    fn apply_pieces(&mut self, pieces: &[Piece], f: &mut Flush) -> Result<(), Error> {
+        let n0 = self.state.seq_len();
+        let unchanged = match pieces {
+            [] => n0 == 0,
+            [p] => p.src == Src::Committed(0) && p.len == n0,
+            _ => false,
+        };
+        if unchanged {
+            return Ok(());
+        }
+        let mut cuts: Vec<u64> = Vec::new();
+        for p in pieces {
+            if let Src::Committed(s) = p.src {
+                cuts.push(s);
+                cuts.push(s + p.len);
+            }
+        }
+        cuts.retain(|&x| x > 0 && x < n0);
+        cuts.sort_unstable();
+        cuts.dedup();
+        for &x in &cuts {
+            self.boundary(x, f)?;
+        }
+        // The committed sequence, cut into segments at those positions.
+        let mut segs: Vec<(u64, u32, bool)> = Vec::new();
+        if n0 > 0 {
+            let mut rest = self.state.root;
+            let mut prev = 0u64;
+            for &x in cuts.iter().chain(std::iter::once(&n0)) {
+                let (seg, r) = self.state.rope.split(rest, x - prev);
+                segs.push((prev, seg, false));
+                rest = r;
+                prev = x;
+            }
+            debug_assert_eq!(rest, NIL);
+        }
+        let mut root = NIL;
+        let mut touched: Vec<u32> = Vec::new();
+        for p in pieces {
+            match p.src {
+                Src::Committed(s) => {
+                    let i = segs
+                        .binary_search_by_key(&s, |x| x.0)
+                        .map_err(|_| corrupt("a piece starts inside a segment"))?;
+                    let seg = segs[i].1;
+                    debug_assert_eq!(self.state.rope.sum(seg), p.len);
+                    segs[i].2 = true;
+                    touched.push(self.state.rope.first(seg));
+                    touched.push(self.state.rope.last(seg));
+                    root = self.state.rope.merge(root, seg);
+                }
+                Src::Arena(a) => {
+                    let mut done = 0u64;
+                    while done < p.len {
+                        let n = (p.len - done).min(1 << 30);
+                        let start = f.scratch.len();
+                        f.scratch.resize(start + n as usize, 0);
+                        self.ops.copy_bytes(a + done, &mut f.scratch[start..]);
+                        self.stats.fresh_bytes += n;
+                        let node = self.state.rope.node(RopeItem::Lit {
+                            start: start as u32,
+                            len: n as u32,
+                        });
+                        touched.push(node);
+                        root = self.state.rope.merge(root, node);
+                        done += n;
                     }
                 }
             }
-            let h = match self.state.allocs.get(&id) {
-                Some(m) => m.size_statement,
-                None => self.state.recyclable.get(&id).and_then(|r| r.tombstone),
-            };
-            if h.is_some_and(|h| self.state.slab.page(h) == page) && held.last() != Some(&id) {
-                held.push(id);
-            }
         }
-        // As the cut states them: a `Size` only where no content statement
-        // ends at the size, and a tombstone wherever one may be needed.
-        let ends: IdSet = stmts
-            .iter()
-            .filter(|s| s.offset + s.size == self.state.size_of(s.id))
-            .map(|s| s.id)
-            .collect();
-        for id in held {
-            match self.state.allocs.get(&id) {
-                Some(m) if !ends.contains(&id) => stmts.push(Stmt::size_to(id, m.size)),
-                Some(_) => {}
-                None => stmts.push(Stmt::tombstone(id)),
-            }
-        }
-        stmts.sort_by_key(Stmt::sort_key);
-        let mut w = TableLen::new();
-        w.end_children();
-        for s in &stmts {
-            w.push(s);
-        }
-        Ok(w.len() - 1)
-    }
-
-    fn take_header(&mut self, dirty: &mut Dirty) -> Result<(), Error> {
-        self.flush_rewritten.insert(self.header_slot);
-        self.rewrite_table_page(self.header_slot, dirty)
-    }
-
-    /// Records that the flush changed `id`, the first time it does.
-    pub(crate) fn touch<'a>(
-        &mut self,
-        id: u32,
-        written: bool,
-        dirty: &'a mut Dirty,
-    ) -> &'a mut IdRecord {
-        let size_before = self.state.size_of(id);
-        if written {
-            if let Some(m) = self.state.allocs.get_mut(&id) {
-                m.last_written = self.state.flush_epoch;
-            }
-        }
-        let rec = dirty.records.entry(id).or_insert(IdRecord {
-            size_before,
-            ..Default::default()
-        });
-        rec.written |= written;
-        rec
-    }
-
-    // ------------------------------------------------------------ the fold
-
-    /// Reads every piece that the fold sources from committed content other
-    /// than where it already lies, and turns it into a literal; except a
-    /// piece that an id still in its committed incarnation shifted within
-    /// itself, by a splice or a move, whose bytes no other piece names. Such
-    /// a piece is restated instead, but for runs of fragments that are
-    /// cheaper to write again than to describe at this and the later shifts
-    /// the allocation's history predicts, which are read and written again
-    /// as one chunk each (see [`restatement`](Self::restatement)): returned
-    /// per id are the fragments it becomes, each a destination range and
-    /// what states it there.
-    ///
-    /// Bytes that two pieces name were copied, and are written again, so that
-    /// no data byte is referenced by two live statements.
-    fn hoist(&mut self, f: &mut Fold) -> Result<Restated, Error> {
-        let mut reads: Vec<(u32, u32, u32, u32, u32)> = Vec::new();
-        let mut restated = Restated::default();
-        let mut copies: IdMap<Vec<(u32, u32)>> = IdMap::default();
-        for (&id, e) in f.ids.iter_mut() {
-            if e.exists && e.existed && !e.ended && e.committed_live {
-                let copied = split_at_copies(id, &mut e.table);
-                if !copied.is_empty() {
-                    copies.insert(id, copied);
-                }
-            }
-        }
-        // Runs of shifted bytes to write again, as (id, at, end, from).
-        let mut merges: Vec<(u32, u32, u32, u32)> = Vec::new();
-        let mut shifted_ids: Vec<u32> = Vec::new();
-        let (epoch, decay) = (self.state.flush_epoch, self.opts.shift_decay);
-        for (&id, e) in &f.ids {
-            if !e.exists {
+        for (_, seg, used) in segs {
+            if used {
                 continue;
             }
-            let keys: Vec<(u32, Source)> = e.table.pieces.iter().map(|(&k, &s)| (k, s)).collect();
-            let persistent = e.existed && !e.ended && e.committed_live;
-            let copied = copies.get(&id).map_or(&[][..], |c| &c[..]);
-            let horizon = self
-                .state
-                .allocs
-                .get(&id)
-                .map_or(0.0, |m| m.shifts_at(epoch, decay));
-            let mut shifted_here = false;
-            for (i, &(k, s)) in keys.iter().enumerate() {
-                if let Source::Storage(src, so) = s {
-                    let identity = src == id && so == k && e.committed_live;
-                    if identity {
+            for n in self.state.rope.nodes(seg) {
+                if let RopeItem::Span { id, .. } = *self.state.rope.item(n) {
+                    self.kill_in(f, id);
+                }
+            }
+            self.state.rope.free_tree(seg);
+        }
+        self.state.root = root;
+        self.settle(f, touched)
+    }
+
+    /// Makes position `x` of the committed sequence a boundary between rope
+    /// items: a long span of a data page or of zeros is split, its left part
+    /// keeping its id; a short or inline span becomes a run of literal bytes,
+    /// to be written again with whatever lands next to it.
+    fn boundary(&mut self, x: u64, f: &mut Flush) -> Result<(), Error> {
+        loop {
+            let Some((node, off)) = self.state.rope.find(self.state.root, x) else {
+                return Ok(());
+            };
+            if off == 0 {
+                return Ok(());
+            }
+            let off32 = off as u32;
+            match *self.state.rope.item(node) {
+                RopeItem::Lit { start, len } => {
+                    self.state
+                        .rope
+                        .set_item(node, RopeItem::Lit { start, len: off32 });
+                    let m = self.state.rope.node(RopeItem::Lit {
+                        start: start + off32,
+                        len: len - off32,
+                    });
+                    self.insert_at(x, m);
+                    return Ok(());
+                }
+                RopeItem::Span { id, len } => {
+                    let s = *self.state.span(id);
+                    let dissolve = match s.content {
+                        Content::Inline { .. } => true,
+                        Content::Ref { .. } => len < self.opts.rewrite_below,
+                        _ => false,
+                    };
+                    if dissolve {
+                        let start = self.span_to_scratch(f, id)?;
+                        self.stats.rewritten_bytes += len as u64;
+                        self.kill_in(f, id);
+                        self.state.rope.set_item(node, RopeItem::Lit { start, len });
                         continue;
                     }
-                    let end = keys.get(i + 1).map_or(e.table.size, |n| n.0);
-                    let len = end - k;
-                    let shifted = persistent && src == id;
-                    if shifted && !copied.iter().any(|&(a, b)| a < so + len && so < b) {
-                        if let Some(parts) = self.restatement(id, k, end, so, horizon) {
-                            shifted_here = true;
-                            for part in parts {
-                                match part {
-                                    Shifted::State(a, b, p) => {
-                                        restated.entry(id).or_default().push((a, b, p));
-                                    }
-                                    Shifted::Write { a, b, from } => merges.push((id, a, b, from)),
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                    reads.push((id, k, src, so, len));
+                    let content = match s.content {
+                        Content::Ref { page, offset } => Content::Ref {
+                            page,
+                            offset: offset + off as u16,
+                        },
+                        Content::Zero => Content::Zero,
+                        other => unreachable!("splitting a span that shows {other:?}"),
+                    };
+                    let t = self.state.new_span(id).ok_or(Error::OutOfBounds)?;
+                    *self.state.span_mut(t) = Span {
+                        len: len - off32,
+                        next: s.next,
+                        content,
+                        chain: Chain::Sequence,
+                        entry_page: NONE,
+                        heat: s.heat,
+                        node: NIL,
+                        ..Span::default()
+                    };
+                    self.state.span_mut(id).len = off32;
+                    self.state.span_mut(id).next = t;
+                    self.state.note_data(t);
+                    self.state
+                        .rope
+                        .set_item(node, RopeItem::Span { id, len: off32 });
+                    let m = self.state.rope.node(RopeItem::Span {
+                        id: t,
+                        len: len - off32,
+                    });
+                    self.state.span_mut(t).node = m;
+                    self.insert_at(x, m);
+                    f.stated.insert(id);
+                    f.stated.insert(t);
+                    self.stats.span_splits += 1;
+                    return Ok(());
                 }
             }
-            if shifted_here {
-                shifted_ids.push(id);
-            }
         }
-        for id in shifted_ids {
-            if let Some(m) = self.state.allocs.get_mut(&id) {
-                m.shifts = (m.shifts_at(epoch, decay) + 1.0) as f32;
-                m.shifted_epoch = epoch as u32;
-            }
-        }
-        for (id, a, b, from) in merges {
-            let mut bytes = vec![0u8; (b - a) as usize];
-            self.read_committed(id, from, &mut bytes)?;
-            let pos = self.ops.scratch(&bytes);
-            let p = Pending {
-                origin: Origin::Arena(pos),
-                place: Place::Unplaced,
-                heat: 0,
-                rewrite: false,
-            };
-            restated.entry(id).or_default().push((a, b, p));
-        }
-        for (id, k, src, so, len) in reads {
-            let mut bytes = vec![0u8; len as usize];
-            self.read_committed(src, so, &mut bytes)?;
-            let pos = self.ops.scratch(&bytes);
-            f.ids
-                .get_mut(&id)
-                .unwrap()
-                .table
-                .pieces
-                .insert(k, Source::Literal(pos));
-        }
-        Ok(restated)
     }
 
-    /// What becomes of the committed bytes `[so, so + end - k)` of `id`,
-    /// shifted to `[k, end)`: in order, runs of the fragments they lie in,
-    /// each restated where it lies, and runs written again as one chunk, to
-    /// merge fragments whose statements would cost more than their bytes.
-    ///
-    /// The costs are estimates in bytes: a `Ref` statement takes about
-    /// [`REF_FRAMING`] bytes, an `Inline` one its payload and
-    /// [`SHORT_FRAMING`] more, and a `Zero` one [`SHORT_FRAMING`]; writing a
-    /// run again costs its bytes and a `Ref` for every page it fills. A
-    /// statement is paid not only now but at every later flush that shifts
-    /// the bytes again, which `horizon` predicts from the allocation's past
-    /// shifts; so a run is written again where its statements, times one
-    /// plus the horizon, would cost more than its bytes plus its new `Ref`s,
-    /// times the same.
-    fn restatement(
-        &self,
-        id: u32,
-        k: u32,
-        end: u32,
-        so: u32,
-        horizon: f64,
-    ) -> Option<Vec<Shifted>> {
-        /// A fragment of the shifted range: where it goes, what restates
-        /// it, what that costs per flush, and whether it may be merged.
-        struct Piece {
-            a: u32,
-            b: u32,
-            p: Pending,
-            cost: u64,
-            mergeable: bool,
-        }
-        let se = so + (end - k);
-        let size = self.state.size_of(id);
-        let mut pieces = Vec::new();
-        let mut at = so;
-        while at < se {
-            if at >= size {
-                // Past the committed size: zeros, below the old size never
-                // stated, and so never worth merging.
-                pieces.push(Piece {
-                    a: k + at - so,
-                    b: end,
-                    p: zero_pending(),
-                    cost: SHORT_FRAMING,
-                    mergeable: false,
-                });
-                break;
-            }
-            let (fk, frag, fend) = self.state.resolve(id, at)?;
-            let d = at - koff(fk);
-            let to = fend.min(se);
-            let (p, cost) = match frag {
-                Fragment::Bytes { page, offset, stmt } => {
-                    let a = address(page, offset + d as u16);
-                    if self.state.slab.kinds[stmt.idx()] == Kind::Inline {
-                        let p = Pending {
-                            origin: Origin::File(a),
-                            place: Place::Inline,
-                            heat: 0,
-                            rewrite: false,
-                        };
-                        (p, SHORT_FRAMING + (to - at) as u64)
-                    } else {
-                        let p = Pending {
-                            origin: Origin::File(a),
-                            place: Place::Data(a),
-                            heat: 0,
-                            rewrite: false,
-                        };
-                        (p, REF_FRAMING)
-                    }
-                }
-                Fragment::Zero { .. } => (zero_pending(), SHORT_FRAMING),
-                Fragment::Pending(p) => {
-                    let mut q = self.state.pending[p as usize].advanced(d);
-                    q.heat = 0;
-                    let cost = match q.place {
-                        Place::Data(_) | Place::Unplaced => REF_FRAMING,
-                        Place::Inline => SHORT_FRAMING + (to - at) as u64,
-                        Place::Zero => SHORT_FRAMING,
-                    };
-                    (q, cost)
-                }
-            };
-            pieces.push(Piece {
-                a: k + at - so,
-                b: k + to - so,
-                p,
-                cost,
-                mergeable: true,
-            });
-            at = to;
-        }
+    /// Inserts the one-node tree `m` at position `x` of the rope, which must
+    /// fall between items.
+    fn insert_at(&mut self, x: u64, m: u32) {
+        let rope = &mut self.state.rope;
+        let (l, r) = rope.split(self.state.root, x);
+        let l = rope.merge(l, m);
+        self.state.root = rope.merge(l, r);
+    }
 
-        // The runs worth writing again: in every stretch of mergeable pieces,
-        // Kadane's maximum-weight run, where a piece weighs what restating
-        // it costs over the horizon less its bytes, kept if it outweighs the
-        // `Ref`s it would need over the same horizon.
-        let m = 1.0 + horizon;
-        let weight = |p: &Piece| m * p.cost as f64 - (p.b - p.a) as f64;
-        let worth = |run: &[Piece]| {
-            let len = (run[run.len() - 1].b - run[0].a) as u64;
-            let refs = m * (REF_FRAMING * len.div_ceil(MAX_PAGE_CONTENT as u64)) as f64;
-            run.iter().map(weight).sum::<f64>() > refs
-        };
-        let mut merge = vec![false; pieces.len()];
-        let (mut cur, mut from) = (0.0f64, 0usize);
-        let mut best: Option<(f64, usize, usize)> = None;
-        let close = |best: &mut Option<(f64, usize, usize)>, merge: &mut [bool]| {
-            if let Some((_, i, j)) = best.take() {
-                if worth(&pieces[i..=j]) {
-                    merge[i..=j].fill(true);
-                }
-            }
-        };
-        for (j, p) in pieces.iter().enumerate() {
-            if !p.mergeable {
-                close(&mut best, &mut merge);
-                cur = 0.0;
+    /// Turns every run of literal bytes that `touched` reaches into new
+    /// spans, and links every span around a touched node to the span that
+    /// now follows it, stating those whose successor changed.
+    fn settle(&mut self, f: &mut Flush, touched: Vec<u32>) -> Result<(), Error> {
+        let e = self.state.flush_epoch;
+        let mut gone = IdSet::default();
+        let mut link: Vec<u32> = Vec::new();
+        for &n in &touched {
+            if n == NIL || gone.contains(&n) {
                 continue;
             }
-            let x = weight(p);
-            if cur <= 0.0 {
-                close(&mut best, &mut merge);
-                (cur, from) = (x, j);
-            } else {
-                cur += x;
-            }
-            if cur > 0.0 && best.is_none_or(|(s, _, _)| cur > s) {
-                best = Some((cur, from, j));
-            }
-        }
-        close(&mut best, &mut merge);
-
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < pieces.len() {
-            if merge[i] {
-                let mut j = i;
-                while j + 1 < pieces.len() && merge[j + 1] {
-                    j += 1;
-                }
-                let (a, b) = (pieces[i].a, pieces[j].b);
-                out.push(Shifted::Write {
-                    a,
-                    b,
-                    from: so + (a - k),
-                });
-                i = j + 1;
-            } else {
-                let p = &pieces[i];
-                out.push(Shifted::State(p.a, p.b, p.p));
-                i += 1;
-            }
-        }
-        Some(out)
-    }
-
-    /// Takes the pieces of `table` that change `id`'s content: literals,
-    /// grouped into runs that go `Inline` when short; zeros below
-    /// `zero_limit`, which deny content the id had before; and `restated`,
-    /// the fragments of the pieces [`hoist`](Self::hoist) left to restate.
-    fn take_pieces(
-        &mut self,
-        id: u32,
-        table: &crate::fold::Table,
-        identity: bool,
-        zero_limit: u32,
-        restated: Vec<(u32, u32, Pending)>,
-        dirty: &mut Dirty,
-    ) {
-        let keys: Vec<(u32, Source)> = table.pieces.iter().map(|(&k, &s)| (k, s)).collect();
-        let mut i = 0;
-        while i < keys.len() {
-            let (k, s) = keys[i];
-            let end = keys.get(i + 1).map_or(table.size, |n| n.0);
-            match s {
-                Source::Storage(src, so) if identity && src == id && so == k => i += 1,
-                Source::Storage(src, _) => {
-                    debug_assert!(
-                        identity && src == id && restated.iter().any(|t| t.0 == k),
-                        "a piece from elsewhere that was neither hoisted nor restated"
-                    );
-                    i += 1;
-                }
-                Source::Zero => {
-                    let e = end.min(zero_limit);
-                    if k < e {
-                        let p = Pending {
-                            origin: Origin::None,
-                            place: Place::Zero,
-                            heat: 0,
-                            rewrite: false,
-                        };
-                        self.state.take(id, k, e, p, dirty);
+            match *self.state.rope.item(n) {
+                RopeItem::Span { .. } => link.push(n),
+                RopeItem::Lit { .. } => {
+                    let rope = &self.state.rope;
+                    let is_lit = |m: u32| m != NIL && matches!(rope.item(m), RopeItem::Lit { .. });
+                    let mut a = n;
+                    while is_lit(rope.prev(a)) {
+                        a = rope.prev(a);
                     }
-                    i += 1;
-                }
-                Source::Literal(_) => {
-                    // A run of adjacent literal pieces.
-                    let mut j = i;
-                    let mut run_end = end;
-                    while j + 1 < keys.len() && matches!(keys[j + 1].1, Source::Literal(_)) {
-                        j += 1;
-                        run_end = keys.get(j + 1).map_or(table.size, |n| n.0);
+                    let mut run = Vec::new();
+                    let mut m = a;
+                    while is_lit(m) {
+                        run.push(m);
+                        m = rope.next(m);
                     }
-                    // A short run goes inline, unless it borders shifted
-                    // bytes written again, which it joins in a data page,
-                    // so that the cut can state both in one `Ref`.
-                    let borders_merge = restated.iter().any(|&(a, b, p)| {
-                        matches!(p.origin, Origin::Arena(_)) && (b == k || a == run_end)
-                    });
-                    let inline = run_end - k <= self.opts.inline_threshold.min(MAX_INLINE as u32);
-                    let place = if inline && !borders_merge {
-                        Place::Inline
-                    } else {
-                        Place::Unplaced
-                    };
-                    for (t, &(pk, ps)) in keys.iter().enumerate().take(j + 1).skip(i) {
-                        let pe = keys.get(t + 1).map_or(table.size, |n| n.0);
-                        let Source::Literal(pos) = ps else {
+                    let pos = rope.pos_of(a);
+                    // The run's bytes, contiguous in the scratch.
+                    let mut total = 0u64;
+                    let mut contiguous = true;
+                    let mut expect = None;
+                    for &r in &run {
+                        let RopeItem::Lit { start, len } = *rope.item(r) else {
                             unreachable!()
                         };
-                        let p = Pending {
-                            origin: Origin::Arena(pos),
-                            place,
-                            heat: 0,
-                            rewrite: false,
+                        if expect.is_some_and(|x| x != start) {
+                            contiguous = false;
+                        }
+                        expect = Some(start + len);
+                        total += len as u64;
+                    }
+                    let start = if contiguous {
+                        let RopeItem::Lit { start, .. } = *rope.item(a) else {
+                            unreachable!()
                         };
-                        self.state.take(id, pk, pe, p, dirty);
-                        self.stats.fresh_bytes += (pe - pk) as u64;
+                        start
+                    } else {
+                        let at = f.scratch.len() as u32;
+                        for &r in &run {
+                            let RopeItem::Lit { start, len } = *self.state.rope.item(r) else {
+                                unreachable!()
+                            };
+                            f.scratch
+                                .extend_from_within(start as usize..(start + len) as usize);
+                        }
+                        at
+                    };
+                    for &r in &run {
+                        gone.insert(r);
                     }
-                    i = j + 1;
+                    let rope = &mut self.state.rope;
+                    let (l, rest) = rope.split(self.state.root, pos);
+                    let (mid, r) = rope.split(rest, total);
+                    rope.free_tree(mid);
+                    self.state.root = rope.merge(l, r);
+                    let total32 = u32::try_from(total).map_err(|_| Error::OutOfBounds)?;
+                    let ids = self.new_spans(f, start, total32, Chain::Sequence, e, 0)?;
+                    let mut at = pos;
+                    for id in ids {
+                        let len = self.state.span(id).len;
+                        let node = self.state.rope.node(RopeItem::Span { id, len });
+                        self.state.span_mut(id).node = node;
+                        gone.remove(&node);
+                        self.insert_at(at, node);
+                        at += len as u64;
+                        link.push(node);
+                    }
                 }
             }
         }
-        for (a, b, p) in restated {
-            // Zeros at or past the old size are pending already, as the
-            // zeros the growth exposed.
-            let b = if p.place == Place::Zero {
-                b.min(zero_limit)
-            } else {
-                b
-            };
-            if a >= b {
+        for n in link {
+            if gone.contains(&n) {
                 continue;
             }
-            self.state.take(id, a, b, p, dirty);
-            if let Origin::Arena(_) = p.origin {
-                // A run written again to merge its fragments.
-                self.stats.merged_bytes += (b - a) as u64;
-                continue;
-            }
-            if let Place::Data(addr) = p.place {
-                // The bytes lie where they did, at a new offset: widen the
-                // reverse index's window, the one rule that keeps it true.
-                self.state.note_reverse(split_address(addr).0, id, a, b);
-            }
-            self.stats.restated_bytes += (b - a) as u64;
-        }
-    }
-
-    /// Grows `id` to `new`. The range the growth exposes is taken as zeros,
-    /// which whatever the flush writes there replaces: every byte an
-    /// allocation gains is stated in the epoch that gains it
-    /// (`spec/address-table.md#the-coverage-rule`).
-    pub(crate) fn grow(&mut self, id: u32, new: u32, dirty: &mut Dirty) {
-        let p = Pending {
-            origin: Origin::None,
-            place: Place::Zero,
-            heat: 0,
-            rewrite: false,
-        };
-        self.state.grow_size_to(id, new, p, dirty);
-    }
-
-    fn apply_fold(
-        &mut self,
-        f: Fold,
-        mut restated: Restated,
-        dirty: &mut Dirty,
-    ) -> Result<(), Error> {
-        for (id, e) in f.ids {
-            match (e.existed, e.ended, e.exists) {
-                (true, false, true) => {
-                    self.touch(id, e.written, dirty);
-                    let old = self.state.size_of(id);
-                    let new = e.table.size;
-                    if new < old {
-                        self.state.shrink_size_to(id, new);
-                    } else if new > old {
-                        self.grow(id, new, dirty);
-                    }
-                    let takes = restated.remove(&id).unwrap_or_default();
-                    self.take_pieces(id, &e.table, true, old.min(new), takes, dirty);
+            let p = self.state.rope.prev(n);
+            for m in [p, n] {
+                if m == NIL {
+                    continue;
                 }
-                (true, true, false) => self.free(id, dirty),
-                (true, true, true) => {
-                    let rec = self.touch(id, true, dirty);
-                    rec.freed = true;
-                    rec.allocated = true;
-                    let old = self.state.size_of(id);
-                    let new = e.table.size;
-                    if new < old {
-                        self.state.shrink_size_to(id, new);
-                    } else if new > old {
-                        self.grow(id, new, dirty);
-                    }
-                    self.take_pieces(id, &e.table, false, old.min(new), Vec::new(), dirty);
+                let id = self.span_at(m);
+                let nx = match self.state.rope.next(m) {
+                    NIL => 0,
+                    k => self.span_at(k),
+                };
+                if self.state.span(id).next != nx {
+                    self.state.span_mut(id).next = nx;
+                    f.stated.insert(id);
                 }
-                (false, _, true) => {
-                    self.allocate(id, e.table.size, dirty);
-                    self.take_pieces(id, &e.table, false, 0, Vec::new(), dirty);
-                }
-                (false, _, false) => {
-                    let live = self
-                        .state
-                        .recyclable
-                        .get(&id)
-                        .is_some_and(|r| r.tombstone.is_some());
-                    self.ids.release(id, live);
-                }
-                (true, false, false) => unreachable!(),
             }
         }
         Ok(())
     }
 
-    pub(crate) fn allocate(&mut self, id: u32, n: u32, dirty: &mut Dirty) {
-        let mut meta = AllocationMeta {
-            last_written: self.state.flush_epoch,
-            ..Default::default()
-        };
-        if let Some(r) = self.state.recyclable.remove(&id) {
-            meta.mentions = r.mentions;
-            // A live tombstone stays the size statement, with its pin, until
-            // the cut binds the new incarnation's.
-            meta.size_statement = r.tombstone;
-        }
-        self.state.allocs.insert(id, meta);
-        let rec = self.touch(id, true, dirty);
-        rec.allocated = true;
-        self.grow(id, n, dirty);
-    }
-
-    fn free(&mut self, id: u32, dirty: &mut Dirty) {
-        let rec = self.touch(id, true, dirty);
-        rec.freed = true;
-        self.state.shrink_size_to(id, 0);
-        let meta = self.state.allocs.remove(&id).unwrap();
-        self.state.recyclable.insert(
-            id,
-            Recyclable {
-                mentions: meta.mentions,
-                tombstone: None,
-            },
-        );
-        if let Some(s) = meta.size_statement {
-            self.state.unpin(s);
-        }
-    }
-
-    // ------------------------------------------------------------ packing
-
-    /// The pending fragments in `dirty` that still need a data page, in key
-    /// order.
-    pub(crate) fn chunks(&self, dirty: &Dirty) -> Vec<Chunk> {
-        let mut out = Vec::new();
-        for (&k, &end) in &dirty.ranges {
-            let id = kid(k);
-            let mut it = self.state.frags.range(k..key(id, end)).peekable();
-            while let Some((&fk, &f)) = it.next() {
-                if let Fragment::Pending(p) = f {
-                    let pe = self.state.pending[p as usize];
-                    if pe.place == Place::Unplaced {
-                        let fend = match it.peek() {
-                            Some((&n, _)) => koff(n),
-                            None => self.state.frag_end(fk),
-                        };
-                        out.push(Chunk {
-                            key: fk,
-                            len: fend - koff(fk),
-                            rewrite: pe.rewrite,
-                        });
-                    }
+    /// Writes the schema's chain and the private chain anew, if their
+    /// content was set.
+    fn write_small_chains(&mut self, f: &mut Flush) -> Result<(), Error> {
+        let e = self.state.flush_epoch;
+        for chain in [Chain::Schema, Chain::Private] {
+            let pending = match chain {
+                Chain::Schema => self.schema_pending.take(),
+                _ => self.private_pending.take(),
+            };
+            let Some(bytes) = pending else { continue };
+            let old = match chain {
+                Chain::Schema => std::mem::take(&mut self.state.schema),
+                _ => std::mem::take(&mut self.state.private),
+            };
+            for id in old {
+                self.kill_in(f, id);
+            }
+            let start = f.scratch.len() as u32;
+            f.scratch.extend_from_slice(&bytes);
+            let ids = if bytes.is_empty() {
+                Vec::new()
+            } else {
+                let len = u32::try_from(bytes.len()).map_err(|_| Error::OutOfBounds)?;
+                self.new_spans(f, start, len, chain, e, 0)?
+            };
+            match chain {
+                Chain::Schema => {
+                    self.state.schema = ids;
+                    self.schema = bytes;
+                }
+                _ => {
+                    self.state.private = ids;
+                    self.private = bytes;
                 }
             }
         }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------- the header
+
+    /// What the entry of span `id` will be, its bytes borrowed from where
+    /// they lie.
+    fn body<'a>(&'a self, f: &'a Flush, id: u32) -> Body<'a> {
+        let s = self.state.span(id);
+        match s.content {
+            Content::Ref { page, offset } => Body::Ref {
+                len: s.len,
+                addr: page as u64 * PAGE_SIZE as u64 + offset as u64,
+            },
+            Content::Zero => Body::Zero { len: s.len },
+            Content::Inline { page, offset } => Body::Inline(
+                &self.table_pages[&page][offset as usize..offset as usize + s.len as usize],
+            ),
+            Content::Pending(i) => {
+                let p = f.pending[i as usize];
+                if p.inline {
+                    Body::Inline(&f.scratch[p.start as usize..(p.start + s.len) as usize])
+                } else {
+                    // Not placed yet: an estimate stands for its address.
+                    Body::Ref {
+                        len: s.len,
+                        addr: 0,
+                    }
+                }
+            }
+            Content::Free => unreachable!("an entry for free span {id}"),
+        }
+    }
+
+    fn estimate_of(&self, f: &Flush, id: u32) -> usize {
+        let s = self.state.span(id);
+        estimate(id, s.next, &self.body(f, id))
+    }
+
+    /// The live leaves, by page number.
+    fn leaves(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .table_pages
+            .keys()
+            .copied()
+            .filter(|&p| {
+                matches!(
+                    self.state.pages[p as usize],
+                    Page::Live(Live {
+                        kind: PageKind::Table,
+                        ..
+                    })
+                )
+            })
+            .collect();
+        out.sort_unstable();
         out
     }
+
+    /// Chooses which entries the new header holds: the hottest of those the
+    /// flush states and those the old header holds, as many as fit, by an
+    /// estimate of their size; every one of them is stated.
+    fn choose_header(&mut self, f: &mut Flush) {
+        if let Some(list) = self.state.table_spans.get(&self.header_slot) {
+            for &id in list {
+                f.stated.insert(id);
+            }
+        }
+        let mut cands: Vec<u32> = f.stated.iter().copied().collect();
+        cands.sort_by_key(|&id| (Reverse(self.state.span(id).heat), id));
+        let ests: Vec<usize> = cands.iter().map(|&id| self.estimate_of(f, id)).collect();
+        let total: usize = ests.iter().sum();
+        let children = children_len(&self.leaves()) + 3 * (total / MAX_PAGE_CONTENT + 1);
+        let capacity = MAX_HEADER_CONTENT.saturating_sub(children + 64);
+        let mut used = 0;
+        for (&id, &est) in cands.iter().zip(&ests) {
+            if used + est > capacity {
+                break;
+            }
+            used += est;
+            f.header.insert(id);
+        }
+    }
+
+    // ---------------------------------------------------------------- merges
+
+    /// Whether span `id`'s entry lies, or will lie after this flush, in a
+    /// leaf rather than in the header.
+    fn leafward(&self, f: &Flush, id: u32) -> bool {
+        self.state.span(id).chain == Chain::Sequence && !f.header.contains(&id)
+    }
+
+    /// Merges the nodes `group`, consecutive in the rope, into one new span,
+    /// whose entry goes to a leaf; returns it.
+    fn merge_group(&mut self, f: &mut Flush, group: &[u32]) -> Result<u32, Error> {
+        let ids: Vec<u32> = group.iter().map(|&n| self.span_at(n)).collect();
+        let pos = self.state.rope.pos_of(group[0]);
+        let pred = self.state.rope.prev(group[0]);
+        let succ = self.state.rope.next(*group.last().unwrap());
+        let succ_id = if succ == NIL { 0 } else { self.span_at(succ) };
+        let pred_id = if pred == NIL { 0 } else { self.span_at(pred) };
+        let start = f.scratch.len() as u32;
+        let mut heat = 0;
+        let mut total = 0u32;
+        for &id in &ids {
+            self.span_to_scratch(f, id)?;
+            heat = heat.max(self.state.span(id).heat);
+            total += self.state.span(id).len;
+        }
+        for &id in &ids {
+            self.kill_in(f, id);
+        }
+        let rope = &mut self.state.rope;
+        let (l, rest) = rope.split(self.state.root, pos);
+        let (mid, r) = rope.split(rest, total as u64);
+        rope.free_tree(mid);
+        self.state.root = rope.merge(l, r);
+        let made = self.new_spans(f, start, total, Chain::Sequence, heat, pred_id)?;
+        let mut at = pos;
+        for &id in &made {
+            let len = self.state.span(id).len;
+            let node = self.state.rope.node(RopeItem::Span { id, len });
+            self.state.span_mut(id).node = node;
+            self.insert_at(at, node);
+            at += len as u64;
+        }
+        let last = *made.last().unwrap();
+        self.state.span_mut(last).next = succ_id;
+        if pred_id != 0 {
+            self.state.span_mut(pred_id).next = made[0];
+            f.stated.insert(pred_id);
+        }
+        Ok(made[0])
+    }
+
+    /// Merges short spans whose entries leave the header for a leaf in this
+    /// flush with their leafward neighbours, wherever two neighbours are
+    /// shorter than `span_min` together.
+    fn merge_evicted(&mut self, f: &mut Flush) -> Result<(), Error> {
+        let l = self.opts.span_min;
+        let mut todo: Vec<u32> = f
+            .stated
+            .iter()
+            .copied()
+            .filter(|&id| self.leafward(f, id) && self.state.span(id).len < l)
+            .collect();
+        todo.sort_unstable();
+        let mut done = IdSet::default();
+        for id in todo {
+            if done.contains(&id) || self.state.span(id).chain != Chain::Sequence {
+                continue;
+            }
+            let len_of = |i: &Inner, n: u32| i.state.span(i.span_at(n)).len;
+            let mut first = self.state.span(id).node;
+            let mut last = first;
+            loop {
+                let p = self.state.rope.prev(first);
+                if p == NIL
+                    || !self.leafward(f, self.span_at(p))
+                    || len_of(self, p) + len_of(self, first) >= l
+                {
+                    break;
+                }
+                first = p;
+            }
+            loop {
+                let n = self.state.rope.next(last);
+                if n == NIL
+                    || !self.leafward(f, self.span_at(n))
+                    || len_of(self, last) + len_of(self, n) >= l
+                {
+                    break;
+                }
+                last = n;
+            }
+            let mut run = vec![first];
+            let mut m = first;
+            while m != last {
+                m = self.state.rope.next(m);
+                run.push(m);
+            }
+            for &n in &run {
+                done.insert(self.span_at(n));
+            }
+            // Greedily, a group grows while it stays shorter than `l`.
+            let mut groups: Vec<Vec<u32>> = Vec::new();
+            let mut cur: Vec<u32> = Vec::new();
+            let mut cur_len = 0u32;
+            for &n in &run {
+                let len = len_of(self, n);
+                if !cur.is_empty() && cur_len + len >= l {
+                    groups.push(std::mem::take(&mut cur));
+                    cur_len = 0;
+                }
+                cur.push(n);
+                cur_len += len;
+            }
+            groups.push(cur);
+            for g in groups {
+                if g.len() < 2 {
+                    continue;
+                }
+                let bytes: u64 = g.iter().map(|&n| len_of(self, n) as u64).sum();
+                let made = self.merge_group(f, &g)?;
+                done.insert(made);
+                self.stats.evict_merges += 1;
+                self.stats.evict_merge_bytes += bytes;
+            }
+        }
+        Ok(())
+    }
+
+    /// The rotating walk: looks at the next `walk` spans of the sequence and
+    /// merges runs of cold spans in leaves where the entry bytes the merge
+    /// retires outweigh `mu` per byte it writes.
+    fn walk(&mut self, f: &mut Flush) -> Result<(), Error> {
+        let e = self.state.flush_epoch;
+        let cold_before = e.saturating_sub(self.opts.cold_flushes as u64);
+        let mut id = self.cons.walk;
+        if id == 0
+            || (id as usize) >= self.state.spans.len()
+            || self.state.span(id).chain != Chain::Sequence
+        {
+            id = self.state.seq_head();
+        }
+        let mut run: Vec<u32> = Vec::new();
+        let mut seen = 0;
+        while id != 0 && seen < self.opts.walk {
+            let s = *self.state.span(id);
+            let eligible = s.chain == Chain::Sequence
+                && s.heat <= cold_before
+                && s.entry_page != NONE
+                && s.entry_page != self.header_slot
+                && !f.stated.contains(&id);
+            let next = s.next;
+            if eligible {
+                run.push(id);
+            } else {
+                self.merge_run(f, &run)?;
+                run.clear();
+            }
+            id = next;
+            seen += 1;
+        }
+        self.merge_run(f, &run)?;
+        self.cons.walk = id;
+        Ok(())
+    }
+
+    /// Merges the groups of `run`, spans consecutive in the sequence, that
+    /// pay: Kadane's maximal sums of what each span's entry costs less `mu`
+    /// per byte it shows, within a page.
+    fn merge_run(&mut self, f: &mut Flush, run: &[u32]) -> Result<(), Error> {
+        if run.len() < 2 {
+            return Ok(());
+        }
+        let mu = self.opts.mu;
+        let weight = |i: &Inner, id: u32| {
+            let s = i.state.span(id);
+            let framing = s.entry_len as f64
+                - match s.content {
+                    Content::Inline { .. } => s.len as f64,
+                    _ => 0.0,
+                };
+            framing - mu * s.len as f64
+        };
+        // A merged span's own entry, about.
+        const NEW_FRAMING: f64 = 6.0;
+        let mut groups: Vec<Vec<u32>> = Vec::new();
+        let mut cur: Vec<u32> = Vec::new();
+        let (mut sum, mut len) = (0.0, 0u32);
+        let close = |cur: &mut Vec<u32>, sum: f64, groups: &mut Vec<Vec<u32>>| {
+            if cur.len() >= 2 && sum > NEW_FRAMING {
+                groups.push(std::mem::take(cur));
+            }
+            cur.clear();
+        };
+        for &id in run {
+            let (w, n) = (weight(self, id), self.state.span(id).len);
+            if len + n > C {
+                close(&mut cur, sum, &mut groups);
+                sum = 0.0;
+                len = 0;
+            }
+            sum += w;
+            len += n;
+            cur.push(id);
+            if sum < 0.0 {
+                cur.clear();
+                sum = 0.0;
+                len = 0;
+            }
+        }
+        close(&mut cur, sum, &mut groups);
+        for g in groups {
+            let nodes: Vec<u32> = g.iter().map(|&id| self.state.span(id).node).collect();
+            let bytes: u64 = g.iter().map(|&id| self.state.span(id).len as u64).sum();
+            self.merge_group(f, &nodes)?;
+            self.stats.walk_merges += 1;
+            self.stats.walk_merge_bytes += bytes;
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------- placement
 
     pub(crate) fn new_data_page(&mut self) -> Result<DataPage, Error> {
         let page = take_page(
@@ -979,99 +871,168 @@ impl Inner {
         })
     }
 
-    /// Places the chunk at `key` into `dp`, copying its bytes.
-    pub(crate) fn place(&mut self, dp: &mut DataPage, key: Key, len: u32) -> Result<(), Error> {
-        let Some(Fragment::Pending(p)) = self.state.frags.get(&key).copied() else {
-            return Err(corrupt("placing a chunk that is not pending"));
-        };
+    /// Places the bytes of span `id`, pending or in a data page, into `dp`,
+    /// which has room for them; the span is stated with its new address.
+    pub(crate) fn place(&mut self, f: &mut Flush, dp: &mut DataPage, id: u32) -> Result<(), Error> {
+        let s = *self.state.span(id);
+        let n = s.len as usize;
         let at = CONTENT_OFFSET + dp.used;
-        let mut bytes = vec![0u8; len as usize];
-        self.read_fragment(Fragment::Pending(p), 0, &mut bytes)?;
-        dp.buf[at..at + len as usize].copy_from_slice(&bytes);
-        let a = address(dp.page, at as u16);
-        self.state.pending[p as usize].place = Place::Data(a);
-        self.state.cover(dp.page, len);
-        self.state
-            .note_reverse(dp.page, kid(key), koff(key), koff(key) + len);
-        dp.used += len as usize;
+        match s.content {
+            Content::Pending(i) => {
+                let p = f.pending[i as usize].start as usize;
+                dp.buf[at..at + n].copy_from_slice(&f.scratch[p..p + n]);
+            }
+            Content::Ref { page, offset } => {
+                let src = self.page_bytes(page)?;
+                dp.buf[at..at + n].copy_from_slice(&src[offset as usize..offset as usize + n]);
+                self.state.unnote_data(id);
+                self.state.uncover(page, s.len);
+            }
+            other => return Err(corrupt(format!("placing span {id}, which shows {other:?}"))),
+        }
+        self.state.span_mut(id).content = Content::Ref {
+            page: dp.page,
+            offset: at as u16,
+        };
+        self.state.note_data(id);
+        self.state.cover(dp.page, s.len);
+        f.stated.insert(id);
+        dp.used += n;
         Ok(())
     }
 
-    /// Packs the flush's chunks into data pages in key order with a bounded
-    /// look-ahead, filling room its own chunks cannot use with victims, and
-    /// cutting only to keep a page from closing more than `θ` empty.
-    fn pack(&mut self, dirty: &mut Dirty, out: &mut Output) -> Result<(), Error> {
-        let c = MAX_PAGE_CONTENT as u32;
-        let chunks = self.chunks(dirty);
-        let mut rem: VecDeque<Chunk> = VecDeque::new();
-        // Whole pages first: the one cut that is forced.
-        for ch in chunks {
-            let (id, mut off, mut len) = (kid(ch.key), koff(ch.key), ch.len);
-            while len >= c {
-                self.state.split(id, off + c);
-                let mut dp = self.new_data_page()?;
-                self.place(&mut dp, key(id, off), c)?;
-                out.data.push(dp);
-                off += c;
-                len -= c;
-            }
-            if len > 0 {
-                rem.push_back(Chunk {
-                    key: key(id, off),
-                    len,
-                    rewrite: ch.rewrite,
+    /// Splits span `id`, `head` bytes into it: it keeps the first `head`,
+    /// and a new span, which it returns, takes the rest. Both are stated.
+    pub(crate) fn split_span(&mut self, f: &mut Flush, id: u32, head: u32) -> Result<u32, Error> {
+        let s = *self.state.span(id);
+        debug_assert!(head > 0 && head < s.len);
+        let content = match s.content {
+            Content::Pending(i) => {
+                let p = f.pending[i as usize];
+                f.pending.push(PendingBytes {
+                    start: p.start + head,
+                    inline: false,
                 });
+                Content::Pending((f.pending.len() - 1) as u32)
+            }
+            Content::Ref { page, offset } => Content::Ref {
+                page,
+                offset: offset + head as u16,
+            },
+            other => {
+                return Err(corrupt(format!(
+                    "splitting span {id}, which shows {other:?}"
+                )))
+            }
+        };
+        let t = self.state.new_span(id).ok_or(Error::OutOfBounds)?;
+        *self.state.span_mut(t) = Span {
+            len: s.len - head,
+            next: s.next,
+            content,
+            chain: s.chain,
+            entry_page: NONE,
+            heat: s.heat,
+            node: NIL,
+            ..Span::default()
+        };
+        self.state.span_mut(id).len = head;
+        self.state.span_mut(id).next = t;
+        self.state.note_data(t);
+        match s.chain {
+            Chain::Sequence => {
+                let pos = self.state.rope.pos_of(s.node);
+                self.state
+                    .rope
+                    .set_item(s.node, RopeItem::Span { id, len: head });
+                let m = self.state.rope.node(RopeItem::Span {
+                    id: t,
+                    len: s.len - head,
+                });
+                self.state.span_mut(t).node = m;
+                self.insert_at(pos + head as u64, m);
+            }
+            Chain::Schema | Chain::Private => {
+                let list = if s.chain == Chain::Schema {
+                    &mut self.state.schema
+                } else {
+                    &mut self.state.private
+                };
+                let i = list.iter().position(|&x| x == id).unwrap();
+                list.insert(i + 1, t);
+            }
+            Chain::None => unreachable!(),
+        }
+        f.stated.insert(id);
+        f.stated.insert(t);
+        if f.header.contains(&id) {
+            f.header.insert(t);
+        }
+        Ok(t)
+    }
+
+    /// The flush's spans that still need a data page, the small chains'
+    /// first, then the sequence's in order.
+    fn chunks(&self, f: &Flush) -> Vec<u32> {
+        let mut small = Vec::new();
+        let mut seq: Vec<(u64, u32)> = Vec::new();
+        for &id in &f.stated {
+            let s = self.state.span(id);
+            if let Content::Pending(i) = s.content {
+                if !f.pending[i as usize].inline {
+                    match s.chain {
+                        Chain::Sequence => seq.push((self.state.rope.pos_of(s.node), id)),
+                        _ => small.push(id),
+                    }
+                }
             }
         }
+        small.sort_unstable();
+        seq.sort_unstable();
+        small.extend(seq.into_iter().map(|(_, id)| id));
+        small
+    }
+
+    /// Packs the flush's chunks into data pages in sequence order with a
+    /// bounded look-ahead, filling room its own chunks cannot use with
+    /// victims, and cutting only to keep a page from closing more than `θ`
+    /// empty.
+    fn pack(&mut self, f: &mut Flush, out: &mut Output) -> Result<(), Error> {
+        let mut rem: VecDeque<u32> = self.chunks(f).into();
         if rem.is_empty() {
             return Ok(());
         }
-        let theta = (self.opts.theta * c as f64) as usize;
+        let theta = (self.opts.theta * C as f64) as usize;
+        let inline_max = self.opts.inline_threshold.min(MAX_INLINE as u32);
         let mut open = self.new_data_page()?;
         loop {
             let room = open.room() as u32;
-            // 1. The first chunk that fits, within reach.
             if let Some(i) = rem
                 .iter()
                 .take(self.opts.lookahead)
-                .position(|ch| ch.len <= room)
+                .position(|&id| self.state.span(id).len <= room)
             {
-                let ch = rem.remove(i).unwrap();
-                self.place(&mut open, ch.key, ch.len)?;
+                let id = rem.remove(i).unwrap();
+                self.place(f, &mut open, id)?;
                 continue;
             }
-            // 2. Free filling: victims that fit the room ride for free.
             if self.opts.consolidate {
-                self.free_fill(&mut open, dirty)?;
+                self.free_fill(f, &mut open)?;
             }
             if rem.is_empty() {
                 break;
             }
-            // 3. Still more than θ empty: cut a chunk so the page closes full,
-            //    a genuine one of the flush's own before a rewrite.
             if open.room() > theta {
-                let i = rem
-                    .iter()
-                    .take(self.opts.lookahead)
-                    .position(|ch| !ch.rewrite)
-                    .unwrap_or(0);
-                let ch = rem.remove(i).unwrap();
+                let id = rem.pop_front().unwrap();
                 let head = open.room() as u32;
-                let (id, off) = (kid(ch.key), koff(ch.key));
-                self.state.split(id, off + head);
-                self.place(&mut open, ch.key, head)?;
-                let tail = Chunk {
-                    key: key(id, off + head),
-                    len: ch.len - head,
-                    rewrite: ch.rewrite,
-                };
-                if tail.len <= self.opts.inline_threshold {
-                    // Too short to be worth a chunk: the cut states it inline.
-                    if let Some(Fragment::Pending(p)) = self.state.frags.get(&tail.key) {
-                        self.state.pending[*p as usize].place = Place::Inline;
+                let t = self.split_span(f, id, head)?;
+                self.place(f, &mut open, id)?;
+                if self.state.span(t).len <= inline_max {
+                    if let Content::Pending(i) = self.state.span(t).content {
+                        f.pending[i as usize].inline = true;
                     }
                 } else {
-                    rem.push_front(tail);
+                    rem.push_front(t);
                 }
             }
             if rem.is_empty() {
@@ -1084,18 +1045,188 @@ impl Inner {
         Ok(())
     }
 
-    // ------------------------------------------------------------ commit
+    // ---------------------------------------------------------------- the cut
 
-    fn commit(&mut self, e: u64, dirty: &Dirty, out: Output) -> Result<(), Error> {
+    /// Encodes the entries of `ids`, sorted, into leaves; returns each
+    /// leaf's content and where its entries landed.
+    fn encode_leaves(&self, f: &Flush, ids: &[u32]) -> Vec<(Vec<u8>, Vec<Placed>)> {
+        let mut pages = Vec::new();
+        let mut enc = PageEncoder::new(&[], MAX_PAGE_CONTENT);
+        for &id in ids {
+            let e = EntryOut {
+                id,
+                next: self.state.span(id).next,
+                body: self.body(f, id),
+            };
+            if !enc.push(&e) {
+                let full = std::mem::replace(&mut enc, PageEncoder::new(&[], MAX_PAGE_CONTENT));
+                pages.push((full.out, full.placed));
+                assert!(enc.push(&e), "an entry larger than a page");
+            }
+        }
+        if !enc.placed.is_empty() {
+            pages.push((enc.out, enc.placed));
+        }
+        pages
+    }
+
+    /// Encodes the header's entries after `children`; `None` if they do not
+    /// fit.
+    fn encode_header(
+        &self,
+        f: &Flush,
+        children: &[u32],
+        ids: &[u32],
+    ) -> Option<(Vec<u8>, Vec<Placed>)> {
+        let mut enc = PageEncoder::new(children, MAX_HEADER_CONTENT);
+        for &id in ids {
+            let e = EntryOut {
+                id,
+                next: self.state.span(id).next,
+                body: self.body(f, id),
+            };
+            if !enc.push(&e) {
+                return None;
+            }
+        }
+        Some((enc.out, enc.placed))
+    }
+
+    /// Writes every stated span's entry: the header's into the header, the
+    /// rest into new leaves, the last of which takes whole sparse leaves
+    /// whose entries fit its room.
+    fn cut(&mut self, f: &mut Flush, out: &mut Output) -> Result<(), Error> {
+        let stated: Vec<u32> = f.stated.iter().copied().collect();
+        for &id in &stated {
+            self.state.drop_entry(id);
+        }
+        let mut head: Vec<u32> = stated
+            .iter()
+            .copied()
+            .filter(|id| f.header.contains(id))
+            .collect();
+        let mut leaf: Vec<u32> = stated
+            .iter()
+            .copied()
+            .filter(|id| !f.header.contains(id))
+            .collect();
+        head.sort_unstable();
+        leaf.sort_unstable();
+        loop {
+            let mut pages = self.encode_leaves(f, &leaf);
+            // Fillers: whole leaves whose entries fit the last leaf's room.
+            if self.opts.consolidate {
+                if let Some((content, _)) = pages.last() {
+                    let room = MAX_PAGE_CONTENT - content.len();
+                    let victims = self.cut_fillers(f, room, &leaf);
+                    if !victims.is_empty() {
+                        for v in &victims {
+                            for id in self.state.table_spans.get(v).cloned().unwrap_or_default() {
+                                self.state.drop_entry(id);
+                                f.stated.insert(id);
+                                leaf.push(id);
+                            }
+                            self.stats.table_rewrites += 1;
+                        }
+                        leaf.sort_unstable();
+                        pages = self.encode_leaves(f, &leaf);
+                    }
+                }
+            }
+            let mut taken = Vec::new();
+            for _ in &pages {
+                taken.push(take_page(
+                    &mut self.ready,
+                    &mut self.state,
+                    &mut self.file_pages,
+                    &mut *self.storage,
+                    &mut self.stats,
+                    Filling::taken(PageKind::Table),
+                )?);
+            }
+            let mut children: Vec<u32> = self
+                .leaves()
+                .into_iter()
+                .filter(|&p| self.state.coverage(p) > 0)
+                .collect();
+            children.extend(&taken);
+            children.sort_unstable();
+            match self.encode_header(f, &children, &head) {
+                Some((content, placed)) => {
+                    // Record where every entry landed.
+                    for ((content, placed), &page) in pages.into_iter().zip(&taken) {
+                        let mut buf = new_page();
+                        encode_page(&mut buf, None, KIND_TABLE, self.state.flush_epoch, &content);
+                        self.table_pages.insert(page, buf);
+                        self.note_placed(f, page, CONTENT_OFFSET, &placed);
+                        out.tables.push((page, self.table_pages[&page].clone()));
+                    }
+                    let slot = (self.state.flush_epoch % 2) as u32;
+                    self.note_placed(f, slot, HEADER_CONTENT_OFFSET, &placed);
+                    out.header_content = content;
+                    self.stats.entries_stated += (head.len() + leaf.len()) as u64;
+                    return Ok(());
+                }
+                None => {
+                    for p in taken {
+                        self.state.pages[p as usize] = Page::Reusable;
+                        self.ready.insert(p);
+                    }
+                    // The coldest eighth of the header's entries go to leaves.
+                    head.sort_by_key(|&id| (Reverse(self.state.span(id).heat), id));
+                    let keep = head.len() - head.len().div_ceil(8);
+                    for id in head.split_off(keep) {
+                        f.header.remove(&id);
+                        leaf.push(id);
+                    }
+                    head.sort_unstable();
+                    leaf.sort_unstable();
+                }
+            }
+        }
+    }
+
+    /// Records the entries `placed` in table page `page`, whose content
+    /// starts `content_at` bytes into it.
+    fn note_placed(&mut self, f: &Flush, page: u32, content_at: usize, placed: &[Placed]) {
+        if page < 2 {
+            // The header slot the flush writes is taken here, its old content
+            // having been moved.
+            if !matches!(self.state.pages[page as usize], Page::Filling(_)) {
+                self.state.pages[page as usize] = Filling::taken(PageKind::Header);
+            }
+        }
+        for p in placed {
+            let s = *self.state.span(p.id);
+            let inline = match s.content {
+                Content::Inline { .. } => true,
+                Content::Pending(i) => f.pending[i as usize].inline,
+                _ => false,
+            };
+            if inline {
+                self.state.span_mut(p.id).content = Content::Inline {
+                    page,
+                    offset: (content_at + p.payload) as u16,
+                };
+            }
+            self.state.note_entry(p.id, page, p.len);
+        }
+    }
+
+    // ---------------------------------------------------------------- commit
+
+    fn commit(&mut self, e: u64, out: Output) -> Result<(), Error> {
         // The next journal starts in the lowest reusable page, or past the end.
         let jp = match self.ready.pop_first() {
             Some(p) => p,
             None => self.file_pages,
         };
         let slot = (e % 2) as u32;
-        // Every page this flush filled, and nothing else, is written here.
+        if !matches!(self.state.pages[slot as usize], Page::Filling(_)) {
+            self.state.pages[slot as usize] = Filling::taken(PageKind::Header);
+        }
         let written: Vec<u32> = (out.data.iter().map(|dp| dp.page))
-            .chain(out.tables.iter().map(|&(p, _)| p))
+            .chain(out.tables.iter().map(|(p, _)| *p))
             .chain([slot])
             .collect();
         debug_assert_eq!(
@@ -1113,12 +1244,9 @@ impl Inner {
                 .write_at(&dp.buf[..], dp.page as u64 * PAGE_SIZE as u64)?;
             self.stats.data_pages_written += 1;
         }
-        for (p, content) in &out.tables {
-            let mut buf = new_page();
-            crate::page::encode_page(&mut buf, None, KIND_ADDRESS_TABLE, e, content);
+        for (p, buf) in &out.tables {
             self.storage
                 .write_at(&buf[..], *p as u64 * PAGE_SIZE as u64)?;
-            self.table_pages.insert(*p, buf);
             self.stats.table_pages_written += 1;
         }
         // A session's first flush clears the page it names for the next
@@ -1131,11 +1259,14 @@ impl Inner {
         self.header.journal_pointer = jp;
         self.header.format_version = FORMAT_VERSION;
         self.header.min_reader_version = MIN_READER_VERSION;
+        self.header.sequence_head = self.state.seq_head();
+        self.header.schema_head = self.state.schema.first().copied().unwrap_or(0);
+        self.header.private_head = self.state.private.first().copied().unwrap_or(0);
         let mut hbuf = new_page();
-        crate::page::encode_page(
+        encode_page(
             &mut hbuf,
             Some(&self.header),
-            KIND_ADDRESS_TABLE,
+            KIND_TABLE,
             e,
             &out.header_content,
         );
@@ -1146,7 +1277,7 @@ impl Inner {
         // The pages the flush filled are in the world now.
         for &p in &written {
             match self.state.pages[p as usize] {
-                Page::Filling(f) => self.state.pages[p as usize] = Page::Live(f.commit(e)),
+                Page::Filling(fl) => self.state.pages[p as usize] = Page::Live(fl.commit(e)),
                 other => unreachable!("page {p} was written but is {other:?}"),
             }
         }
@@ -1160,31 +1291,21 @@ impl Inner {
         let mut retiring = Vec::new();
         let candidates: Vec<u32> = self.state.dropped_candidates.drain().collect();
         for p in candidates {
+            if p == slot || p == self.header_slot {
+                continue;
+            }
             if let Page::Live(Live {
-                coverage: 0,
-                kind: PageKind::Data,
-                ..
+                coverage: 0, kind, ..
             }) = self.state.pages[p as usize]
             {
+                debug_assert!(kind != PageKind::Header);
                 self.state.unbucket(p);
                 self.state.pages[p as usize] = Page::Fallback;
-                self.state.reverse.remove(&p);
+                self.table_pages.remove(&p);
+                self.mirror.remove(&p);
+                self.cache.remove(&p);
                 retiring.push(p);
             }
-        }
-        for p in out.dropped_tables {
-            if cfg!(debug_assertions) {
-                let live = self.live_statements_in(p);
-                assert!(
-                    live.is_empty(),
-                    "unlinked table page {p} still holds live statements: {live:?}"
-                );
-            }
-            self.state.unbucket(p);
-            self.state.pages[p as usize] = Page::Fallback;
-            self.table_pages.remove(&p);
-            self.state.children.remove(&p);
-            retiring.push(p);
         }
         for &p in &self.journal.pages {
             if p < self.file_pages && self.state.pages[p as usize] == Page::Journal {
@@ -1192,21 +1313,22 @@ impl Inner {
                 retiring.push(p);
             }
         }
-        self.retiring = retiring;
-        // The header this commit replaced leaves the world; the flush took
-        // everything it stated.
+        // The header this commit replaced leaves the world; the flush moved
+        // everything it held. A header slot is never handed out, so it does
+        // not join the rotation of reusable pages.
         let old = self.header_slot;
-        if cfg!(debug_assertions) {
-            let live = self.live_statements_in(old);
-            assert!(
-                live.is_empty(),
-                "the replaced header still holds live statements: {live:?}"
+        if old != slot {
+            debug_assert!(
+                !self.state.table_spans.contains_key(&old),
+                "the replaced header still holds live entries"
             );
+            self.state.pages[old as usize] = Page::Fallback;
         }
-        self.state.pages[old as usize] = Page::Fallback;
-        self.state.children.remove(&old);
-        self.table_pages.remove(&old);
+        self.retiring = retiring;
         self.table_pages.insert(slot, hbuf);
+        if old != slot {
+            self.table_pages.remove(&old);
+        }
         self.header_slot = slot;
         self.epoch = e;
         for p in written {
@@ -1217,24 +1339,8 @@ impl Inner {
             self.state.pages[jp as usize] = Page::Journal;
         }
         self.journal = crate::journal::JournalWriter::new(e + 1, jp);
-        debug_assert!(self
-            .state
-            .frags
-            .values()
-            .all(|f| !matches!(f, Fragment::Pending(_))));
-        self.state.pending.clear();
         self.first_flush = false;
         self.cache.clear();
-        for (&id, rec) in &dirty.records {
-            if rec.freed && !self.state.allocs.contains_key(&id) {
-                let live = self
-                    .state
-                    .recyclable
-                    .get(&id)
-                    .is_some_and(|r| r.tombstone.is_some());
-                self.ids.release(id, live);
-            }
-        }
         self.stats.flushes += 1;
         self.after_commit()?;
         self.truncate(false)

@@ -19,9 +19,12 @@ pub fn new_page() -> Box<PageBuf> {
 pub struct HeaderFields {
     pub format_version: u16,
     pub min_reader_version: u16,
-    pub root_allocation: u32,
-    pub schema_table: u32,
-    pub consolidator_state: u32,
+    /// The first span of the sequence's chain, or 0 for an empty sequence.
+    pub sequence_head: u32,
+    /// The first span of the schema's chain, or 0.
+    pub schema_head: u32,
+    /// The first span of the implementation's private chain, or 0.
+    pub private_head: u32,
     pub root_fingerprint: [u8; 16],
     pub journal_pointer: u32,
 }
@@ -32,9 +35,9 @@ impl HeaderFields {
         out[11] = LOG2_PAGE_SIZE;
         out[12..14].copy_from_slice(&self.format_version.to_le_bytes());
         out[14..16].copy_from_slice(&self.min_reader_version.to_le_bytes());
-        out[16..20].copy_from_slice(&self.root_allocation.to_le_bytes());
-        out[20..24].copy_from_slice(&self.schema_table.to_le_bytes());
-        out[24..28].copy_from_slice(&self.consolidator_state.to_le_bytes());
+        out[16..20].copy_from_slice(&self.sequence_head.to_le_bytes());
+        out[20..24].copy_from_slice(&self.schema_head.to_le_bytes());
+        out[24..28].copy_from_slice(&self.private_head.to_le_bytes());
         out[28..44].copy_from_slice(&self.root_fingerprint);
         out[44..48].copy_from_slice(&self.journal_pointer.to_le_bytes());
     }
@@ -53,9 +56,9 @@ impl HeaderFields {
         Ok(HeaderFields {
             format_version: u16_at(12),
             min_reader_version: u16_at(14),
-            root_allocation: u32_at(16),
-            schema_table: u32_at(20),
-            consolidator_state: u32_at(24),
+            sequence_head: u32_at(16),
+            schema_head: u32_at(20),
+            private_head: u32_at(24),
             root_fingerprint,
             journal_pointer: u32_at(44),
         })
@@ -197,15 +200,15 @@ mod tests {
     #[test]
     fn a_header_page_round_trips() {
         let h = HeaderFields {
-            root_allocation: 3,
-            schema_table: 4,
-            consolidator_state: 5,
+            sequence_head: 3,
+            schema_head: 4,
+            private_head: 5,
             root_fingerprint: [9; 16],
             journal_pointer: 12,
             ..Default::default()
         };
         let mut buf = new_page();
-        encode_page(&mut buf, Some(&h), KIND_ADDRESS_TABLE, 2, &[1, 2, 3]);
+        encode_page(&mut buf, Some(&h), KIND_TABLE, 2, &[1, 2, 3]);
         let d = decode_page(&buf, true).unwrap();
         assert_eq!(d.header.as_ref(), Some(&h));
         assert_eq!(d.epoch, 2);
@@ -244,7 +247,7 @@ mod tests {
         encode_page(
             &mut buf,
             Some(&HeaderFields::default()),
-            KIND_ADDRESS_TABLE,
+            KIND_TABLE,
             1,
             &content,
         );

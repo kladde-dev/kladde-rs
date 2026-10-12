@@ -6,8 +6,7 @@
 /// use kladde_store::{MemoryStorage, Store, WriteBackend};
 ///
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
-/// let p = store.alloc(20_000)?;
-/// store.write(p.raw(), 0, &[1; 20_000])?;
+/// store.splice(0, 0, &[1; 20_000])?;
 /// store.flush()?;
 /// let s = store.stats();
 /// assert_eq!(s.data_pages, 5);
@@ -24,7 +23,7 @@ pub struct Stats {
     pub journal_bytes: u64,
     /// Data pages written by flushes.
     pub data_pages_written: u64,
-    /// Address-table pages written by flushes, headers excluded.
+    /// Span-table pages written by flushes, headers excluded.
     pub table_pages_written: u64,
     /// Header pages written.
     pub headers_written: u64,
@@ -36,7 +35,7 @@ pub struct Stats {
     pub truncations: u64,
     /// Data pages evacuated.
     pub evacuated_pages: u64,
-    /// Survivor bytes evacuation rewrote.
+    /// Survivor bytes evacuation wrote again.
     pub evacuated_bytes: u64,
     /// Victims taken in pages the flush wrote anyway.
     pub free_filled_pages: u64,
@@ -45,53 +44,53 @@ pub struct Stats {
     /// Flushes that ran in compaction mode, moving content off the end of
     /// the file.
     pub compaction_flushes: u64,
-    /// Address-table pages the page rewrite drained.
+    /// Leaves whose live entries a rewrite moved, to drain them.
     pub table_rewrites: u64,
-    /// Fragments the rotating window restated.
-    pub window_restated: u64,
-    /// Description defragmentation rewrites executed.
-    pub defrag_rewrites: u64,
-    /// Bytes description defragmentation rewrote.
-    pub defrag_bytes: u64,
-    /// Bytes the application wrote into data pages through flushes.
+    /// Bytes of new content flushes wrote into data pages.
     pub fresh_bytes: u64,
-    /// Bytes a splice or a move shifted within their allocation that flushes
-    /// stated at their new offsets where they lie, rather than writing them
+    /// Entries written, in the header and in leaves.
+    pub entries_stated: u64,
+    /// Spans split where an edit cut into them.
+    pub span_splits: u64,
+    /// Bytes of short spans written again where an edit cut into them,
+    /// rather than split.
+    pub rewritten_bytes: u64,
+    /// Merges of short spans as their entries left the header, and the
+    /// bytes they wrote again.
+    pub evict_merges: u64,
+    pub evict_merge_bytes: u64,
+    /// Merges of cold spans by the rotating walk, and the bytes they wrote
     /// again.
-    pub restated_bytes: u64,
-    /// Bytes a splice or a move shifted within their allocation that flushes
-    /// wrote again instead, to merge the fragments they lay in, since those
-    /// would otherwise be stated again at every later shift.
-    pub merged_bytes: u64,
+    pub walk_merges: u64,
+    pub walk_merge_bytes: u64,
 
     // A snapshot of the file, filled when the stats are read.
     /// The file's length in pages.
     pub file_pages: u64,
     /// Live data pages.
     pub data_pages: u64,
-    /// Live address-table pages, the headers excluded.
+    /// Live span-table pages, the headers excluded.
     pub table_pages: u64,
-    /// Reusable pages, ready or retiring.
+    /// Pages within the file that hold nothing live: reusable, or retired
+    /// by the last commit.
     pub free_pages: u64,
     /// Bytes of data pages current state relies on.
     pub live_data_bytes: u64,
-    /// Bytes of table pages current state relies on.
+    /// Bytes of leaves current state relies on.
     pub live_table_bytes: u64,
-    /// Bytes of all live allocations.
-    pub allocation_bytes: u64,
-    /// Live allocations.
-    pub allocations: u64,
-    /// Fragments in the fragment map.
-    pub fragments: u64,
-    /// Live statements.
-    pub statements: u64,
+    /// The sequence's length.
+    pub sequence_bytes: u64,
+    /// The schema chain's length.
+    pub schema_bytes: u64,
+    /// Spans the chains reach, each with one live entry.
+    pub spans: u64,
     /// The consolidation budget in pages.
     pub budget: u64,
 }
 
 impl Stats {
     /// Live bytes over the content capacity of every live page, data and
-    /// address table alike; 1 for a file without such pages.
+    /// span table alike; 1 for a file without such pages.
     ///
     /// See [`Stats`] for an example.
     pub fn live_fraction(&self) -> f64 {

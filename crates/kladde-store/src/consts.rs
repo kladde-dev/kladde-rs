@@ -21,8 +21,8 @@ pub const HEADER_CONTENT_OFFSET: usize = HEADER_FIELDS + CONTENT_OFFSET;
 /// are the trailer.
 pub const JOURNAL_STREAM: usize = PAGE_SIZE - 8;
 
-/// `kind` of an address-table page, including the header pages.
-pub const KIND_ADDRESS_TABLE: u8 = 0x01;
+/// `kind` of a span-table page, including the header pages.
+pub const KIND_TABLE: u8 = 0x01;
 /// `kind` of a data page.
 pub const KIND_DATA: u8 = 0x02;
 
@@ -37,7 +37,7 @@ pub const MIN_READER_VERSION: u16 = 0;
 /// The newest `min_reader_version` this implementation can read.
 pub const READER_VERSION: u16 = 0;
 
-/// The format's ceiling on an `Inline` payload.
-pub const MAX_INLINE: usize = 125;
-/// The largest allocation size, `2^32 - 1`.
-pub const MAX_ALLOCATION_SIZE: u64 = u32::MAX as u64;
+/// The format's ceiling on an `Inline` entry's payload.
+pub const MAX_INLINE: usize = 126;
+/// The largest a sequence may be: positions stay below `2^48`.
+pub const MAX_SEQUENCE: u64 = 1 << 48;

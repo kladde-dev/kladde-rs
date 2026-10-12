@@ -1,12 +1,15 @@
 [workspace]
 resolver = "2"
+# The crates above the store rejoin as they are ported onto one sequence.
 members = [
-    "crates/kladde",
-    "crates/kladde-derive",
-    "crates/kladde-types",
     "crates/kladde-varint",
     "crates/kladde-schema",
     "crates/kladde-store",
+]
+exclude = [
+    "crates/kladde",
+    "crates/kladde-derive",
+    "crates/kladde-types",
     "crates/kladde-persist",
     "crates/kladde-bench",
     "crates/kladde-svg",

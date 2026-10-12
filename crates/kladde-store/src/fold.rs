@@ -1,568 +1,364 @@
-//! Phase A of the flush (`impl/flush.md#phase-a--the-fold`): the net effect
-//! of the journal, per id, as a piece table over the id's final bytes.
+//! The fold: the journal's records applied to a piece table over the
+//! sequence, which starts as one piece, the committed sequence, and ends as
+//! the new sequence described by committed ranges and new bytes.
+//!
+//! The pieces sit in a counted tree, so each record costs `O(log p)` for the
+//! `p` pieces the journal made, however long the sequence; a transaction's
+//! cuts are kept as trees of their own until the transaction ends.
 
-use std::collections::BTreeMap;
-
+use crate::error::{corrupt, Error};
 use crate::journal::Record;
-#[cfg(test)]
-use crate::journal::Records;
+use crate::treap::{Item, Treap, NIL};
 
-/// Where a piece's bytes come from, offset-relative so that it can advance.
+/// Where a piece's bytes come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Source {
-    /// Bytes in the records' arena, from this position.
-    Literal(u64),
-    /// The committed content of `id`, from this offset.
-    Storage(u32, u32),
-    /// Zeros.
-    Zero,
+pub enum Src {
+    /// The committed sequence, from this position on.
+    Committed(u64),
+    /// The journal buffer's arena, from this position on.
+    Arena(u64),
 }
 
-impl Source {
-    fn advanced(self, d: u32) -> Source {
-        match self {
-            Source::Literal(p) => Source::Literal(p + d as u64),
-            Source::Storage(id, o) => Source::Storage(id, o + d),
-            Source::Zero => Source::Zero,
-        }
+impl Default for Src {
+    fn default() -> Self {
+        Src::Committed(0)
+    }
+}
+
+/// A run of the new sequence and where its bytes come from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Piece {
+    pub src: Src,
+    pub len: u64,
+}
+
+impl Item for Piece {
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+impl Piece {
+    /// The two parts of the piece, `off` bytes into it.
+    fn cut(&self, off: u64) -> (Piece, Piece) {
+        let right = match self.src {
+            Src::Committed(s) => Src::Committed(s + off),
+            Src::Arena(s) => Src::Arena(s + off),
+        };
+        (
+            Piece {
+                src: self.src,
+                len: off,
+            },
+            Piece {
+                src: right,
+                len: self.len - off,
+            },
+        )
     }
 
-    fn continues(self, len: u32, next: Source) -> bool {
-        match (self, next) {
-            (Source::Literal(a), Source::Literal(b)) => a + len as u64 == b,
-            (Source::Storage(i, a), Source::Storage(j, b)) => i == j && a + len == b,
-            (Source::Zero, Source::Zero) => true,
+    /// Whether `next` continues this piece's bytes where they end.
+    fn continued_by(&self, next: &Piece) -> bool {
+        match (self.src, next.src) {
+            (Src::Committed(a), Src::Committed(b)) | (Src::Arena(a), Src::Arena(b)) => {
+                a + self.len == b
+            }
             _ => false,
         }
     }
 }
 
-/// A piece table: the source of every byte of `[0, size)`.
-#[derive(Clone, Debug, Default)]
-pub struct Table {
-    /// Segment start -> source; the first key is 0 whenever `size > 0`.
-    pub pieces: BTreeMap<u32, Source>,
-    pub size: u32,
+/// The piece table of one fold.
+struct PieceTable {
+    t: Treap<Piece>,
+    root: u32,
 }
 
-impl Table {
-    fn persistent(id: u32, size: u32) -> Table {
-        let mut pieces = BTreeMap::new();
-        if size > 0 {
-            pieces.insert(0, Source::Storage(id, 0));
-        }
-        Table { pieces, size }
+impl PieceTable {
+    fn len(&self) -> u64 {
+        self.t.sum(self.root)
     }
 
-    /// The pieces covering `[start, end)`, clipped and made relative to
-    /// `start`; bytes past the size read as zero.
-    fn slice(&self, start: u32, end: u32) -> Vec<(u32, Source)> {
-        let mut out = Vec::new();
-        if start < self.size && start < end {
-            let first = self
-                .pieces
-                .range(..=start)
-                .next_back()
-                .map(|(&k, &s)| (k, s))
-                .unwrap();
-            out.push((0, first.1.advanced(start - first.0)));
-            let upper = end.min(self.size);
-            if start + 1 < upper {
-                for (&k, &s) in self.pieces.range(start + 1..upper) {
-                    out.push((k - start, s));
-                }
-            }
-        }
-        if end > self.size.max(start) {
-            let from = self.size.max(start) - start;
-            if out.last().is_none_or(|(_, s)| *s != Source::Zero) {
-                out.push((from, Source::Zero));
-            }
-        }
-        out
+    fn split(&mut self, root: u32, pos: u64) -> (u32, u32) {
+        self.t.split_at(root, pos, |p, off| p.cut(off))
     }
 
-    /// Splits so that a piece starts at `at`.
-    fn split(&mut self, at: u32) {
-        if at >= self.size || self.pieces.contains_key(&at) {
-            return;
-        }
-        let (k, s) = self
-            .pieces
-            .range(..at)
-            .next_back()
-            .map(|(&k, &s)| (k, s))
-            .unwrap();
-        self.pieces.insert(at, s.advanced(at - k));
+    /// Takes `[pos, pos + n)` out, and returns it as a tree of its own.
+    fn take(&mut self, pos: u64, n: u64) -> u32 {
+        let (a, rest) = self.split(self.root, pos);
+        let (m, b) = self.split(rest, n);
+        self.root = self.t.merge(a, b);
+        m
     }
 
-    /// Overwrites `[start, end)`, within the size, with `repl` (relative).
-    fn overwrite(&mut self, start: u32, end: u32, repl: &[(u32, Source)]) {
-        if start >= end {
-            return;
-        }
-        self.split(start);
-        self.split(end);
-        let doomed: Vec<u32> = self.pieces.range(start..end).map(|(&k, _)| k).collect();
-        for k in doomed {
-            self.pieces.remove(&k);
-        }
-        for &(rel, s) in repl {
-            if start + rel < end {
-                self.pieces.insert(start + rel, s);
-            }
-        }
-        self.coalesce_at(start);
-        self.coalesce_at(end);
-        for &(rel, _) in repl.iter().skip(1) {
-            self.coalesce_at(start + rel);
-        }
+    /// Inserts the tree `m` at `pos`.
+    fn insert(&mut self, pos: u64, m: u32) {
+        let (a, b) = self.split(self.root, pos);
+        let left = self.t.merge(a, m);
+        self.root = self.t.merge(left, b);
     }
 
-    fn coalesce_at(&mut self, at: u32) {
-        if at == 0 || at >= self.size {
-            return;
-        }
-        let Some(&s) = self.pieces.get(&at) else {
-            return;
-        };
-        let (k, p) = self
-            .pieces
-            .range(..at)
-            .next_back()
-            .map(|(&k, &p)| (k, p))
-            .unwrap();
-        if p.continues(at - k, s) {
-            self.pieces.remove(&at);
-        }
-    }
-
-    fn grow_to(&mut self, n: u32) {
-        if n <= self.size {
-            return;
-        }
-        let old = self.size;
-        self.size = n;
-        match self.pieces.range(..old).next_back() {
-            Some((_, Source::Zero)) => {}
-            _ => {
-                self.pieces.insert(old, Source::Zero);
-            }
-        }
-    }
-
-    fn truncate(&mut self, n: u32) {
-        if n >= self.size {
-            return;
-        }
-        let doomed: Vec<u32> = self.pieces.range(n..).map(|(&k, _)| k).collect();
-        for k in doomed {
-            self.pieces.remove(&k);
-        }
-        self.size = n;
-    }
-
-    /// Replaces `[off, off + old_len)` with `new_len` bytes from `repl`,
-    /// shifting the tail.
-    fn splice(&mut self, off: u32, old_len: u32, repl: &[(u32, Source)], new_len: u32) {
-        self.grow_to(off + old_len);
-        self.split(off);
-        self.split(off + old_len);
-        let tail: Vec<(u32, Source)> = self
-            .pieces
-            .range(off + old_len..)
-            .map(|(&k, &s)| (k, s))
-            .collect();
-        let doomed: Vec<u32> = self.pieces.range(off..).map(|(&k, _)| k).collect();
-        for k in doomed {
-            self.pieces.remove(&k);
-        }
-        for &(rel, s) in repl {
-            self.pieces.insert(off + rel, s);
-        }
-        let new_size = self.size - old_len + new_len;
-        for (k, s) in tail {
-            self.pieces.insert(k - old_len + new_len, s);
-        }
-        self.size = new_size;
-        if new_len > 0 {
-            self.coalesce_at(off);
-            self.coalesce_at(off + new_len);
-        } else {
-            self.coalesce_at(off);
+    fn insert_piece(&mut self, pos: u64, p: Piece) {
+        if p.len > 0 {
+            let m = self.t.node(p);
+            self.insert(pos, m);
         }
     }
 }
 
-/// The net effect of the journal on one id.
-#[derive(Clone, Debug, Default)]
-pub struct IdFold {
-    /// It existed before the journal.
-    pub existed: bool,
-    /// Its committed incarnation ended during the journal.
-    pub ended: bool,
-    /// It exists after the journal.
-    pub exists: bool,
-    /// Its bytes at the end, when it exists.
-    pub table: Table,
-    /// The committed incarnation is still the current one.
-    pub committed_live: bool,
-    /// A record wrote its content or size.
-    pub written: bool,
+fn past_end() -> Error {
+    corrupt("a journal record reaches past the end of the sequence")
 }
 
-/// The fold of the journal.
-#[derive(Debug, Default)]
-pub struct Fold {
-    pub ids: BTreeMap<u32, IdFold>,
-}
-
-impl Fold {
-    fn entry<'a>(&'a mut self, id: u32, committed: &impl Fn(u32) -> Option<u32>) -> &'a mut IdFold {
-        self.ids.entry(id).or_insert_with(|| match committed(id) {
-            Some(size) => IdFold {
-                existed: true,
-                exists: true,
-                committed_live: true,
-                table: Table::persistent(id, size),
-                ..Default::default()
-            },
-            None => IdFold::default(),
-        })
-    }
-
-    /// Brings `id` into existence if it is not, as every record but `Free` does.
-    fn bring(&mut self, id: u32, committed: &impl Fn(u32) -> Option<u32>) -> &mut IdFold {
-        let f = self.entry(id, committed);
-        if !f.exists {
-            f.exists = true;
-            f.table = Table::default();
-        }
-        f.written = true;
-        f
-    }
-
-    /// `[start, start + len)` of `id` as it currently reads.
-    fn read(
-        &mut self,
-        id: u32,
-        start: u32,
-        len: u32,
-        committed: &impl Fn(u32) -> Option<u32>,
-    ) -> Vec<(u32, Source)> {
-        let end = start + len;
-        match self.ids.get(&id) {
-            Some(f) if f.exists => f.table.slice(start, end),
-            Some(_) => vec![(0, Source::Zero)],
-            None => match committed(id) {
-                Some(size) => Table::persistent(id, size).slice(start, end),
-                None => vec![(0, Source::Zero)],
-            },
-        }
-    }
-}
-
-/// Folds `records` against the committed state, which `committed` describes:
-/// the size of each existing id.
+/// Applies `records`, each with whether a journal transaction starts at it,
+/// to a sequence of `committed` bytes, and returns the new sequence as
+/// pieces, adjacent pieces that continue each other merged.
+///
+/// Fails on a record whose range does not lie inside the sequence, or on a
+/// paste of a cut its transaction did not make or already pasted.
 pub fn fold<'a>(
-    records: impl IntoIterator<Item = &'a Record>,
-    committed: impl Fn(u32) -> Option<u32>,
-) -> Fold {
-    let mut f = Fold::default();
-    for r in records {
+    records: impl Iterator<Item = (bool, &'a Record)>,
+    committed: u64,
+) -> Result<Vec<Piece>, Error> {
+    let mut pt = PieceTable {
+        t: Treap::new(),
+        root: NIL,
+    };
+    if committed > 0 {
+        pt.root = pt.t.node(Piece {
+            src: Src::Committed(0),
+            len: committed,
+        });
+    }
+    // The cuts of the current transaction, oldest first: their trees, or
+    // `NIL` once pasted.
+    let mut cuts: Vec<u32> = Vec::new();
+    let end_transaction = |pt: &mut PieceTable, cuts: &mut Vec<u32>| {
+        for c in cuts.drain(..) {
+            pt.t.free_tree(c);
+        }
+    };
+    for (start, r) in records {
+        if start {
+            end_transaction(&mut pt, &mut cuts);
+        }
+        let len = pt.len();
         match *r {
-            Record::Free { id } => {
-                let e = f.entry(id, &committed);
-                if e.exists {
-                    e.exists = false;
-                    e.table = Table::default();
-                    if e.committed_live {
-                        e.committed_live = false;
-                        e.ended = true;
-                    }
-                    e.written = true;
+            Record::Write { pos, bytes } => {
+                let n = bytes.len as u64;
+                if pos.checked_add(n).is_none_or(|e| e > len) {
+                    return Err(past_end());
                 }
-            }
-            Record::Resize { id, size } => {
-                let e = f.bring(id, &committed);
-                if size < e.table.size {
-                    e.table.truncate(size);
-                } else {
-                    e.table.grow_to(size);
-                }
-            }
-            Record::Write { id, offset, bytes } => {
-                let e = f.bring(id, &committed);
-                let end = offset + bytes.len;
-                e.table.grow_to(end);
-                if bytes.len > 0 {
-                    e.table
-                        .overwrite(offset, end, &[(0, Source::Literal(bytes.start))]);
-                }
+                let m = pt.take(pos, n);
+                pt.t.free_tree(m);
+                pt.insert_piece(
+                    pos,
+                    Piece {
+                        src: Src::Arena(bytes.start),
+                        len: n,
+                    },
+                );
             }
             Record::Splice {
-                id,
-                offset,
-                old_len,
+                pos,
+                removed,
                 bytes,
             } => {
-                let e = f.bring(id, &committed);
-                let repl: Vec<(u32, Source)> = if bytes.len > 0 {
-                    vec![(0, Source::Literal(bytes.start))]
-                } else {
-                    vec![]
-                };
-                e.table.splice(offset, old_len, &repl, bytes.len);
+                if pos.checked_add(removed).is_none_or(|e| e > len) {
+                    return Err(past_end());
+                }
+                if removed > 0 {
+                    let m = pt.take(pos, removed);
+                    cuts.push(m);
+                }
+                pt.insert_piece(
+                    pos,
+                    Piece {
+                        src: Src::Arena(bytes.start),
+                        len: bytes.len as u64,
+                    },
+                );
             }
-            Record::Copy {
-                src,
-                src_offset,
-                len,
-                dst,
-                dst_offset,
+            Record::Move { from, len: n, to } => {
+                if from.checked_add(n).is_none_or(|e| e > len) || to > len - n {
+                    return Err(past_end());
+                }
+                let m = pt.take(from, n);
+                pt.insert(to, m);
             }
-            | Record::Move {
-                src,
-                src_offset,
-                len,
-                dst,
-                dst_offset,
+            Record::Paste {
+                pos,
+                removed,
+                cut,
+                len: n,
             } => {
-                let is_move = matches!(r, Record::Move { .. });
-                // The whole source range is read before anything is written.
-                let pieces = f.read(src, src_offset, len, &committed);
-                let src_size = match f.ids.get(&src) {
-                    Some(e) if e.exists => Some(e.table.size),
-                    Some(_) => None,
-                    None => committed(src),
+                if pos.checked_add(removed).is_none_or(|e| e > len) {
+                    return Err(past_end());
+                }
+                let Some(i) = cuts.len().checked_sub(1 + cut as usize) else {
+                    return Err(corrupt("a paste names a cut its transaction did not make"));
                 };
-                let e = f.bring(dst, &committed);
-                e.table.grow_to(dst_offset + len);
-                if len > 0 {
-                    e.table.overwrite(dst_offset, dst_offset + len, &pieces);
+                let m = std::mem::replace(&mut cuts[i], NIL);
+                if m == NIL && n > 0 {
+                    return Err(corrupt("a paste names a cut already pasted"));
                 }
-                if is_move && len > 0 {
-                    if let Some(size) = src_size {
-                        let (s, t) = (src_offset.min(size), (src_offset + len).min(size));
-                        let d = (dst_offset, dst_offset + len);
-                        // Zero what the destination did not just overwrite.
-                        let mut zero = Vec::new();
-                        if src == dst {
-                            if s < d.0.min(t) {
-                                zero.push((s, d.0.min(t)));
-                            }
-                            if d.1.max(s) < t {
-                                zero.push((d.1.max(s), t));
-                            }
-                        } else if s < t {
-                            zero.push((s, t));
-                        }
-                        let es = f.entry(src, &committed);
-                        es.written = true;
-                        for (a, b) in zero {
-                            es.table.overwrite(a, b, &[(0, Source::Zero)]);
-                        }
-                    }
+                if pt.t.sum(m) != n {
+                    return Err(corrupt("a paste's cut has another length"));
                 }
+                let dropped = pt.take(pos, removed);
+                pt.t.free_tree(dropped);
+                pt.insert(pos, m);
             }
         }
     }
-    f
+    end_transaction(&mut pt, &mut cuts);
+    let mut out: Vec<Piece> = Vec::new();
+    for n in pt.t.nodes(pt.root) {
+        let p = *pt.t.item(n);
+        match out.last_mut() {
+            Some(last) if last.continued_by(&p) => last.len += p.len,
+            _ => out.push(p),
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
-    use crate::journal::Bytes;
-    use std::collections::HashMap;
+    use crate::journal::Records;
 
-    /// Replays records naively over byte vectors: the oracle.
-    pub fn naive(records: &Records, mut state: HashMap<u32, Vec<u8>>) -> HashMap<u32, Vec<u8>> {
-        for r in records.iter() {
-            match *r {
-                Record::Free { id } => {
-                    state.remove(&id);
-                }
-                Record::Resize { id, size } => {
-                    state.entry(id).or_default().resize(size as usize, 0)
-                }
-                Record::Write { id, offset, bytes } => {
-                    let v = state.entry(id).or_default();
-                    let end = offset as usize + bytes.len as usize;
-                    if v.len() < end {
-                        v.resize(end, 0);
-                    }
-                    v[offset as usize..end].copy_from_slice(&records.to_vec(bytes));
-                }
-                Record::Splice {
-                    id,
-                    offset,
-                    old_len,
-                    bytes,
-                } => {
-                    let v = state.entry(id).or_default();
-                    let end = (offset + old_len) as usize;
-                    if v.len() < end {
-                        v.resize(end, 0);
-                    }
-                    v.splice(offset as usize..end, records.to_vec(bytes));
-                }
-                Record::Copy {
-                    src,
-                    src_offset,
-                    len,
-                    dst,
-                    dst_offset,
-                }
-                | Record::Move {
-                    src,
-                    src_offset,
-                    len,
-                    dst,
-                    dst_offset,
-                } => {
-                    let is_move = matches!(r, Record::Move { .. });
-                    let from = state.get(&src).cloned();
-                    let bytes: Vec<u8> = (0..len as usize)
-                        .map(|i| {
-                            from.as_ref()
-                                .and_then(|v| v.get(src_offset as usize + i).copied())
-                                .unwrap_or(0)
-                        })
-                        .collect();
-                    let v = state.entry(dst).or_default();
-                    let end = (dst_offset + len) as usize;
-                    if v.len() < end {
-                        v.resize(end, 0);
-                    }
-                    v[dst_offset as usize..end].copy_from_slice(&bytes);
-                    if is_move {
-                        if let Some(sv) = state.get_mut(&src) {
-                            for i in src_offset as usize..(src_offset + len) as usize {
-                                let in_dst = src == dst && i >= dst_offset as usize && i < end;
-                                if i < sv.len() && !in_dst {
-                                    sv[i] = 0;
-                                }
-                            }
-                        }
-                    }
+    /// The bytes the pieces describe, committed bytes read from `old` and
+    /// new ones from the arena.
+    fn apply(pieces: &[Piece], old: &[u8], recs: &Records) -> Vec<u8> {
+        let mut out = Vec::new();
+        for p in pieces {
+            match p.src {
+                Src::Committed(s) => out.extend_from_slice(&old[s as usize..(s + p.len) as usize]),
+                Src::Arena(s) => {
+                    let mut b = vec![0; p.len as usize];
+                    recs.copy_bytes(s, &mut b);
+                    out.extend(b);
                 }
             }
-        }
-        state
-    }
-
-    /// Materializes a fold over `committed` bytes.
-    pub fn materialize(
-        f: &Fold,
-        records: &Records,
-        committed: &HashMap<u32, Vec<u8>>,
-    ) -> HashMap<u32, Vec<u8>> {
-        let mut out = committed.clone();
-        for (&id, e) in &f.ids {
-            if !e.exists {
-                out.remove(&id);
-                continue;
-            }
-            let mut v = vec![0u8; e.table.size as usize];
-            let keys: Vec<(u32, Source)> = e.table.pieces.iter().map(|(&k, &s)| (k, s)).collect();
-            for (i, &(k, s)) in keys.iter().enumerate() {
-                let end = keys.get(i + 1).map_or(e.table.size, |n| n.0);
-                for j in k..end {
-                    v[j as usize] = match s.advanced(j - k) {
-                        Source::Literal(p) => records.byte(p),
-                        Source::Storage(src, o) => committed
-                            .get(&src)
-                            .and_then(|b| b.get(o as usize).copied())
-                            .unwrap_or(0),
-                        Source::Zero => 0,
-                    };
-                }
-            }
-            out.insert(id, v);
         }
         out
     }
 
     struct Rng(u64);
     impl Rng {
-        fn next(&mut self) -> u64 {
+        fn below(&mut self, n: u64) -> u64 {
             self.0 ^= self.0 << 13;
             self.0 ^= self.0 >> 7;
             self.0 ^= self.0 << 17;
-            self.0
-        }
-        fn below(&mut self, n: u64) -> u64 {
-            self.next() % n.max(1)
+            self.0 % n.max(1)
         }
     }
 
     #[test]
-    fn the_fold_agrees_with_naive_replay() {
-        for seed in 1..400u64 {
+    fn the_fold_agrees_with_a_vector() {
+        for seed in 1..40u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let mut committed: HashMap<u32, Vec<u8>> = HashMap::new();
-            for id in 1..4u32 {
-                let len = rng.below(40) as usize;
-                committed.insert(id, (0..len).map(|i| (id as u8) * 16 + i as u8).collect());
-            }
+            let old: Vec<u8> = (0..rng.below(300)).map(|i| i as u8).collect();
+            let mut model = old.clone();
             let mut recs = Records::new();
-            for _ in 0..rng.below(12) + 1 {
-                let id = 1 + rng.below(5) as u32;
-                let other = 1 + rng.below(5) as u32;
-                let rec = match rng.below(6) {
-                    0 => Record::Free { id },
-                    1 => Record::Resize {
-                        id,
-                        size: rng.below(50) as u32,
-                    },
-                    2 => {
-                        let len = rng.below(10) as usize;
-                        let fill = rng.below(200) as u8 + 1;
-                        let bytes: Bytes = recs.stash(&vec![fill; len]);
+            let mut cuts: Vec<Option<Vec<u8>>> = Vec::new();
+            for _ in 0..200 {
+                if rng.below(5) == 0 {
+                    recs.mark_start(recs.end().at);
+                    cuts.clear();
+                }
+                let len = model.len() as u64;
+                let r = match rng.below(4) {
+                    0 if len > 0 => {
+                        let pos = rng.below(len);
+                        let n = rng.below(len - pos) + 1;
+                        let new: Vec<u8> = (0..n).map(|_| rng.below(256) as u8).collect();
+                        model[pos as usize..(pos + n) as usize].copy_from_slice(&new);
                         Record::Write {
-                            id,
-                            offset: rng.below(40) as u32,
-                            bytes,
+                            pos,
+                            bytes: recs.stash(&new),
                         }
                     }
-                    3 => {
-                        let len = rng.below(10) as usize;
-                        let fill = rng.below(200) as u8 + 1;
-                        let bytes = recs.stash(&vec![fill; len]);
+                    1 => {
+                        let pos = rng.below(len + 1);
+                        let removed = rng.below(len - pos + 1);
+                        let new: Vec<u8> =
+                            (0..rng.below(20)).map(|_| rng.below(256) as u8).collect();
+                        let cut: Vec<u8> = model
+                            .splice(pos as usize..(pos + removed) as usize, new.iter().copied())
+                            .collect();
+                        if removed > 0 {
+                            cuts.push(Some(cut));
+                        }
                         Record::Splice {
-                            id,
-                            offset: rng.below(40) as u32,
-                            old_len: rng.below(10) as u32,
-                            bytes,
+                            pos,
+                            removed,
+                            bytes: recs.stash(&new),
                         }
                     }
-                    4 => Record::Copy {
-                        src: other,
-                        src_offset: rng.below(40) as u32,
-                        len: rng.below(15) as u32,
-                        dst: id,
-                        dst_offset: rng.below(40) as u32,
-                    },
-                    _ => Record::Move {
-                        src: other,
-                        src_offset: rng.below(40) as u32,
-                        len: rng.below(15) as u32,
-                        dst: id,
-                        dst_offset: rng.below(40) as u32,
+                    2 if len > 0 => {
+                        let from = rng.below(len);
+                        let n = rng.below(len - from) + 1;
+                        let to = rng.below(len - n + 1);
+                        let m: Vec<u8> = model.drain(from as usize..(from + n) as usize).collect();
+                        model.splice(to as usize..to as usize, m);
+                        Record::Move { from, len: n, to }
+                    }
+                    _ => match cuts.iter().rposition(|c| c.is_some()) {
+                        Some(i) => {
+                            let cut = cuts[i].take().unwrap();
+                            let pos = rng.below(len + 1);
+                            let removed = rng.below(len - pos + 1);
+                            let n = cut.len() as u64;
+                            model.splice(pos as usize..(pos + removed) as usize, cut);
+                            Record::Paste {
+                                pos,
+                                removed,
+                                cut: (cuts.len() - 1 - i) as u32,
+                                len: n,
+                            }
+                        }
+                        None => continue,
                     },
                 };
-                recs.push(rec);
+                recs.push(r);
             }
-            let want = naive(&recs, committed.clone());
-            let f = fold(recs.iter(), |id| committed.get(&id).map(|v| v.len() as u32));
-            let got = materialize(&f, &recs, &committed);
-            assert_eq!(
-                got,
-                want,
-                "seed {seed}: {:?}",
-                recs.iter().collect::<Vec<_>>()
-            );
+            let pieces = fold(recs.range(recs.front(), recs.end()), old.len() as u64).unwrap();
+            assert_eq!(apply(&pieces, &old, &recs), model, "seed {seed}");
+            // Adjacent pieces never continue each other.
+            for w in pieces.windows(2) {
+                assert!(!w[0].continued_by(&w[1]));
+            }
         }
+    }
+
+    #[test]
+    fn a_record_past_the_end_is_refused() {
+        let mut recs = Records::new();
+        let bytes = recs.stash(b"ab");
+        recs.push(Record::Write { pos: 9, bytes });
+        assert!(fold(recs.range(recs.front(), recs.end()), 10).is_err());
+        assert!(fold(recs.range(recs.front(), recs.end()), 11).is_ok());
+    }
+
+    #[test]
+    fn a_cut_from_another_transaction_is_refused() {
+        let mut recs = Records::new();
+        recs.mark_start(0);
+        let bytes = recs.stash(b"");
+        recs.push(Record::Splice {
+            pos: 0,
+            removed: 2,
+            bytes,
+        });
+        recs.mark_start(1);
+        recs.push(Record::Paste {
+            pos: 0,
+            removed: 0,
+            cut: 0,
+            len: 2,
+        });
+        assert!(fold(recs.range(recs.front(), recs.end()), 5).is_err());
     }
 }

@@ -1,32 +1,33 @@
-//! The kladde storage layer: a file of fixed-size pages holding byte
-//! allocations, described by an address table of statements, mutated through
-//! a journal, flushed copy-on-write, and consolidated as it goes.
+//! The kladde storage layer: one sequence of bytes, kept in a file of
+//! fixed-size pages as a chain of spans, mutated through a journal, flushed
+//! copy-on-write, and consolidated as it goes.
 //!
-//! The format is specified in kladde-docs' `spec/`, and the algorithms here
-//! follow its `impl/`. Everything is type-agnostic: allocations are byte
-//! ranges, and what their bytes mean is the business of the layers above.
+//! The sequence is the encoding of an application's root value, which the
+//! layers above define; the store knows only bytes. Each span shows a run of
+//! the sequence's bytes and names the span after it, so that a splice or a
+//! move anywhere in the sequence states a few spans, however long the
+//! sequence is. Besides the sequence, the file holds two short chains of the
+//! same kind: the schema the layers above describe the sequence with, and the
+//! implementation's private state.
 //!
 //! ```
 //! use kladde_store::{MemoryStorage, Store, WriteBackend};
 //!
 //! let storage = MemoryStorage::new();
 //! let store = Store::create(Box::new(storage.clone()), Default::default())?;
-//! let p = store.alloc(5)?;
-//! store.write(p.raw(), 0, b"hello")?;
+//! store.splice(0, 0, b"hello")?;
 //! store.close()?;
 //!
 //! let store = Store::open(Box::new(storage), Default::default())?;
-//! assert_eq!(store.read_all(p.raw())?, b"hello");
+//! assert_eq!(store.read_all()?, b"hello");
 //! # Ok::<(), kladde_store::Error>(())
 //! ```
 
 mod backend;
 mod consolidate;
-mod constate;
 mod consts;
 mod crc;
-mod cut;
-mod defrag;
+mod entries;
 mod error;
 mod flush;
 mod fold;
@@ -35,20 +36,16 @@ mod journal;
 mod load;
 mod options;
 mod page;
-mod pointer;
 mod state;
-mod statement;
 mod stats;
 mod storage;
 mod store;
+mod treap;
 
-pub use backend::{Backend, ReadBackend, WriteBackend};
+pub use backend::{CutId, WriteBackend};
 pub use consts::{MAX_PAGE_CONTENT, PAGE_SIZE};
 pub use error::{Error, Result};
 pub use options::Options;
-pub use pointer::{
-    decode_option, decode_option_slice, encode_option, Pointer, PointerRepr, UniquePointer, Word,
-};
 pub use stats::Stats;
 pub use storage::{FileStorage, MemoryStorage, Storage};
-pub use store::{AllocationReader, Store};
+pub use store::{SequenceReader, Store};

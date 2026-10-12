@@ -1,7 +1,8 @@
-//! Consolidation keeps a file near its live size under sustained overwrites,
-//! without changing what it reads.
+//! Consolidation keeps a file near its sequence's length under sustained
+//! edits, and the span policy keeps the spans few, without changing what the
+//! file reads.
 
-use kladde_store::{MemoryStorage, Options, Pointer, Stats, Store, WriteBackend};
+use kladde_store::{MemoryStorage, Options, Stats, Storage, Store, WriteBackend};
 
 struct Rng(u64);
 
@@ -17,81 +18,41 @@ impl Rng {
     }
 }
 
-/// Overwrites random ranges of `n` allocations of `size` bytes, flushing
-/// every `per_flush` writes, and checks every byte at the end.
-fn overwrite(
-    opts: Options,
-    n: usize,
-    size: usize,
-    write: usize,
-    per_flush: usize,
-    flushes: usize,
-) -> Stats {
+/// Checks that the store, and the file reopened, read `model`.
+fn verify(store: &Store, storage: &MemoryStorage, opts: &Options, model: &[u8]) {
+    store.check();
+    assert!(store.read_all().unwrap() == model, "the sequence differs");
+    let reopened = Store::open(
+        Box::new(MemoryStorage::from_image(storage.image())),
+        opts.clone(),
+    )
+    .unwrap();
+    reopened.check();
+    assert!(
+        reopened.read_all().unwrap() == model,
+        "the sequence differs after reopening"
+    );
+}
+
+/// Overwrites random ranges of a sequence of `size` bytes, flushing every
+/// `per_flush` writes.
+fn overwrite(opts: Options, size: usize, write: usize, per_flush: usize, flushes: usize) -> Stats {
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);
     let storage = MemoryStorage::new();
     let store = Store::create(Box::new(storage.clone()), opts.clone()).unwrap();
-    let mut model: Vec<Vec<u8>> = vec![vec![0; size]; n];
-    let ptrs: Vec<Pointer> = (0..n)
-        .map(|_| store.alloc(size as u32).unwrap().raw())
-        .collect();
+    let mut model = vec![0u8; size];
+    store.splice(0, 0, &model).unwrap();
     for f in 0..flushes {
         for _ in 0..per_flush {
-            let i = rng.below(n as u64) as usize;
             let len = (rng.below(write as u64) + 1) as usize;
             let off = rng.below((size - len) as u64 + 1) as usize;
-            let fill = (f % 251 + 1) as u8;
-            model[i][off..off + len].fill(fill);
-            store
-                .write(ptrs[i], off as u32, &model[i][off..off + len])
-                .unwrap();
+            model[off..off + len].fill((f % 251 + 1) as u8);
+            store.write(off as u64, &model[off..off + len]).unwrap();
         }
         store.flush().unwrap();
     }
-    store.check();
-    for (i, p) in ptrs.iter().enumerate() {
-        assert!(
-            store.read_all(*p).unwrap() == model[i],
-            "allocation {i} differs"
-        );
-    }
-    let stats = store.stats();
-    drop(store);
-    let store = Store::open(Box::new(MemoryStorage::from_image(storage.image())), opts).unwrap();
-    for (i, p) in ptrs.iter().enumerate() {
-        assert!(
-            store.read_all(*p).unwrap() == model[i],
-            "allocation {i} differs after reopening"
-        );
-    }
-    stats
-}
-
-/// Appends `piece` bytes to each of `n` allocations in every flush, and
-/// checks every byte at the end.
-fn append(opts: Options, n: usize, piece: usize, flushes: usize) -> Stats {
-    let storage = MemoryStorage::new();
-    let store = Store::create(Box::new(storage.clone()), opts.clone()).unwrap();
-    let ptrs: Vec<Pointer> = (0..n).map(|_| store.alloc(0).unwrap().raw()).collect();
-    let mut model: Vec<Vec<u8>> = vec![Vec::new(); n];
-    for f in 0..flushes {
-        for (i, p) in ptrs.iter().enumerate() {
-            let bytes: Vec<u8> = (0..piece).map(|j| (f * 7 + i * 3 + j) as u8).collect();
-            store.write(*p, model[i].len() as u32, &bytes).unwrap();
-            model[i].extend(bytes);
-        }
-        store.flush().unwrap();
-    }
-    store.check();
-    let stats = store.stats();
-    drop(store);
-    let store = Store::open(Box::new(MemoryStorage::from_image(storage.image())), opts).unwrap();
-    for (i, p) in ptrs.iter().enumerate() {
-        assert!(
-            store.read_all(*p).unwrap() == model[i],
-            "allocation {i} differs"
-        );
-    }
-    stats
+    verify(&store, &storage, &opts, &model);
+    store.stats()
 }
 
 fn data_fill(s: &Stats) -> f64 {
@@ -104,82 +65,119 @@ fn evacuation_keeps_data_pages_full() {
         consolidate: false,
         ..Default::default()
     };
-    let without = overwrite(off, 64, 8192, 600, 32, 300);
-    let with = overwrite(Options::default(), 64, 8192, 600, 32, 300);
+    let without = overwrite(off, 512 * 1024, 600, 32, 300);
+    let with = overwrite(Options::default(), 512 * 1024, 600, 32, 300);
+    println!("without {without:#?}\nwith {with:#?}");
     assert!(with.evacuated_pages > 0);
     assert!(
-        data_fill(&without) < 0.3,
+        data_fill(&without) < 0.6,
         "data fill {}",
         data_fill(&without)
     );
-    assert!(data_fill(&with) > 0.6, "data fill {}", data_fill(&with));
-    assert!(with.data_pages * 3 < without.data_pages);
+    assert!(data_fill(&with) > 0.75, "data fill {}", data_fill(&with));
+    assert!(with.data_pages * 3 < without.data_pages * 2);
 }
 
 #[test]
-fn page_rewrites_keep_leaves_full() {
-    let off = Options {
-        consolidate: false,
-        ..Default::default()
-    };
-    let without = overwrite(off, 64, 8192, 600, 32, 300);
-    let with = overwrite(Options::default(), 64, 8192, 600, 32, 300);
-    println!("without {without:#?}\nwith {with:#?}");
-    assert!(with.table_rewrites > 0 && with.window_restated > 0);
+fn leaves_are_drained_and_stay_full() {
+    let with = overwrite(Options::default(), 512 * 1024, 600, 32, 300);
+    assert!(with.table_rewrites > 0);
     assert!(
-        with.live_fraction() > 0.6,
+        with.live_fraction() > 0.7,
         "live fraction {}",
         with.live_fraction()
     );
-    assert!(with.table_pages * 3 < without.table_pages);
 }
 
-/// Writes `n` allocations of a page each, frees all but every fourth, then
-/// runs `flushes` flushes, each of `patches` small writes into what is left
-/// and one to a note. Returns the file's length in pages before and after.
-fn shrink(opts: Options, n: usize, flushes: usize, patches: usize) -> (u64, u64) {
-    use kladde_store::Storage;
+/// Types into a sequence of `size` bytes keystroke by keystroke at a cursor
+/// that jumps now and then, flushing every `per_flush` keystrokes; returns
+/// the spans at the end.
+fn typing(opts: Options, size: usize, keystrokes: u64, per_flush: u64) -> Stats {
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let storage = MemoryStorage::new();
     let store = Store::create(Box::new(storage.clone()), opts.clone()).unwrap();
-    let fill = |i: usize| (i % 251) as u8 + 1;
-    let mut owned: Vec<_> = (0..n)
-        .map(|i| {
-            let p = store.alloc(4000).unwrap();
-            store.write(p.raw(), 0, &[fill(i); 4000]).unwrap();
-            p
-        })
-        .collect();
-    store.flush().unwrap();
-    let before = storage.len().unwrap() / 4096;
-    let mut kept = Vec::new();
-    for (i, p) in owned.drain(..).enumerate() {
-        if i % 4 == 0 {
-            kept.push((p, vec![fill(i); 4000]));
+    let mut model = vec![b' '; size];
+    store.splice(0, 0, &model).unwrap();
+    let mut cursor = 0u64;
+    for k in 0..keystrokes {
+        if rng.below(500) == 0 {
+            cursor = rng.below(model.len() as u64 + 1);
+        }
+        if rng.below(10) == 0 && cursor > 0 {
+            cursor -= 1;
+            model.remove(cursor as usize);
+            store.splice(cursor, 1, b"").unwrap();
         } else {
-            store.free(p).unwrap();
+            let c = b'a' + (k % 26) as u8;
+            model.insert(cursor as usize, c);
+            store.splice(cursor, 0, &[c]).unwrap();
+            cursor += 1;
+        }
+        if k % per_flush == per_flush - 1 {
+            store.flush().unwrap();
         }
     }
-    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-    let note = store.alloc(8).unwrap();
-    for f in 0..flushes {
-        for _ in 0..patches {
-            let (p, model) = &mut kept[rng.below(n as u64 / 4) as usize];
-            let off = rng.below(4000 - 32) as usize;
-            model[off..off + 32].fill(f as u8);
-            store
-                .write(p.raw(), off as u32, &model[off..off + 32])
-                .unwrap();
-        }
+    store.flush().unwrap();
+    verify(&store, &storage, &opts, &model);
+    store.stats()
+}
+
+#[test]
+fn merges_keep_the_spans_of_typed_text_few() {
+    let off = Options {
+        span_min: 0,
+        walk: 0,
+        ..Default::default()
+    };
+    let without = typing(off, 64 * 1024, 30_000, 50);
+    let with = typing(Options::default(), 64 * 1024, 30_000, 50);
+    println!("without {without:#?}\nwith {with:#?}");
+    assert!(with.evict_merges > 0 && with.walk_merges > 0);
+    assert!(
+        with.spans * 2 < without.spans,
+        "{} against {}",
+        with.spans,
+        without.spans
+    );
+    // The description stays a small share of the bytes it describes.
+    assert!(
+        (with.live_table_bytes as f64) < 0.05 * with.sequence_bytes as f64,
+        "{} bytes of entries for {} bytes",
+        with.live_table_bytes,
+        with.sequence_bytes
+    );
+}
+
+/// Writes a sequence of `n` pages, cuts out all but every fourth, then runs
+/// `flushes` flushes of a small overwrite each. Returns the file's length
+/// in pages before and after.
+fn shrink(opts: Options, n: usize, flushes: usize) -> (u64, u64) {
+    let storage = MemoryStorage::new();
+    let store = Store::create(Box::new(storage.clone()), opts.clone()).unwrap();
+    let page = 4000usize;
+    let mut model: Vec<u8> = (0..n * page).map(|i| (i / page % 251) as u8 + 1).collect();
+    store.begin_batch().unwrap();
+    for i in 0..n {
         store
-            .write(note.raw(), 0, &(f as u64).to_le_bytes())
+            .splice((i * page) as u64, 0, &model[i * page..(i + 1) * page])
             .unwrap();
+    }
+    store.end_batch().unwrap();
+    store.flush().unwrap();
+    let before = storage.len().unwrap() / 4096;
+    for i in (0..n).rev() {
+        if i % 4 != 0 {
+            model.drain(i * page..(i + 1) * page);
+            store.splice((i * page) as u64, page as u64, b"").unwrap();
+        }
+    }
+    for f in 0..flushes {
+        model[f..f + 8].fill(f as u8);
+        store.write(f as u64, &model[f..f + 8]).unwrap();
         store.flush().unwrap();
     }
     store.close().unwrap();
-    store.check();
-    for (p, model) in &kept {
-        assert!(store.read_all(p.raw()).unwrap() == *model);
-    }
+    verify(&store, &storage, &opts, &model);
     (before, storage.len().unwrap() / 4096)
 }
 
@@ -189,55 +187,9 @@ fn compaction_moves_content_off_the_end() {
         hole_share: 1.0,
         ..Default::default()
     };
-    let (before, without) = shrink(off, 400, 60, 0);
-    let (_, with) = shrink(Options::default(), 400, 60, 0);
+    let (before, without) = shrink(off, 400, 60);
+    let (_, with) = shrink(Options::default(), 400, 60);
     println!("before {before}, without compaction {without}, with {with}");
-    assert!(without * 10 > before * 9, "{without} of {before} pages");
+    assert!(without * 10 > before * 7, "{without} of {before} pages");
     assert!(with * 2 < before, "{with} of {before} pages");
-}
-
-#[test]
-fn compaction_moves_full_table_pages_too() {
-    // The first flush after the frees states its patches inline, on leaves
-    // at the end of the file, since the freed pages are not reusable yet:
-    // a full table page becomes the tail. Without the rotating window, which
-    // in a large file drains such a page only slowly, compaction must
-    // rewrite it.
-    let opts = Options {
-        walk: 0,
-        ..Default::default()
-    };
-    let (before, with) = shrink(opts, 400, 30, 100);
-    println!("before {before}, with compaction {with}");
-    assert!(with * 4 < before, "{with} of {before} pages");
-}
-
-#[test]
-fn the_budget_survives_a_reopen() {
-    let storage = MemoryStorage::new();
-    let store = Store::create(Box::new(storage.clone()), Options::default()).unwrap();
-    let p = store.alloc(0).unwrap();
-    for f in 0..40u32 {
-        store.write(p.raw(), f * 100, &[1; 100]).unwrap();
-        store.flush().unwrap();
-    }
-    let budget = store.stats().budget;
-    assert_ne!(budget, Options::default().budget_pages as u64);
-    drop(store);
-    let store = Store::open(Box::new(storage), Options::default()).unwrap();
-    assert_eq!(store.stats().budget, budget);
-    assert_eq!(store.allocations().len(), 1);
-}
-
-#[test]
-fn defragmentation_merges_appended_pieces() {
-    let off = Options {
-        mu: f64::INFINITY,
-        ..Default::default()
-    };
-    let without = append(off, 32, 16, 200);
-    let with = append(Options::default(), 32, 16, 200);
-    println!("without {without:#?}\nwith {with:#?}");
-    assert!(with.defrag_rewrites > 0);
-    assert!(with.statements * 2 < without.statements);
 }

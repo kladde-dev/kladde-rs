@@ -1,12 +1,15 @@
-//! Consolidation (`impl/consolidation.md`): evacuating sparse data pages,
-//! in the room of pages the flush writes anyway and on pages of their own,
-//! and the controller that paces it.
+//! Consolidation: evacuating sparse data pages, in the room of pages the
+//! flush writes anyway and on pages of their own; draining sparse leaves;
+//! compaction mode; and the controller that paces it.
+//!
+//! The policy is today's churn floor, unchanged: a budgeted victim must free
+//! `churn_floor` bytes of space per byte it writes. Its survivors are whole
+//! spans, which keep their ids and are stated with their new addresses.
 
 use crate::consts::MAX_PAGE_CONTENT;
-use crate::defrag::{Candidate, Weighed};
 use crate::error::Error;
-use crate::flush::{DataPage, Output};
-use crate::hash::{IdMap, IdSet};
+use crate::flush::{DataPage, Flush, Output};
+use crate::hash::IdSet;
 use crate::state::*;
 use crate::stats::Stats;
 use crate::store::Inner;
@@ -17,62 +20,32 @@ const C: u32 = MAX_PAGE_CONTENT as u32;
 /// What consolidation carries from flush to flush.
 #[derive(Debug, Default)]
 pub struct ConsState {
-    /// The rotating window's cursor.
-    pub cursor: Key,
     /// The per-flush budget in pages, as the controller moved it.
     pub budget: f64,
     /// Where sampling starts within a bucket; rotates so that no prefix of
     /// a bucket is examined forever.
     pub rot: usize,
-    /// Victims this flush found unusable, so that it does not pick them again.
+    /// Victims this flush found unusable or took already, so that it does
+    /// not pick them again.
     pub skip: IdSet,
-    /// Description defragmentation's candidates from the latest walk, for
-    /// the next flush.
-    pub candidates: Vec<Candidate>,
-    /// This flush's candidates beyond its share, for free filling.
-    pub spare: Vec<Candidate>,
     /// Whether this flush runs in compaction mode.
     pub compaction: bool,
     /// Where the search for the highest live page resumes.
     pub tail: u32,
-    /// Where the consolidator state is kept.
-    pub kept: crate::constate::Kept,
-}
-
-/// A live fragment in a data page being evacuated.
-#[derive(Clone, Copy, Debug)]
-struct Survivor {
-    id: u32,
-    start: u32,
-    end: u32,
-    /// The statement stating it, or `None` if the flush took it already.
-    stmt: Option<StmtRef>,
-    /// Where its bytes are.
-    addr: u64,
-}
-
-impl Survivor {
-    fn len(&self) -> u32 {
-        self.end - self.start
-    }
+    /// Where the rotating walk resumes: a span of the sequence, or 0 for its
+    /// start.
+    pub walk: u32,
 }
 
 /// What one budgeted data page would hold, or what table victims would
 /// restate, and what either would reclaim.
 #[derive(Debug, Default)]
 struct Offer {
-    /// Victims evacuated, or rewritten, whole.
     whole: Vec<u32>,
-    /// One more victim whose survivors fill the page and lead the next one.
     cut: Option<u32>,
-    /// Whether the offer holds compaction mode's tail, which the budget
-    /// takes whatever the offer's ratio and fill.
     tail: bool,
-    /// The space it frees, net of the room its writes take.
     reclaimed: f64,
     written: f64,
-    /// How full a data offer's page would close, as a fraction of its
-    /// capacity.
     fill: f64,
 }
 
@@ -80,8 +53,6 @@ impl Inner {
     /// Resets what consolidation keeps for one flush only.
     pub(crate) fn begin_consolidation(&mut self) {
         self.cons.skip.clear();
-        // Compaction mode: while holes below the highest live page exceed a
-        // share of the file, that page is every mechanism's first victim.
         self.cons.tail = self.file_pages.saturating_sub(1);
         let holes = match self.tail() {
             Some(t) => (2..t)
@@ -96,15 +67,11 @@ impl Inner {
         }
     }
 
-    /// The highest page that may be a victim and is none of this flush yet:
-    /// where compaction mode works down from. Journal pages are passed over,
-    /// since the next flush moves the journal by itself, and so are pages
-    /// with children, which every cut that needs them writes afresh.
+    /// The highest page that may be a victim and is none of this flush yet.
     fn tail(&mut self) -> Option<u32> {
         let mut p = self.cons.tail;
         while p >= 2 && (p as usize) < self.state.pages.len() {
-            let live = self.state.victim(p).is_some();
-            if live && !self.cons.skip.contains(&p) && !self.flush_rewritten.contains(&p) {
+            if self.state.victim(p).is_some() && !self.cons.skip.contains(&p) {
                 self.cons.tail = p;
                 return Some(p);
             }
@@ -114,8 +81,6 @@ impl Inner {
         None
     }
 
-    /// The tail, if compaction mode is on and the tail is a page of the kind
-    /// asked for.
     fn compaction_tail(&mut self, data: bool) -> Option<u32> {
         if !self.cons.compaction {
             return None;
@@ -126,10 +91,7 @@ impl Inner {
         })
     }
 
-    /// The compaction tail, if a page that is reusable now lies below it for
-    /// its content: moved to a page the file grows by, it would only become
-    /// the next tail. Right after a mass free, the holes are still in
-    /// quarantine.
+    /// The compaction tail, if a page that is reusable now lies below it.
     fn compaction_victim(&mut self, data: bool) -> Option<u32> {
         let lowest = self.ready.first().copied();
         self.compaction_tail(data)
@@ -194,149 +156,59 @@ impl Inner {
         None
     }
 
-    /// The live fragments pointing into data page `v`, in key order. Narrows
-    /// the reverse index's windows to what it finds.
-    fn survivors(&mut self, v: u32) -> Vec<Survivor> {
-        let entries = self.state.reverse.remove(&v).unwrap_or_default();
-        let mut out = Vec::new();
-        let mut kept = Vec::new();
-        for (id, lo, hi) in entries {
-            let size = self.state.size_of(id);
-            let hi = hi.min(size);
-            if lo >= hi {
-                continue;
-            }
-            let first = match self.state.frags.range(..=key(id, lo)).next_back() {
-                Some((&k, _)) if kid(k) == id => k,
-                _ => key(id, lo),
-            };
-            let mut span: Option<(u32, u32)> = None;
-            let mut it = self.state.frags.range(first..key(id, hi)).peekable();
-            while let Some((&k, &f)) = it.next() {
-                let addr = match f {
-                    Fragment::Bytes { page, offset, .. } if page == v => address(page, offset),
-                    Fragment::Pending(p) => match self.state.pending[p as usize].place {
-                        Place::Data(a) if split_address(a).0 == v => a,
-                        _ => continue,
-                    },
-                    _ => continue,
-                };
-                let end = match it.peek() {
-                    Some((&n, _)) => koff(n),
-                    None => self.state.frag_end(k),
-                };
-                out.push(Survivor {
-                    id,
-                    start: koff(k),
-                    end,
-                    stmt: f.stmt(),
-                    addr,
-                });
-                span = Some(span.map_or((koff(k), end), |(a, b)| (a.min(koff(k)), b.max(end))));
-            }
-            if let Some((a, b)) = span {
-                kept.push((id, a, b));
-            }
-        }
-        if !kept.is_empty() {
-            self.state.reverse.insert(v, kept);
-        }
-        out.sort_by_key(|s| key(s.id, s.start));
+    /// The spans whose bytes lie in data page `v`, in the order they lie.
+    fn survivors(&self, v: u32) -> Vec<u32> {
+        let mut out = self.state.data_spans.get(&v).cloned().unwrap_or_default();
+        out.sort_by_key(|&id| match self.state.span(id).content {
+            Content::Ref { offset, .. } => offset,
+            _ => 0,
+        });
         out
     }
 
-    /// The survivors of victim `v`, if they account for all of its coverage;
-    /// otherwise the reverse index lost a referrer, and `v` is skipped.
-    fn all_survivors(&mut self, v: u32) -> Option<Vec<Survivor>> {
-        let surv = self.survivors(v);
-        let total: u64 = surv.iter().map(|s| s.len() as u64).sum();
-        if total != self.state.live(v).coverage as u64 {
-            debug_assert!(false, "the reverse index lost a referrer of page {v}");
-            self.cons.skip.insert(v);
-            return None;
-        }
-        Some(surv)
-    }
-
-    /// Takes `s` for the flush, as a chunk whose bytes stay where they are
-    /// until something places them.
-    fn take_survivor(&mut self, s: &Survivor, dirty: &mut Dirty) {
-        let heat = self.heat_of(s.id);
-        let p = Pending {
-            origin: Origin::File(s.addr),
-            place: Place::Unplaced,
-            heat,
-            rewrite: false,
-        };
-        self.state.take(s.id, s.start, s.end, p, dirty);
-    }
-
-    /// Relocates `survivors` into `dp`, which has room for them.
-    fn relocate(
-        &mut self,
-        survivors: &[Survivor],
-        dp: &mut DataPage,
-        dirty: &mut Dirty,
-    ) -> Result<(), Error> {
-        for s in survivors {
-            self.take_survivor(s, dirty);
-            self.place(dp, key(s.id, s.start), s.len())?;
-        }
-        Ok(())
-    }
-
     /// Evacuates all of `v` into `dp`, if it fits.
-    fn evacuate_into(
-        &mut self,
-        v: u32,
-        dp: &mut DataPage,
-        dirty: &mut Dirty,
-    ) -> Result<bool, Error> {
-        let Some(surv) = self.all_survivors(v) else {
-            return Ok(false);
-        };
-        let total: u32 = surv.iter().map(Survivor::len).sum();
+    fn evacuate_into(&mut self, f: &mut Flush, v: u32, dp: &mut DataPage) -> Result<bool, Error> {
+        self.cons.skip.insert(v);
+        let total = self.state.live(v).coverage;
         if total as usize > dp.room() {
-            self.cons.skip.insert(v);
             return Ok(false);
         }
-        self.relocate(&surv, dp, dirty)?;
+        for id in self.survivors(v) {
+            self.place(f, dp, id)?;
+        }
         self.stats.evacuated_pages += 1;
         self.stats.evacuated_bytes += total as u64;
         Ok(true)
     }
 
-    /// Evacuates `v` into what room `dp` has left, cutting the survivor that
-    /// crosses the boundary; returns the rest, taken but not placed.
+    /// Evacuates `v` into what room `dp` has left, cutting the span that
+    /// crosses the boundary; returns the rest, not placed yet.
     fn evacuate_across(
         &mut self,
+        f: &mut Flush,
         v: u32,
         dp: &mut DataPage,
-        dirty: &mut Dirty,
-    ) -> Result<Vec<Survivor>, Error> {
-        let Some(surv) = self.all_survivors(v) else {
-            return Ok(Vec::new());
-        };
-        let total: u64 = surv.iter().map(|s| s.len() as u64).sum();
+    ) -> Result<Vec<u32>, Error> {
+        self.cons.skip.insert(v);
+        let total = self.state.live(v).coverage;
         let mut rest = Vec::new();
-        for s in surv {
-            self.take_survivor(&s, dirty);
+        for id in self.survivors(v) {
             let room = dp.room() as u32;
+            let len = self.state.span(id).len;
             if !rest.is_empty() || room == 0 {
-                rest.push(s);
-            } else if s.len() <= room {
-                self.place(dp, key(s.id, s.start), s.len())?;
+                rest.push(id);
+            } else if len <= room {
+                self.place(f, dp, id)?;
+            } else if self.state.span(id).chain == Chain::Sequence {
+                let t = self.split_span(f, id, room)?;
+                self.place(f, dp, id)?;
+                rest.push(t);
             } else {
-                self.state.split(s.id, s.start + room);
-                self.place(dp, key(s.id, s.start), room)?;
-                rest.push(Survivor {
-                    start: s.start + room,
-                    ..s
-                });
+                rest.push(id);
             }
         }
         self.stats.evacuated_pages += 1;
-        self.stats.evacuated_bytes += total;
+        self.stats.evacuated_bytes += total as u64;
         Ok(rest)
     }
 
@@ -344,72 +216,34 @@ impl Inner {
 
     /// Fills the room of `open`, a page the flush writes anyway, with what
     /// costs nothing to move there: whole victims that fit, then as many of
-    /// one victim's statements as fit, a whole statement's survivors at a
-    /// time.
-    pub(crate) fn free_fill(
-        &mut self,
-        open: &mut DataPage,
-        dirty: &mut Dirty,
-    ) -> Result<(), Error> {
+    /// one victim's spans as fit.
+    pub(crate) fn free_fill(&mut self, f: &mut Flush, open: &mut DataPage) -> Result<(), Error> {
         while let Some(b) = self.state.data_buckets.lowest_non_empty() {
             let room = open.room() as u32;
             if room == 0 {
                 return Ok(());
             }
-            // In compaction mode, the tail first whenever it fits, and `open`
-            // lies below it.
             let tail = self
                 .compaction_tail(true)
                 .filter(|&t| open.page < t && self.state.live(t).coverage <= room);
             let Some(v) = tail.or_else(|| self.pick_victim(true, b, room, &|_, _| true)) else {
                 break;
             };
-            if self.evacuate_into(v, open, dirty)? {
+            if self.evacuate_into(f, v, open)? {
                 self.stats.free_filled_pages += 1;
             }
         }
-        self.fill_with_candidates(open, dirty)?;
-        match self.state.data_buckets.lowest_non_empty() {
-            Some(b) if open.room() > 0 => self.fill_with_part(b, open, dirty),
-            _ => Ok(()),
-        }
-    }
-
-    /// Moves the survivors of as many of one victim's statements as fit into
-    /// `open`, each statement's all or none; the victim is the best-scoring
-    /// sample of bucket `b`, the sparsest. It stays a victim, only a sparser
-    /// one.
-    fn fill_with_part(
-        &mut self,
-        b: usize,
-        open: &mut DataPage,
-        dirty: &mut Dirty,
-    ) -> Result<(), Error> {
-        let Some(v) = self.pick_victim(true, b, C, &|_, _| true) else {
-            return Ok(());
-        };
-        let Some(surv) = self.all_survivors(v) else {
-            return Ok(());
-        };
-        let mut groups: Vec<Vec<Survivor>> = Vec::new();
-        let mut group_of: IdMap<usize> = IdMap::default();
-        for s in surv {
-            match s.stmt {
-                Some(st) => {
-                    let g = *group_of.entry(st.idx() as u32).or_insert_with(|| {
-                        groups.push(Vec::new());
-                        groups.len() - 1
-                    });
-                    groups[g].push(s);
+        if let Some(b) = self.state.data_buckets.lowest_non_empty() {
+            if open.room() > 0 {
+                if let Some(v) = self.pick_victim(true, b, C, &|_, _| true) {
+                    for id in self.survivors(v) {
+                        let len = self.state.span(id).len;
+                        if len as usize <= open.room() {
+                            self.place(f, open, id)?;
+                            self.stats.evacuated_bytes += len as u64;
+                        }
+                    }
                 }
-                None => groups.push(vec![s]),
-            }
-        }
-        for g in groups {
-            let len: u32 = g.iter().map(Survivor::len).sum();
-            if len as usize <= open.room() {
-                self.relocate(&g, open, dirty)?;
-                self.stats.evacuated_bytes += len as u64;
             }
         }
         Ok(())
@@ -426,8 +260,6 @@ impl Inner {
         let mut room = C - carry;
         let mut offer = Offer::default();
         let mut chosen = IdSet::default();
-        // In compaction mode, the tail first, whatever its fill: it returns a
-        // whole page to the file system, not only to the pool.
         if let Some(t) = self.compaction_victim(true) {
             let cov = self.state.live(t).coverage;
             let taken = if cov <= room {
@@ -482,76 +314,10 @@ impl Inner {
         Some(offer)
     }
 
-    /// Spends the flush's budget, in pages written. Data pages are opened
-    /// only to reclaim, one at a time, each only if its offer passes the
-    /// churn floor and fills it. Table victims open no page of their own,
-    /// since their restatements join the leaves the cut packs anyway: their
-    /// offer passes on the churn floor alone, and costs the budget the pages
-    /// its restatements are estimated to take. A survivor cut at one page's
-    /// end leads the next, which is opened whatever its own offer, so the
-    /// budget's last page cuts nothing. An offer holding compaction mode's
-    /// tail passes whatever its ratio and fill, and goes first, since the
-    /// budget alone paces the mode.
-    pub(crate) fn budget_loop(&mut self, dirty: &mut Dirty, out: &mut Output) -> Result<(), Error> {
-        let budget = self.cons.budget.round().max(0.0);
-        let (lambda, theta) = (self.opts.churn_floor, self.opts.theta);
-        let pays = |o: &Offer| o.tail || o.reclaimed >= lambda * o.written;
-        let fills = |o: &Offer| o.tail || o.fill >= 1.0 - theta;
-        let ratio = |o: &Offer| o.reclaimed / o.written.max(1.0);
-        let mut spent = 0.0;
-        let mut carry: Vec<Survivor> = Vec::new();
-        while spent < budget {
-            let carry_len: u32 = carry.iter().map(Survivor::len).sum();
-            // A data page takes a whole page of the budget, and may cut a
-            // survivor only if the page its tail leads fits too.
-            let data = if spent + 1.0 <= budget {
-                self.data_offer(carry_len, spent + 2.0 <= budget)
-            } else {
-                None
-            };
-            // A carried tail opens a data page whatever the offers.
-            let offer = if !carry.is_empty() {
-                data
-            } else {
-                let data = data.filter(|o| pays(o) && fills(o));
-                let table = self.table_offer(budget - spent).filter(pays);
-                match (data, table) {
-                    (Some(d), Some(t)) if d.tail || (!t.tail && ratio(&d) >= ratio(&t)) => Some(d),
-                    (_, Some(t)) => {
-                        spent += t.written / C as f64;
-                        self.rewrite_table_victims(&t.whole, dirty)?;
-                        continue;
-                    }
-                    (Some(d), None) => Some(d),
-                    (None, None) => break,
-                }
-            };
-            spent += 1.0;
-            let mut dp = self.new_data_page()?;
-            for s in std::mem::take(&mut carry) {
-                self.place(&mut dp, key(s.id, s.start), s.len())?;
-            }
-            if let Some(o) = offer {
-                for v in o.whole {
-                    self.evacuate_into(v, &mut dp, dirty)?;
-                }
-                if let Some(v) = o.cut {
-                    carry = self.evacuate_across(v, &mut dp, dirty)?;
-                }
-            }
-            self.stats.budget_pages += 1;
-            out.data.push(dp);
-        }
-        debug_assert!(carry.is_empty(), "the budget's last page cut a survivor");
-        Ok(())
-    }
-
-    /// What rewriting table victims would restate and reclaim, without
-    /// taking anything: the tail first in compaction mode, whatever its
-    /// size, then whole victims within the churn floor, best score first,
-    /// while their restatements fit a leaf and the `pages` of budget left.
-    /// A victim's restatements are priced at its coverage, which they take
-    /// to within a few percent, and it reclaims its page less that.
+    /// What rewriting leaves would restate and reclaim: the tail first in
+    /// compaction mode, then whole victims within the churn floor, best
+    /// score first, while their entries fit a leaf and the `pages` of
+    /// budget left. A leaf's entries are priced at its coverage.
     fn table_offer(&mut self, pages: f64) -> Option<Offer> {
         let max = (C as f64 / (1.0 + self.opts.churn_floor)) as u32;
         let mut room = pages.min(1.0) * C as f64;
@@ -567,7 +333,7 @@ impl Inner {
             room -= cov as f64;
         }
         while let Some(b) = self.state.table_buckets.lowest_non_empty() {
-            let fresh = |i: &Inner, p: u32| !chosen.contains(&p) && !i.flush_rewritten.contains(&p);
+            let fresh = |_: &Inner, p: u32| !chosen.contains(&p);
             let limit = (room.max(0.0) as u32).min(max);
             let Some(v) = self.pick_victim(false, b, limit, &fresh) else {
                 break;
@@ -585,198 +351,106 @@ impl Inner {
         Some(offer)
     }
 
-    /// Rewrites table pages: their live content is taken in place, for the
-    /// cut to state again, and they are unlinked.
-    fn rewrite_table_victims(&mut self, victims: &[u32], dirty: &mut Dirty) -> Result<(), Error> {
+    /// Rewrites leaves: every live entry they hold is stated again by the
+    /// cut, which drains them.
+    fn rewrite_table_victims(&mut self, f: &mut Flush, victims: &[u32]) {
         for &v in victims {
-            self.rewrite_table_page(v, dirty)?;
-            self.flush_rewritten.insert(v);
+            self.cons.skip.insert(v);
+            for id in self.state.table_spans.get(&v).cloned().unwrap_or_default() {
+                f.stated.insert(id);
+            }
             self.stats.table_rewrites += 1;
+        }
+    }
+
+    /// Spends the flush's budget, in pages written. Data pages are opened
+    /// only to reclaim, one at a time, each only if its offer passes the
+    /// churn floor and fills it. Leaves open no page of their own, since
+    /// their entries join the leaves the cut writes anyway: their offer
+    /// passes on the churn floor alone, and costs the budget the pages its
+    /// entries are estimated to take.
+    pub(crate) fn budget_loop(&mut self, f: &mut Flush, out: &mut Output) -> Result<(), Error> {
+        let budget = self.cons.budget.round().max(0.0);
+        let (lambda, theta) = (self.opts.churn_floor, self.opts.theta);
+        let pays = |o: &Offer| o.tail || o.reclaimed >= lambda * o.written;
+        let fills = |o: &Offer| o.tail || o.fill >= 1.0 - theta;
+        let ratio = |o: &Offer| o.reclaimed / o.written.max(1.0);
+        let mut spent = 0.0;
+        let mut carry: Vec<u32> = Vec::new();
+        while spent < budget {
+            let carry_len: u32 = carry.iter().map(|&id| self.state.span(id).len).sum();
+            let data = if spent + 1.0 <= budget {
+                self.data_offer(carry_len, spent + 2.0 <= budget)
+            } else {
+                None
+            };
+            let offer = if !carry.is_empty() {
+                data
+            } else {
+                let data = data.filter(|o| pays(o) && fills(o));
+                let table = self.table_offer(budget - spent).filter(pays);
+                match (data, table) {
+                    (Some(d), Some(t)) if d.tail || (!t.tail && ratio(&d) >= ratio(&t)) => Some(d),
+                    (_, Some(t)) => {
+                        spent += t.written / C as f64;
+                        self.rewrite_table_victims(f, &t.whole);
+                        continue;
+                    }
+                    (Some(d), None) => Some(d),
+                    (None, None) => break,
+                }
+            };
+            spent += 1.0;
+            let mut dp = self.new_data_page()?;
+            for id in std::mem::take(&mut carry) {
+                self.place(f, &mut dp, id)?;
+            }
+            if let Some(o) = offer {
+                for v in o.whole {
+                    self.evacuate_into(f, v, &mut dp)?;
+                }
+                if let Some(v) = o.cut {
+                    carry = self.evacuate_across(f, v, &mut dp)?;
+                }
+            }
+            self.stats.budget_pages += 1;
+            out.data.push(dp);
+        }
+        if !carry.is_empty() {
+            // The budget's last page cut a span: its rest takes a page of
+            // its own.
+            let mut dp = self.new_data_page()?;
+            for id in carry {
+                self.place(f, &mut dp, id)?;
+            }
+            out.data.push(dp);
         }
         Ok(())
     }
 
-    // ------------------------------------------------------------ at the cut
-
-    /// The fillers of the cut's last page: whole table victims whose
-    /// restatements fit its `room`, then the rotating window. Takes into
-    /// `fillers`, and returns the victims.
-    ///
-    /// A victim's coverage is the first test; what its restatements take is
-    /// then computed before it is taken, and a victim they would overflow the
-    /// room with is passed over for the rest of the flush, so that the last
-    /// page never spills for a filler's sake.
-    pub(crate) fn cut_fillers(
-        &mut self,
-        room: usize,
-        fillers: &mut Dirty,
-    ) -> Result<Vec<u32>, Error> {
-        let mut room = room;
-        let mut victims = Vec::new();
-        let mut refused = IdSet::default();
+    /// Whole leaves whose entries fit `room` bytes of the cut's last leaf,
+    /// sparsest first; at most a page's worth.
+    pub(crate) fn cut_fillers(&mut self, f: &Flush, room: usize, _leaf: &[u32]) -> Vec<u32> {
+        // Entries restated among others take a little more than they did:
+        // keep a margin.
+        let mut room = (room as f64 * 0.9) as u32;
+        let mut out = Vec::new();
         while let Some(b) = self.state.table_buckets.lowest_non_empty() {
-            let limit = room as u32;
-            let fresh =
-                |i: &Inner, p: u32| !i.flush_rewritten.contains(&p) && !refused.contains(&p);
-            let tail = self
-                .compaction_victim(false)
-                .filter(|&t| self.state.live(t).coverage <= limit && fresh(self, t));
-            let Some(v) = tail.or_else(|| self.pick_victim(false, b, limit, &fresh)) else {
+            let ok = |i: &Inner, p: u32| {
+                i.state
+                    .table_spans
+                    .get(&p)
+                    .is_some_and(|l| l.iter().all(|id| !f.stated.contains(id)))
+            };
+            let Some(v) = self.pick_victim(false, b, room, &ok) else {
                 break;
             };
-            let len = self.restatement_len(v)?;
-            if len > room {
-                refused.insert(v);
-                continue;
-            }
-            room -= len;
-            self.rewrite_table_victims(&[v], fillers)?;
-            victims.push(v);
+            let cov = self.state.live(v).coverage;
+            self.cons.skip.insert(v);
+            out.push(v);
+            room -= cov;
         }
-        self.window(room, fillers);
-        Ok(victims)
-    }
-
-    /// One step of the rotating window (`impl/consolidation.md#the-rotating-window`):
-    /// restates live fragments from the cursor on, in place, while they fit
-    /// `room` bytes of encoding together with the `Size` statements they call
-    /// for, and moves the cursor past `walk` fragments either way.
-    pub(crate) fn window(&mut self, room: usize, fillers: &mut Dirty) {
-        let n = self.opts.walk.min(self.state.frags.len());
-        if n == 0 {
-            return;
-        }
-        let start = self.cons.cursor;
-        let items: Vec<(Key, Fragment)> = self
-            .state
-            .frags
-            .range(start..)
-            .chain(self.state.frags.range(..start))
-            .take(n)
-            .map(|(&k, &f)| (k, f))
-            .collect();
-        let mut w = crate::statement::TableLen::new();
-        w.end_children();
-        // The bytes encoded before the walk last wrapped around.
-        let mut done = 0usize;
-        // Per fragment taken, the bytes the window takes up to it, and the
-        // bytes of the `Size` statements those fragments call for: one for
-        // each id taken whose size statement lies in a page they restate
-        // from, as the take below marks them, encoded alone.
-        let mut used: Vec<(usize, usize)> = Vec::new();
-        let (mut touched, mut charged) = (IdSet::default(), IdSet::default());
-        let mut waiting: IdMap<Vec<u32>> = IdMap::default();
-        let mut size_bytes = 0usize;
-        let size_len = |i: &Inner, id: u32| {
-            crate::statement::TableWriter::standalone_len(&crate::statement::Stmt::size_to(
-                id,
-                i.state.size_of(id),
-            ))
-        };
-        let mut prev: Option<Key> = None;
-        let mut full = false;
-        let mut take: Vec<(u32, u32, u32, Fragment)> = Vec::new();
-        // Description defragmentation rides along: Kadane's search over each
-        // id's walked fragments, reset at every id boundary.
-        let mut found = Vec::new();
-        let mut run: Vec<Weighed> = Vec::new();
-        for &(k, f) in &items {
-            let (id, off, end) = (kid(k), koff(k), self.state.frag_end(k));
-            let wrapped = prev.is_some_and(|p| k < p);
-            if wrapped || prev.is_some_and(|p| kid(p) != id) {
-                self.candidates_of(prev.map_or(0, kid), &run, &mut found);
-                run.clear();
-            }
-            if wrapped {
-                // The encoding starts afresh, after what came before.
-                done += w.len();
-                w = crate::statement::TableLen::new();
-                w.end_children();
-            }
-            prev = Some(k);
-            run.push(self.weigh(off, end, f));
-            let Some(s) = f.stmt() else { continue };
-            if full {
-                continue;
-            }
-            let len = end - off;
-            let inline = self.state.slab.kinds[s.idx()] == crate::statement::Kind::Inline;
-            let stmt = match f {
-                Fragment::Bytes { .. } if inline => crate::statement::Stmt::inline(id, off, len),
-                Fragment::Bytes { page, offset, .. } => {
-                    crate::statement::Stmt::reference(id, off, len, address(page, offset))
-                }
-                _ => crate::statement::Stmt::zero(id, off, len),
-            };
-            if done + w.len() + w.statement_len(&stmt) > room {
-                full = true;
-                continue;
-            }
-            w.push(&stmt);
-            take.push((id, off, end, f));
-            // A page the window now restates from calls for the size
-            // statements it holds of ids already taken, and this id's size
-            // statement is called for once its page is restated from.
-            let page = self.state.slab.page(s);
-            if touched.insert(page) {
-                for other in waiting.remove(&page).unwrap_or_default() {
-                    if charged.insert(other) {
-                        size_bytes += size_len(self, other);
-                    }
-                }
-            }
-            if let Some(sp) = self
-                .state
-                .allocs
-                .get(&id)
-                .and_then(|m| m.size_statement)
-                .map(|h| self.state.slab.page(h))
-            {
-                if touched.contains(&sp) {
-                    if charged.insert(id) {
-                        size_bytes += size_len(self, id);
-                    }
-                } else {
-                    waiting.entry(sp).or_default().push(id);
-                }
-            }
-            used.push((done + w.len(), size_bytes));
-        }
-        // The fragments that fit together with the size statements they call
-        // for; both only grow along the walk.
-        let fit = used
-            .iter()
-            .rposition(|&(bytes, sizes)| bytes + sizes <= room)
-            .map_or(0, |i| i + 1);
-        take.truncate(fit);
-        self.candidates_of(prev.map_or(0, kid), &run, &mut found);
-        self.cons.candidates = found;
-        self.cons.cursor = items.last().map_or(start, |&(k, _)| k.wrapping_add(1));
-        // The pages the window restates from, read before taking releases the
-        // statements that name them.
-        let touched: IdSet = take
-            .iter()
-            .map(|&(_, _, _, f)| self.state.slab.page(f.stmt().unwrap()))
-            .collect();
-        let mut ids: Vec<u32> = take.iter().map(|&(id, ..)| id).collect();
-        ids.dedup();
-        for &(id, off, end, f) in &take {
-            let heat = self.heat_of(id);
-            self.take_in_place(id, off, end, f, heat, fillers);
-        }
-        // A size statement in a page the window restates from is stated again
-        // too, so that the page can empty.
-        for id in ids {
-            let Some(m) = self.state.allocs.get(&id) else {
-                continue;
-            };
-            if m.size_statement
-                .is_some_and(|s| touched.contains(&self.state.slab.page(s)))
-            {
-                self.touch(id, false, fillers).replace = true;
-            }
-        }
-        self.stats.window_restated += take.len() as u64;
+        out
     }
 
     /// Moves the budget toward the target fill, after each commit. The fill
@@ -829,16 +503,12 @@ impl Inner {
                     kind: PageKind::Header,
                     ..
                 }) => {}
-                Page::Filling(f) => unreachable!("a page is filling between flushes: {f:?}"),
+                Page::Filling(fl) => unreachable!("a page is filling between flushes: {fl:?}"),
             }
         }
-        // The consolidator state is the store's own, not the application's.
-        let own = self.header.consolidator_state;
-        let apps = self.state.allocs.iter().filter(|(&id, _)| id != own);
-        s.allocations = apps.clone().count() as u64;
-        s.allocation_bytes = apps.map(|(_, m)| m.size as u64).sum();
-        s.fragments = self.state.frags.len() as u64;
-        s.statements = self.state.slab.live as u64;
+        s.sequence_bytes = self.state.seq_len();
+        s.schema_bytes = self.schema.len() as u64;
+        s.spans = self.state.ids.count() as u64;
         s.budget = self.cons.budget as u64;
     }
 }

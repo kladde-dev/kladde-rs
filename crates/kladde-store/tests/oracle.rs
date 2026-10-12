@@ -1,10 +1,8 @@
-//! Differential tests: random mutations against a naive model of byte
-//! vectors, with flushes and reopenings in between. The model is kept in
-//! ordered maps, so that a seed makes the same mutations in every run.
+//! Differential tests: random writes, splices, moves, and cuts pasted within
+//! transactions, against a plain byte vector, with flushes, reopenings and
+//! new schema chains in between.
 
-use std::collections::BTreeMap;
-
-use kladde_store::{Backend, MemoryStorage, Options, Pointer, Store, UniquePointer, WriteBackend};
+use kladde_store::{MemoryStorage, Options, Store, WriteBackend};
 
 struct Rng(u64);
 
@@ -18,16 +16,17 @@ impl Rng {
     fn below(&mut self, n: u64) -> u64 {
         self.next() % n.max(1)
     }
-    fn chance(&mut self, p: f64) -> bool {
-        (self.next() % 1_000_000) as f64 / 1_000_000.0 < p
+    fn bytes(&mut self, n: usize) -> Vec<u8> {
+        let fill = self.below(255) as u8 + 1;
+        (0..n).map(|i| fill.wrapping_add((i % 7) as u8)).collect()
     }
 }
 
 struct World {
     store: Store,
     storage: MemoryStorage,
-    model: BTreeMap<u32, Vec<u8>>,
-    owned: BTreeMap<u32, UniquePointer>,
+    model: Vec<u8>,
+    schema: Vec<u8>,
     opts: Options,
 }
 
@@ -38,10 +37,29 @@ impl World {
         World {
             store,
             storage,
-            model: BTreeMap::new(),
-            owned: BTreeMap::new(),
+            model: Vec::new(),
+            schema: Vec::new(),
             opts,
         }
+    }
+
+    fn verify(&self, what: &str) {
+        self.store.check();
+        let got = self.store.read_all().unwrap();
+        if got != self.model {
+            let first = got
+                .iter()
+                .zip(&self.model)
+                .position(|(a, b)| a != b)
+                .unwrap_or(got.len().min(self.model.len()));
+            panic!(
+                "{what}: the sequence differs at {first} (lengths {} and {})\n{}",
+                got.len(),
+                self.model.len(),
+                self.store.describe()
+            );
+        }
+        assert_eq!(self.store.schema(), self.schema, "{what}: the schema");
     }
 
     fn reopen(&mut self) {
@@ -49,215 +67,223 @@ impl World {
         let storage = MemoryStorage::from_image(image);
         self.store = Store::open(Box::new(storage.clone()), self.opts.clone()).unwrap();
         self.storage = storage;
-        self.owned = self
-            .model
-            .keys()
-            .map(|&id| {
-                (
-                    id,
-                    UniquePointer::from_pointer(Pointer::from_raw(id).unwrap()),
-                )
-            })
-            .collect();
+        assert_eq!(self.store.len(), self.model.len() as u64);
     }
 
-    fn verify(&mut self) {
-        self.store.flush().unwrap();
-        self.store.check();
-        for (&id, want) in &self.model {
-            let p = Pointer::from_raw(id).unwrap();
-            assert_eq!(
-                self.store.size(p).unwrap() as usize,
-                want.len(),
-                "size of {id}"
-            );
-            let got = self.store.read_all(p).unwrap();
-            assert!(
-                got == *want,
-                "content of {id}: got {:?}.. want {:?}..",
-                &got[..got.len().min(16)],
-                &want[..want.len().min(16)]
-            );
-        }
-        let stats = self.store.stats();
-        assert_eq!(stats.allocations as usize, self.model.len());
-    }
-
-    fn step(&mut self, rng: &mut Rng, max_size: u64) {
-        let ids: Vec<u32> = self.model.keys().copied().collect();
-        let pick = |rng: &mut Rng| ids[rng.below(ids.len() as u64) as usize];
-        match rng.below(10) {
-            0 | 1 if ids.len() < 200 => {
-                let size = rng.below(max_size) as u32;
-                let p = self.store.alloc(size).unwrap();
-                let id = p.raw().raw();
-                assert!(!self.model.contains_key(&id));
-                self.model.insert(id, vec![0; size as usize]);
-                self.owned.insert(id, p);
+    /// One random operation, applied to the store and the model alike.
+    fn step(&mut self, rng: &mut Rng, max_len: u64) {
+        let len = self.model.len() as u64;
+        let store = &self.store;
+        match rng.below(12) {
+            0..=2 if len > 0 => {
+                let pos = rng.below(len);
+                let n = rng.below((len - pos).min(600)) + 1;
+                let bytes = rng.bytes(n as usize);
+                self.model[pos as usize..(pos + n) as usize].copy_from_slice(&bytes);
+                store.write(pos, &bytes).unwrap();
             }
-            2 if !ids.is_empty() => {
-                let id = pick(rng);
-                let p = self.owned.remove(&id).unwrap();
-                self.store.free(p).unwrap();
-                self.model.remove(&id);
-            }
-            3 if !ids.is_empty() => {
-                let id = pick(rng);
-                let size = rng.below(max_size) as u32;
-                self.store.resize(&self.owned[&id], size).unwrap();
-                self.model.get_mut(&id).unwrap().resize(size as usize, 0);
-            }
-            4..=6 if !ids.is_empty() => {
-                let id = pick(rng);
-                let v = self.model.get_mut(&id).unwrap();
-                let off = rng.below(v.len() as u64 + 8) as u32;
-                let cap = if rng.chance(0.2) { max_size } else { 64 };
-                let len = rng.below(cap) as usize;
-                let fill = (rng.below(255) + 1) as u8;
-                let bytes: Vec<u8> = (0..len).map(|i| fill.wrapping_add(i as u8)).collect();
-                self.store
-                    .write(Pointer::from_raw(id).unwrap(), off, &bytes)
-                    .unwrap();
-                let end = off as usize + len;
-                if v.len() < end {
-                    v.resize(end, 0);
-                }
-                v[off as usize..end].copy_from_slice(&bytes);
-            }
-            7 if !ids.is_empty() => {
-                let id = pick(rng);
-                let v = self.model.get_mut(&id).unwrap();
-                let off = rng.below(v.len() as u64 + 1) as u32;
-                let old = rng.below(16) as u32;
-                let len = rng.below(24) as usize;
-                let bytes: Vec<u8> = (0..len).map(|i| 200u8.wrapping_add(i as u8)).collect();
-                self.store
-                    .splice(&self.owned[&id], off, old, &bytes)
-                    .unwrap();
-                let end = (off + old) as usize;
-                if v.len() < end {
-                    v.resize(end, 0);
-                }
-                v.splice(off as usize..end, bytes);
-            }
-            8 | 9 if !ids.is_empty() => {
-                let src = pick(rng);
-                let dst = pick(rng);
-                let slen = self.model[&src].len() as u64;
-                let so = rng.below(slen + 1) as u32;
-                let len = rng.below(64) as u32;
-                let doff = rng.below(self.model[&dst].len() as u64 + 1) as u32;
-                let is_move = rng.chance(0.5);
-                let from = self.model[&src].clone();
-                let bytes: Vec<u8> = (0..len as usize)
-                    .map(|i| from.get(so as usize + i).copied().unwrap_or(0))
-                    .collect();
-                let (sp, dp) = (
-                    Pointer::from_raw(src).unwrap(),
-                    Pointer::from_raw(dst).unwrap(),
+            3..=6 => {
+                // Mostly keystrokes and short deletions near one place, now
+                // and then a long run, and the sequence kept below `max_len`.
+                let pos = rng.below(len + 1);
+                let removed = match rng.below(4) {
+                    0 => rng.below((len - pos).min(3000) + 1),
+                    _ => rng.below((len - pos).min(3) + 1),
+                };
+                let n = match rng.below(8) {
+                    0 => rng.below(9000),
+                    1..=3 => rng.below(40),
+                    _ => 1,
+                };
+                let n = if len - removed + n > max_len { 0 } else { n };
+                let bytes = rng.bytes(n as usize);
+                self.model.splice(
+                    pos as usize..(pos + removed) as usize,
+                    bytes.iter().copied(),
                 );
-                if is_move {
-                    self.store.move_range(sp, so, len, dp, doff).unwrap();
-                } else {
-                    self.store.copy(sp, so, len, dp, doff).unwrap();
-                }
-                let v = self.model.get_mut(&dst).unwrap();
-                let end = (doff + len) as usize;
-                if v.len() < end {
-                    v.resize(end, 0);
-                }
-                v[doff as usize..end].copy_from_slice(&bytes);
-                if is_move {
-                    let sv = self.model.get_mut(&src).unwrap();
-                    for i in so as usize..(so + len) as usize {
-                        let in_dst = src == dst && i >= doff as usize && i < end;
-                        if i < sv.len() && !in_dst {
-                            sv[i] = 0;
+                store.splice(pos, removed, &bytes).unwrap();
+            }
+            7 if len > 0 => {
+                let from = rng.below(len);
+                let n = rng.below((len - from).min(5000)) + 1;
+                let to = rng.below(len - n + 1);
+                let m: Vec<u8> = self
+                    .model
+                    .drain(from as usize..(from + n) as usize)
+                    .collect();
+                self.model.splice(to as usize..to as usize, m);
+                store.move_range(from, n, to).unwrap();
+            }
+            8 if len > 1 => {
+                // Two cuts in one transaction, pasted in the other order, the
+                // second over bytes it replaces.
+                let model = &mut self.model;
+                store
+                    .atomically(|| {
+                        let len = model.len() as u64;
+                        let a = rng.below(len);
+                        let an = rng.below((len - a).min(2000)) + 1;
+                        let ca: Vec<u8> = model.drain(a as usize..(a + an) as usize).collect();
+                        let cut_a = store.splice(a, an, b"")?.unwrap();
+                        let len = model.len() as u64;
+                        let b = rng.below(len + 1);
+                        let bn = rng.below((len - b).min(2000) + 1);
+                        let cb: Vec<u8> = model.drain(b as usize..(b + bn) as usize).collect();
+                        let cut_b = store.splice(b, bn, b"x")?;
+                        model.insert(b as usize, b'x');
+                        let len = model.len() as u64;
+                        let p = rng.below(len + 1);
+                        model.splice(p as usize..p as usize, ca);
+                        store.paste(p, 0, cut_a)?;
+                        if let Some(cut_b) = cut_b {
+                            let len = model.len() as u64;
+                            let q = rng.below(len + 1);
+                            let r = rng.below((len - q).min(10) + 1);
+                            model.splice(q as usize..(q + r) as usize, cb);
+                            store.paste(q, r, cut_b)?;
                         }
-                    }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            9 => {
+                let n = rng.below(400) as usize;
+                self.schema = rng.bytes(n);
+                store.set_schema(self.schema.clone());
+            }
+            10 => {
+                store.flush().unwrap();
+                self.verify("after a flush");
+            }
+            _ => {
+                if rng.below(3) == 0 {
+                    store.flush().unwrap();
+                    self.reopen();
+                    self.verify("after reopening");
                 }
             }
-            _ => {}
         }
     }
 }
 
-fn run(seed: u64, steps: usize, max_size: u64, opts: Options) {
+fn run(seed: u64, opts: Options, steps: usize, max_len: u64) {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut w = World::new(opts);
-    for step in 0..steps {
-        w.step(&mut rng, max_size);
-        if rng.chance(0.05) {
-            w.verify();
-        }
-        if rng.chance(0.01) {
-            w.verify();
-            w.reopen();
-            w.verify();
-        }
-        let _ = step;
+    for _ in 0..steps {
+        w.step(&mut rng, max_len);
     }
-    w.verify();
+    w.store.flush().unwrap();
+    w.verify(&format!("seed {seed}, at the end"));
     w.reopen();
-    w.verify();
+    w.verify(&format!("seed {seed}, reopened at the end"));
 }
 
 #[test]
-fn small_allocations_without_consolidation() {
+fn short_sequences() {
+    for seed in 1..60 {
+        run(seed, Options::default(), 300, 20_000);
+    }
+}
+
+#[test]
+fn long_sequences() {
+    for seed in 1..12 {
+        run(seed, Options::default(), 600, 400_000);
+    }
+}
+
+#[test]
+fn without_consolidation() {
     let opts = Options {
         consolidate: false,
         ..Default::default()
     };
-    for seed in 1..40 {
-        run(seed, 400, 200, opts.clone());
+    for seed in 1..30 {
+        run(seed, opts.clone(), 300, 50_000);
     }
 }
 
 #[test]
-fn large_allocations_without_consolidation() {
+fn with_a_tiny_journal() {
+    let opts = Options {
+        journal_budget_pages: 1,
+        ..Default::default()
+    };
+    for seed in 1..30 {
+        run(seed, opts.clone(), 300, 50_000);
+    }
+}
+
+#[test]
+fn with_eager_merges_and_a_tiny_header() {
+    // Every flush walks the whole sequence, everything is cold at once, and
+    // short spans merge readily.
+    let opts = Options {
+        cold_flushes: 0,
+        walk: 100_000,
+        span_min: 4000,
+        mu: 0.0,
+        rewrite_below: 0,
+        inline_threshold: 1,
+        ..Default::default()
+    };
+    for seed in 1..30 {
+        run(seed, opts.clone(), 300, 50_000);
+    }
+}
+
+#[test]
+fn a_cut_from_another_transaction_is_refused() {
+    let store = Store::create(Box::new(MemoryStorage::new()), Options::default()).unwrap();
+    store.splice(0, 0, b"abcdef").unwrap();
+    store.begin_transaction().unwrap();
+    let cut = store.splice(0, 2, b"").unwrap().unwrap();
+    store.end_transaction().unwrap();
+    store.begin_transaction().unwrap();
+    assert!(store.paste(0, 0, cut).is_err());
+    store.end_transaction().unwrap();
+    // Outside a transaction, a splice makes no cut.
+    assert!(store.splice(0, 1, b"").unwrap().is_none());
+    store.flush().unwrap();
+    assert_eq!(store.read_all().unwrap(), b"def");
+}
+
+#[test]
+fn a_failed_transaction_leaves_nothing() {
+    let store = Store::create(Box::new(MemoryStorage::new()), Options::default()).unwrap();
+    store.splice(0, 0, b"abc").unwrap();
+    let r: Result<(), _> = store.atomically(|| {
+        store.splice(0, 1, b"xyz")?;
+        store.write(100, b"past the end")
+    });
+    assert!(r.is_err());
+    assert_eq!(store.len(), 3);
+    store.flush().unwrap();
+    assert_eq!(store.read_all().unwrap(), b"abc");
+}
+
+#[test]
+fn a_splice_states_a_few_spans_however_long_the_sequence() {
+    // Without consolidation, whose compaction mode would move the file's
+    // tail down over the pages the first megabyte's journal left free.
     let opts = Options {
         consolidate: false,
         ..Default::default()
     };
-    for seed in 1..15 {
-        run(seed, 300, 20_000, opts.clone());
-    }
-}
-
-#[test]
-fn small_allocations() {
-    for seed in 1..40 {
-        run(seed, 400, 200, Options::default());
-    }
-}
-
-#[test]
-fn large_allocations() {
-    for seed in 1..15 {
-        run(seed, 300, 20_000, Options::default());
-    }
-}
-
-#[test]
-fn a_tiny_journal_budget_flushes_often() {
-    let opts = Options {
-        journal_budget_pages: 1,
-        ..Default::default()
-    };
-    for seed in 1..10 {
-        run(seed, 500, 3000, opts.clone());
-    }
-}
-
-/// A grow witness a flush binds into a page it reuses is that flush's, and
-/// must not look older than its allocation's anchor: declared dead, it left
-/// with its page, and the allocation reopened at its anchored size. This seed
-/// lost one so.
-#[test]
-fn a_grow_witness_in_a_reused_page_survives() {
-    let opts = Options {
-        journal_budget_pages: 1,
-        ..Default::default()
-    };
-    run(229, 800, 3000, opts);
+    let store = Store::create(Box::new(MemoryStorage::new()), opts).unwrap();
+    store.splice(0, 0, &vec![7u8; 1 << 20]).unwrap();
+    store.flush().unwrap();
+    let before = store.stats();
+    store
+        .splice(1000, 0, b"a long sequence, a short splice")
+        .unwrap();
+    store.flush().unwrap();
+    let after = store.stats();
+    // The span the splice lands in is split, and the new bytes are inline:
+    // no data page and no leaf is written, only the header.
+    assert_eq!(after.span_splits, before.span_splits + 1);
+    assert_eq!(after.data_pages_written, before.data_pages_written);
+    assert_eq!(after.table_pages_written, before.table_pages_written);
+    assert_eq!(after.headers_written, before.headers_written + 1);
+    store.check();
 }

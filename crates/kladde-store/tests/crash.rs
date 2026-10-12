@@ -1,9 +1,7 @@
 //! Power cuts at every kind of moment: recovery must land exactly on a
 //! transaction boundary no earlier than the last completed flush.
 
-use std::collections::BTreeMap;
-
-use kladde_store::{MemoryStorage, Options, Pointer, Store, UniquePointer, WriteBackend};
+use kladde_store::{MemoryStorage, Options, Store, WriteBackend};
 
 struct Rng(u64);
 
@@ -19,56 +17,35 @@ impl Rng {
     }
 }
 
-type Model = BTreeMap<u32, Vec<u8>>;
+/// The sequence and the schema chain.
+type Model = (Vec<u8>, Vec<u8>);
 
 fn recovered(image: Vec<u8>, opts: &Options) -> Model {
     let store = Store::open(Box::new(MemoryStorage::from_image(image)), opts.clone())
         .expect("a crashed file opens");
     store.check();
-    store
-        .allocations()
-        .into_iter()
-        .map(|(p, _)| (p.raw(), store.read_all(p).unwrap()))
-        .collect()
+    (store.read_all().unwrap(), store.schema())
 }
 
-/// Whether `got` is `want` plus one allocation of `size` zeros: what an
-/// `alloc` leaves that failed after its transaction reached the journal.
-fn plus_one_alloc(got: &Model, want: &Model, size: usize) -> bool {
-    let extra: Vec<&u32> = got.keys().filter(|id| !want.contains_key(id)).collect();
-    extra.len() == 1
-        && got[extra[0]] == vec![0; size]
-        && got.len() == want.len() + 1
-        && want.iter().all(|(id, v)| got.get(id) == Some(v))
-}
-
-fn run(seed: u64, opts: &Options) {
-    run_mixed(seed, opts, false)
-}
-
-/// As `run`, and with `mixed`, also with batches, transactions of a few
-/// writes, and writes of up to two pages.
-fn run_mixed(seed: u64, opts: &Options, mixed: bool) {
+/// Random operations until the storage fails, then power cuts; with
+/// `mixed`, batches, transactions with cuts and pastes, and splices of up
+/// to two pages too.
+fn run(seed: u64, opts: &Options, mixed: bool) {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let storage = MemoryStorage::with_crash_tracking();
     let store = Store::create(Box::new(storage.clone()), opts.clone()).unwrap();
     // The model after each transaction; `history[flushed]` is the state the
     // last completed flush made durable.
-    let mut model = Model::new();
-    let mut owned: BTreeMap<u32, UniquePointer> = BTreeMap::new();
+    let mut model: Model = (Vec::new(), Vec::new());
     let mut history: Vec<Model> = vec![model.clone()];
     let mut flushed = 0usize;
-    let mut failed_alloc: Option<usize> = None;
     let mut in_batch = false;
     storage.fail_after(rng.below(400) + 1);
     for _ in 0..300 {
-        let ids: Vec<u32> = model.keys().copied().collect();
-        let pick = |rng: &mut Rng| ids[rng.below(ids.len() as u64) as usize];
-        let kind = rng.below(if mixed { 10 } else { 8 });
+        let len = model.0.len() as u64;
+        let kind = rng.below(if mixed { 11 } else { 8 });
         let r = match kind {
             8 => {
-                // A batch begins or ends; every operation in it is still a
-                // boundary, since a crash keeps a prefix of its pieces.
                 in_batch = !in_batch;
                 if in_batch {
                     store.begin_batch()
@@ -76,75 +53,67 @@ fn run_mixed(seed: u64, opts: &Options, mixed: bool) {
                     store.end_batch()
                 }
             }
-            9 if !ids.is_empty() => {
-                // A transaction of a few writes, all or none of them.
-                let writes: Vec<(u32, u32, Vec<u8>)> = (0..rng.below(3) + 2)
-                    .map(|_| {
-                        let id = pick(&mut rng);
-                        let off = rng.below(model[&id].len() as u64 + 1) as u32;
-                        let fill = (rng.below(250) + 1) as u8;
-                        (id, off, vec![fill; rng.below(900) as usize])
-                    })
-                    .collect();
-                for (id, off, bytes) in &writes {
-                    let v = model.get_mut(id).unwrap();
-                    let end = *off as usize + bytes.len();
-                    if v.len() < end {
-                        v.resize(end, 0);
-                    }
-                    v[*off as usize..end].copy_from_slice(bytes);
-                }
+            9 if len > 0 => {
+                // A transaction: a cut, a write, and the cut pasted back
+                // elsewhere, all or none of it.
+                let seq = &mut model.0;
+                let a = rng.below(len);
+                let n = rng.below((len - a).min(900)) + 1;
+                let w = rng.below(len - n + 1);
+                let fill = (rng.below(250) + 1) as u8;
+                let to = rng.below(len - n + 1);
+                let cut: Vec<u8> = seq.drain(a as usize..(a + n) as usize).collect();
+                let wn = (seq.len() as u64 - w).min(3);
+                seq[w as usize..(w + wn) as usize].fill(fill);
+                seq.splice(to as usize..to as usize, cut);
                 store.atomically(|| {
-                    for (id, off, bytes) in &writes {
-                        store.write(Pointer::from_raw(*id).unwrap(), *off, bytes)?;
-                    }
-                    Ok(())
+                    let c = store.splice(a, n, b"")?.unwrap();
+                    store.write(w, &vec![fill; wn as usize])?;
+                    store.paste(to, 0, c)
                 })
             }
-            0 | 1 => {
-                let size = rng.below(3000) as u32;
-                store
-                    .alloc(size)
-                    .map(|p| {
-                        model.insert(p.raw().raw(), vec![0; size as usize]);
-                        owned.insert(p.raw().raw(), p);
-                    })
-                    .inspect_err(|_| failed_alloc = Some(size as usize))
+            10 => {
+                model.1 = vec![(rng.below(250) + 1) as u8; rng.below(300) as usize];
+                store.set_schema(model.1.clone());
+                Ok(())
             }
-            2 if !ids.is_empty() => {
-                let id = pick(&mut rng);
-                model.remove(&id);
-                store.free(owned.remove(&id).unwrap())
-            }
-            3 if !ids.is_empty() => {
-                let id = pick(&mut rng);
-                let size = rng.below(3000) as u32;
-                model.get_mut(&id).unwrap().resize(size as usize, 0);
-                store.resize(&owned[&id], size)
-            }
-            4..=6 if !ids.is_empty() => {
-                let id = pick(&mut rng);
-                let v = model.get_mut(&id).unwrap();
-                let off = rng.below(v.len() as u64 + 1) as u32;
+            0..=2 if len > 0 => {
+                let pos = rng.below(len);
+                let n = rng.below((len - pos).min(900)) + 1;
                 let fill = (rng.below(250) + 1) as u8;
-                // Now and then two pages, more than a tiny journal holds.
-                let len = if mixed && rng.below(10) == 0 {
+                model.0[pos as usize..(pos + n) as usize].fill(fill);
+                store.write(pos, &vec![fill; n as usize])
+            }
+            3..=5 => {
+                let pos = rng.below(len + 1);
+                let removed = rng.below((len - pos).min(500) + 1);
+                let max = if mixed && rng.below(10) == 0 {
                     8192
                 } else {
                     900
                 };
-                let bytes = vec![fill; rng.below(len) as usize];
-                let end = off as usize + bytes.len();
-                if v.len() < end {
-                    v.resize(end, 0);
-                }
-                v[off as usize..end].copy_from_slice(&bytes);
-                store.write(Pointer::from_raw(id).unwrap(), off, &bytes)
+                let fill = (rng.below(250) + 1) as u8;
+                let bytes = vec![fill; rng.below(max) as usize];
+                model.0.splice(
+                    pos as usize..(pos + removed) as usize,
+                    bytes.iter().copied(),
+                );
+                store.splice(pos, removed, &bytes).map(|_| ())
+            }
+            6 if len > 0 => {
+                let from = rng.below(len);
+                let n = rng.below(len - from) + 1;
+                let to = rng.below(len - n + 1);
+                let m: Vec<u8> = model.0.drain(from as usize..(from + n) as usize).collect();
+                model.0.splice(to as usize..to as usize, m);
+                store.move_range(from, n, to)
             }
             _ => store.flush().map(|()| flushed = history.len() - 1),
         };
         // A failed operation may or may not have reached the journal, so both
-        // the state before it and the state after it are boundaries.
+        // the state before it and the state after it are boundaries. A new
+        // schema reaches the file only with a flush, so the states with and
+        // without it are both boundaries until then.
         if history.last() != Some(&model) {
             history.push(model.clone());
         }
@@ -152,8 +121,6 @@ fn run_mixed(seed: u64, opts: &Options, mixed: bool) {
             break;
         }
     }
-    // Power cuts: nothing written since the last sync survives, all of it,
-    // or random subsets of it.
     let n = storage.unsynced_ops();
     let mut images = vec![
         storage.crash_image(|_| false),
@@ -165,45 +132,19 @@ fn run_mixed(seed: u64, opts: &Options, mixed: bool) {
     }
     for image in images {
         let got = recovered(image, opts);
-        match history.iter().rposition(|h| *h == got) {
+        // The schema chain is written by flushes alone, so a state matches
+        // a boundary whose sequence is the same, and whose schema is the
+        // one the last flush before it wrote.
+        let matches = history.iter().enumerate().rposition(|(k, h)| {
+            h.0 == got.0 && (h.1 == got.1 || history[..=k].iter().rev().any(|e| e.1 == got.1))
+        });
+        match matches {
             Some(k) => assert!(
                 k >= flushed,
                 "seed {seed}: recovered transaction {k}, but {flushed} were flushed"
             ),
-            None => assert!(
-                failed_alloc.is_some_and(|size| plus_one_alloc(
-                    &got,
-                    history.last().unwrap(),
-                    size
-                )),
-                "seed {seed}: the recovered state is no transaction boundary"
-            ),
+            None => panic!("seed {seed}: the recovered state is no transaction boundary"),
         }
-    }
-}
-
-/// An id the recovered journal allocated is in use after recovery, for the
-/// application and for the store's own allocations alike.
-#[test]
-fn recovered_ids_are_not_handed_out_again() {
-    for consolidator_state in [false, true] {
-        let opts = Options {
-            consolidator_state,
-            ..Default::default()
-        };
-        let storage = MemoryStorage::new();
-        let store = Store::create(Box::new(storage.clone()), opts.clone()).unwrap();
-        let a = store.alloc(4).unwrap();
-        store.write(a.raw(), 0, b"kept").unwrap();
-        drop(store);
-        let store =
-            Store::open(Box::new(MemoryStorage::from_image(storage.image())), opts).unwrap();
-        let b = store.alloc(4).unwrap();
-        assert_ne!(a.raw(), b.raw());
-        store.flush().unwrap();
-        store.check();
-        assert_eq!(store.read_all(a.raw()).unwrap(), b"kept");
-        assert_eq!(store.allocations().len(), 2);
     }
 }
 
@@ -214,14 +155,14 @@ fn power_cuts_land_on_transaction_boundaries() {
         ..Default::default()
     };
     for seed in 1..150 {
-        run(seed, &opts);
+        run(seed, &opts, false);
     }
 }
 
 #[test]
 fn power_cuts_with_consolidation() {
     for seed in 1..150 {
-        run(seed, &Options::default());
+        run(seed, &Options::default(), false);
     }
 }
 
@@ -232,19 +173,19 @@ fn power_cuts_with_a_tiny_journal() {
         ..Default::default()
     };
     for seed in 1..150 {
-        run(seed, &opts);
+        run(seed, &opts, false);
     }
 }
 
 /// With a journal of one page, batches are cut and flushed often, and a
-/// write of two pages is flushed before and after.
+/// splice of two pages is flushed before and after.
 #[test]
-fn power_cuts_with_batches_transactions_and_overlong_writes_in_a_tiny_journal() {
+fn power_cuts_with_batches_cuts_and_overlong_splices_in_a_tiny_journal() {
     let opts = Options {
         journal_budget_pages: 1,
         ..Default::default()
     };
     for seed in 1..150 {
-        run_mixed(seed, &opts, true);
+        run(seed, &opts, true);
     }
 }
