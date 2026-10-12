@@ -1,101 +1,60 @@
 //! `#[derive(Persistable)]`: turns a struct or enum composed of
-//! `Persistable` fields into a backed type. Applications reach it through the
-//! `kladde` crate, which re-exports it.
+//! `Persistable` fields into a persistable type. Applications reach it
+//! through the `kladde` crate, which re-exports it.
 //!
 //! For a type `T`, it generates
 //!
-//! - a `Persistable` implementation: both encodings (`encoded_size`, `encode`,
-//!   `decode`), `prepare`, `free`, and the schema descriptor;
+//! - a `Persistable` implementation: the encoding (`encoded_len`, `encode`,
+//!   `decode`), the fixed form (`encode_fixed`, `decode_fixed`), the sizes
+//!   `FIXED_SIZE` and `FIXED_FORM_SIZE`, and the schema descriptor;
 //! - a guard type `TGuard`, with a `{field}_mut()` accessor per field
 //!   (`field_{i}_mut()` for a tuple struct's positional fields), a `parts()`
 //!   method handing out a guard for every field at once, and a whole-value
-//!   `set` that stores the new value and then frees the old one, in one
-//!   transaction;
+//!   `set`;
 //! - `Deref` on the guard, so read-only methods stay available.
 //!
-//! The guard's last type parameter is the encoding of the place the value
-//! sits in, `Slotted` by default: `TGuard<'_, B>` is the guard of a value in a
-//! slotted place, `TGuard<'_, B, Packed>` that of one in a packed place. Every
-//! field inherits it.
+//! Encoding:
 //!
-//! Layout:
-//!
-//! - A struct's fixed encoding is its fields' fixed encodings back to back,
-//!   each field at the static offset of the fields before it; its packed
-//!   encoding is its fields' packed encodings back to back. It owns no
-//!   allocation of its own.
-//! - An enum's fixed encoding is its discriminant, its variant's fields laid
-//!   out like a struct's, and zeros up to the size of the largest variant;
-//!   its packed encoding is the discriminant as a varint followed by the
-//!   variant's fields, with no padding. The discriminant's fixed width is
-//!   what an integer `#[repr(u8 | u16 | u32 | u64)]` says, or else the
-//!   smallest of 1, 2, 4 and 8 bytes that holds the largest discriminant
-//!   value. Its guard's `parts()` returns a generated `{Enum}Parts` enum
-//!   holding the guards of the current variant's fields, for mutating them in
-//!   place; `set` replaces the whole value, which is how the variant changes.
-//! - A single-field struct marked `#[kladde(transparent)]` is persisted exactly
-//!   as its field: same bytes and same fingerprint. Its guard has a `get_mut()`
-//!   returning the field's guard.
+//! - A struct is its fields' encodings back to back. It is fixed-size if
+//!   every field is.
+//! - An enum is its discriminant as a varint, then its variant's fields. It
+//!   is fixed-size if every discriminant is below 128 and every variant
+//!   takes the same fixed size. Its fixed form, which `Fixed<T>` holds, puts
+//!   the discriminant at the width an integer `#[repr(u8 | u16 | u32 |
+//!   u64)]` says, or else at the smallest of 1, 2, 4 and 8 bytes that holds
+//!   the largest discriminant, and pads every variant with zeros to the
+//!   largest. Its guard's `parts()` returns a generated `{Enum}Parts` enum
+//!   holding the guards of the current variant's fields, for mutating them
+//!   in place; `set` replaces the whole value, which is how the variant
+//!   changes.
+//! - A single-field struct marked `#[kladde(transparent)]` is persisted
+//!   exactly as its field: same bytes and same fingerprint. Its guard has a
+//!   `get_mut()` returning the field's guard.
 //! - Type parameters get a `Persistable` bound, as `#[derive(Debug)]` does;
 //!   lifetime and const parameters are rejected.
 //!
-//! In a packed place, a field whose encoding changes size -- an enum that
-//! switches variant, an integer whose varint grows -- splices its new
-//! encoding in and tells its parent, so the guards of its siblings, and of
-//! everything around it, find themselves at their new offsets.
-//!
-//! **Slotted fields and packed-only types.** A field marked
-//! `#[kladde(slotted)]` keeps its fixed encoding inside a packed value, so
-//! that it never changes size: for a counter, say, whose varint would grow
-//! at every power of 128. Its type must be `Slottable`. The derive implements
-//! `Slottable` for every type whose fields all have a fixed encoding; a type
-//! with a field that has none, such as a small string, is marked
-//! `#[kladde(packed_only)]`, gets no `Slottable` impl, and stands only in
-//! packed places.
+//! A field guard made by its accessor holds where its field starts: at a
+//! constant offset up to the first field whose size depends on its value,
+//! and after that at the sum of the sizes of the fields before it. Guards
+//! made together by `parts()` find where they start whenever they write, so
+//! that a field before them may change size meanwhile:
 //!
 //! ```
-//! use kladde::{Kladde, Packed, Persistable};
-//! use kladde_types::{PackedPersistableVec, SmallPersistableString};
+//! use kladde::{Kladde, Persistable};
 //!
 //! #[derive(Persistable)]
-//! #[kladde(packed_only)]
-//! struct Page {
-//!     title: SmallPersistableString,
-//!     #[kladde(slotted)]
-//!     visits: u32,
+//! struct Counts {
+//!     small: u32, // a varint
+//!     flag: bool,
 //! }
 //!
-//! let page = Page { title: "home".into(), visits: 300 };
-//! // A tag and four bytes of text, then the count's four fixed bytes.
-//! assert_eq!(page.encoded_size::<Packed>(), 1 + 4 + 4);
-//! let mut pages = Kladde::new(PackedPersistableVec::<Page>::new());
-//! pages.guard().push(page)?;
-//! pages.guard().get_mut(0).unwrap().visits_mut().set(301)?;
+//! let mut counts = Kladde::new(Counts { small: 5, flag: false });
+//! let mut guard = counts.guard();
+//! let mut parts = guard.parts();
+//! parts.small.set(1 << 30)?; // five bytes now, so `flag` moves
+//! parts.flag.set(true)?;
+//! assert_eq!(counts.get().small, 1 << 30);
 //! # Ok::<(), kladde::Error>(())
-//! ```
-//!
-//! A type with such a field that is not marked does not compile:
-//!
-//! ```compile_fail
-//! use kladde_types::SmallPersistableString;
-//!
-//! #[derive(kladde::Persistable)]
-//! struct Page {
-//!     title: SmallPersistableString, // error: `Page` has a field without a fixed encoding, `title`: mark `Page` #[kladde(packed_only)], ...
-//! }
-//! ```
-//!
-//! Nor does a slotted field without a fixed encoding:
-//!
-//! ```compile_fail
-//! use kladde_types::SmallPersistableString;
-//!
-//! #[derive(kladde::Persistable)]
-//! #[kladde(packed_only)]
-//! struct Page {
-//!     #[kladde(slotted)]
-//!     title: SmallPersistableString, // error[E0277]: `SmallPersistableString` has no fixed encoding, so it cannot stand in a slotted place
-//! }
 //! ```
 //!
 //! **Every field must be `Persistable`.** Plain `String` is not, and the
@@ -144,20 +103,23 @@
 //! #[derive(Persistable)]
 //! enum Shape {
 //!     Origin,
-//!     Circle(i32),
-//!     Rectangle { width: i32, height: i32 },
+//!     Circle(f32),
+//!     Rectangle { width: f32, height: f32 },
 //! }
 //!
-//! let mut shape = Kladde::new(Shape::Rectangle { width: 1, height: 2 });
+//! let mut shape = Kladde::new(Shape::Rectangle { width: 1.0, height: 2.0 });
 //! match shape.guard().parts() {
-//!     ShapeParts::Rectangle { mut width, .. } => width.set(3).unwrap(),
-//!     ShapeParts::Circle(mut radius) => radius.set(3).unwrap(),
+//!     ShapeParts::Rectangle { mut width, .. } => width.set(3.0)?,
+//!     ShapeParts::Circle(mut radius) => radius.set(3.0)?,
 //!     ShapeParts::Origin => {}
 //! }
-//! assert!(matches!(shape.get(), Shape::Rectangle { width: 3, height: 2 }));
+//! assert!(matches!(shape.get(), Shape::Rectangle { width: 3.0, height: 2.0 }));
 //!
-//! // Three variants fit a one-byte discriminant.
-//! assert_eq!(<Shape as kladde::Persistable>::SLOTTED_SIZE, Some(1 + 8));
+//! // The variants differ in size, so the enum is not fixed-size; its fixed
+//! // form takes a one-byte discriminant and the largest variant.
+//! assert_eq!(<Shape as Persistable>::FIXED_SIZE, None);
+//! assert_eq!(<Shape as Persistable>::FIXED_FORM_SIZE, Some(1 + 8));
+//! # Ok::<(), kladde::Error>(())
 //! ```
 //!
 //! The variant cannot be switched while a field's guard is alive:
@@ -179,9 +141,9 @@
 //! }
 //! ```
 //!
-//! An integer `#[repr]` fixes the discriminant's width, and only unsigned
-//! ones of up to 64 bits are accepted, since discriminants are stored
-//! unsigned:
+//! An integer `#[repr]` fixes the discriminant's width in the fixed form,
+//! and only unsigned ones of up to 64 bits are accepted, since
+//! discriminants are stored unsigned:
 //!
 //! ```
 //! #[derive(kladde::Persistable)]
@@ -190,7 +152,8 @@
 //!     A,
 //!     B,
 //! }
-//! assert_eq!(<Pinned as kladde::Persistable>::SLOTTED_SIZE, Some(4));
+//! assert_eq!(<Pinned as kladde::Persistable>::FIXED_SIZE, Some(1));
+//! assert_eq!(<Pinned as kladde::Persistable>::FIXED_FORM_SIZE, Some(4));
 //! ```
 //!
 //! ```compile_fail
@@ -224,16 +187,12 @@ type Tokens = proc_macro2::TokenStream;
 pub fn derive_persistable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
-    let TypeAttrs {
-        transparent,
-        packed_only,
-        krate,
-    } = match kladde_attrs(&input.attrs) {
+    let TypeAttrs { transparent, krate } = match kladde_attrs(&input.attrs) {
         Ok(parsed) => parsed,
         Err(err) => return err.to_compile_error().into(),
     };
 
-    let ctx = match Ctx::build(&input, krate, packed_only) {
+    let ctx = match Ctx::build(&input, krate) {
         Ok(ctx) => ctx,
         Err(err) => return err.to_compile_error().into(),
     };
@@ -261,31 +220,25 @@ pub fn derive_persistable(input: TokenStream) -> TokenStream {
 /// - the *type*'s own `impl`/type/where fragments, with a `Persistable` bound
 ///   added to each type parameter (the `#[derive(Debug)]` heuristic); and
 /// - the generated *guard*'s generic lists, which extend the type's own
-///   parameters with a fresh lifetime `'__s`, backend `__B` and encoding
-///   `__E`, given underscore-prefixed names so that a user type like
-///   `struct Foo<B>` does not clash with them -- the same hygiene trick serde's
-///   derive uses.
+///   parameters with a fresh lifetime `'__r` and backend `__B`, given
+///   underscore-prefixed names so that a user type like `struct Foo<B>` does
+///   not clash with them -- the same hygiene trick serde's derive uses.
 ///
 /// Only type parameters are supported; lifetime and const parameters are
 /// rejected in [`build`](Ctx::build).
 struct Ctx {
     /// The `impl` generics of the `Persistable` impl: the type's own
-    /// parameters, each bounded by `Persistable<Pointer>`.
+    /// parameters, each bounded by `Persistable`.
     impl_generics: Tokens,
     /// The type's type generics, e.g. `<T>` (empty for a non-generic type).
     type_generics: Tokens,
     /// The type's own `where`-clause, verbatim (empty if none).
     where_clause: Tokens,
-    /// Generic list for *declaring* the guard struct, whose encoding
-    /// parameter defaults to `Slotted`.
-    guard_decl_generics: Tokens,
-    /// Generic list for every `impl` block on the guard.
+    /// Generic list for declaring the guard struct and its `impl` blocks.
     guard_impl_generics: Tokens,
     /// Generic list for *naming* the guard type (bare parameter names).
     guard_use_generics: Tokens,
-    /// The type's type parameters rendered with their bounds, for building
-    /// further generic lists (the `Parts` types) that need a different
-    /// lifetime than the guard's.
+    /// The type's type parameters rendered with their bounds.
     bounded_params: Vec<Tokens>,
     /// The type's type parameters as bare idents.
     param_idents: Vec<syn::Ident>,
@@ -294,12 +247,10 @@ struct Ctx {
     /// The crate every generated path is rooted at -- `::kladde` unless
     /// `#[kladde(crate = "...")]` says otherwise.
     krate: syn::Path,
-    /// `#[kladde(packed_only)]`: no `Slottable` impl.
-    packed_only: bool,
 }
 
 impl Ctx {
-    fn build(input: &DeriveInput, krate: syn::Path, packed_only: bool) -> syn::Result<Ctx> {
+    fn build(input: &DeriveInput, krate: syn::Path) -> syn::Result<Ctx> {
         for param in &input.generics.params {
             match param {
                 GenericParam::Type(_) => {}
@@ -320,9 +271,7 @@ impl Ctx {
 
         let mut bounded = input.generics.clone();
         for tp in bounded.type_params_mut() {
-            tp.bounds.push(parse_quote!(
-                #krate::Persistable<#krate::Pointer>
-            ));
+            tp.bounds.push(parse_quote!(#krate::Persistable));
         }
         let (_, type_generics, where_clause) = bounded.split_for_impl();
 
@@ -341,120 +290,31 @@ impl Ctx {
             impl_generics: quote! { <#(#bounded_params,)*> },
             type_generics: quote!(#type_generics),
             where_clause: quote!(#where_clause),
-            guard_decl_generics: quote! {
-                <
-                    '__s,
-                    #(#bounded_params,)*
-                    __B: #krate::WriteBackend<Pointer = #krate::Pointer>,
-                    __E: #krate::Encoding = #krate::Slotted
-                >
-            },
             guard_impl_generics: quote! {
-                <
-                    '__s,
-                    #(#bounded_params,)*
-                    __B: #krate::WriteBackend<Pointer = #krate::Pointer>,
-                    __E: #krate::Encoding
-                >
+                <'__r, #(#bounded_params,)* __B: #krate::Backend>
             },
-            guard_use_generics: quote! { <'__s, #(#param_idents,)* __B, __E> },
+            guard_use_generics: quote! { <'__r, #(#param_idents,)* __B> },
             bounded_params,
             param_idents,
             user_where_preds,
             krate,
-            packed_only,
-        })
-    }
-
-    /// The `where` clause of the `Persistable` impl: the type's own
-    /// predicates, and a `Slottable` bound on the type of every field
-    /// declared `#[kladde(slotted)]`, so that a field without a fixed
-    /// encoding there fails to compile at the type that declares it.
-    fn persistable_where(&self, fields: &[&FieldInfo]) -> Tokens {
-        let krate = &self.krate;
-        let user = &self.user_where_preds;
-        let slotted = fields.iter().filter(|f| f.slotted).map(|f| &f.ty);
-        quote! {
-            where #user #(#slotted: #krate::Slottable<#krate::Pointer>,)*
-        }
-    }
-
-    /// The type's `Slottable` impl, or nothing for a type marked
-    /// `#[kladde(packed_only)]`.
-    ///
-    /// It requires `Slottable` of every type parameter, as `#[derive(Debug)]`
-    /// requires `Debug`, rather than of every field's type: a type that holds
-    /// itself through a container, `struct Node { children:
-    /// PersistableVec<Node> }`, would make that requirement circular. Fields
-    /// whose types name no parameter are checked by an assertion instead,
-    /// which names the attribute when it fails.
-    fn slottable_impl(&self, ident: &syn::Ident, fields: &[&FieldInfo]) -> Tokens {
-        if self.packed_only {
-            return Tokens::new();
-        }
-        let krate = &self.krate;
-        let (impl_generics, type_generics) = (&self.impl_generics, &self.type_generics);
-        let user = &self.user_where_preds;
-        let params = &self.param_idents;
-        let checks = fields
-            .iter()
-            .filter(|f| !mentions_any(&f.ty, params))
-            .map(|f| {
-                let ty = persistable(&f.ty, krate);
-                let message = format!(
-                    "`{ident}` has a field without a fixed encoding, `{}`: mark `{ident}` \
-                     #[kladde(packed_only)], so that it stands only in packed places",
-                    f.schema_name
-                );
-                quote! {
-                    const _: () = if #ty::SLOTTED_SIZE.is_none() {
-                        ::std::panic!(#message)
-                    };
-                }
-            });
-        quote! {
-            impl #impl_generics #krate::Slottable<#krate::Pointer> for #ident #type_generics
-            where #user #(#params: #krate::Slottable<#krate::Pointer>,)*
-            {}
-
-            #(#checks)*
-        }
-    }
-
-    /// The type's `RootEncoding`: `Slotted` joined with every field's.
-    fn root_encoding(&self, fields: &[&FieldInfo]) -> Tokens {
-        let krate = &self.krate;
-        fields.iter().fold(quote!(#krate::Slotted), |acc, f| {
-            let ty = persistable(&f.ty, krate);
-            quote!(<#acc as #krate::Encoding>::Join<#ty::RootEncoding>)
         })
     }
 
     /// The generics of a generated `Parts` type, which holds field guards for
-    /// a lifetime `'__f`, and the arguments that name it from a guard method.
-    /// The encoding parameter is left out when no field inherits it, since
-    /// an unused parameter would not compile.
-    fn parts_generics(&self, uses_encoding: bool) -> (Tokens, Tokens, Tokens) {
+    /// a lifetime `'__f`, the arguments that name it from a guard method,
+    /// and its `where` clause.
+    fn parts_generics(&self) -> (Tokens, Tokens, Tokens) {
         let krate = &self.krate;
         let bounded_params = &self.bounded_params;
         let param_idents = &self.param_idents;
         let user_where_preds = &self.user_where_preds;
-        let (decl_e, use_e) = if uses_encoding {
-            (
-                quote!(, __E: #krate::Encoding = #krate::Slotted),
-                quote!(, __E),
-            )
-        } else {
-            (Tokens::new(), Tokens::new())
-        };
-        let decl = quote! {
-            <'__f, #(#bounded_params,)* __B: #krate::WriteBackend<Pointer = #krate::Pointer> #decl_e>
-        };
-        let ret = quote! { <'_, #(#param_idents,)* __B #use_e> };
-        // The `Parts` types hold `Guard<'__f, __B, _>` associated types, whose
-        // GAT bounds need `Param: '__f` and `__B: '__f`.
+        let decl = quote! { <'__f, #(#bounded_params,)* __B: #krate::Backend + '__f> };
+        let ret = quote! { <'_, #(#param_idents,)* __B> };
+        // The `Parts` types hold `Guard<'__f, __B>` associated types, whose
+        // GAT bounds need `Param: '__f`.
         let where_ = quote! {
-            where #user_where_preds #(#param_idents: '__f,)* __B: '__f
+            where #user_where_preds #(#param_idents: '__f,)*
         };
         (decl, ret, where_)
     }
@@ -466,7 +326,6 @@ impl Ctx {
 fn kladde_attrs(attrs: &[syn::Attribute]) -> syn::Result<TypeAttrs> {
     let mut parsed = TypeAttrs {
         transparent: false,
-        packed_only: false,
         krate: syn::parse_quote!(::kladde),
     };
     for attr in attrs {
@@ -477,17 +336,13 @@ fn kladde_attrs(attrs: &[syn::Attribute]) -> syn::Result<TypeAttrs> {
             if meta.path.is_ident("transparent") {
                 parsed.transparent = true;
                 Ok(())
-            } else if meta.path.is_ident("packed_only") {
-                parsed.packed_only = true;
-                Ok(())
             } else if meta.path.is_ident("crate") {
                 let lit: syn::LitStr = meta.value()?.parse()?;
                 parsed.krate = lit.parse()?;
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unknown `#[kladde(...)]` option; supported are `transparent`, \
-                     `packed_only` and `crate`",
+                    "unknown `#[kladde(...)]` option; supported are `transparent` and `crate`",
                 ))
             }
         })?;
@@ -498,202 +353,100 @@ fn kladde_attrs(attrs: &[syn::Attribute]) -> syn::Result<TypeAttrs> {
 /// The type's own `#[kladde(...)]` options.
 struct TypeAttrs {
     transparent: bool,
-    /// The type holds a field without a fixed encoding, so it gets no
-    /// `Slottable` impl.
-    packed_only: bool,
     krate: syn::Path,
 }
 
-/// Whether a field is marked `#[kladde(slotted)]`, the one option a field
-/// takes.
-fn field_slotted(attrs: &[syn::Attribute]) -> syn::Result<bool> {
-    let mut slotted = false;
-    for attr in attrs {
-        if !attr.path().is_ident("kladde") {
-            continue;
+/// Refuses `#[kladde(...)]` on a field: fields take no options.
+fn no_field_attrs(fields: &Fields) -> syn::Result<()> {
+    for f in fields.iter() {
+        if let Some(attr) = f.attrs.iter().find(|a| a.path().is_ident("kladde")) {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "fields take no `#[kladde(...)]` options; for a fixed-size field, use `Fixed<T>`",
+            ));
         }
-        attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("slotted") {
-                slotted = true;
-                Ok(())
-            } else {
-                Err(meta
-                    .error("unknown `#[kladde(...)]` option on a field; supported is `slotted`"))
-            }
-        })?;
     }
-    Ok(slotted)
+    Ok(())
 }
 
 /// One field of a struct or of an enum variant, as the generated code needs
 /// it.
 struct FieldInfo {
     ty: syn::Type,
-    /// Declared `#[kladde(slotted)]`: its place holds the fixed encoding,
-    /// whatever the value around it holds.
-    slotted: bool,
-    /// The encoding the field's place holds: `Slotted` if declared so, and
-    /// otherwise `__E`, inherited from the value around it.
-    encoding: Tokens,
     /// The field's name in the schema: its identifier, or its position.
     schema_name: String,
 }
 
 impl FieldInfo {
-    fn of(fields: &Fields, krate: &syn::Path) -> syn::Result<Vec<FieldInfo>> {
-        let fields: Vec<&syn::Field> = match fields {
-            Fields::Named(f) => f.named.iter().collect(),
-            Fields::Unnamed(f) => f.unnamed.iter().collect(),
-            Fields::Unit => Vec::new(),
-        };
-        fields
+    fn of(fields: &Fields) -> syn::Result<Vec<FieldInfo>> {
+        no_field_attrs(fields)?;
+        Ok(fields
             .iter()
             .enumerate()
-            .map(|(i, f)| {
-                let slotted = field_slotted(&f.attrs)?;
-                Ok(FieldInfo {
-                    ty: f.ty.clone(),
-                    slotted,
-                    encoding: if slotted {
-                        quote!(#krate::Slotted)
-                    } else {
-                        quote!(__E)
-                    },
-                    schema_name: match &f.ident {
-                        Some(name) => name.to_string(),
-                        None => i.to_string(),
-                    },
-                })
+            .map(|(i, f)| FieldInfo {
+                ty: f.ty.clone(),
+                schema_name: match &f.ident {
+                    Some(name) => name.to_string(),
+                    None => i.to_string(),
+                },
             })
-            .collect()
-    }
-
-    /// The reference to the field's descriptor: `Slotted(T)` for a field
-    /// declared slotted, `T`'s own otherwise.
-    fn describe(&self, krate: &syn::Path) -> Tokens {
-        let ty = &self.ty;
-        if self.slotted {
-            quote!(__builder.slotted::<#krate::Pointer, #ty>())
-        } else {
-            let ty = persistable(ty, krate);
-            quote!(#ty::describe(__builder))
-        }
+            .collect())
     }
 }
 
-/// Whether `ty` names any of `params`.
-fn mentions_any(ty: &syn::Type, params: &[syn::Ident]) -> bool {
-    fn walk(tokens: proc_macro2::TokenStream, params: &[syn::Ident]) -> bool {
-        tokens.into_iter().any(|tree| match tree {
-            proc_macro2::TokenTree::Ident(ident) => params.contains(&ident),
-            proc_macro2::TokenTree::Group(group) => walk(group.stream(), params),
-            _ => false,
-        })
-    }
-    !params.is_empty() && walk(quote!(#ty), params)
-}
-
-/// `<ty as Persistable<Pointer>>`, the path every generated call goes
-/// through.
+/// `<ty as Persistable>`, the path every generated call goes through.
 fn persistable(ty: &syn::Type, krate: &syn::Path) -> Tokens {
-    quote!(<#ty as #krate::Persistable<#krate::Pointer>>)
+    quote!(<#ty as #krate::Persistable>)
 }
 
-/// For fields laid out back to back starting at `base` bytes into the value's
-/// fixed encoding, each field's static offset there: the sum of every earlier
-/// field's slot. `base` is a `usize` expression. Only a slotted value at a
-/// fixed location uses these offsets, so a field without a slot counts as
-/// zero rather than failing to compile.
-fn fixed_offsets(fields: &[FieldInfo], base: &Tokens, krate: &syn::Path) -> Vec<Tokens> {
-    (0..fields.len())
-        .map(|i| {
-            let earlier = fields[..i].iter().map(|f| persistable(&f.ty, krate));
-            quote! {
-                #base #( + match #earlier::SLOTTED_SIZE {
-                    ::std::option::Option::Some(size) => size,
-                    ::std::option::Option::None => 0,
-                } )*
-            }
-        })
-        .collect()
-}
-
-/// The `SLOTTED_SIZE` and `PACKED_SIZE` contributions of fields laid out
-/// back to back: `Option<usize>` constant expressions. A field declared
-/// slotted takes its slot in either.
+/// The `Option<usize>` constant expressions summing the fields' `FIXED_SIZE`
+/// and `FIXED_FORM_SIZE`.
 fn field_sizes(fields: &[FieldInfo], krate: &syn::Path) -> (Tokens, Tokens) {
     let paths: Vec<Tokens> = fields.iter().map(|f| persistable(&f.ty, krate)).collect();
-    let packed: Vec<Tokens> = fields
-        .iter()
-        .zip(&paths)
-        .map(|(f, path)| {
-            if f.slotted {
-                quote!(#path::SLOTTED_SIZE)
-            } else {
-                quote!(#path::PACKED_SIZE)
-            }
-        })
-        .collect();
     (
-        quote!(#krate::sum_sizes(&[#(#paths::SLOTTED_SIZE),*])),
-        quote!(#krate::sum_sizes(&[#(#packed),*])),
+        quote!(#krate::sum_sizes(&[#(#paths::FIXED_SIZE),*])),
+        quote!(#krate::sum_sizes(&[#(#paths::FIXED_FORM_SIZE),*])),
     )
 }
 
-/// The guard type every derive kind shares: a `{ inner, backend, place }`
-/// struct, plus the offsets of its fields when it has any (`offsets` is the
-/// `FieldOffsets` capacity), and its `Guard` and `Deref` impls. Each kind adds
-/// `set` and accessors of its own.
+/// The guard type every derive kind shares: a `{ inner, region, fields }`
+/// struct, and its `Guard` and `Deref` impls. Each kind adds `set` and
+/// accessors of its own.
 fn guard_scaffold(
     ctx: &Ctx,
     ident: &syn::Ident,
     vis: &syn::Visibility,
     guard_ident: &syn::Ident,
-    offsets: Option<usize>,
 ) -> Tokens {
     let krate = &ctx.krate;
     let Ctx {
         type_generics,
         where_clause,
-        guard_decl_generics,
         guard_impl_generics,
         guard_use_generics,
         ..
     } = ctx;
     let doc = format!(
-        "The guard of [`{ident}`]: records and applies mutations of a backed `{ident}`, \
-         in a place of encoding `__E`."
+        "The guard of [`{ident}`]: records and applies mutations of a persisted `{ident}`."
     );
-    let offsets_field = offsets.map(|n| {
-        quote! {
-            /// Where each field starts, for fields whose places link to it.
-            fields: #krate::FieldOffsets<#n>,
-        }
-    });
 
     quote! {
         #[doc = #doc]
-        #vis struct #guard_ident #guard_decl_generics #where_clause {
-            inner: &'__s mut #ident #type_generics,
-            backend: &'__s __B,
-            place: #krate::Place<'__s, __B, __E>,
-            #offsets_field
+        #vis struct #guard_ident #guard_impl_generics #where_clause {
+            inner: &'__r mut #ident #type_generics,
+            region: #krate::Region<'__r, __B>,
+            /// The fields' sizes, for guards that `parts` makes together.
+            #[allow(dead_code)]
+            fields: #krate::FieldSizes,
         }
 
         impl #guard_impl_generics #krate::Guard
             for #guard_ident #guard_use_generics #where_clause
         {
             type Persistable = #ident #type_generics;
-            type Backend = __B;
 
             fn as_persistable(&self) -> &#ident #type_generics {
                 self.inner
-            }
-            fn as_persistable_mut(&mut self) -> &mut #ident #type_generics {
-                self.inner
-            }
-            fn backend(&self) -> &__B {
-                self.backend
             }
         }
 
@@ -709,111 +462,65 @@ fn guard_scaffold(
 }
 
 /// The `Guard` associated type and `guard()` constructor every derived
-/// `Persistable` impl shares. A guard with field offsets fills them as it is
-/// made.
-fn guard_assoc(ctx: &Ctx, guard_ident: &syn::Ident, with_offsets: bool) -> Tokens {
+/// `Persistable` impl shares.
+fn guard_assoc(ctx: &Ctx, guard_ident: &syn::Ident) -> Tokens {
     let krate = &ctx.krate;
     let guard_use_generics = &ctx.guard_use_generics;
-    let construct = if with_offsets {
-        quote! {
-            let guard = #guard_ident {
-                inner: self,
-                backend,
-                place,
-                fields: #krate::FieldOffsets::new(),
-            };
-            guard.__kladde_refresh();
-            guard
-        }
-    } else {
-        quote! {
-            #guard_ident {
-                inner: self,
-                backend,
-                place,
-            }
-        }
-    };
     quote! {
-        type Guard<'__s, __B: #krate::WriteBackend<Pointer = #krate::Pointer>, __E: #krate::Encoding>
+        type Guard<'__r, __B: #krate::Backend + '__r>
             = #guard_ident #guard_use_generics
         where
-            Self: '__s,
-            __B: '__s;
+            Self: '__r;
 
         #[inline]
-        fn guard<'__s, __B: #krate::WriteBackend<Pointer = #krate::Pointer>, __E: #krate::Encoding>(
-            &'__s mut self,
-            backend: &'__s __B,
-            place: #krate::Place<'__s, __B, __E>,
-        ) -> Self::Guard<'__s, __B, __E> {
-            #construct
+        fn guard<'__r, __B: #krate::Backend + '__r>(
+            &'__r mut self,
+            region: #krate::Region<'__r, __B>,
+        ) -> Self::Guard<'__r, __B> {
+            #guard_ident {
+                inner: self,
+                region,
+                fields: #krate::FieldSizes::new(),
+            }
         }
     }
 }
 
 /// The signatures every derive kind spells the same way.
-fn encoded_size_sig(krate: &syn::Path) -> Tokens {
-    quote! {
-        fn encoded_size<__E: #krate::Encoding>(&self) -> usize
-    }
+fn codec_sigs(krate: &syn::Path) -> [Tokens; 4] {
+    [
+        quote! {
+            #[allow(unused_variables)]
+            fn encode(&self, __out: &mut #krate::Encoder<'_>)
+        },
+        quote! {
+            #[allow(unused_variables)]
+            fn decode(__input: &mut #krate::Decoder<'_>) -> ::std::result::Result<Self, #krate::Error>
+        },
+        quote! {
+            #[allow(unused_variables)]
+            fn encode_fixed(&self, __out: &mut #krate::Encoder<'_>)
+        },
+        quote! {
+            #[allow(unused_variables)]
+            fn decode_fixed(__input: &mut #krate::Decoder<'_>) -> ::std::result::Result<Self, #krate::Error>
+        },
+    ]
 }
 
-fn encode_sig(krate: &syn::Path) -> Tokens {
-    quote! {
-        fn encode<__E: #krate::Encoding>(&self, __out: &mut ::std::vec::Vec<u8>)
-    }
-}
-
-// The three below allow unused variables: an enum whose variants have no
-// fields never reads its backend.
-fn decode_sig(krate: &syn::Path) -> Tokens {
-    quote! {
-        #[allow(unused_variables)]
-        fn decode<__B: #krate::ReadBackend<Pointer = #krate::Pointer>, __E: #krate::Encoding>(
-            __backend: &mut __B,
-            __input: &mut #krate::Input<'_>,
-        ) -> ::std::result::Result<Self, #krate::Error>
-    }
-}
-
-fn prepare_sig(krate: &syn::Path) -> Tokens {
-    quote! {
-        #[allow(unused_variables)]
-        fn prepare<__B: #krate::WriteBackend<Pointer = #krate::Pointer>>(
-            &mut self,
-            __backend: &__B,
-        ) -> ::std::result::Result<(), #krate::Error>
-    }
-}
-
-fn free_sig(krate: &syn::Path) -> Tokens {
-    quote! {
-        #[allow(unused_variables)]
-        fn free<__B: #krate::WriteBackend<Pointer = #krate::Pointer>>(
-            &mut self,
-            __backend: &__B,
-        ) -> ::std::result::Result<(), #krate::Error>
-    }
-}
-
-/// The whole-value `set` of a guard: `replace`, then refilling the field
-/// offsets for the new value.
-fn set_method(ctx: &Ctx, ident: &syn::Ident, vis: &syn::Visibility, with_offsets: bool) -> Tokens {
+/// The whole-value `set` of a guard.
+fn set_method(ctx: &Ctx, ident: &syn::Ident, vis: &syn::Visibility) -> Tokens {
     let krate = &ctx.krate;
     let type_generics = &ctx.type_generics;
-    let refresh = with_offsets.then(|| quote!(self.__kladde_refresh();));
     quote! {
-        /// Replaces the whole value: stores `value`, which publishes it,
-        /// then frees what the old value owned, in one transaction. If
-        /// anything fails, the value is left as it was.
+        /// Replaces the whole value: an overwrite in place if its encoding
+        /// keeps its size, a splice otherwise. If the write fails, the value
+        /// is left as it was.
         #vis fn set(
             &mut self,
             value: #ident #type_generics,
         ) -> ::std::result::Result<(), #krate::Error> {
-            #krate::replace(&mut *self.inner, value, self.backend, &self.place)?;
-            #refresh
-            ::std::result::Result::Ok(())
+            #krate::replace(&mut *self.inner, value, &self.region)
         }
     }
 }
@@ -866,27 +573,9 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> Tokens {
             .to_compile_error();
         }
     };
-
-    match field_slotted(&field.attrs) {
-        Ok(false) => {}
-        Ok(true) => {
-            return syn::Error::new_spanned(
-                field,
-                "#[kladde(transparent)] persists the field exactly as it is; it cannot be \
-                 declared slotted",
-            )
-            .to_compile_error();
-        }
-        Err(err) => return err.to_compile_error(),
+    if let Err(err) = no_field_attrs(fields) {
+        return err.to_compile_error();
     }
-    let info = FieldInfo {
-        ty: field.ty.clone(),
-        slotted: false,
-        encoding: quote!(__E),
-        schema_name: String::new(),
-    };
-    let slottable_impl = ctx.slottable_impl(ident, &[&info]);
-    let root_encoding = ctx.root_encoding(&[&info]);
 
     let field_ty = persistable(&field.ty, krate);
     let (member, construct): (syn::Member, Tokens) = match &field.ident {
@@ -900,15 +589,10 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> Tokens {
         ),
     };
 
-    let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident, None);
-    let guard_assoc = guard_assoc(ctx, &guard_ident, false);
-    let set = set_method(ctx, ident, vis, false);
-    let (encoded_size_sig, encode_sig, decode_sig) = (
-        encoded_size_sig(krate),
-        encode_sig(krate),
-        decode_sig(krate),
-    );
-    let (prepare_sig, free_sig) = (prepare_sig(krate), free_sig(krate));
+    let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident);
+    let guard_assoc = guard_assoc(ctx, &guard_ident);
+    let set = set_method(ctx, ident, vis);
+    let [encode_sig, decode_sig, encode_fixed_sig, decode_fixed_sig] = codec_sigs(krate);
 
     quote! {
         #scaffold
@@ -916,44 +600,42 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> Tokens {
         impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
             #set
 
-            /// The guard of the wrapped value, which lives at the wrapper's
-            /// own place: its whole mutation API, passed through.
+            /// The guard of the wrapped value, which fills the wrapper's own
+            /// region: its whole mutation API, passed through.
             #[inline]
-            #vis fn get_mut(&mut self) -> #field_ty::Guard<'_, __B, __E> {
-                #field_ty::guard(&mut self.inner.#member, self.backend, self.place)
+            #vis fn get_mut(&mut self) -> #field_ty::Guard<'_, __B> {
+                let __len = self.region.len();
+                #field_ty::guard(&mut self.inner.#member, self.region.child(0, __len, None, 0))
             }
         }
 
-        #slottable_impl
-
-        impl #impl_generics #krate::Persistable<#krate::Pointer> for #ident #type_generics #where_clause {
-            const SLOTTED_SIZE: ::std::option::Option<usize> = #field_ty::SLOTTED_SIZE;
-            const PACKED_SIZE: ::std::option::Option<usize> = #field_ty::PACKED_SIZE;
-
-            type RootEncoding = #root_encoding;
+        impl #impl_generics #krate::Persistable for #ident #type_generics #where_clause {
+            const FIXED_SIZE: ::std::option::Option<usize> = #field_ty::FIXED_SIZE;
+            const FIXED_FORM_SIZE: ::std::option::Option<usize> = #field_ty::FIXED_FORM_SIZE;
 
             #guard_assoc
 
             #[inline]
-            #encoded_size_sig {
-                #field_ty::encoded_size::<__E>(&self.#member)
+            fn encoded_len(&self) -> usize {
+                #field_ty::encoded_len(&self.#member)
             }
 
             #encode_sig {
-                #field_ty::encode::<__E>(&self.#member, __out)
+                #field_ty::encode(&self.#member, __out)
             }
 
             #decode_sig {
-                let __value = #field_ty::decode::<__B, __E>(__backend, __input)?;
+                let __value = #field_ty::decode(__input)?;
                 ::std::result::Result::Ok(#construct)
             }
 
-            #prepare_sig {
-                #field_ty::prepare(&mut self.#member, __backend)
+            #encode_fixed_sig {
+                #field_ty::encode_fixed(&self.#member, __out)
             }
 
-            #free_sig {
-                #field_ty::free(&mut self.#member, __backend)
+            #decode_fixed_sig {
+                let __value = #field_ty::decode_fixed(__input)?;
+                ::std::result::Result::Ok(#construct)
             }
 
             fn describe(builder: &mut #krate::SchemaBuilder) -> #krate::TypeRef
@@ -980,31 +662,13 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
         ..
     } = ctx;
 
-    if matches!(data.fields, Fields::Unit) {
-        return derive_unit_like_struct(ctx, ident, vis, &guard_ident);
-    }
-    // Named and tuple structs are laid out identically; only how each field
-    // is *named* differs.
-    let raw_fields: Vec<&syn::Field> = match &data.fields {
-        Fields::Named(fields) => fields.named.iter().collect(),
-        Fields::Unnamed(fields) => fields.unnamed.iter().collect(),
-        Fields::Unit => unreachable!(),
-    };
-    let fields = match FieldInfo::of(&data.fields, krate) {
+    let fields = match FieldInfo::of(&data.fields) {
         Ok(fields) => fields,
         Err(err) => return err.to_compile_error(),
     };
-    let field_refs: Vec<&FieldInfo> = fields.iter().collect();
-    let persistable_where = ctx.persistable_where(&field_refs);
-    let slottable_impl = ctx.slottable_impl(ident, &field_refs);
-    let root_encoding = ctx.root_encoding(&field_refs);
-    let field_describe: Vec<Tokens> = fields.iter().map(|f| f.describe(krate)).collect();
-    let field_count = fields.len();
-    let capacity = field_count + 1;
-
     let ty: Vec<Tokens> = fields.iter().map(|f| persistable(&f.ty, krate)).collect();
-    let enc: Vec<&Tokens> = fields.iter().map(|f| &f.encoding).collect();
-    let member: Vec<syn::Member> = raw_fields
+    let member: Vec<syn::Member> = data
+        .fields
         .iter()
         .enumerate()
         .map(|(i, f)| match &f.ident {
@@ -1012,7 +676,11 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
             None => syn::Member::Unnamed(syn::Index::from(i)),
         })
         .collect();
-    let accessor_ident: Vec<syn::Ident> = raw_fields
+    let binding: Vec<syn::Ident> = (0..fields.len())
+        .map(|i| format_ident!("__field_{}", i))
+        .collect();
+    let accessor_ident: Vec<syn::Ident> = data
+        .fields
         .iter()
         .enumerate()
         .map(|(i, f)| match &f.ident {
@@ -1025,81 +693,114 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
         .map(|f| format!("The guard of field `{}`.", f.schema_name))
         .collect();
     let schema_name: Vec<&String> = fields.iter().map(|f| &f.schema_name).collect();
+    let (fixed_size, fixed_form_size) = field_sizes(&fields, krate);
 
-    let fixed_offset = fixed_offsets(&fields, &quote!(0usize), krate);
-    let (slotted_size, packed_size) = field_sizes(&fields, krate);
-
-    let is_tuple = matches!(&data.fields, Fields::Unnamed(_));
-    let field_ident: Vec<&syn::Ident> =
-        raw_fields.iter().filter_map(|f| f.ident.as_ref()).collect();
-    let decode_body = if is_tuple {
-        quote! {
-            #ident(
-                #( #ty::decode::<__B, #enc>(__backend, __input)?, )*
-            )
+    // `S { a, b }`, `S(a, b)` or `S`, built from or bound to `values`.
+    let shape = |values: &[Tokens]| match &data.fields {
+        Fields::Named(_) => {
+            let names = data.fields.iter().map(|f| f.ident.as_ref().unwrap());
+            quote! { #ident { #(#names: #values),* } }
         }
-    } else {
-        quote! {
-            #ident {
-                #( #field_ident: #ty::decode::<__B, #enc>(__backend, __input)?, )*
-            }
-        }
+        Fields::Unnamed(_) => quote! { #ident( #(#values),* ) },
+        Fields::Unit => quote! { #ident },
     };
+    let decoded: Vec<Tokens> = ty.iter().map(|t| quote!(#t::decode(__input)?)).collect();
+    let decoded_fixed: Vec<Tokens> = ty
+        .iter()
+        .map(|t| quote!(#t::decode_fixed(__input)?))
+        .collect();
+    let decode_body = shape(&decoded);
+    let decode_fixed_body = shape(&decoded_fixed);
+    let bindings: Vec<Tokens> = binding.iter().map(|b| quote!(#b)).collect();
+    let pattern = shape(&bindings);
 
-    // The guard of a field: at its fixed offset in a slotted value at a fixed
-    // location, and linked to the guard's field offsets everywhere else.
-    let field_guard: Vec<Tokens> = (0..field_count)
+    // A field's accessor: a guard made on its own, at the sum of the sizes
+    // of the fields before it, constant up to the first variable-size one.
+    let accessor_body: Vec<Tokens> = (0..fields.len())
         .map(|i| {
-            let (ty, enc, member, offset) = (&ty[i], enc[i], &member[i], &fixed_offset[i]);
+            let (t, m) = (&ty[i], &member[i]);
+            let (earlier_ty, earlier_member) = (&ty[..i], &member[..i]);
             quote! {
-                #ty::guard(
-                    &mut self.inner.#member,
-                    self.backend,
-                    self.place.field::<#enc, #capacity>(&self.fields, #i, #offset),
-                )
+                let __offset = 0usize #(
+                    + match #earlier_ty::FIXED_SIZE {
+                        ::std::option::Option::Some(__n) => __n,
+                        ::std::option::Option::None => #earlier_ty::encoded_len(&self.inner.#earlier_member),
+                    }
+                )*;
+                let __len = #t::encoded_len(&self.inner.#m);
+                let Self { inner, region, .. } = self;
+                #t::guard(&mut inner.#m, region.child(__offset as u64, __len as u64, None, #i))
             }
         })
         .collect();
 
     // A `{Ident}Parts` struct plus a `parts()` method handing out a guard for
-    // *every* field at once, each borrowing a disjoint part of `self.inner`,
-    // so that all fields can be mutated simultaneously.
+    // *every* field at once, each borrowing a disjoint part of `self.inner`.
     let parts_ident = format_ident!("{}Parts", ident);
-    let uses_encoding = fields.iter().any(|f| !f.slotted);
-    let (parts_decl_generics, parts_ret_generics, parts_where) = ctx.parts_generics(uses_encoding);
+    let (parts_decl_generics, parts_ret_generics, parts_where) = ctx.parts_generics();
     let parts_doc = format!("The guards of every field of [`{ident}`] at once.");
-    let (parts_struct, parts_ctor) = if is_tuple {
-        let struct_def = quote! {
-            #[doc = #parts_doc]
-            #vis struct #parts_ident #parts_decl_generics (
-                #( #vis #ty::Guard<'__f, __B, #enc>, )*
-            ) #parts_where;
-        };
-        let ctor = quote! { #parts_ident( #( #field_guard, )* ) };
-        (struct_def, ctor)
-    } else {
-        let struct_def = quote! {
-            #[doc = #parts_doc]
-            #vis struct #parts_ident #parts_decl_generics #parts_where {
-                #(
-                    #[doc = #accessor_doc]
-                    #vis #field_ident: #ty::Guard<'__f, __B, #enc>,
-                )*
-            }
-        };
-        let ctor = quote! { #parts_ident { #( #field_ident: #field_guard, )* } };
-        (struct_def, ctor)
+    let field_guard: Vec<Tokens> = (0..fields.len())
+        .map(|i| {
+            let (t, b) = (&ty[i], &binding[i]);
+            quote!(#t::guard(#b, __region.field(__fields, #i)))
+        })
+        .collect();
+    let (parts_struct, parts_ctor) = match &data.fields {
+        Fields::Named(_) => {
+            let names: Vec<&syn::Ident> = data
+                .fields
+                .iter()
+                .map(|f| f.ident.as_ref().unwrap())
+                .collect();
+            (
+                quote! {
+                    #[doc = #parts_doc]
+                    #vis struct #parts_ident #parts_decl_generics #parts_where {
+                        #(
+                            #[doc = #accessor_doc]
+                            #vis #names: #ty::Guard<'__f, __B>,
+                        )*
+                    }
+                },
+                quote! { #parts_ident { #( #names: #field_guard, )* } },
+            )
+        }
+        Fields::Unnamed(_) => (
+            quote! {
+                #[doc = #parts_doc]
+                #vis struct #parts_ident #parts_decl_generics (
+                    #( #vis #ty::Guard<'__f, __B>, )*
+                ) #parts_where;
+            },
+            quote! { #parts_ident( #( #field_guard, )* ) },
+        ),
+        Fields::Unit => (Tokens::new(), Tokens::new()),
     };
+    let parts_method = (!matches!(data.fields, Fields::Unit)).then(|| {
+        quote! {
+            /// A guard for every field at once, so that all fields can be
+            /// mutated simultaneously; each finds where it starts whenever
+            /// it writes.
+            #[inline]
+            #vis fn parts(&mut self) -> #parts_ident #parts_ret_generics {
+                let Self { inner, region, fields } = self;
+                fields.fill(
+                    0,
+                    &[#( #ty::FIXED_SIZE, )*],
+                    &[#( #ty::encoded_len(&inner.#member), )*],
+                );
+                let (__fields, __region) = (&*fields, &*region);
+                let #pattern = &mut **inner;
+                #parts_ctor
+            }
+        }
+    });
 
-    let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident, Some(capacity));
-    let guard_assoc = guard_assoc(ctx, &guard_ident, true);
-    let set = set_method(ctx, ident, vis, true);
-    let (encoded_size_sig, encode_sig, decode_sig) = (
-        encoded_size_sig(krate),
-        encode_sig(krate),
-        decode_sig(krate),
-    );
-    let (prepare_sig, free_sig) = (prepare_sig(krate), free_sig(krate));
+    let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident);
+    let guard_assoc = guard_assoc(ctx, &guard_ident);
+    let set = set_method(ctx, ident, vis);
+    let [encode_sig, decode_sig, encode_fixed_sig, decode_fixed_sig] = codec_sigs(krate);
+    let field_describe = ty.iter().map(|t| quote!(#t::describe(__builder)));
 
     quote! {
         #scaffold
@@ -1112,63 +813,39 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
             #(
                 #[doc = #accessor_doc]
                 #[inline]
-                #vis fn #accessor_ident(&mut self) -> #ty::Guard<'_, __B, #enc> {
-                    #field_guard
+                #vis fn #accessor_ident(&mut self) -> #ty::Guard<'_, __B> {
+                    #accessor_body
                 }
             )*
 
-            /// A guard for every field at once, so that all fields can be
-            /// mutated simultaneously.
-            #[inline]
-            #vis fn parts(&mut self) -> #parts_ident #parts_ret_generics {
-                #parts_ctor
-            }
-
-            /// Records where each field starts, if the fields' places link
-            /// to the record.
-            fn __kladde_refresh(&self) {
-                if self.place.links_fields() {
-                    self.fields.fill(0, &[
-                        #( #ty::encoded_size::<#enc>(&self.inner.#member), )*
-                    ]);
-                }
-            }
+            #parts_method
         }
 
-        #slottable_impl
-
-        impl #impl_generics #krate::Persistable<#krate::Pointer> for #ident #type_generics #persistable_where {
-            const SLOTTED_SIZE: ::std::option::Option<usize> = #slotted_size;
-            const PACKED_SIZE: ::std::option::Option<usize> = #packed_size;
-
-            type RootEncoding = #root_encoding;
+        impl #impl_generics #krate::Persistable for #ident #type_generics #where_clause {
+            const FIXED_SIZE: ::std::option::Option<usize> = #fixed_size;
+            const FIXED_FORM_SIZE: ::std::option::Option<usize> = #fixed_form_size;
 
             #guard_assoc
 
             #[inline]
-            #encoded_size_sig {
-                if !<__E as #krate::Encoding>::PACKED {
-                    return #krate::slot_size::<Self, #krate::Pointer>();
-                }
-                0usize #( + #ty::encoded_size::<#enc>(&self.#member) )*
+            fn encoded_len(&self) -> usize {
+                0usize #( + #ty::encoded_len(&self.#member) )*
             }
 
             #encode_sig {
-                #( #ty::encode::<#enc>(&self.#member, __out); )*
+                #( #ty::encode(&self.#member, __out); )*
             }
 
             #decode_sig {
                 ::std::result::Result::Ok(#decode_body)
             }
 
-            #prepare_sig {
-                #( #ty::prepare(&mut self.#member, __backend)?; )*
-                ::std::result::Result::Ok(())
+            #encode_fixed_sig {
+                #( #ty::encode_fixed(&self.#member, __out); )*
             }
 
-            #free_sig {
-                #( #ty::free(&mut self.#member, __backend)?; )*
-                ::std::result::Result::Ok(())
+            #decode_fixed_sig {
+                ::std::result::Result::Ok(#decode_fixed_body)
             }
 
             fn describe_local(
@@ -1193,78 +870,6 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
     }
 }
 
-/// A unit struct (`struct Foo;`): no fields, and no bytes in either encoding.
-fn derive_unit_like_struct(
-    ctx: &Ctx,
-    ident: &syn::Ident,
-    vis: &syn::Visibility,
-    guard_ident: &syn::Ident,
-) -> Tokens {
-    let krate = &ctx.krate;
-    let Ctx {
-        impl_generics,
-        type_generics,
-        where_clause,
-        guard_impl_generics,
-        guard_use_generics,
-        ..
-    } = ctx;
-    let scaffold = guard_scaffold(ctx, ident, vis, guard_ident, None);
-    let guard_assoc = guard_assoc(ctx, guard_ident, false);
-    let set = set_method(ctx, ident, vis, false);
-    let (encoded_size_sig, encode_sig, decode_sig) = (
-        encoded_size_sig(krate),
-        encode_sig(krate),
-        decode_sig(krate),
-    );
-    let slottable_impl = ctx.slottable_impl(ident, &[]);
-
-    quote! {
-        #scaffold
-
-        impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
-            #set
-        }
-
-        #slottable_impl
-
-        impl #impl_generics #krate::Persistable<#krate::Pointer> for #ident #type_generics #where_clause {
-            const SLOTTED_SIZE: ::std::option::Option<usize> = ::std::option::Option::Some(0);
-            const PACKED_SIZE: ::std::option::Option<usize> = ::std::option::Option::Some(0);
-
-            type RootEncoding = #krate::Slotted;
-
-            #guard_assoc
-
-            #[inline]
-            #encoded_size_sig {
-                0
-            }
-
-            #encode_sig {
-                let _ = __out;
-            }
-
-            #decode_sig {
-                let _ = (__backend, __input);
-                ::std::result::Result::Ok(#ident)
-            }
-
-            fn describe_local(
-                _builder: &mut #krate::SchemaBuilder,
-            ) -> #krate::TypeDescriptor
-            where
-                Self: 'static,
-            {
-                #krate::TypeDescriptor::Struct {
-                    name: ::std::string::ToString::to_string(::std::stringify!(#ident)),
-                    fields: ::std::vec![],
-                }
-            }
-        }
-    }
-}
-
 /// One variant of an enum, as the generated code needs it.
 struct VariantInfo {
     ident: syn::Ident,
@@ -1274,8 +879,6 @@ struct VariantInfo {
     bindings: Vec<syn::Ident>,
     /// A match pattern binding the fields to `bindings`.
     pattern: Tokens,
-    /// An expression building the variant from expressions `values`, one per
-    /// field.
     kind: VariantKind,
 }
 
@@ -1286,13 +889,9 @@ enum VariantKind {
 }
 
 impl VariantInfo {
-    fn of(
-        enum_ident: &syn::Ident,
-        variant: &syn::Variant,
-        krate: &syn::Path,
-    ) -> syn::Result<VariantInfo> {
+    fn of(enum_ident: &syn::Ident, variant: &syn::Variant) -> syn::Result<VariantInfo> {
         let v_ident = &variant.ident;
-        let fields = FieldInfo::of(&variant.fields, krate)?;
+        let fields = FieldInfo::of(&variant.fields)?;
         let (bindings, pattern, kind) = match &variant.fields {
             Fields::Named(f) => {
                 let names: Vec<syn::Ident> =
@@ -1337,10 +936,10 @@ impl VariantInfo {
     }
 }
 
-/// Fixed encoding: the discriminant at its width, the variant's fields laid
-/// out like a struct's but based past the discriminant, and zeros up to the
-/// size of the largest variant, so that every value takes the same slot.
-/// Packed encoding: the discriminant as a varint, then the variant's fields.
+/// The encoding: the discriminant as a varint, then the variant's fields.
+/// The fixed form: the discriminant at its width, little-endian, the
+/// variant's fields in their fixed forms, and zeros up to the size of the
+/// largest variant.
 ///
 /// The discriminant follows Rust's own rule: the explicit value where the
 /// author wrote one (`A = 42`), otherwise `predecessor + 1`. So the value
@@ -1378,19 +977,14 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
     let variants: Vec<VariantInfo> = match data
         .variants
         .iter()
-        .map(|v| VariantInfo::of(ident, v, krate))
+        .map(|v| VariantInfo::of(ident, v))
         .collect()
     {
         Ok(variants) => variants,
         Err(err) => return err.to_compile_error(),
     };
-    let all_fields: Vec<&FieldInfo> = variants.iter().flat_map(|v| &v.fields).collect();
-    let persistable_where = ctx.persistable_where(&all_fields);
-    let slottable_impl = ctx.slottable_impl(ident, &all_fields);
-    let root_encoding = ctx.root_encoding(&all_fields);
     let variant_count = variants.len();
-    let capacity = variants.iter().map(|v| v.fields.len()).max().unwrap_or(0) + 1;
-    let has_fields = capacity > 1;
+    let has_fields = variants.iter().any(|v| !v.fields.is_empty());
 
     // The discriminant values, evaluated as Rust evaluates them: an explicit
     // expression at the `repr` type (`isize` without one), otherwise one more
@@ -1439,15 +1033,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
                     }
                     i += 1;
                 }
-                if max <= 0xFF {
-                    1
-                } else if max <= 0xFFFF {
-                    2
-                } else if max <= 0xFFFF_FFFF {
-                    4
-                } else {
-                    8
-                }
+                #krate::discriminant_width(max)
             }
         },
     };
@@ -1455,14 +1041,13 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
     let discriminants = quote!(<#ident #type_generics>::__KLADDE_DISCRIMINANTS);
     let disc_width = quote!(<#ident #type_generics>::__KLADDE_DISCRIMINANT_WIDTH);
 
-    let mut slotted_sizes = Vec::new();
-    let mut packed_sizes = Vec::new();
-    let mut size_arms = Vec::new();
+    let mut fixed_sizes = Vec::new();
+    let mut fixed_form_sizes = Vec::new();
+    let mut len_arms = Vec::new();
     let mut encode_arms = Vec::new();
-    let mut decode_branches = Vec::new();
-    let mut prepare_arms = Vec::new();
-    let mut free_arms = Vec::new();
-    let mut refresh_arms = Vec::new();
+    let mut encode_fixed_arms = Vec::new();
+    let mut decode_arms = Vec::new();
+    let mut decode_fixed_arms = Vec::new();
     let mut describe_variants = Vec::new();
     let mut parts_variants = Vec::new();
     let mut parts_arms = Vec::new();
@@ -1477,55 +1062,50 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
             ..
         } = variant;
         let ty: Vec<Tokens> = fields.iter().map(|f| persistable(&f.ty, krate)).collect();
-        let enc: Vec<&Tokens> = fields.iter().map(|f| &f.encoding).collect();
-        let (slotted, packed) = field_sizes(fields, krate);
-        slotted_sizes.push(slotted);
-        packed_sizes.push(packed);
+        let (fixed, form) = field_sizes(fields, krate);
+        fixed_sizes.push(fixed);
+        fixed_form_sizes.push(form.clone());
 
-        size_arms.push(quote! {
-            #pattern => #krate::varint_len(#discriminants[#i])
-                #( + #ty::encoded_size::<#enc>(#bindings) )*
+        len_arms.push(quote! {
+            #pattern => #krate::varint_len(#discriminants[#i]) #( + #ty::encoded_len(#bindings) )*
         });
         encode_arms.push(quote! {
             #pattern => {
-                if <__E as #krate::Encoding>::PACKED {
-                    #krate::write_varint(#discriminants[#i], __out);
-                } else {
-                    __out.extend_from_slice(&#discriminants[#i].to_le_bytes()[..#disc_width]);
-                }
-                #( #ty::encode::<#enc>(#bindings, __out); )*
+                __out.varint(#discriminants[#i]);
+                #( #ty::encode(#bindings, __out); )*
             }
         });
-        let decoded: Vec<Tokens> = (0..fields.len())
-            .map(|k| {
-                let (ty, enc) = (&ty[k], enc[k]);
-                quote!(#ty::decode::<__B, #enc>(__backend, __input)?)
-            })
-            .collect();
-        let construct = variant.construct(ident, &decoded);
-        decode_branches.push(quote! {
-            if __discriminant == #discriminants[#i] {
-                #construct
-            }
-        });
-        prepare_arms.push(quote! {
-            #pattern => { #( #ty::prepare(#bindings, __backend)?; )* }
-        });
-        free_arms.push(quote! {
-            #pattern => { #( #ty::free(#bindings, __backend)?; )* }
-        });
-        refresh_arms.push(quote! {
+        encode_fixed_arms.push(quote! {
             #pattern => {
-                let __start = if <__E as #krate::Encoding>::PACKED {
-                    #krate::varint_len(#discriminants[#i])
-                } else {
-                    #disc_width
-                };
-                self.fields.fill(__start, &[ #( #ty::encoded_size::<#enc>(#bindings), )* ]);
+                __out.bytes(&#discriminants[#i].to_le_bytes()[..#disc_width]);
+                #( #ty::encode_fixed(#bindings, __out); )*
+                let __used = #disc_width + #form.unwrap_or(0);
+                __out.zeros(Self::FIXED_FORM_SIZE.unwrap_or(__used) - __used);
+            }
+        });
+        let decoded: Vec<Tokens> = ty.iter().map(|t| quote!(#t::decode(__input)?)).collect();
+        let construct = variant.construct(ident, &decoded);
+        decode_arms.push(quote! {
+            __d if __d == #discriminants[#i] => #construct
+        });
+        let decoded_fixed: Vec<Tokens> = ty
+            .iter()
+            .map(|t| quote!(#t::decode_fixed(__input)?))
+            .collect();
+        let construct_fixed = variant.construct(ident, &decoded_fixed);
+        decode_fixed_arms.push(quote! {
+            __d if __d == #discriminants[#i] => {
+                let __value = #construct_fixed;
+                let __used = #disc_width + #form.unwrap_or(0);
+                for _ in __used..Self::FIXED_FORM_SIZE.unwrap_or(__used) {
+                    if __input.byte()? != 0 {
+                        return ::std::result::Result::Err(__input.corrupt("padding that is not zero"));
+                    }
+                }
+                __value
             }
         });
         let field_name: Vec<&String> = fields.iter().map(|f| &f.schema_name).collect();
-        let field_describe: Vec<Tokens> = fields.iter().map(|f| f.describe(krate)).collect();
         describe_variants.push(quote! {
             #krate::Variant {
                 discriminant: #discriminants[#i],
@@ -1534,29 +1114,29 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
                     #(
                         #krate::Field {
                             name: ::std::string::ToString::to_string(#field_name),
-                            ty: #field_describe,
+                            ty: #ty::describe(__builder),
                         },
                     )*
                 ],
             }
         });
 
-        // `parts()`: each field guard at its fixed offset past the
-        // discriminant in a slotted value at a fixed location, linked to the
-        // guard's field offsets everywhere else.
-        let fixed_offset = fixed_offsets(fields, &disc_width, krate);
+        // `parts()`: the guards of the current variant's fields, made
+        // together, past the discriminant.
         let guards: Vec<Tokens> = (0..fields.len())
             .map(|k| {
-                let (ty, enc, binding, offset) = (&ty[k], enc[k], &bindings[k], &fixed_offset[k]);
-                quote! {
-                    #ty::guard(
-                        #binding,
-                        self.backend,
-                        self.place.field::<#enc, #capacity>(&self.fields, #k, #offset),
-                    )
-                }
+                let (t, b) = (&ty[k], &bindings[k]);
+                quote!(#t::guard(#b, __region.field(__fields, #k)))
             })
             .collect();
+        let fill = quote! {
+            fields.fill(
+                #krate::varint_len(#discriminants[#i]) as u64,
+                &[#( #ty::FIXED_SIZE, )*],
+                &[#( #ty::encoded_len(#bindings), )*],
+            );
+            let (__fields, __region) = (&*fields, &*region);
+        };
         let doc = format!("The guards of the fields of [`{ident}::{v_ident}`].");
         match &variant.kind {
             VariantKind::Named(names) => {
@@ -1568,21 +1148,21 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
                     #v_ident {
                         #(
                             #[doc = #field_docs]
-                            #names: #ty::Guard<'__f, __B, #enc>,
+                            #names: #ty::Guard<'__f, __B>,
                         )*
                     }
                 });
                 parts_arms.push(quote! {
-                    #pattern => #parts_ident::#v_ident { #(#names: #guards,)* }
+                    #pattern => { #fill #parts_ident::#v_ident { #(#names: #guards,)* } }
                 });
             }
             VariantKind::Unnamed => {
                 parts_variants.push(quote! {
                     #[doc = #doc]
-                    #v_ident( #(#ty::Guard<'__f, __B, #enc>,)* )
+                    #v_ident( #(#ty::Guard<'__f, __B>,)* )
                 });
                 parts_arms.push(quote! {
-                    #pattern => #parts_ident::#v_ident(#(#guards,)*)
+                    #pattern => { #fill #parts_ident::#v_ident(#(#guards,)*) }
                 });
             }
             VariantKind::Unit => {
@@ -1603,11 +1183,9 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
     // is alive. An enum without any fields gets neither: there is nothing to
     // mutate in place, and the `Parts` enum would not use its parameters.
     let parts = has_fields.then(|| {
-        let uses_encoding = variants.iter().flat_map(|v| &v.fields).any(|f| !f.slotted);
-        let (parts_decl_generics, parts_ret_generics, parts_where) =
-            ctx.parts_generics(uses_encoding);
+        let (parts_decl_generics, parts_ret_generics, parts_where) = ctx.parts_generics();
         let parts_doc = format!(
-            "The guards of the fields of the current variant of a backed [`{ident}`], \
+            "The guards of the fields of the current variant of a persisted [`{ident}`], \
              handed out by its guard's `parts()`."
         );
         quote! {
@@ -1617,12 +1195,14 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
             }
 
             impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
-                /// The guards of the current variant's fields, for mutating them
-                /// in place; match on the result to reach them. To switch to
-                /// another variant, use `set`.
+                /// The guards of the current variant's fields, for mutating
+                /// them in place; match on the result to reach them. To
+                /// switch to another variant, use `set`.
                 #[inline]
+                #[allow(unused_variables)]
                 #vis fn parts(&mut self) -> #parts_ident #parts_ret_generics {
-                    match &mut *self.inner {
+                    let Self { inner, region, fields } = self;
+                    match &mut **inner {
                         #(#parts_arms,)*
                     }
                 }
@@ -1630,27 +1210,10 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
         }
     });
 
-    let refresh_body = if has_fields {
-        quote! {
-            if self.place.links_fields() {
-                match &*self.inner {
-                    #(#refresh_arms)*
-                }
-            }
-        }
-    } else {
-        Tokens::new()
-    };
-
-    let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident, Some(capacity));
-    let guard_assoc = guard_assoc(ctx, &guard_ident, true);
-    let set = set_method(ctx, ident, vis, true);
-    let (encoded_size_sig, encode_sig, decode_sig) = (
-        encoded_size_sig(krate),
-        encode_sig(krate),
-        decode_sig(krate),
-    );
-    let (prepare_sig, free_sig) = (prepare_sig(krate), free_sig(krate));
+    let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident);
+    let guard_assoc = guard_assoc(ctx, &guard_ident);
+    let set = set_method(ctx, ident, vis);
+    let [encode_sig, decode_sig, encode_fixed_sig, decode_fixed_sig] = codec_sigs(krate);
 
     quote! {
         #scaffold
@@ -1659,12 +1222,6 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
 
         impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
             #set
-
-            /// Records where each field of the current variant starts, if the
-            /// fields' places link to the record.
-            fn __kladde_refresh(&self) {
-                #refresh_body
-            }
         }
 
         // Rejected here rather than wrapped: a descriptor stores discriminants
@@ -1694,77 +1251,65 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
                 }
                 out
             };
-            /// The discriminant's width in bytes in the fixed encoding: the
+            /// The discriminant's width in bytes in the fixed form: the
             /// integer `repr`'s, or else the smallest of 1, 2, 4 and 8 that
             /// holds every value.
             const __KLADDE_DISCRIMINANT_WIDTH: usize = #width_expr;
         }
 
-        #slottable_impl
-
-        impl #impl_generics #krate::Persistable<#krate::Pointer> for #ident #type_generics #persistable_where {
-            const SLOTTED_SIZE: ::std::option::Option<usize> =
-                #krate::enum_slotted_size(#disc_width, &[#(#slotted_sizes),*]);
-            const PACKED_SIZE: ::std::option::Option<usize> =
-                #krate::enum_packed_size(&#discriminants, &[#(#packed_sizes),*]);
-
-            type RootEncoding = #root_encoding;
+        impl #impl_generics #krate::Persistable for #ident #type_generics #where_clause {
+            const FIXED_SIZE: ::std::option::Option<usize> =
+                #krate::enum_fixed_size(&#discriminants, &[#(#fixed_sizes),*]);
+            const FIXED_FORM_SIZE: ::std::option::Option<usize> =
+                #krate::enum_fixed_form_size(#disc_width, &[#(#fixed_form_sizes),*]);
 
             #guard_assoc
 
-            #encoded_size_sig {
-                if !<__E as #krate::Encoding>::PACKED {
-                    return #krate::slot_size::<Self, #krate::Pointer>();
-                }
+            #[inline]
+            fn encoded_len(&self) -> usize {
                 match self {
-                    #(#size_arms,)*
+                    #(#len_arms,)*
                 }
             }
 
             #encode_sig {
-                let __start = __out.len();
                 match self {
                     #(#encode_arms)*
-                }
-                if !<__E as #krate::Encoding>::PACKED {
-                    __out.resize(__start + #krate::slot_size::<Self, #krate::Pointer>(), 0);
                 }
             }
 
             #decode_sig {
-                let __start = __input.position();
-                let __discriminant = if <__E as #krate::Encoding>::PACKED {
-                    __input.varint()?
-                } else {
-                    let mut __buf = [0u8; 8];
-                    __buf[..#disc_width].copy_from_slice(__input.take(#disc_width)?);
-                    u64::from_le_bytes(__buf)
-                };
-                let __value = #(#decode_branches else)* {
-                    return ::std::result::Result::Err(#krate::Error::Corrupt(::std::format!(
+                let __discriminant = __input.varint()?;
+                ::std::result::Result::Ok(match __discriminant {
+                    #(#decode_arms,)*
+                    _ => return ::std::result::Result::Err(__input.corrupt(::std::format!(
                         "unknown discriminant {} of {}",
                         __discriminant,
                         ::std::stringify!(#ident),
-                    )));
-                };
-                if !<__E as #krate::Encoding>::PACKED {
-                    __input.skip_to(__start + #krate::slot_size::<Self, #krate::Pointer>())?;
-                }
-                ::std::result::Result::Ok(__value)
+                    ))),
+                })
             }
 
-            #prepare_sig {
+            #encode_fixed_sig {
                 match self {
-                    #(#prepare_arms)*
+                    #(#encode_fixed_arms)*
                 }
-                ::std::result::Result::Ok(())
             }
 
-            #free_sig {
-                match self {
-                    #(#free_arms)*
+            #decode_fixed_sig {
+                let mut __buf = [0u8; 8];
+                for __b in &mut __buf[..#disc_width] {
+                    *__b = __input.byte()?;
                 }
-                ::std::result::Result::Ok(())
+                let __discriminant = u64::from_le_bytes(__buf);
+                ::std::result::Result::Ok(match __discriminant {
+                    #(#decode_fixed_arms,)*
+                    _ => return ::std::result::Result::Err(__input.corrupt(::std::format!(
+                        "unknown discriminant {} of {}",
+                        __discriminant,
+                        ::std::stringify!(#ident),
+                    ))),
+                })
             }
 
             fn describe_local(

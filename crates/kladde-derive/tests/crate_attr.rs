@@ -1,40 +1,43 @@
-//! `#[kladde(crate = "...")]` -- the escape hatch for code that builds on
-//! `kladde-persist` without the `kladde` facade.
-//!
-//! Generated code is rooted at `::kladde` by default, because an application
-//! should need only that one dependency. A library one layer down has no reason
-//! to pull the facade in, so it redirects the macro at `kladde-persist` instead.
-
-mod support;
+//! `#[kladde(crate = "...")]` roots the generated paths elsewhere than at
+//! `::kladde`: here at `kladde_persist`, as a library built on it without the
+//! facade would.
 
 use kladde_derive::Persistable;
-use kladde_persist::{Persistable, Slotted};
-use support::{Fixture, Number};
+use kladde_persist::{Persistable as _, Region};
+use kladde_store::{MemoryStorage, Store, WriteBackend};
 
-#[derive(Persistable)]
+#[derive(Persistable, Debug, PartialEq)]
 #[kladde(crate = "kladde_persist")]
-struct Redirected {
-    x: Number,
-    y: Number,
+struct Sample {
+    count: u32,
+    flag: bool,
+}
+
+#[derive(Persistable, Debug, PartialEq)]
+#[kladde(crate = "kladde_persist")]
+enum Choice {
+    One(u8),
+    Two,
 }
 
 #[test]
-fn a_type_rooted_at_kladde_persist_round_trips() {
-    let mut f = Fixture::for_type::<Redirected>();
-    let mut value = Redirected {
-        x: Number(7),
-        y: Number(9),
+fn generated_code_names_the_crate_it_is_told() {
+    let store = Store::create(Box::new(MemoryStorage::new()), Default::default()).unwrap();
+    let mut sample = Sample {
+        count: 1,
+        flag: false,
     };
-    value.store::<_, Slotted>(&f.store, f.location).unwrap();
-    let loaded: Redirected = f.reload();
-    assert_eq!(loaded.x, Number(7));
-    assert_eq!(loaded.y, Number(9));
-}
-
-#[test]
-fn the_slot_is_the_sum_of_the_fields() {
+    store.splice(0, 0, &sample.to_bytes()).unwrap();
+    sample
+        .guard(Region::root(&store))
+        .count_mut()
+        .set(500)
+        .unwrap();
+    store.flush().unwrap();
     assert_eq!(
-        <Redirected as Persistable>::SLOTTED_SIZE,
-        Some(2 * <Number as Persistable>::SLOTTED_SIZE.unwrap())
+        Sample::from_bytes(&store.read_all().unwrap()).unwrap(),
+        sample
     );
+    assert_eq!(Choice::Two.to_bytes(), [1]);
+    assert_eq!(Choice::One(9).to_bytes(), [0, 9]);
 }

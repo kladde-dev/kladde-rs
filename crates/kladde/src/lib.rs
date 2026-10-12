@@ -1,27 +1,31 @@
 //! Durable data structures: plain Rust values whose every mutation is
 //! recorded durably as it happens.
 //!
-//! A [`Kladde<T>`] pairs a root value with the file that backs it. Reading is
-//! ordinary reading, through [`get`](Kladde::get). Mutating goes through
-//! [`guard`](Kladde::guard), whose methods append the change to the file's
-//! journal before they return, so there is no save call.
+//! A [`Kladde<T>`] pairs a root value with the file that backs it. The file
+//! holds one byte sequence, the root value's encoding, with every value
+//! inline in its parent. Reading is ordinary reading, through
+//! [`get`](Kladde::get). Mutating goes through [`guard`](Kladde::guard),
+//! whose methods append the change to the file's journal before they
+//! return, so there is no save call.
 //!
 //! ```
 //! use kladde::{Kladde, Persistable};
-//! use kladde_types::{PersistableString, PersistableVec};
 //!
 //! #[derive(Persistable)]
-//! struct Notes {
-//!     title: PersistableString,
-//!     lines: PersistableVec<PersistableString>,
+//! struct Settings {
+//!     volume: u8,
+//!     theme: Theme,
 //! }
 //!
-//! let mut notes = Kladde::new(Notes {
-//!     title: PersistableString::from("today"),
-//!     lines: PersistableVec::new(),
-//! });
-//! notes.guard().lines_mut().push(PersistableString::from("wrote a doc"))?;
-//! assert_eq!(notes.get().lines.len(), 1);
+//! #[derive(Persistable, Debug, PartialEq)]
+//! enum Theme {
+//!     Light,
+//!     Dark,
+//! }
+//!
+//! let mut settings = Kladde::new(Settings { volume: 3, theme: Theme::Light });
+//! settings.guard().theme_mut().set(Theme::Dark)?;
+//! assert_eq!(settings.get().theme, Theme::Dark);
 //! # Ok::<(), kladde::Error>(())
 //! ```
 //!
@@ -43,12 +47,9 @@ pub use kladde_derive::Persistable;
 // who hand-writes an impl finds the same items here, so there is never a second
 // dependency, and never two incompatible copies of the same trait.
 pub use kladde_persist::{
-    decode_option, decode_option_slice, encode_option, enum_packed_size, enum_slotted_size,
-    read_allocation, replace, slot_size, splice_at, sum_sizes, varint_len, write_encoded,
-    write_varint, Backend, BoolGuard, CharGuard, Encoding, Error, F32Guard, F64Guard, FieldOffsets,
-    Guard, I16Guard, I32Guard, I64Guard, I8Guard, Input, Link, Location, Node, Packed, Persistable,
-    Place, Pointer, PointerRepr, ReadBackend, Result, SchemaBuilder, Slottable, Slotted,
-    TupleGuard, U16Guard, U32Guard, U64Guard, U8Guard, UniquePointer, Word, WriteBackend,
+    discriminant_width, enum_fixed_form_size, enum_fixed_size, replace, sum_sizes, varint_len,
+    Backend, Cut, CutId, Decoder, Encoder, Error, FieldSizes, Fixed, Guard, Node, OptionGuard,
+    Persistable, Region, Result, SchemaBuilder, SetGuard, TupleGuard, WriteBackend, TERMINATOR,
 };
 
 // The schema and fingerprint surface, so an application can inspect its root
@@ -61,9 +62,7 @@ pub use kladde_persist::{
 // against, how it is tuned, what it reports, and where its bytes live.
 pub use kladde_store::{FileStorage, MemoryStorage, Options, Stats, Storage, Store};
 
-/// The guard of a root value of type `T`, as [`Kladde::guard`] hands it out:
-/// in a slotted place if `T` has a fixed encoding, and in a packed one if it
-/// does not, as `T`'s [`RootEncoding`](Persistable::RootEncoding) says.
+/// The guard of a root value of type `T`, as [`Kladde::guard`] hands it out.
 ///
 /// ```
 /// use kladde::{Kladde, RootGuard};
@@ -77,17 +76,7 @@ pub use kladde_store::{FileStorage, MemoryStorage, Options, Stats, Storage, Stor
 /// assert_eq!(*k.get(), 2);
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub type RootGuard<'a, T> = <T as Persistable>::Guard<'a, Store, <T as Persistable>::RootEncoding>;
-
-/// How many bytes the root allocation starts with: the slot of a slotted
-/// root, and nothing for a packed one, whose encoding grows it.
-fn root_slot<T: Persistable>() -> usize {
-    if <T::RootEncoding as Encoding>::PACKED {
-        0
-    } else {
-        slot_size::<T, Pointer>()
-    }
-}
+pub type RootGuard<'a, T> = <T as Persistable>::Guard<'a, &'a Store>;
 
 /// A root [`Persistable`] value paired with the file that backs it.
 ///
@@ -100,21 +89,19 @@ fn root_slot<T: Persistable>() -> usize {
 ///
 /// ```
 /// use kladde::Kladde;
-/// use kladde_types::PersistableVec;
 ///
 /// let path = std::env::temp_dir().join("kladde-doc-kladde.kladde");
-/// let mut v = Kladde::create(&path, PersistableVec::<u32>::new())?;
-/// v.guard().push(1)?;
-/// v.close()?;
-/// let v = Kladde::<PersistableVec<u32>>::open(&path)?;
-/// assert_eq!(v.get().as_slice(), &[1]);
+/// let mut k = Kladde::create(&path, (0u32, false))?;
+/// k.guard().set((7, true))?;
+/// k.close()?;
+/// let k = Kladde::<(u32, bool)>::open(&path)?;
+/// assert_eq!(*k.get(), (7, true));
 /// # std::fs::remove_file(&path).ok();
 /// # Ok::<(), kladde::Error>(())
 /// ```
 pub struct Kladde<T: Persistable + 'static> {
     store: Store,
     root: T,
-    root_pointer: Pointer,
 }
 
 impl<T: Persistable + 'static> Kladde<T> {
@@ -146,6 +133,8 @@ impl<T: Persistable + 'static> Kladde<T> {
     /// Creates a kladde file holding `root` in `storage`, discarding whatever
     /// it held, with `opts` tuning the store.
     ///
+    /// Encodes `root` whole, in time linear in its encoded size.
+    ///
     /// ```
     /// use kladde::{Kladde, MemoryStorage, Options};
     ///
@@ -154,24 +143,13 @@ impl<T: Persistable + 'static> Kladde<T> {
     /// assert_eq!(*k.get(), 7);
     /// # Ok::<(), kladde::Error>(())
     /// ```
-    pub fn create_in(storage: Box<dyn Storage>, mut root: T, opts: Options) -> Result<Self> {
+    pub fn create_in(storage: Box<dyn Storage>, root: T, opts: Options) -> Result<Self> {
         let store = Store::create(storage, opts)?;
-        let table = T::schema().encode();
-        let fingerprint = *T::fingerprint().as_bytes();
-        let root_pointer = store.atomically(|| {
-            let pointer = store.alloc(size(root_slot::<T>())?)?;
-            let schema = store.alloc(size(table.len())?)?;
-            store.write(schema.raw(), 0, &table)?;
-            root.store::<_, T::RootEncoding>(&store, Location::new(pointer.raw(), 0))?;
-            store.set_roots(pointer.raw(), schema.raw(), fingerprint);
-            Ok(pointer.raw())
-        })?;
+        store.set_schema(T::schema().encode());
+        store.set_root_fingerprint(*T::fingerprint().as_bytes());
+        store.splice(0, 0, &root.to_bytes())?;
         store.flush()?;
-        Ok(Kladde {
-            store,
-            root,
-            root_pointer,
-        })
+        Ok(Kladde { store, root })
     }
 
     /// Opens the file at `path` and loads its root value.
@@ -186,6 +164,10 @@ impl<T: Persistable + 'static> Kladde<T> {
     }
 
     /// Opens the kladde file in `storage`, with `opts` tuning the store.
+    ///
+    /// Decodes the whole sequence into the root value, in time linear in its
+    /// length; fails with [`Error::Corrupt`] if the sequence is not a `T`'s
+    /// encoding.
     ///
     /// ```
     /// use kladde::{Kladde, MemoryStorage, Options};
@@ -202,22 +184,24 @@ impl<T: Persistable + 'static> Kladde<T> {
     /// # Ok::<(), kladde::Error>(())
     /// ```
     pub fn open_in(storage: Box<dyn Storage>, opts: Options) -> Result<Self> {
-        let mut store = Store::open(storage, opts)?;
-        let root_pointer = store
-            .root()
-            .ok_or_else(|| Error::Corrupt("the file has no root value".into()))?;
+        let store = Store::open(storage, opts)?;
         let expected = *T::fingerprint().as_bytes();
         let found = store.root_fingerprint();
         if found != expected {
             return Err(Error::SchemaMismatch { expected, found });
         }
-        let root = T::load::<_, T::RootEncoding>(&mut store, Location::new(root_pointer, 0))?;
+        let root = store.with_reader(|reader| {
+            // The map shortens the chunks' lifetime to the reader's borrow.
+            #[allow(clippy::map_identity)]
+            let mut input = Decoder::from_chunks(reader.map(|chunk| chunk));
+            let root = T::decode(&mut input)?;
+            if !input.is_at_end() {
+                return Err(input.corrupt("bytes after the root value"));
+            }
+            Ok(root)
+        })??;
         store.end_load();
-        Ok(Kladde {
-            store,
-            root,
-            root_pointer,
-        })
+        Ok(Kladde { store, root })
     }
 
     /// The root value, for reading.
@@ -250,8 +234,9 @@ impl<T: Persistable + 'static> Kladde<T> {
     /// # Ok::<(), kladde::Error>(())
     /// ```
     pub fn guard(&mut self) -> RootGuard<'_, T> {
-        self.root
-            .guard(&self.store, Place::at(Location::new(self.root_pointer, 0)))
+        let Kladde { store, root } = self;
+        debug_assert_eq!(root.encoded_len() as u64, store.len());
+        root.guard(Region::root(&*store))
     }
 
     /// Folds the journal into the file now, which also makes every mutation
@@ -278,9 +263,7 @@ impl<T: Persistable + 'static> Kladde<T> {
     /// Free pages below that page stay in the file. Each flush consolidates a
     /// bounded amount, moving live content down, and space a flush frees is
     /// available from the next flush on; so calling [`flush`](Self::flush) a
-    /// few times before closing lets more of the file be truncated. A freshly
-    /// created file, for instance, needs one or two flushes before `close` to
-    /// shrink to its live pages.
+    /// few times before closing lets more of the file be truncated.
     ///
     /// Closing is optional: a file dropped without it, or left by a crash,
     /// opens with every mutation that returned `Ok`. See [`Kladde`] for an
@@ -322,22 +305,20 @@ impl<T: Persistable + 'static> Kladde<T> {
     /// The batch holds its mutations back until the next would no longer fit
     /// in what is left of [`Options::journal_budget_pages`], and its end
     /// appends what it holds still. A batch saves journal writes and is no
-    /// transaction: a crash may keep
-    /// some of its pieces and lose the rest, though never part of one
-    /// mutation, nor of a transaction opened inside it with
-    /// [`Batch::transaction`].
+    /// transaction: a crash may keep some of its pieces and lose the rest,
+    /// though never part of one mutation, nor of a transaction opened inside
+    /// it with [`Batch::transaction`].
     ///
     /// ```
     /// use kladde::Kladde;
-    /// use kladde_types::PersistableVec;
     ///
-    /// let mut v = Kladde::new(PersistableVec::<u32>::new());
-    /// let mut batch = v.batch();
+    /// let mut n = Kladde::new(0u32);
+    /// let mut batch = n.batch();
     /// for i in 0..1000 {
-    ///     batch.guard().push(i)?;
+    ///     batch.guard().set(i)?;
     /// }
     /// batch.end()?;
-    /// assert_eq!(v.get().len(), 1000);
+    /// assert_eq!(*n.get(), 999);
     /// # Ok::<(), kladde::Error>(())
     /// ```
     pub fn batch(&mut self) -> Batch<'_, T> {
@@ -355,7 +336,7 @@ impl<T: Persistable + 'static> Kladde<T> {
     /// use kladde::Kladde;
     ///
     /// let k = Kladde::new(0u8);
-    /// assert!(k.stats().file_pages >= 3);
+    /// assert!(k.stats().file_pages >= 2);
     /// ```
     pub fn stats(&self) -> Stats {
         self.store.stats()
@@ -372,10 +353,6 @@ impl<T: Persistable + 'static> Kladde<T> {
     pub fn store(&self) -> &Store {
         &self.store
     }
-}
-
-fn size(n: usize) -> Result<u32> {
-    u32::try_from(n).map_err(|_| Error::OutOfBounds)
 }
 
 /// A transaction on a [`Kladde`], from [`Kladde::transaction`] or
@@ -516,86 +493,60 @@ mod tests {
     // if a name an impl needs stops being re-exported, this stops building.
     use super::*;
 
-    /// A `u32` that keeps its four bytes in a packed place too.
+    /// A `u32` kept in four bytes whatever its value: a hand-written leaf.
     struct Counter(u32);
 
-    impl<P: PointerRepr> Persistable<P> for Counter {
-        const SLOTTED_SIZE: Option<usize> = Some(4);
-        const PACKED_SIZE: Option<usize> = Some(4);
+    impl Persistable for Counter {
+        const FIXED_SIZE: Option<usize> = Some(4);
 
-        type RootEncoding = Slotted;
-
-        type Guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>
-            = CounterGuard<'s, B, E>
-        where
-            Self: 's,
-            B: 's;
-
-        fn guard<'s, B: WriteBackend<Pointer = P>, E: Encoding>(
-            &'s mut self,
-            backend: &'s B,
-            place: Place<'s, B, E>,
-        ) -> Self::Guard<'s, B, E> {
-            CounterGuard {
-                inner: self,
-                backend,
-                place,
-            }
-        }
-
-        fn encoded_size<E: Encoding>(&self) -> usize {
+        fn encoded_len(&self) -> usize {
             4
         }
 
-        fn encode<E: Encoding>(&self, out: &mut Vec<u8>) {
-            out.extend_from_slice(&self.0.to_le_bytes());
+        fn encode(&self, out: &mut Encoder<'_>) {
+            out.bytes(&self.0.to_le_bytes());
         }
 
-        fn decode<B: ReadBackend<Pointer = P>, E: Encoding>(
-            _backend: &mut B,
-            input: &mut Input<'_>,
-        ) -> Result<Self> {
+        fn decode(input: &mut Decoder<'_>) -> Result<Self> {
             Ok(Counter(u32::from_le_bytes(input.array()?)))
         }
 
-        fn describe_local(_builder: &mut SchemaBuilder) -> TypeDescriptor {
-            TypeDescriptor::Primitive(Primitive::U32)
+        type Guard<'r, B: Backend + 'r> = CounterGuard<'r, B>;
+
+        fn guard<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Guard<'r, B> {
+            CounterGuard {
+                inner: self,
+                region,
+            }
+        }
+
+        fn describe_local(builder: &mut SchemaBuilder) -> TypeDescriptor {
+            TypeDescriptor::Fixed(u32::describe(builder))
         }
     }
 
-    struct CounterGuard<'s, B: WriteBackend, E: Encoding> {
-        inner: &'s mut Counter,
-        backend: &'s B,
-        place: Place<'s, B, E>,
+    struct CounterGuard<'r, B> {
+        inner: &'r mut Counter,
+        region: Region<'r, B>,
     }
 
-    impl<'s, B: WriteBackend, E: Encoding> CounterGuard<'s, B, E> {
+    impl<B: Backend> CounterGuard<'_, B> {
         fn set(&mut self, value: u32) -> Result<()> {
-            let at = self.place.location();
-            self.backend
-                .write(at.anchor, at.offset, &value.to_le_bytes())?;
+            self.region.write(0, &value.to_le_bytes())?;
             self.inner.0 = value;
             Ok(())
         }
     }
 
-    impl<'s, B: WriteBackend, E: Encoding> Guard for CounterGuard<'s, B, E> {
+    impl<B> Guard for CounterGuard<'_, B> {
         type Persistable = Counter;
-        type Backend = B;
 
         fn as_persistable(&self) -> &Counter {
             self.inner
         }
-        fn as_persistable_mut(&mut self) -> &mut Counter {
-            self.inner
-        }
-        fn backend(&self) -> &B {
-            self.backend
-        }
     }
 
-    fn reopen<T: Persistable + 'static>(k: &Kladde<T>, storage: &MemoryStorage) -> Kladde<T> {
-        let _ = k;
+    fn reopen<T: Persistable + 'static>(storage: &MemoryStorage) -> Kladde<T> {
         let image = MemoryStorage::from_image(storage.image());
         Kladde::open_in(Box::new(image), Options::default()).unwrap()
     }
@@ -607,7 +558,7 @@ mod tests {
             Kladde::create_in(Box::new(storage.clone()), Counter(0), Options::default()).unwrap();
         k.guard().set(42).unwrap();
         assert_eq!(k.get().0, 42);
-        assert_eq!(reopen(&k, &storage).get().0, 42);
+        assert_eq!(reopen::<Counter>(&storage).get().0, 42);
     }
 
     #[test]
@@ -623,7 +574,7 @@ mod tests {
         assert!(unwound.is_err());
         assert!(k.store().is_poisoned());
         assert!(matches!(k.guard().set(3), Err(Error::Poisoned)));
-        assert_eq!(reopen(&k, &storage).get().0, 1);
+        assert_eq!(reopen::<Counter>(&storage).get().0, 1);
     }
 
     #[test]
@@ -638,7 +589,7 @@ mod tests {
         }));
         assert!(unwound.is_err());
         assert!(!k.store().is_poisoned());
-        assert_eq!(reopen(&k, &storage).get().0, 2);
+        assert_eq!(reopen::<Counter>(&storage).get().0, 2);
     }
 
     #[test]

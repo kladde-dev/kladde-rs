@@ -6,10 +6,10 @@ members = [
     "crates/kladde-schema",
     "crates/kladde-store",
     "crates/kladde-persist",
+    "crates/kladde-derive",
+    "crates/kladde",
 ]
 exclude = [
-    "crates/kladde",
-    "crates/kladde-derive",
     "crates/kladde-types",
     "crates/kladde-bench",
     "crates/kladde-svg",

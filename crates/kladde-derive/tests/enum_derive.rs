@@ -1,343 +1,145 @@
 mod support;
 
-use kladde_derive::Persistable;
-use kladde_persist::{Packed, Persistable, Slotted};
-use support::{Fixture, Number};
+use kladde::{Fixed, Persistable, TypeDescriptor, TypeRef};
+use support::Fixture;
 
-#[derive(Persistable, Debug, PartialEq)]
+#[derive(Persistable, Debug, PartialEq, Clone)]
 enum Shape {
     Origin,
-    Circle(Number),
-    Rectangle { width: Number, height: Number },
+    Circle(f32),
+    Rectangle { width: u32, height: u32 },
 }
 
 #[test]
-fn each_variant_kind_round_trips_through_store_and_load() {
-    let mut f = Fixture::for_type::<Shape>();
-    for mut value in [
-        Shape::Origin,
-        Shape::Circle(Number(7)),
+fn an_enum_is_its_discriminant_then_its_fields() {
+    assert_eq!(Shape::Origin.to_bytes(), [0]);
+    assert_eq!(Shape::Circle(1.0).to_bytes(), [1, 0, 0, 0x80, 0x3f]);
+    assert_eq!(
         Shape::Rectangle {
-            width: Number(3),
-            height: Number(4),
+            width: 300,
+            height: 2
+        }
+        .to_bytes(),
+        [2, 0xac, 0x02, 2]
+    );
+    for shape in [
+        Shape::Origin,
+        Shape::Circle(2.5),
+        Shape::Rectangle {
+            width: 1,
+            height: 1 << 20,
         },
     ] {
-        value.store::<_, Slotted>(&f.store, f.location).unwrap();
-        let reloaded: Shape = f.reload();
-        assert_eq!(reloaded, value);
+        assert_eq!(Shape::from_bytes(&shape.to_bytes()).unwrap(), shape);
+        assert_eq!(shape.encoded_len(), shape.to_bytes().len());
+        let fixed = Fixed(shape.clone()).to_bytes();
+        assert_eq!(fixed.len(), 1 + 8);
+        assert_eq!(<Fixed<Shape>>::from_bytes(&fixed).unwrap(), Fixed(shape));
     }
+    assert!(Shape::from_bytes(&[3]).is_err());
 }
 
 #[test]
-fn guard_set_replaces_the_whole_value_across_variant_kinds() {
-    let mut f = Fixture::for_type::<Shape>();
-    let mut value = Shape::Origin;
-    for next in [
-        Shape::Circle(Number(5)),
-        Shape::Rectangle {
-            width: Number(1),
-            height: Number(2),
-        },
-        Shape::Origin,
-    ] {
-        let expected = format!("{next:?}");
-        value.guard(&f.store, f.place()).set(next).unwrap();
-        assert_eq!(format!("{value:?}"), expected);
-        let reloaded: Shape = f.reload();
-        assert_eq!(reloaded, value);
-    }
-}
-
-#[test]
-fn a_smaller_variant_zeroes_what_it_leaves_unused() {
-    let mut f = Fixture::for_type::<Shape>();
-    let mut value = Shape::Rectangle {
-        width: Number(-1),
-        height: Number(-1),
-    };
-    value.store::<_, Slotted>(&f.store, f.location).unwrap();
-    let mut value = Shape::Circle(Number(9));
-    value.store::<_, Slotted>(&f.store, f.location).unwrap();
-    // The one-byte discriminant 1, the circle's number, and zeros where the
-    // rectangle's height was.
-    assert_eq!(f.bytes(), [1, 9, 0, 0, 0, 0, 0, 0, 0]);
-}
-
-#[test]
-fn an_unknown_discriminant_is_corruption() {
-    let mut f = Fixture::for_type::<Shape>();
-    kladde_store::WriteBackend::write(&f.store, f.location.anchor, 0, &[9, 0, 0, 0]).unwrap();
-    f.store.flush().unwrap();
-    assert!(matches!(
-        <Shape as Persistable>::load::<_, Slotted>(&mut f.store, f.location),
-        Err(kladde_persist::Error::Corrupt(_))
-    ));
-}
-
-#[test]
-fn the_slot_fits_the_largest_variant_plus_the_discriminant() {
-    assert_eq!(
-        <Shape as Persistable>::SLOTTED_SIZE,
-        Some(1 + 2 * <Number as Persistable>::SLOTTED_SIZE.unwrap())
-    );
-}
-
-#[test]
-fn a_packed_enum_takes_its_current_variant_only() {
-    assert_eq!(<Shape as Persistable>::PACKED_SIZE, None);
-    assert_eq!(Shape::Origin.to_bytes::<Packed>(), [0]);
-    assert_eq!(
-        Shape::Circle(Number(9)).to_bytes::<Packed>(),
-        [1, 9, 0, 0, 0]
-    );
-    let rectangle = Shape::Rectangle {
-        width: Number(1),
-        height: Number(2),
-    };
-    assert_eq!(rectangle.encoded_size::<Packed>(), 9);
-    assert_eq!(rectangle.encoded_size::<Slotted>(), 9);
-}
-
-#[test]
-fn switching_a_packed_variant_splices() {
-    let mut f = Fixture::new(0);
-    let mut value = Shape::Origin;
-    value.store::<_, Packed>(&f.store, f.location).unwrap();
-    for next in [
-        Shape::Rectangle {
-            width: Number(1),
-            height: Number(2),
-        },
-        Shape::Circle(Number(3)),
-        Shape::Origin,
-        Shape::Circle(Number(4)),
-    ] {
-        let size = next.encoded_size::<Packed>();
-        value.guard(&f.store, f.packed()).set(next).unwrap();
-        assert_eq!(f.bytes().len(), size);
-        let reloaded: Shape = f.reload_as::<_, Packed>();
-        assert_eq!(reloaded, value);
-    }
-}
-
-#[derive(Persistable, Debug, PartialEq)]
-enum Pairing {
-    Two { first: u32, second: Shape },
-}
-
-#[test]
-fn packed_parts_find_themselves_after_a_sibling_grows() {
-    let mut f = Fixture::new(0);
-    let mut value = Pairing::Two {
-        first: 1,
-        second: Shape::Origin,
-    };
-    value.store::<_, Packed>(&f.store, f.location).unwrap();
-    {
-        let mut guard = value.guard(&f.store, f.packed());
-        let PairingParts::Two {
-            mut first,
-            mut second,
-        } = guard.parts();
-        first.set(1 << 21).unwrap(); // three bytes longer: `second` moves
-        second.set(Shape::Circle(Number(5))).unwrap();
-        if let ShapeParts::Circle(mut radius) = second.parts() {
-            radius.set(6).unwrap();
+fn parts_reach_into_the_current_variant() {
+    let mut f = Fixture::new(Shape::Rectangle {
+        width: 1,
+        height: 2,
+    });
+    match f.kladde.guard().parts() {
+        ShapeParts::Rectangle {
+            mut width,
+            mut height,
+        } => {
+            width.set(1 << 21).unwrap(); // grows, and moves `height`
+            height.set(5).unwrap();
         }
-        first.set(2).unwrap();
+        _ => unreachable!(),
     }
     assert_eq!(
-        value,
-        Pairing::Two {
-            first: 2,
-            second: Shape::Circle(Number(6))
+        *f.kladde.get(),
+        Shape::Rectangle {
+            width: 1 << 21,
+            height: 5
         }
     );
-    assert_eq!(f.bytes(), [0, 2, 1, 6, 0, 0, 0]);
-    let reloaded: Pairing = f.reload_as::<_, Packed>();
-    assert_eq!(reloaded, value);
-}
-
-fn descriptor_width<T: Persistable + 'static>() -> u8 {
-    match &T::schema().descriptors()[0] {
-        kladde_persist::TypeDescriptor::Enum {
-            discriminant_width, ..
-        } => *discriminant_width,
-        other => panic!("not an enum: {other:?}"),
+    f.check();
+    f.kladde.guard().set(Shape::Circle(3.0)).unwrap();
+    if let ShapeParts::Circle(mut r) = f.kladde.guard().parts() {
+        r.set(4.0).unwrap();
     }
+    assert_eq!(*f.kladde.get(), Shape::Circle(4.0));
+    f.check();
 }
 
-#[test]
-fn parts_mutates_a_named_field_in_place() {
-    let mut f = Fixture::for_type::<Shape>();
-    let mut value = Shape::Rectangle {
-        width: Number(3),
-        height: Number(4),
-    };
-    value.store::<_, Slotted>(&f.store, f.location).unwrap();
-    match value.guard(&f.store, f.place()).parts() {
-        ShapeParts::Rectangle { mut width, .. } => width.set(30).unwrap(),
-        _ => panic!("the value is a rectangle"),
-    }
-    assert_eq!(
-        value,
-        Shape::Rectangle {
-            width: Number(30),
-            height: Number(4),
-        }
-    );
-    // The discriminant 2 is untouched, the width is rewritten in place.
-    assert_eq!(f.bytes(), [2, 30, 0, 0, 0, 4, 0, 0, 0]);
-    let reloaded: Shape = f.reload();
-    assert_eq!(reloaded, value);
-}
-
-#[test]
-fn parts_of_tuple_and_unit_variants() {
-    let mut f = Fixture::for_type::<Shape>();
-    let mut value = Shape::Circle(Number(7));
-    value.store::<_, Slotted>(&f.store, f.location).unwrap();
-    if let ShapeParts::Circle(mut radius) = value.guard(&f.store, f.place()).parts() {
-        radius.set(8).unwrap();
-    } else {
-        panic!("the value is a circle");
-    }
-    assert_eq!(value, Shape::Circle(Number(8)));
-    let reloaded: Shape = f.reload();
-    assert_eq!(reloaded, value);
-
-    let mut guard = value.guard(&f.store, f.place());
-    guard.set(Shape::Origin).unwrap();
-    assert!(matches!(guard.parts(), ShapeParts::Origin));
-}
-
-#[derive(Persistable, Debug, PartialEq)]
-enum Maybe<T> {
-    Absent,
-    Present(T),
-}
-
-#[test]
-fn parts_of_a_generic_enum() {
-    let mut f = Fixture::for_type::<Maybe<Number>>();
-    let mut value = Maybe::Present(Number(1));
-    value.store::<_, Slotted>(&f.store, f.location).unwrap();
-    if let MaybeParts::Present(mut inner) = value.guard(&f.store, f.place()).parts() {
-        inner.set(2).unwrap();
-    }
-    assert_eq!(value, Maybe::Present(Number(2)));
-    let reloaded: Maybe<Number> = f.reload();
-    assert_eq!(reloaded, value);
-    let absent: Maybe<Number> = Maybe::Absent;
-    assert_eq!(absent, Maybe::Absent);
-}
-
-// Fields named like the parameters of the generated methods.
-#[derive(Persistable, Debug, PartialEq)]
-enum Shadowing {
-    Only {
-        backend: Number,
-        location: Number,
-        input: Number,
-        out: Number,
-    },
-}
-
-#[test]
-fn fields_named_like_generated_parameters_round_trip() {
-    let mut f = Fixture::for_type::<Shadowing>();
-    let mut value = Shadowing::Only {
-        backend: Number(1),
-        location: Number(2),
-        input: Number(3),
-        out: Number(4),
-    };
-    value.store::<_, Slotted>(&f.store, f.location).unwrap();
-    let mut guard = value.guard(&f.store, f.place());
-    let ShadowingParts::Only { mut location, .. } = guard.parts();
-    location.set(3).unwrap();
-    let reloaded: Shadowing = f.reload();
-    assert_eq!(reloaded, value);
-}
-
-#[derive(Persistable, Debug, PartialEq)]
-enum Wide {
-    Low,
-    High = 256,
-}
-
-#[derive(Persistable, Debug, PartialEq)]
-#[repr(u16)]
-enum PinnedU16 {
+#[derive(Persistable, Debug, PartialEq, Clone, Copy)]
+enum Unit {
     A,
     B,
+    C = 127,
 }
 
-#[derive(Persistable, Debug, PartialEq)]
-#[repr(C, u64)]
-enum PinnedU64 {
-    A(Number),
+#[derive(Persistable, Debug, PartialEq, Clone, Copy)]
+enum Wide {
+    A,
+    B = 128,
+}
+
+#[derive(Persistable, Debug, PartialEq, Clone, Copy)]
+#[repr(u16)]
+enum Pinned {
+    A = 3,
     B,
 }
 
 #[test]
-fn the_width_is_the_smallest_that_holds_every_discriminant() {
-    assert_eq!(<Shape as Persistable>::SLOTTED_SIZE, Some(9));
-    assert_eq!(descriptor_width::<Shape>(), 1);
-    assert_eq!(<Wide as Persistable>::SLOTTED_SIZE, Some(2));
-    assert_eq!(descriptor_width::<Wide>(), 2);
-
-    let mut f = Fixture::for_type::<Wide>();
-    let mut value = Wide::High;
-    value.store::<_, Slotted>(&f.store, f.location).unwrap();
-    assert_eq!(f.bytes(), [0x00, 0x01]);
-    let reloaded: Wide = f.reload();
-    assert_eq!(reloaded, Wide::High);
-    // Packed, a discriminant is a varint whatever the width.
-    assert_eq!(Wide::High.to_bytes::<Packed>(), [0x80, 0x02]);
-    assert_eq!(Wide::Low.to_bytes::<Packed>(), [0]);
-}
-
-#[cfg(target_pointer_width = "64")]
-#[test]
-fn a_discriminant_beyond_32_bits_takes_8_bytes() {
-    // Only compiled for 64-bit targets, where `isize` holds the value.
-    #[allow(clippy::enum_clike_unportable_variant)]
+fn discriminants_are_rusts_and_fix_the_size_below_128() {
+    assert_eq!(<Unit as Persistable>::FIXED_SIZE, Some(1));
+    assert_eq!(Unit::C.to_bytes(), [127]);
+    assert_eq!(<Wide as Persistable>::FIXED_SIZE, None);
+    assert_eq!(Wide::B.to_bytes(), [0x80, 0x01]);
+    assert_eq!(<Wide as Persistable>::FIXED_FORM_SIZE, Some(1));
+    assert_eq!(Fixed(Wide::B).to_bytes(), [128]);
+    assert_eq!(<Pinned as Persistable>::FIXED_FORM_SIZE, Some(2));
+    assert_eq!(Fixed(Pinned::B).to_bytes(), [4, 0]);
+    let TypeDescriptor::Enum {
+        discriminant_width,
+        variants,
+        ..
+    } = Pinned::schema().get(TypeRef(0)).clone()
+    else {
+        panic!("an enum descriptor")
+    };
+    assert_eq!(discriminant_width, 2);
+    assert_eq!(variants[1].discriminant, 4);
+    // Every variant of one fixed size makes a fixed-size enum.
     #[derive(Persistable)]
-    enum Huge {
-        A = 0x1_0000_0000,
+    enum Same {
+        A(f32),
+        B(u8, u8, u8, u8),
     }
-    assert_eq!(<Huge as Persistable>::SLOTTED_SIZE, Some(8));
-    assert_eq!(descriptor_width::<Huge>(), 8);
+    assert_eq!(<Same as Persistable>::FIXED_SIZE, Some(5));
+}
+
+/// A list held inline, through a box.
+#[derive(Persistable, Debug, PartialEq)]
+enum List {
+    Nil,
+    Cons(u8, Box<List>),
 }
 
 #[test]
-fn an_integer_repr_fixes_the_width() {
-    assert_eq!(<PinnedU16 as Persistable>::SLOTTED_SIZE, Some(2));
-    assert_eq!(descriptor_width::<PinnedU16>(), 2);
-    assert_eq!(<PinnedU64 as Persistable>::SLOTTED_SIZE, Some(8 + 4));
-    assert_eq!(descriptor_width::<PinnedU64>(), 8);
-
-    let mut f = Fixture::for_type::<PinnedU64>();
-    for mut value in [PinnedU64::A(Number(5)), PinnedU64::B] {
-        value.store::<_, Slotted>(&f.store, f.location).unwrap();
-        let reloaded: PinnedU64 = f.reload();
-        assert_eq!(reloaded, value);
+fn a_recursive_enum_holds_itself_inline() {
+    let list = List::Cons(1, Box::new(List::Cons(2, Box::new(List::Nil))));
+    assert_eq!(list.to_bytes(), [1, 1, 1, 2, 0]);
+    assert_eq!(<List as Persistable>::FIXED_SIZE, None);
+    assert_eq!(<List as Persistable>::FIXED_FORM_SIZE, None);
+    let table = List::schema();
+    assert_eq!(table.validate(), Ok(()));
+    let mut f = Fixture::new(list);
+    if let ListParts::Cons(mut head, mut tail) = f.kladde.guard().parts() {
+        tail.set(List::Nil).unwrap();
+        head.set(9).unwrap();
     }
-    let mut value = PinnedU64::A(Number(5));
-    value.store::<_, Slotted>(&f.store, f.location).unwrap();
-    assert_eq!(f.bytes(), [0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0]);
-}
-
-/// Every variant packs to the same size, so the type is fixed-size.
-#[derive(Persistable)]
-enum Even {
-    A(u8),
-    B(bool),
-}
-
-#[test]
-fn an_enum_whose_variants_pack_alike_is_fixed_size() {
-    assert_eq!(<Even as Persistable>::PACKED_SIZE, Some(2));
-    assert_eq!(<Even as Persistable>::SLOTTED_SIZE, Some(2));
+    assert_eq!(*f.kladde.get(), List::Cons(9, Box::new(List::Nil)));
+    f.check();
 }
