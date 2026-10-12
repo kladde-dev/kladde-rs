@@ -2,12 +2,12 @@
 //! would.
 //!
 //! ```text
-//! text-bench <output directory> [--quick] [--size BYTES] [--keystrokes N] [--seed N] [--variant NAME] [--focus SHARE] [--focus-moves N] [--journal-budget PAGES] [--shift-decay FACTOR] [--churn-floor λ] [--target-fill τ]
+//! text-bench <output directory> [--quick] [--size BYTES] [--keystrokes N] [--seed N] [--variant NAME] [--focus SHARE] [--focus-moves N] [--journal-budget PAGES] [--churn-floor λ] [--target-fill τ] [--span-min BYTES] [--rewrite-below BYTES]
 //! ```
 //!
 //! The text is `--size` bytes, 64 KiB by default, of random words of one to
-//! nine lowercase letters, each followed by a space, in one allocation of a
-//! [`Store`]: below the typed layers, so that the store alone is measured.
+//! nine lowercase letters, each followed by a space, as the whole sequence of
+//! a [`Store`]: below the typed layers, so that the store alone is measured.
 //! It is stored and flushed first, which is not measured, and then edited
 //! keystroke by keystroke at a cursor, 100,000 times (10,000 with `--quick`,
 //! or `N` with `--keystrokes`):
@@ -34,20 +34,21 @@
 //!
 //! `--journal-budget` sets the store's [`Options::journal_budget_pages`], so
 //! that it also flushes by itself whenever the journal outgrows that many
-//! pages, `--shift-decay` its [`Options::shift_decay`], `--churn-floor` its
-//! [`Options::churn_floor`], and `--target-fill` its [`Options::target_fill`].
+//! pages, `--churn-floor` its [`Options::churn_floor`], `--target-fill` its
+//! [`Options::target_fill`], `--span-min` its [`Options::span_min`], and
+//! `--rewrite-below` its [`Options::rewrite_below`].
 //!
 //! At the end, the store is closed and reopened, and the text must be what a
 //! model of every keystroke says. A summary on stderr gives what the store
-//! wrote per keystroke, by where it went, what it restated and wrote again
-//! for the bytes the splices shifted, what the file holds, its size once
-//! closed, and the time to reopen it, as the median of 21 opens.
+//! wrote per keystroke, by where it went, what its span policy split, wrote
+//! again and merged, what the file holds, its size once closed, and the time
+//! to reopen it, as the median of 21 opens.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kladde_bench::{row, save, Rng};
-use kladde_store::{FileStorage, Options, Stats, Store, UniquePointer, WriteBackend};
+use kladde_store::{FileStorage, Options, Stats, Store, WriteBackend};
 
 /// Keystrokes between two explicit flushes, as in kladde-bench.
 const OPS_PER_FLUSH: u64 = 1000;
@@ -72,11 +73,10 @@ const MOVE: u64 = 995;
 /// A page's size, for counting the bytes of pages written.
 const PAGE: u64 = 4096;
 
-const USAGE: &str = "usage: text-bench <output directory> [--quick] [--size BYTES] [--keystrokes N] [--seed N] [--variant NAME] [--focus SHARE] [--focus-moves N] [--journal-budget PAGES] [--shift-decay FACTOR] [--churn-floor λ] [--target-fill τ]";
+const USAGE: &str = "usage: text-bench <output directory> [--quick] [--size BYTES] [--keystrokes N] [--seed N] [--variant NAME] [--focus SHARE] [--focus-moves N] [--journal-budget PAGES] [--churn-floor λ] [--target-fill τ] [--span-min BYTES] [--rewrite-below BYTES]";
 
 struct Bench {
     store: Store,
-    text: UniquePointer,
     /// What the text should hold, keystroke by keystroke.
     model: Vec<u8>,
     rng: Rng,
@@ -103,7 +103,7 @@ impl Bench {
     fn splice(&mut self, at: usize, old_len: usize, new: &[u8]) {
         let t = Instant::now();
         self.store
-            .splice(&self.text, at as u32, old_len as u32, new)
+            .splice(at as u64, old_len as u64, new)
             .expect("splice");
         self.store_time += t.elapsed();
         self.model.splice(at..at + old_len, new.iter().copied());
@@ -208,7 +208,8 @@ fn main() {
             "--focus" => focus = value(&mut args, "--focus"),
             "--focus-moves" => focus_moves = value(&mut args, "--focus-moves"),
             "--journal-budget" => opts.journal_budget_pages = value(&mut args, "--journal-budget"),
-            "--shift-decay" => opts.shift_decay = value(&mut args, "--shift-decay"),
+            "--span-min" => opts.span_min = value(&mut args, "--span-min"),
+            "--rewrite-below" => opts.rewrite_below = value(&mut args, "--rewrite-below"),
             "--churn-floor" => opts.churn_floor = value(&mut args, "--churn-floor"),
             "--target-fill" => opts.target_fill = value(&mut args, "--target-fill"),
             _ if out.is_none() && !arg.starts_with("--") => out = Some(PathBuf::from(arg)),
@@ -259,14 +260,12 @@ fn run(
     let model = words(&mut rng, size);
     let storage = FileStorage::create(file).expect("create the kladde file");
     let store = Store::create(Box::new(storage), opts.clone()).expect("create the store");
-    let text = store.alloc(model.len() as u32).expect("alloc");
-    store.write(text.raw(), 0, &model).expect("write the text");
+    store.splice(0, 0, &model).expect("store the text");
     store.flush().expect("flush");
     let base = store.stats();
 
     let mut bench = Bench {
         store,
-        text,
         cursor: model.len() / 2,
         model,
         rng,
@@ -321,7 +320,7 @@ fn run(
     };
     let (open_time, reopened) = reopen();
     assert!(
-        reopened.read_all(bench.text.raw()).expect("read the text") == bench.model,
+        reopened.read_all().expect("read the text") == bench.model,
         "{variant}: the text differs after reopening"
     );
     drop(reopened);
@@ -351,14 +350,16 @@ fn run(
         per(headers),
     );
     eprintln!(
-        "shifted bytes per keystroke: {:.1} restated where they lie, {:.1} written again",
-        per(s.restated_bytes - base.restated_bytes),
-        per(s.merged_bytes - base.merged_bytes),
+        "per keystroke: {:.2} entries stated, {:.3} spans split, {:.1} bytes of short spans written again, {:.1} bytes merged as entries left the header, {:.1} by the walk",
+        per(s.entries_stated - base.entries_stated),
+        per(s.span_splits - base.span_splits),
+        per(s.rewritten_bytes - base.rewritten_bytes),
+        per(s.evict_merge_bytes - base.evict_merge_bytes),
+        per(s.walk_merge_bytes - base.walk_merge_bytes),
     );
     eprintln!(
-        "the file holds {} statements, {} fragments, {} table pages and {} data pages; flushes take {:.1} ms at the median",
-        s.statements,
-        s.fragments,
+        "the file holds {} spans, {} table pages and {} data pages; flushes take {:.1} ms at the median",
+        s.spans,
         s.table_pages,
         s.data_pages,
         median(flush_times) as f64 / 1e3,

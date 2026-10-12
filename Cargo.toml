@@ -9,9 +9,9 @@ members = [
     "crates/kladde-derive",
     "crates/kladde",
     "crates/kladde-types",
+    "crates/kladde-bench",
 ]
 exclude = [
-    "crates/kladde-bench",
     "crates/kladde-svg",
 ]
 

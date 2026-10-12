@@ -1,6 +1,6 @@
-//! What kladde-bench's scenarios share with other benchmarks that want to be
-//! plotted the same way: the table's columns, one row per flush, a seeded
-//! random number generator, and writing a table out.
+//! What kladde's benchmarks share, `text-bench` here and kladde-svg's
+//! `svg-bench`: the table's columns, one row per flush, a seeded random
+//! number generator, and writing a table out.
 //!
 //! `plot-evaluation.py` in kladde-docs draws figures from any table with
 //! these columns, so a benchmark built on [`row`] and [`save`] plots with it
@@ -25,12 +25,23 @@ use std::time::Instant;
 use kladde_store::Stats;
 
 /// The header of every table: one column per field of a [`row`].
+///
+/// The columns up to `merged_bytes` are those of the tables recorded on
+/// stores that kept allocations, so that one script plots both; on one
+/// sequence, `alloc_bytes` is the live size, the sequence's and the schema
+/// chain's bytes; `allocations` is 0; `statements` and `fragments` both
+/// count the spans; `window_restated` counts every entry stated;
+/// `defrag_rewrites` and `defrag_bytes` count the span policy's merges and
+/// the bytes they wrote again, as does `merged_bytes`; and `restated_bytes`
+/// counts the bytes of short spans written again where an edit cut into
+/// them. The columns after it are the span policy's own counters.
 pub const COLUMNS: &str =
     "scenario,variant,size,flush,ops,app_bytes,file_pages,data_pages,table_pages,\
 free_pages,live_data,live_table,alloc_bytes,allocations,statements,fragments,budget,\
 data_written,table_written,headers_written,journal_bytes,fresh_bytes,evacuated_pages,\
 evacuated_bytes,free_filled,budget_pages,table_rewrites,window_restated,defrag_rewrites,\
-defrag_bytes,compaction_flushes,truncations,flush_us,ops_us,restated_bytes,merged_bytes";
+defrag_bytes,compaction_flushes,truncations,flush_us,ops_us,restated_bytes,merged_bytes,\
+spans,span_splits,rewritten_bytes,evict_merges,evict_merge_bytes,walk_merges,walk_merge_bytes";
 
 /// xorshift64: deterministic, and good enough for workloads.
 ///
@@ -103,45 +114,54 @@ pub fn row(
     ops_us: u128,
 ) -> String {
     let b = base;
-    format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-        scenario,
-        variant,
-        size,
-        flushes,
-        ops,
-        app_bytes,
-        s.file_pages,
-        s.data_pages,
-        s.table_pages,
-        s.free_pages,
-        s.live_data_bytes,
-        s.live_table_bytes,
-        s.allocation_bytes,
-        s.allocations,
-        s.statements,
-        s.fragments,
-        s.budget,
-        s.data_pages_written - b.data_pages_written,
-        s.table_pages_written - b.table_pages_written,
-        s.headers_written - b.headers_written,
-        s.journal_bytes - b.journal_bytes,
-        s.fresh_bytes - b.fresh_bytes,
-        s.evacuated_pages - b.evacuated_pages,
-        s.evacuated_bytes - b.evacuated_bytes,
-        s.free_filled_pages - b.free_filled_pages,
-        s.budget_pages - b.budget_pages,
-        s.table_rewrites - b.table_rewrites,
-        s.window_restated - b.window_restated,
-        s.defrag_rewrites - b.defrag_rewrites,
-        s.defrag_bytes - b.defrag_bytes,
-        s.compaction_flushes - b.compaction_flushes,
-        s.truncations - b.truncations,
-        flush_us,
-        ops_us,
-        s.restated_bytes - b.restated_bytes,
-        s.merged_bytes - b.merged_bytes,
-    )
+    let merges = |s: &Stats| s.evict_merges + s.walk_merges;
+    let merged = |s: &Stats| s.evict_merge_bytes + s.walk_merge_bytes;
+    let fields: [String; 43] = [
+        scenario.to_string(),
+        variant.to_string(),
+        size.to_string(),
+        flushes.to_string(),
+        ops.to_string(),
+        app_bytes.to_string(),
+        s.file_pages.to_string(),
+        s.data_pages.to_string(),
+        s.table_pages.to_string(),
+        s.free_pages.to_string(),
+        s.live_data_bytes.to_string(),
+        s.live_table_bytes.to_string(),
+        (s.sequence_bytes + s.schema_bytes).to_string(),
+        0.to_string(),
+        s.spans.to_string(),
+        s.spans.to_string(),
+        s.budget.to_string(),
+        (s.data_pages_written - b.data_pages_written).to_string(),
+        (s.table_pages_written - b.table_pages_written).to_string(),
+        (s.headers_written - b.headers_written).to_string(),
+        (s.journal_bytes - b.journal_bytes).to_string(),
+        (s.fresh_bytes - b.fresh_bytes).to_string(),
+        (s.evacuated_pages - b.evacuated_pages).to_string(),
+        (s.evacuated_bytes - b.evacuated_bytes).to_string(),
+        (s.free_filled_pages - b.free_filled_pages).to_string(),
+        (s.budget_pages - b.budget_pages).to_string(),
+        (s.table_rewrites - b.table_rewrites).to_string(),
+        (s.entries_stated - b.entries_stated).to_string(),
+        (merges(s) - merges(b)).to_string(),
+        (merged(s) - merged(b)).to_string(),
+        (s.compaction_flushes - b.compaction_flushes).to_string(),
+        (s.truncations - b.truncations).to_string(),
+        flush_us.to_string(),
+        ops_us.to_string(),
+        (s.rewritten_bytes - b.rewritten_bytes).to_string(),
+        (merged(s) - merged(b)).to_string(),
+        s.spans.to_string(),
+        (s.span_splits - b.span_splits).to_string(),
+        (s.rewritten_bytes - b.rewritten_bytes).to_string(),
+        (s.evict_merges - b.evict_merges).to_string(),
+        (s.evict_merge_bytes - b.evict_merge_bytes).to_string(),
+        (s.walk_merges - b.walk_merges).to_string(),
+        (s.walk_merge_bytes - b.walk_merge_bytes).to_string(),
+    ];
+    fields.join(",")
 }
 
 /// Writes `rows` under a [`COLUMNS`] header to `<out>/<name>.csv`, and

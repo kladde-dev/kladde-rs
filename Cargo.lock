@@ -77,6 +77,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kladde-bench"
+version = "0.1.0"
+dependencies = [
+ "kladde-store",
+]
+
+[[package]]
 name = "kladde-derive"
 version = "0.1.0"
 dependencies = [
