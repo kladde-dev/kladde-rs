@@ -241,7 +241,8 @@ pub(crate) fn write_count<B: Backend>(
 ) -> Result<(), Error> {
     let mut bytes = Vec::with_capacity(10);
     Encoder::new(&mut bytes).varint(new as u64);
-    region.replace_at(0, varint_len(old as u64) as u64, &bytes)
+    region.splice(0, varint_len(old as u64) as u64, &bytes)?;
+    Ok(())
 }
 
 /// The [`Guard`] of a [`PersistableVec`]: insert, remove, reorder and cut

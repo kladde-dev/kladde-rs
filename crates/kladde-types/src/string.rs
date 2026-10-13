@@ -232,7 +232,7 @@ impl<B: Backend> PersistableStringGuard<'_, B> {
     pub fn set(&mut self, text: impl Into<String>) -> Result<(), Error> {
         let text = text.into();
         let end = self.inner.0.len();
-        self.region.replace_at(0, end as u64, text.as_bytes())?;
+        self.region.splice(0, end as u64, text.as_bytes())?;
         self.inner.0 = text;
         Ok(())
     }

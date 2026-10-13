@@ -82,7 +82,7 @@ fn run(seed: u64, opts: &Options, mixed: bool) {
                 let n = rng.below((len - pos).min(900)) + 1;
                 let fill = (rng.below(250) + 1) as u8;
                 model.0[pos as usize..(pos + n) as usize].fill(fill);
-                store.write(pos, &vec![fill; n as usize])
+                store.write(pos, &vec![fill; n as usize]).map(|_| ())
             }
             3..=5 => {
                 let pos = rng.below(len + 1);

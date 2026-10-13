@@ -372,7 +372,7 @@ pub fn replace<T: Persistable, B: Backend>(
     region: &Region<'_, B>,
 ) -> Result<(), Error> {
     debug_assert_eq!(current.encoded_len() as u64, region.len());
-    region.replace(region.len(), &new.to_bytes())?;
+    region.splice(0, region.len(), &new.to_bytes())?;
     *current = new;
     Ok(())
 }

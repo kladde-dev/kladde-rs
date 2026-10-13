@@ -5,8 +5,8 @@
 
 use crate::error::Error;
 
-/// The bytes a splice removed inside a transaction, which a
-/// [`paste`](WriteBackend::paste) of the same transaction can insert
+/// The bytes a write overwrote or a splice removed inside a transaction,
+/// which a [`paste`](WriteBackend::paste) of the same transaction can insert
 /// elsewhere, once, without carrying them.
 ///
 /// It is neither `Copy` nor `Clone`, so it is pasted at most once.
@@ -40,8 +40,8 @@ impl CutId {
         self.len
     }
 
-    /// Whether the cut holds no bytes, which never happens: a splice that
-    /// removes nothing makes no cut.
+    /// Whether the cut holds no bytes, which never happens: a write or splice
+    /// that removes nothing makes no cut.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -85,12 +85,33 @@ pub trait WriteBackend {
     }
 
     /// Overwrites `bytes.len()` bytes at `pos`.
-    fn write(&self, pos: u64, bytes: &[u8]) -> Result<(), Error>;
+    ///
+    /// Inside a transaction, what it overwrites is a cut, which it returns
+    /// for a later [`paste`](Self::paste); otherwise, or if `bytes` is
+    /// empty, it returns `None`.
+    ///
+    /// ```
+    /// use kladde_store::{MemoryStorage, Store, WriteBackend};
+    ///
+    /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
+    /// store.splice(0, 0, b"abcd")?;
+    /// store.atomically(|| {
+    ///     let old = store.write(0, b"xy")?.expect("a cut");
+    ///     store.paste(4, 0, old)
+    /// })?;
+    /// store.flush()?;
+    /// assert_eq!(store.read_all()?, b"xycdab");
+    /// # Ok::<(), kladde_store::Error>(())
+    /// ```
+    fn write(&self, pos: u64, bytes: &[u8]) -> Result<Option<CutId>, Error>;
 
     /// Replaces the `removed` bytes at `pos` with `bytes`, shifting what
-    /// follows. Inside a transaction, what it removes is a cut, which it
-    /// returns for a later [`paste`](Self::paste); otherwise, or if it
-    /// removes nothing, it returns `None`.
+    /// follows; with `removed == bytes.len()`, it is a
+    /// [`write`](Self::write).
+    ///
+    /// Inside a transaction, what it removes is a cut, which it returns for
+    /// a later [`paste`](Self::paste); otherwise, or if it removes nothing,
+    /// it returns `None`.
     fn splice(&self, pos: u64, removed: u64, bytes: &[u8]) -> Result<Option<CutId>, Error>;
 
     /// Cuts `[from, from + len)` and inserts it at `to`, a position in the
@@ -98,7 +119,8 @@ pub trait WriteBackend {
     fn move_range(&self, from: u64, len: u64, to: u64) -> Result<(), Error>;
 
     /// Replaces the `removed` bytes at `pos` with the bytes of `cut`, which a
-    /// splice of the open transaction made. See [`CutId`] for an example.
+    /// write or splice of the open transaction made. See [`CutId`] for an
+    /// example.
     ///
     /// Fails with [`Error::Corrupt`], recording nothing, if `cut` comes from
     /// another transaction.
@@ -147,7 +169,7 @@ impl<B: WriteBackend> WriteBackend for &B {
     fn len(&self) -> u64 {
         (**self).len()
     }
-    fn write(&self, pos: u64, bytes: &[u8]) -> Result<(), Error> {
+    fn write(&self, pos: u64, bytes: &[u8]) -> Result<Option<CutId>, Error> {
         (**self).write(pos, bytes)
     }
     fn splice(&self, pos: u64, removed: u64, bytes: &[u8]) -> Result<Option<CutId>, Error> {

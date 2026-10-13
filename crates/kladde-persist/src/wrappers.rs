@@ -144,7 +144,7 @@ impl<T: Persistable, B: Backend> OptionGuard<'_, T, B> {
         if self.inner.is_none() {
             return Ok(None);
         }
-        self.region.replace(self.region.len(), &[0])?;
+        self.region.splice(0, self.region.len(), &[0])?;
         Ok(self.inner.take())
     }
 

@@ -150,7 +150,7 @@ pub fn fold<'a>(
                     return Err(past_end());
                 }
                 let m = pt.take(pos, n);
-                pt.t.free_tree(m);
+                cuts.push(m);
                 pt.insert_piece(
                     pos,
                     Piece {
@@ -274,7 +274,9 @@ mod tests {
                         let pos = rng.below(len);
                         let n = rng.below(len - pos) + 1;
                         let new: Vec<u8> = (0..n).map(|_| rng.below(256) as u8).collect();
+                        let cut = model[pos as usize..(pos + n) as usize].to_vec();
                         model[pos as usize..(pos + n) as usize].copy_from_slice(&new);
+                        cuts.push(Some(cut));
                         Record::Write {
                             pos,
                             bytes: recs.stash(&new),

@@ -3,10 +3,10 @@
 //! recovery.
 //!
 //! The records act on positions of the one sequence: `Write`, `Splice`,
-//! `Move`, and `Paste`, which inserts what a `Splice` earlier in the same
-//! transaction cut out. On file each position is written as its distance from
-//! where the record before it left off, and the record's kind rides in the
-//! low two bits of that varint.
+//! `Move`, and `Paste`, which inserts what a `Write` or `Splice` earlier in
+//! the same transaction cut out. On file each position is written as its
+//! distance from where the record before it left off, and the record's kind
+//! rides in the low two bits of that varint.
 
 use std::collections::VecDeque;
 
@@ -27,7 +27,8 @@ pub struct Bytes {
 /// One record: a byte-level effect on the sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Record {
-    /// Overwrites `[pos, pos + bytes.len)`.
+    /// Overwrites `[pos, pos + bytes.len)`; what it overwrites is a cut of
+    /// its transaction.
     Write { pos: u64, bytes: Bytes },
     /// Replaces the `removed` bytes at `pos` with `bytes`; what it removes
     /// is a cut of its transaction, if anything.
@@ -356,6 +357,7 @@ pub fn decode_records(input: &[u8], cursor: &mut u64, into: &mut Records) -> Res
                     if len == 0 {
                         return Err(corrupt("a journal record uses the reserved escape"));
                     }
+                    cuts.push((len, false));
                     Record::Write { pos, bytes }
                 } else {
                     if removed > 0 {
@@ -713,6 +715,7 @@ mod tests {
                 0 => {
                     let n = rng.next(8) as usize + 1;
                     let bytes = recs.stash(&vec![rng.next(8) as u8; n]);
+                    cuts.push((n as u64, false));
                     Record::Write {
                         pos: rng.next(bits),
                         bytes,
@@ -855,6 +858,29 @@ mod tests {
             put(&mut out, 0);
         }
         assert!(decode_records(&out, &mut 0, &mut Records::new()).is_err());
+    }
+
+    #[test]
+    fn a_write_makes_a_cut_of_its_length() {
+        // A write of two bytes, then a paste of the cut it made.
+        let mut out = Vec::new();
+        put(&mut out, zz(0));
+        put(&mut out, 2);
+        out.extend_from_slice(b"xy");
+        put(&mut out, zz(3 - (2 << 2)));
+        put(&mut out, 0);
+        put(&mut out, 0);
+        let mut recs = Records::new();
+        decode_records(&out, &mut 0, &mut recs).unwrap();
+        assert_eq!(
+            recs.iter().nth(1),
+            Some(&Record::Paste {
+                pos: 0,
+                removed: 0,
+                cut: 0,
+                len: 2
+            })
+        );
     }
 
     #[test]

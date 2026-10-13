@@ -853,6 +853,20 @@ impl Inner {
         }
     }
 
+    /// The cut of `n` bytes that the record about to be recorded makes, if a
+    /// transaction is open; outside one nothing could paste it.
+    fn new_cut(&mut self, n: u64) -> Option<CutId> {
+        if !self.tx.in_transaction() {
+            return None;
+        }
+        self.cuts.list.push((n, false));
+        Some(CutId {
+            serial: self.cuts.serial,
+            index: (self.cuts.list.len() - 1) as u32,
+            len: n,
+        })
+    }
+
     /// Appends, holds back, and flushes as
     /// `impl/transactions-and-batches.md#flush-triggers` has it, now that the
     /// operations `ops[ready..]` have closed, a bare operation or a whole
@@ -1104,33 +1118,32 @@ impl WriteBackend for Store {
         self.inner.borrow().len
     }
 
-    fn write(&self, pos: u64, bytes: &[u8]) -> Result<(), Error> {
+    fn write(&self, pos: u64, bytes: &[u8]) -> Result<Option<CutId>, Error> {
         self.with(|i| {
             if bytes.is_empty() {
-                return Ok(());
+                return Ok(None);
             }
             i.check_range(pos, bytes.len() as u64)?;
             let bytes = i.ops.stash(bytes);
-            i.record(Record::Write { pos, bytes })
+            let cut = i.new_cut(bytes.len as u64);
+            i.record(Record::Write { pos, bytes })?;
+            Ok(cut)
         })
     }
 
     fn splice(&self, pos: u64, removed: u64, bytes: &[u8]) -> Result<Option<CutId>, Error> {
+        if removed == bytes.len() as u64 {
+            return self.write(pos, bytes);
+        }
         self.with(|i| {
-            if removed == 0 && bytes.is_empty() {
-                return Ok(None);
-            }
             i.check_range(pos, removed)?;
             let len = i.grown(removed, bytes.len() as u64)?;
             let stashed: Bytes = i.ops.stash(bytes);
-            let cut = (removed > 0 && i.tx.in_transaction()).then(|| {
-                i.cuts.list.push((removed, false));
-                CutId {
-                    serial: i.cuts.serial,
-                    index: (i.cuts.list.len() - 1) as u32,
-                    len: removed,
-                }
-            });
+            let cut = if removed > 0 {
+                i.new_cut(removed)
+            } else {
+                None
+            };
             i.len = len;
             i.record(Record::Splice {
                 pos,

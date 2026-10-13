@@ -171,8 +171,8 @@ where
         let mut out = Encoder::new(&mut bytes);
         out.varint(new.len() as u64);
         out.bytes(&new);
-        match self.region.replace(self.region.len(), &bytes) {
-            Ok(()) => {
+        match self.region.splice(0, self.region.len(), &bytes) {
+            Ok(_) => {
                 self.inner.serialized = new;
                 Ok(())
             }

@@ -116,7 +116,8 @@ impl World {
             }
             8 if len > 1 => {
                 // Two cuts in one transaction, pasted in the other order, the
-                // second over bytes it replaces.
+                // second over bytes it replaces, and between them the bytes a
+                // write overwrote.
                 let model = &mut self.model;
                 store
                     .atomically(|| {
@@ -132,9 +133,20 @@ impl World {
                         let cut_b = store.splice(b, bn, b"x")?;
                         model.insert(b as usize, b'x');
                         let len = model.len() as u64;
+                        let w = rng.below(len);
+                        let wn = rng.below((len - w).min(50)) + 1;
+                        let new = rng.bytes(wn as usize);
+                        let range = w as usize..(w + wn) as usize;
+                        let cw: Vec<u8> = model.splice(range, new.iter().copied()).collect();
+                        let cut_w = store.write(w, &new)?.unwrap();
+                        let len = model.len() as u64;
                         let p = rng.below(len + 1);
                         model.splice(p as usize..p as usize, ca);
                         store.paste(p, 0, cut_a)?;
+                        let len = model.len() as u64;
+                        let s = rng.below(len + 1);
+                        model.splice(s as usize..s as usize, cw);
+                        store.paste(s, 0, cut_w)?;
                         if let Some(cut_b) = cut_b {
                             let len = model.len() as u64;
                             let q = rng.below(len + 1);
@@ -242,10 +254,26 @@ fn a_cut_from_another_transaction_is_refused() {
     store.begin_transaction().unwrap();
     assert!(store.paste(0, 0, cut).is_err());
     store.end_transaction().unwrap();
-    // Outside a transaction, a splice makes no cut.
+    // Outside a transaction, a splice or a write makes no cut.
     assert!(store.splice(0, 1, b"").unwrap().is_none());
+    assert!(store.write(0, b"D").unwrap().is_none());
     store.flush().unwrap();
-    assert_eq!(store.read_all().unwrap(), b"def");
+    assert_eq!(store.read_all().unwrap(), b"Def");
+}
+
+#[test]
+fn a_splice_of_equal_lengths_cuts_what_it_overwrites() {
+    let store = Store::create(Box::new(MemoryStorage::new()), Options::default()).unwrap();
+    store.splice(0, 0, b"abcdef").unwrap();
+    store
+        .atomically(|| {
+            let old = store.splice(1, 2, b"XY")?.unwrap();
+            assert_eq!(store.len(), 6);
+            store.paste(6, 0, old)
+        })
+        .unwrap();
+    store.flush().unwrap();
+    assert_eq!(store.read_all().unwrap(), b"aXYdefbc");
 }
 
 #[test]
@@ -254,7 +282,7 @@ fn a_failed_transaction_leaves_nothing() {
     store.splice(0, 0, b"abc").unwrap();
     let r: Result<(), _> = store.atomically(|| {
         store.splice(0, 1, b"xyz")?;
-        store.write(100, b"past the end")
+        store.write(100, b"past the end").map(|_| ())
     });
     assert!(r.is_err());
     assert_eq!(store.len(), 3);

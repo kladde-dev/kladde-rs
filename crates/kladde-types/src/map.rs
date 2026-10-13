@@ -360,7 +360,7 @@ impl<K: Persistable + Hash + Eq, V: Persistable, B: Backend> PersistableMapGuard
                 let at = self.inner.offset_of(i) + self.inner.entries[i].0.encoded_len() as u64;
                 let old_len = self.inner.entries[i].1.encoded_len() as u64;
                 let bytes = value.to_bytes();
-                self.region.replace_at(at, old_len, &bytes)?;
+                self.region.splice(at, old_len, &bytes)?;
                 let map = &mut *self.inner;
                 if !PersistableMap::<K, V>::fixed() {
                     map.sizes.add(i, bytes.len() as i64 - old_len as i64);
