@@ -1,9 +1,9 @@
 mod support;
 
-use kladde::{Bounded, Fixed, Persistable, TypeDescriptor, TypeRef};
+use kladde::{Bounded, Durable, Fixed, TypeDescriptor, TypeRef};
 use support::Fixture;
 
-#[derive(Persistable, Debug, PartialEq, Clone)]
+#[derive(Durable, Debug, PartialEq, Clone)]
 #[kladde(bounded)]
 enum Shape {
     Origin,
@@ -72,21 +72,21 @@ fn parts_reach_into_the_current_variant() {
     f.check();
 }
 
-#[derive(Persistable, Debug, PartialEq, Clone, Copy)]
+#[derive(Durable, Debug, PartialEq, Clone, Copy)]
 enum Unit {
     A,
     B,
     C = 127,
 }
 
-#[derive(Persistable, Debug, PartialEq, Clone, Copy)]
+#[derive(Durable, Debug, PartialEq, Clone, Copy)]
 #[kladde(bounded)]
 enum Wide {
     A,
     B = 128,
 }
 
-#[derive(Persistable, Debug, PartialEq, Clone, Copy)]
+#[derive(Durable, Debug, PartialEq, Clone, Copy)]
 #[kladde(bounded)]
 #[repr(u16)]
 enum Pinned {
@@ -96,9 +96,9 @@ enum Pinned {
 
 #[test]
 fn discriminants_are_rusts_and_fix_the_size_below_128() {
-    assert_eq!(<Unit as Persistable>::FIXED_SIZE, Some(1));
+    assert_eq!(<Unit as Durable>::FIXED_SIZE, Some(1));
     assert_eq!(Unit::C.to_bytes(), [127]);
-    assert_eq!(<Wide as Persistable>::FIXED_SIZE, None);
+    assert_eq!(<Wide as Durable>::FIXED_SIZE, None);
     assert_eq!(Wide::B.to_bytes(), [0x80, 0x01]);
     assert_eq!(<Wide as Bounded>::FIXED_FORM_SIZE, 1);
     assert_eq!(Fixed(Wide::B).to_bytes(), [128]);
@@ -115,16 +115,16 @@ fn discriminants_are_rusts_and_fix_the_size_below_128() {
     assert_eq!(discriminant_width, 2);
     assert_eq!(variants[1].discriminant, 4);
     // Every variant of one fixed size makes a fixed-size enum.
-    #[derive(Persistable)]
+    #[derive(Durable)]
     enum Same {
         A(f32),
         B(u8, u8, u8, u8),
     }
-    assert_eq!(<Same as Persistable>::FIXED_SIZE, Some(5));
+    assert_eq!(<Same as Durable>::FIXED_SIZE, Some(5));
 }
 
 /// A list held inline, through a box.
-#[derive(Persistable, Debug, PartialEq)]
+#[derive(Durable, Debug, PartialEq)]
 enum List {
     Nil,
     Cons(u8, Box<List>),
@@ -134,7 +134,7 @@ enum List {
 fn a_recursive_enum_holds_itself_inline() {
     let list = List::Cons(1, Box::new(List::Cons(2, Box::new(List::Nil))));
     assert_eq!(list.to_bytes(), [1, 1, 1, 2, 0]);
-    assert_eq!(<List as Persistable>::FIXED_SIZE, None);
+    assert_eq!(<List as Durable>::FIXED_SIZE, None);
     let table = List::schema();
     assert_eq!(table.validate(), Ok(()));
     let mut f = Fixture::new(list);

@@ -1,15 +1,15 @@
-//! [`PersistableVec<T>`]: a vector, encoded as its count and its elements.
+//! [`DurableVec<T>`]: a vector, encoded as its count and its elements.
 
 use std::ops::Deref;
 
 use kladde_persist::{
-    varint_len, Backend, Cut, Decoder, Encoder, Error, Guard, Node, Persistable, Region,
-    SchemaBuilder, TypeDescriptor,
+    varint_len, Backend, Cut, Decoder, Durable, Encoder, Error, Guard, Node, Region, SchemaBuilder,
+    TypeDescriptor,
 };
 
 use crate::index::Sizes;
 
-/// A vector of persistable values: the number of elements as a varint, then
+/// A vector of durable values: the number of elements as a varint, then
 /// the elements.
 ///
 /// In memory, a `Vec<T>`, and for a `T` whose size depends on its value a
@@ -19,30 +19,30 @@ use crate::index::Sizes;
 /// keeps nothing more.
 ///
 /// Read it as a slice, through `Deref<Target = [T]>`; change it through a
-/// [`PersistableVecGuard`].
+/// [`DurableVecGuard`].
 ///
 /// ```
 /// use kladde::Kladde;
-/// use kladde_types::{PersistableString, PersistableVec};
+/// use kladde_types::{DurableString, DurableVec};
 ///
-/// let mut lines = Kladde::new(PersistableVec::<PersistableString>::new());
+/// let mut lines = Kladde::new(DurableVec::<DurableString>::new());
 /// lines.guard().push("hello".into())?;
 /// lines.guard().get_mut(0).unwrap().push_str(", world")?;
 /// assert_eq!(lines.get()[0], "hello, world");
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub struct PersistableVec<T> {
+pub struct DurableVec<T> {
     items: Vec<T>,
     /// The elements' sizes, for a `T` whose size depends on its value;
     /// empty otherwise.
     sizes: Sizes,
 }
 
-impl<T: Persistable> PersistableVec<T> {
+impl<T: Durable> DurableVec<T> {
     /// An empty vector.
     ///
     /// ```
-    /// let v = kladde_types::PersistableVec::<u32>::new();
+    /// let v = kladde_types::DurableVec::<u32>::new();
     /// assert!(v.is_empty());
     /// ```
     pub fn new() -> Self {
@@ -57,7 +57,7 @@ impl<T: Persistable> PersistableVec<T> {
                 varint_len(items.len() as u64) as u64,
             ),
         };
-        PersistableVec { items, sizes }
+        DurableVec { items, sizes }
     }
 
     /// The elements, as a slice.
@@ -68,7 +68,7 @@ impl<T: Persistable> PersistableVec<T> {
     /// The elements, as a `Vec`.
     ///
     /// ```
-    /// let v: kladde_types::PersistableVec<u8> = vec![1, 2].into();
+    /// let v: kladde_types::DurableVec<u8> = vec![1, 2].into();
     /// assert_eq!(v.into_vec(), [1, 2]);
     /// ```
     pub fn into_vec(self) -> Vec<T> {
@@ -108,7 +108,7 @@ impl<T: Persistable> PersistableVec<T> {
     /// otherwise: for tests of guards that change elements' sizes.
     ///
     /// ```
-    /// let v: kladde_types::PersistableVec<u32> = vec![1, 300].into();
+    /// let v: kladde_types::DurableVec<u32> = vec![1, 300].into();
     /// v.check();
     /// ```
     pub fn check(&self) {
@@ -128,25 +128,25 @@ impl<T: Persistable> PersistableVec<T> {
     }
 }
 
-impl<T: Persistable> Default for PersistableVec<T> {
+impl<T: Durable> Default for DurableVec<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Persistable> From<Vec<T>> for PersistableVec<T> {
+impl<T: Durable> From<Vec<T>> for DurableVec<T> {
     fn from(items: Vec<T>) -> Self {
         Self::from_items(items)
     }
 }
 
-impl<T: Persistable> FromIterator<T> for PersistableVec<T> {
+impl<T: Durable> FromIterator<T> for DurableVec<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         Self::from_items(iter.into_iter().collect())
     }
 }
 
-impl<T> Deref for PersistableVec<T> {
+impl<T> Deref for DurableVec<T> {
     type Target = [T];
 
     fn deref(&self) -> &[T] {
@@ -154,7 +154,7 @@ impl<T> Deref for PersistableVec<T> {
     }
 }
 
-impl<'a, T> IntoIterator for &'a PersistableVec<T> {
+impl<'a, T> IntoIterator for &'a DurableVec<T> {
     type Item = &'a T;
     type IntoIter = std::slice::Iter<'a, T>;
 
@@ -163,34 +163,34 @@ impl<'a, T> IntoIterator for &'a PersistableVec<T> {
     }
 }
 
-impl<T: Clone> Clone for PersistableVec<T> {
+impl<T: Clone> Clone for DurableVec<T> {
     fn clone(&self) -> Self {
-        PersistableVec {
+        DurableVec {
             items: self.items.clone(),
             sizes: self.sizes.clone(),
         }
     }
 }
 
-impl<T: std::fmt::Debug> std::fmt::Debug for PersistableVec<T> {
+impl<T: std::fmt::Debug> std::fmt::Debug for DurableVec<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.items.fmt(f)
     }
 }
 
-impl<T: PartialEq> PartialEq for PersistableVec<T> {
+impl<T: PartialEq> PartialEq for DurableVec<T> {
     fn eq(&self, other: &Self) -> bool {
         self.items == other.items
     }
 }
 
-impl<T: Eq> Eq for PersistableVec<T> {}
+impl<T: Eq> Eq for DurableVec<T> {}
 
 /// At most this many elements are reserved before they are decoded, so that
 /// a corrupt count cannot make a decode allocate without bound.
 const RESERVE_AT_MOST: usize = 1 << 16;
 
-impl<T: Persistable> Persistable for PersistableVec<T> {
+impl<T: Durable> Durable for DurableVec<T> {
     const FIXED_SIZE: Option<usize> = None;
 
     fn encoded_len(&self) -> usize {
@@ -214,12 +214,12 @@ impl<T: Persistable> Persistable for PersistableVec<T> {
     }
 
     type Guard<'r, B: Backend + 'r>
-        = PersistableVecGuard<'r, T, B>
+        = DurableVecGuard<'r, T, B>
     where
         Self: 'r;
 
     fn guard<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Guard<'r, B> {
-        PersistableVecGuard {
+        DurableVecGuard {
             inner: self,
             region,
         }
@@ -245,7 +245,7 @@ pub(crate) fn write_count<B: Backend>(
     Ok(())
 }
 
-/// The [`Guard`] of a [`PersistableVec`]: insert, remove, reorder and cut
+/// The [`Guard`] of a [`DurableVec`]: insert, remove, reorder and cut
 /// elements, and reach each element's own guard.
 ///
 /// An insertion or a removal is one transaction of two records, the element
@@ -254,9 +254,9 @@ pub(crate) fn write_count<B: Backend>(
 ///
 /// ```
 /// use kladde::Kladde;
-/// use kladde_types::PersistableVec;
+/// use kladde_types::DurableVec;
 ///
-/// let mut v = Kladde::new(PersistableVec::<u32>::from(vec![1, 2, 3]));
+/// let mut v = Kladde::new(DurableVec::<u32>::from(vec![1, 2, 3]));
 /// let mut guard = v.guard();
 /// guard.push(4)?;
 /// guard.move_element(3, 0)?;
@@ -265,12 +265,12 @@ pub(crate) fn write_count<B: Backend>(
 /// assert_eq!(v.get().as_slice(), [400, 2, 3]);
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub struct PersistableVecGuard<'r, T, B> {
-    inner: &'r mut PersistableVec<T>,
+pub struct DurableVecGuard<'r, T, B> {
+    inner: &'r mut DurableVec<T>,
     region: Region<'r, B>,
 }
 
-impl<'r, T: Persistable, B: Backend> PersistableVecGuard<'r, T, B> {
+impl<'r, T: Durable, B: Backend> DurableVecGuard<'r, T, B> {
     fn check_index(&self, index: usize, len: usize) -> Result<(), Error> {
         if index < len {
             Ok(())
@@ -281,13 +281,13 @@ impl<'r, T: Persistable, B: Backend> PersistableVecGuard<'r, T, B> {
 
     /// The guard of element `index`, or `None` past the end. Finds where the
     /// element starts in `O(log m)`, or by a multiplication for a fixed-size
-    /// `T`. See [`PersistableVecGuard`] for an example.
+    /// `T`. See [`DurableVecGuard`] for an example.
     pub fn get_mut(&mut self, index: usize) -> Option<T::Guard<'_, B>> {
         if index >= self.inner.items.len() {
             return None;
         }
         let offset = self.inner.offset_of(index);
-        let PersistableVec { items, sizes } = &mut *self.inner;
+        let DurableVec { items, sizes } = &mut *self.inner;
         let item = &mut items[index];
         let len = item.encoded_len() as u64;
         let node: Option<&dyn Node> = match T::FIXED_SIZE {
@@ -297,7 +297,7 @@ impl<'r, T: Persistable, B: Backend> PersistableVecGuard<'r, T, B> {
         Some(item.guard(self.region.child(offset, len, node, index)))
     }
 
-    /// Appends `value`. See [`PersistableVecGuard`] for an example.
+    /// Appends `value`. See [`DurableVecGuard`] for an example.
     pub fn push(&mut self, value: T) -> Result<(), Error> {
         let n = self.inner.items.len();
         self.insert(n, value)
@@ -308,9 +308,9 @@ impl<'r, T: Persistable, B: Backend> PersistableVecGuard<'r, T, B> {
     ///
     /// ```
     /// use kladde::Kladde;
-    /// use kladde_types::PersistableVec;
+    /// use kladde_types::DurableVec;
     ///
-    /// let mut v = Kladde::new(PersistableVec::<i32>::from(vec![1, 3]));
+    /// let mut v = Kladde::new(DurableVec::<i32>::from(vec![1, 3]));
     /// v.guard().insert(1, 2)?;
     /// assert_eq!(v.get().as_slice(), [1, 2, 3]);
     /// # Ok::<(), kladde::Error>(())
@@ -340,9 +340,9 @@ impl<'r, T: Persistable, B: Backend> PersistableVecGuard<'r, T, B> {
     ///
     /// ```
     /// use kladde::Kladde;
-    /// use kladde_types::PersistableVec;
+    /// use kladde_types::DurableVec;
     ///
-    /// let mut v = Kladde::new(PersistableVec::<u8>::from(vec![1, 2]));
+    /// let mut v = Kladde::new(DurableVec::<u8>::from(vec![1, 2]));
     /// assert_eq!(v.guard().pop()?, Some(2));
     /// # Ok::<(), kladde::Error>(())
     /// ```
@@ -354,7 +354,7 @@ impl<'r, T: Persistable, B: Backend> PersistableVecGuard<'r, T, B> {
     }
 
     /// Removes element `index` and returns it, shifting the elements after
-    /// it. See [`PersistableVecGuard`] for an example.
+    /// it. See [`DurableVecGuard`] for an example.
     pub fn remove(&mut self, index: usize) -> Result<T, Error> {
         let n = self.inner.items.len();
         self.check_index(index, n)?;
@@ -386,9 +386,9 @@ impl<'r, T: Persistable, B: Backend> PersistableVecGuard<'r, T, B> {
     ///
     /// ```
     /// use kladde::Kladde;
-    /// use kladde_types::PersistableVec;
+    /// use kladde_types::DurableVec;
     ///
-    /// let mut v = Kladde::new(PersistableVec::<u8>::from(vec![1, 2]));
+    /// let mut v = Kladde::new(DurableVec::<u8>::from(vec![1, 2]));
     /// v.guard().delete(0)?;
     /// assert_eq!(v.get().as_slice(), [2]);
     /// # Ok::<(), kladde::Error>(())
@@ -399,7 +399,7 @@ impl<'r, T: Persistable, B: Backend> PersistableVecGuard<'r, T, B> {
 
     /// Moves element `from` to position `to`, shifting the elements between:
     /// one `Move` in the file, which writes none of the element's bytes,
-    /// however large it is. See [`PersistableVecGuard`] for an example.
+    /// however large it is. See [`DurableVecGuard`] for an example.
     pub fn move_element(&mut self, from: usize, to: usize) -> Result<(), Error> {
         let n = self.inner.items.len();
         self.check_index(from, n)?;
@@ -427,19 +427,19 @@ impl<'r, T: Persistable, B: Backend> PersistableVecGuard<'r, T, B> {
     ///
     /// ```
     /// use kladde::Kladde;
-    /// use kladde_types::PersistableVec;
+    /// use kladde_types::DurableVec;
     ///
-    /// let mut v = Kladde::new(PersistableVec::<u8>::from(vec![1, 2]));
+    /// let mut v = Kladde::new(DurableVec::<u8>::from(vec![1, 2]));
     /// v.guard().clear()?;
     /// assert!(v.get().is_empty());
     /// # Ok::<(), kladde::Error>(())
     /// ```
     pub fn clear(&mut self) -> Result<(), Error> {
-        self.set(PersistableVec::new())
+        self.set(DurableVec::new())
     }
 
     /// Replaces the whole vector.
-    pub fn set(&mut self, value: PersistableVec<T>) -> Result<(), Error> {
+    pub fn set(&mut self, value: DurableVec<T>) -> Result<(), Error> {
         kladde_persist::replace(self.inner, value, &self.region)
     }
 
@@ -448,18 +448,18 @@ impl<'r, T: Persistable, B: Backend> PersistableVecGuard<'r, T, B> {
     /// transaction open until it is pasted, committed or dropped.
     ///
     /// ```
-    /// use kladde::{Kladde, Persistable};
-    /// use kladde_types::{PersistableString, PersistableVec};
+    /// use kladde::{Kladde, Durable};
+    /// use kladde_types::{DurableString, DurableVec};
     ///
-    /// #[derive(Persistable)]
+    /// #[derive(Durable)]
     /// struct Groups {
-    ///     a: PersistableVec<PersistableString>,
-    ///     b: PersistableVec<PersistableString>,
+    ///     a: DurableVec<DurableString>,
+    ///     b: DurableVec<DurableString>,
     /// }
     ///
     /// let mut groups = Kladde::new(Groups {
     ///     a: vec!["circle".into(), "square".into()].into(),
-    ///     b: PersistableVec::new(),
+    ///     b: DurableVec::new(),
     /// });
     /// let mut guard = groups.guard();
     /// let cut = guard.a_mut().cut(1)?;
@@ -518,18 +518,18 @@ impl<'r, T: Persistable, B: Backend> PersistableVecGuard<'r, T, B> {
     }
 }
 
-impl<T, B> Guard for PersistableVecGuard<'_, T, B> {
-    type Persistable = PersistableVec<T>;
+impl<T, B> Guard for DurableVecGuard<'_, T, B> {
+    type Durable = DurableVec<T>;
 
-    fn as_persistable(&self) -> &PersistableVec<T> {
+    fn as_durable(&self) -> &DurableVec<T> {
         self.inner
     }
 }
 
-impl<T, B> Deref for PersistableVecGuard<'_, T, B> {
-    type Target = PersistableVec<T>;
+impl<T, B> Deref for DurableVecGuard<'_, T, B> {
+    type Target = DurableVec<T>;
 
-    fn deref(&self) -> &PersistableVec<T> {
+    fn deref(&self) -> &DurableVec<T> {
         self.inner
     }
 }

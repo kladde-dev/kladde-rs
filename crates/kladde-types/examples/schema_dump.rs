@@ -1,31 +1,31 @@
 //! Dumps a type's descriptor table and 128-bit schema fingerprint.
 //!
 //! Run with `cargo run -p kladde-types --example schema_dump`. Handy for
-//! eyeballing what `#[derive(Persistable)]` produces and for reading off
+//! eyeballing what `#[derive(Durable)]` produces and for reading off
 //! golden-vector fingerprints.
 
-use kladde::{Persistable, TypeDescriptor};
-use kladde_types::{PersistableString, PersistableVec};
+use kladde::{Durable, TypeDescriptor};
+use kladde_types::{DurableString, DurableVec};
 
-#[derive(kladde::Persistable)]
+#[derive(kladde::Durable)]
 enum PhoneKind {
     Mobile,
     Work,
     Home,
 }
 
-#[derive(kladde::Persistable)]
+#[derive(kladde::Durable)]
 struct Contact {
-    name: PersistableString,
+    name: DurableString,
     kind: PhoneKind,
-    numbers: PersistableVec<PersistableString>,
+    numbers: DurableVec<DurableString>,
 }
 
 fn main() {
     dump::<Contact>("Contact");
 }
 
-fn dump<T: Persistable + 'static>(label: &str) {
+fn dump<T: Durable + 'static>(label: &str) {
     let table = T::schema();
     println!("{label}: fingerprint = {}", T::fingerprint());
     println!("  descriptors ({}):", table.descriptors().len());

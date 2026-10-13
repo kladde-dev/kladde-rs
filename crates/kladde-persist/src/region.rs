@@ -19,7 +19,7 @@ use std::cell::Cell;
 
 use kladde_store::{CutId, Error, WriteBackend};
 
-use crate::persistable::Persistable;
+use crate::durable::Durable;
 
 /// What a guard records through: a [`WriteBackend`] that is cheap to copy,
 /// such as `&Store`, so that guards can hand it to their children and to
@@ -299,7 +299,7 @@ impl<'r, B: Backend> Region<'r, B> {
     /// assert_eq!(root.splice_value(0, 0, &300u32)?, 2);
     /// # Ok::<(), kladde_store::Error>(())
     /// ```
-    pub fn splice_value<T: Persistable>(
+    pub fn splice_value<T: Durable>(
         &self,
         at: u64,
         removed: u64,

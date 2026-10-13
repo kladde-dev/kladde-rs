@@ -1,7 +1,7 @@
 //! Kladde's serialization layer: how typed values encode into the one byte
 //! sequence of [`kladde_store`], and how their guards mutate it.
 //!
-//! - [`Persistable`]: a type that encodes itself into one buffer
+//! - [`Durable`]: a type that encodes itself into one buffer
 //!   ([`Encoder`]), decodes itself from the sequence ([`Decoder`]), and
 //!   hands out a [`Guard`] over its [`Region`]. It never allocates, frees,
 //!   or knows where it lies.
@@ -15,15 +15,15 @@
 //!   guard is a [`SetGuard`].
 //! - [`Cut`]: a value cut out of one container, to be pasted into another
 //!   without encoding it again.
-//! - [`SchemaBuilder`] and the schema hooks on `Persistable`, bridging to the
+//! - [`SchemaBuilder`] and the schema hooks on `Durable`, bridging to the
 //!   language-neutral `kladde-schema` model.
 //!
 //! Applications use this crate through the `kladde` facade, which re-exports
-//! everything here; a library of persistable types may depend on it
+//! everything here; a library of durable types may depend on it
 //! directly.
 //!
 //! ```
-//! use kladde_persist::{Persistable, Region};
+//! use kladde_persist::{Durable, Region};
 //! use kladde_store::{MemoryStorage, Store, WriteBackend};
 //!
 //! let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
@@ -42,7 +42,7 @@
 
 mod codec;
 mod cut;
-mod persistable;
+mod durable;
 mod region;
 mod scalar;
 mod schema;
@@ -52,19 +52,19 @@ mod wrappers;
 
 pub use codec::{varint_len, Decoder, Encoder, TERMINATOR};
 pub use cut::Cut;
-pub use persistable::{replace, Bounded, Guard, Persistable, SetGuard};
+pub use durable::{replace, Bounded, Durable, Guard, SetGuard};
 pub use region::{Backend, FieldSizes, Node, Region};
 pub use schema::SchemaBuilder;
 pub use sizes::{discriminant_width, enum_fixed_form_size, enum_fixed_size, sum_sizes};
 pub use tuple::TupleGuard;
 pub use wrappers::{Fixed, OptionGuard};
 
-// Re-exported so `#[derive(Persistable)]` output and hand-written `describe`
+// Re-exported so `#[derive(Durable)]` output and hand-written `describe`
 // impls can name every schema type through this crate alone.
 pub use kladde_schema::{
     Field, Fingerprint, Primitive, TypeDescriptor, TypeRef, TypeTable, Variant, Version,
 };
 
-// The store items every `Persistable` implementation names, so that it needs
+// The store items every `Durable` implementation names, so that it needs
 // no second dependency.
 pub use kladde_store::{CutId, Error, Result, WriteBackend};

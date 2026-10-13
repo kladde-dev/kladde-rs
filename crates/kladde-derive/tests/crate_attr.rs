@@ -2,18 +2,18 @@
 //! `::kladde`: here at `kladde_persist`, as a library built on it without the
 //! facade would.
 
-use kladde_derive::Persistable;
-use kladde_persist::{Persistable as _, Region};
+use kladde_derive::Durable;
+use kladde_persist::{Durable as _, Region};
 use kladde_store::{MemoryStorage, Store, WriteBackend};
 
-#[derive(Persistable, Debug, PartialEq)]
+#[derive(Durable, Debug, PartialEq)]
 #[kladde(crate = "kladde_persist")]
 struct Sample {
     count: u32,
     flag: bool,
 }
 
-#[derive(Persistable, Debug, PartialEq)]
+#[derive(Durable, Debug, PartialEq)]
 #[kladde(crate = "kladde_persist")]
 enum Choice {
     One(u8),

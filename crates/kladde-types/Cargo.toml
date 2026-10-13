@@ -15,7 +15,7 @@ kladde = { workspace = true }
 kladde-store = { workspace = true }
 
 [features]
-# Gates `PersistableBlob<T>`, the wrapper for foreign types that can get
-# neither a derive nor a hand-written `Persistable`. Nothing else in this crate
+# Gates `DurableBlob<T>`, the wrapper for foreign types that can get
+# neither a derive nor a hand-written `Durable`. Nothing else in this crate
 # needs `serde`/`postcard`.
 serde = ["dep:serde", "dep:postcard"]

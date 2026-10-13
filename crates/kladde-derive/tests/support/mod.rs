@@ -1,4 +1,4 @@
-//! Shared fixtures for exercising `#[derive(Persistable)]`-generated code: a
+//! Shared fixtures for exercising `#[derive(Durable)]`-generated code: a
 //! value in a file in memory, and the checks that its sequence holds the
 //! value's encoding, before and after reopening.
 //!
@@ -6,15 +6,15 @@
 //! (each `tests/*.rs` file compiles as its own crate).
 #![allow(dead_code)]
 
-use kladde::{Kladde, MemoryStorage, Options, Persistable, TypeRef};
+use kladde::{Durable, Kladde, MemoryStorage, Options, TypeRef};
 
 /// A value in a file in memory.
-pub struct Fixture<T: Persistable + 'static> {
+pub struct Fixture<T: Durable + 'static> {
     pub kladde: Kladde<T>,
     storage: MemoryStorage,
 }
 
-impl<T: Persistable + 'static> Fixture<T> {
+impl<T: Durable + 'static> Fixture<T> {
     pub fn new(value: T) -> Fixture<T> {
         let storage = MemoryStorage::new();
         let kladde =

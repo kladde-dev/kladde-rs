@@ -1,11 +1,11 @@
-//! [`Persistable`] for the wrappers: [`Option`], an enum; [`Box`], persisted
+//! [`Durable`] for the wrappers: [`Option`], an enum; [`Box`], persisted
 //! as what it holds; and [`Fixed`], a type's values at a fixed size.
 
 use kladde_schema::{Field, TypeDescriptor, TypeRef, Variant};
 use kladde_store::Error;
 
 use crate::codec::{Decoder, Encoder};
-use crate::persistable::{replace, Bounded, Guard, Persistable, SetGuard};
+use crate::durable::{replace, Bounded, Durable, Guard, SetGuard};
 use crate::region::{Backend, Region};
 use crate::schema::SchemaBuilder;
 
@@ -45,7 +45,7 @@ impl<T: Bounded> Bounded for Option<T> {
 
 /// `None` as the discriminant 0, `Some(v)` as 1 followed by `v`: an enum,
 /// described as one.
-impl<T: Persistable> Persistable for Option<T> {
+impl<T: Durable> Durable for Option<T> {
     const FIXED_SIZE: Option<usize> = match T::FIXED_SIZE {
         Some(0) => Some(1),
         _ => None,
@@ -115,7 +115,7 @@ impl<T: Persistable> Persistable for Option<T> {
 /// holds.
 ///
 /// ```
-/// use kladde_persist::{Persistable, Region};
+/// use kladde_persist::{Durable, Region};
 /// use kladde_store::{MemoryStorage, Store, WriteBackend};
 ///
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
@@ -135,7 +135,7 @@ pub struct OptionGuard<'r, T, B> {
     region: Region<'r, B>,
 }
 
-impl<T: Persistable, B: Backend> OptionGuard<'_, T, B> {
+impl<T: Durable, B: Backend> OptionGuard<'_, T, B> {
     /// Replaces the whole value. See [`OptionGuard`] for an example.
     pub fn set(&mut self, value: Option<T>) -> Result<(), Error> {
         replace(self.inner, value, &self.region)
@@ -160,9 +160,9 @@ impl<T: Persistable, B: Backend> OptionGuard<'_, T, B> {
 }
 
 impl<T, B> Guard for OptionGuard<'_, T, B> {
-    type Persistable = Option<T>;
+    type Durable = Option<T>;
 
-    fn as_persistable(&self) -> &Option<T> {
+    fn as_durable(&self) -> &Option<T> {
         self.inner
     }
 }
@@ -185,11 +185,11 @@ impl<T, B> std::ops::Deref for OptionGuard<'_, T, B> {
 /// compiler would refuse. For the same reason it has no fixed form.
 ///
 /// ```
-/// use kladde_persist::Persistable;
+/// use kladde_persist::Durable;
 ///
 /// #[derive(Debug, PartialEq)]
 /// enum List { Nil, Cons(u8, Box<List>) }
-/// # impl Persistable for List {
+/// # impl Durable for List {
 /// #     const FIXED_SIZE: Option<usize> = None;
 /// #     fn encoded_len(&self) -> usize { match self { List::Nil => 1, List::Cons(_, t) => 2 + t.encoded_len() } }
 /// #     fn encode(&self, out: &mut kladde_persist::Encoder<'_>) {
@@ -207,7 +207,7 @@ impl<T, B> std::ops::Deref for OptionGuard<'_, T, B> {
 /// assert_eq!(list.to_bytes(), [1, 1, 1, 2, 0]);
 /// assert_eq!(Box::new(7u32).to_bytes(), 7u32.to_bytes());
 /// ```
-impl<T: Persistable> Persistable for Box<T> {
+impl<T: Durable> Durable for Box<T> {
     const FIXED_SIZE: Option<usize> = None;
 
     fn encoded_len(&self) -> usize {
@@ -255,10 +255,10 @@ impl<T: Persistable> Persistable for Box<T> {
 /// field in its fixed form.
 ///
 /// ```
-/// use kladde_persist::{Fixed, Persistable, Region};
+/// use kladde_persist::{Fixed, Durable, Region};
 /// use kladde_store::{MemoryStorage, Store, WriteBackend};
 ///
-/// assert_eq!(<Fixed<Option<u32>> as Persistable>::FIXED_SIZE, Some(5));
+/// assert_eq!(<Fixed<Option<u32>> as Durable>::FIXED_SIZE, Some(5));
 /// assert_eq!(Fixed(1u32).to_bytes(), [1, 0, 0, 0]);
 ///
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
@@ -283,7 +283,7 @@ impl<T: Bounded> Bounded for Fixed<T> {
     }
 }
 
-impl<T: Bounded> Persistable for Fixed<T> {
+impl<T: Bounded> Durable for Fixed<T> {
     const FIXED_SIZE: Option<usize> = Some(T::FIXED_FORM_SIZE);
 
     fn encoded_len(&self) -> usize {

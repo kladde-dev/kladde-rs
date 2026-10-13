@@ -1,9 +1,9 @@
 mod support;
 
-use kladde::{Bounded, Fixed, Persistable};
+use kladde::{Bounded, Durable, Fixed};
 use support::Fixture;
 
-#[derive(Persistable, Debug, PartialEq, Clone)]
+#[derive(Durable, Debug, PartialEq, Clone)]
 struct Point {
     x: f32,
     y: f32,
@@ -20,7 +20,7 @@ fn a_guard_has_a_mut_accessor_per_field() {
         assert_eq!(guard.x, 10.0);
     }
     assert_eq!(*f.kladde.get(), Point { x: 10.0, y: 20.0 });
-    assert_eq!(<Point as Persistable>::FIXED_SIZE, Some(8));
+    assert_eq!(<Point as Durable>::FIXED_SIZE, Some(8));
     f.check();
 }
 
@@ -32,18 +32,18 @@ fn set_replaces_the_whole_value() {
     f.check();
 }
 
-#[derive(Persistable)]
+#[derive(Durable)]
 struct Empty;
 
 #[test]
 fn a_unit_struct_takes_no_bytes() {
     let mut f = Fixture::new(Empty);
     let _guard = f.kladde.guard();
-    assert_eq!(<Empty as Persistable>::FIXED_SIZE, Some(0));
+    assert_eq!(<Empty as Durable>::FIXED_SIZE, Some(0));
     assert!(Empty.to_bytes().is_empty());
 }
 
-#[derive(Persistable)]
+#[derive(Durable)]
 struct Nested {
     label: u16,
     point: Point,
@@ -64,7 +64,7 @@ fn nested_fields_find_their_starts() {
 }
 
 /// Integers whose encodings are varints.
-#[derive(Persistable, Debug, PartialEq, Clone, Copy)]
+#[derive(Durable, Debug, PartialEq, Clone, Copy)]
 #[kladde(bounded)]
 struct Counts {
     small: u32,
@@ -79,7 +79,7 @@ fn a_struct_is_its_fields_back_to_back() {
         signed: -3,
         flag: true,
     };
-    assert_eq!(<Counts as Persistable>::FIXED_SIZE, None);
+    assert_eq!(<Counts as Durable>::FIXED_SIZE, None);
     assert_eq!(<Counts as Bounded>::FIXED_FORM_SIZE, 4 + 8 + 1);
     assert_eq!(counts.encoded_len(), 3);
     assert_eq!(counts.to_bytes(), [5, 5, 1]);
@@ -118,7 +118,7 @@ fn fields_made_together_find_themselves_after_a_sibling_grows() {
     f.check();
 }
 
-#[derive(Persistable, Debug, PartialEq)]
+#[derive(Durable, Debug, PartialEq)]
 struct Pair(u32, Fixed<u32>);
 
 #[test]
@@ -143,37 +143,37 @@ fn a_tuple_struct_names_its_accessors_by_position() {
 // the four remote cousins. Every level holds a varint before the next, so
 // that a write that changes size anywhere moves what follows it.
 
-#[derive(Persistable)]
+#[derive(Durable)]
 struct Root {
     a: Level1,
     b: Level1,
 }
 
-#[derive(Persistable)]
+#[derive(Durable)]
 struct Level1 {
     pad: u32,
     down: Level2,
 }
 
-#[derive(Persistable)]
+#[derive(Durable)]
 struct Level2 {
     pad: u32,
     down: Level3,
 }
 
-#[derive(Persistable)]
+#[derive(Durable)]
 struct Level3 {
     x: Level4,
     y: Level4,
 }
 
-#[derive(Persistable)]
+#[derive(Durable)]
 struct Level4 {
     pad: u32,
     down: Level5,
 }
 
-#[derive(Persistable)]
+#[derive(Durable)]
 struct Level5 {
     pad: u32,
     value: u32,

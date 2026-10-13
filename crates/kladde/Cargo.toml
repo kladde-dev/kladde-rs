@@ -15,7 +15,7 @@ kladde-derive = { workspace = true, optional = true }
 # depended on by half the ecosystem, much of which only wants the traits, so
 # making everyone build a proc macro would be a poor trade there. This crate is
 # the application-facing facade (a library builds on `kladde-persist` instead),
-# and `#[derive(Persistable)]` is what application code reaches for first.
+# and `#[derive(Durable)]` is what application code reaches for first.
 # Generated code names `::kladde`, so the macro and the items it expands to
 # arrive together or not at all.
 default = ["derive"]

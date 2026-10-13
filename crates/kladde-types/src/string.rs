@@ -1,10 +1,10 @@
-//! [`PersistableString`]: text, encoded as UTF-8 and the byte `0xFF`.
+//! [`DurableString`]: text, encoded as UTF-8 and the byte `0xFF`.
 
 use std::hash::{Hash, Hasher};
 use std::ops::{Deref, Range};
 
 use kladde_persist::{
-    Backend, Decoder, Encoder, Error, Guard, Persistable, Region, SchemaBuilder, TypeDescriptor,
+    Backend, Decoder, Durable, Encoder, Error, Guard, Region, SchemaBuilder, TypeDescriptor,
 };
 
 /// Text: UTF-8, then the byte `0xFF`, which UTF-8 never contains. In memory,
@@ -14,13 +14,13 @@ use kladde_persist::{
 /// sequence, wherever it lands and however long the text is.
 ///
 /// Read it as a `str`, through `Deref`; change it through a
-/// [`PersistableStringGuard`].
+/// [`DurableStringGuard`].
 ///
 /// ```
-/// use kladde::{Kladde, Persistable};
-/// use kladde_types::PersistableString;
+/// use kladde::{Kladde, Durable};
+/// use kladde_types::DurableString;
 ///
-/// let s = PersistableString::from("Map");
+/// let s = DurableString::from("Map");
 /// assert_eq!(s.to_bytes(), [b'M', b'a', b'p', 0xff]);
 /// let mut title = Kladde::new(s);
 /// title.guard().insert_str(0, "World ")?;
@@ -28,13 +28,13 @@ use kladde_persist::{
 /// # Ok::<(), kladde::Error>(())
 /// ```
 #[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PersistableString(String);
+pub struct DurableString(String);
 
-impl PersistableString {
+impl DurableString {
     /// An empty string.
     ///
     /// ```
-    /// assert!(kladde_types::PersistableString::new().is_empty());
+    /// assert!(kladde_types::DurableString::new().is_empty());
     /// ```
     pub fn new() -> Self {
         Self::default()
@@ -46,19 +46,19 @@ impl PersistableString {
     }
 }
 
-impl std::fmt::Debug for PersistableString {
+impl std::fmt::Debug for DurableString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
 }
 
-impl std::fmt::Display for PersistableString {
+impl std::fmt::Display for DurableString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
 }
 
-impl Deref for PersistableString {
+impl Deref for DurableString {
     type Target = str;
 
     fn deref(&self) -> &str {
@@ -66,55 +66,55 @@ impl Deref for PersistableString {
     }
 }
 
-impl From<&str> for PersistableString {
+impl From<&str> for DurableString {
     fn from(s: &str) -> Self {
-        PersistableString(s.to_owned())
+        DurableString(s.to_owned())
     }
 }
 
-impl From<String> for PersistableString {
+impl From<String> for DurableString {
     fn from(s: String) -> Self {
-        PersistableString(s)
+        DurableString(s)
     }
 }
 
-impl From<PersistableString> for String {
-    fn from(s: PersistableString) -> Self {
+impl From<DurableString> for String {
+    fn from(s: DurableString) -> Self {
         s.0
     }
 }
 
-impl Hash for PersistableString {
+impl Hash for DurableString {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.hash(state)
     }
 }
 
-impl PartialEq<str> for PersistableString {
+impl PartialEq<str> for DurableString {
     fn eq(&self, other: &str) -> bool {
         self.0 == other
     }
 }
 
-impl PartialEq<&str> for PersistableString {
+impl PartialEq<&str> for DurableString {
     fn eq(&self, other: &&str) -> bool {
         self.0 == *other
     }
 }
 
-impl PartialEq<PersistableString> for str {
-    fn eq(&self, other: &PersistableString) -> bool {
+impl PartialEq<DurableString> for str {
+    fn eq(&self, other: &DurableString) -> bool {
         self == other.0
     }
 }
 
-impl PartialEq<PersistableString> for &str {
-    fn eq(&self, other: &PersistableString) -> bool {
+impl PartialEq<DurableString> for &str {
+    fn eq(&self, other: &DurableString) -> bool {
         *self == other.0
     }
 }
 
-impl Persistable for PersistableString {
+impl Durable for DurableString {
     const FIXED_SIZE: Option<usize> = None;
 
     fn encoded_len(&self) -> usize {
@@ -126,13 +126,13 @@ impl Persistable for PersistableString {
     }
 
     fn decode(input: &mut Decoder<'_>) -> Result<Self, Error> {
-        input.text().map(PersistableString)
+        input.text().map(DurableString)
     }
 
-    type Guard<'r, B: Backend + 'r> = PersistableStringGuard<'r, B>;
+    type Guard<'r, B: Backend + 'r> = DurableStringGuard<'r, B>;
 
     fn guard<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Guard<'r, B> {
-        PersistableStringGuard {
+        DurableStringGuard {
             inner: self,
             region,
         }
@@ -143,7 +143,7 @@ impl Persistable for PersistableString {
     }
 }
 
-/// The [`Guard`] of a [`PersistableString`]: every edit is one splice of
+/// The [`Guard`] of a [`DurableString`]: every edit is one splice of
 /// the text's bytes, and the terminator stays where the text ends.
 ///
 /// Byte positions must lie on `char` boundaries; one that does not fails
@@ -151,9 +151,9 @@ impl Persistable for PersistableString {
 ///
 /// ```
 /// use kladde::Kladde;
-/// use kladde_types::PersistableString;
+/// use kladde_types::DurableString;
 ///
-/// let mut s = Kladde::new(PersistableString::from("kladde"));
+/// let mut s = Kladde::new(DurableString::from("kladde"));
 /// let mut guard = s.guard();
 /// guard.push_str(" file")?;
 /// guard.replace_range(0..6, "Kladde")?;
@@ -161,14 +161,14 @@ impl Persistable for PersistableString {
 /// assert_eq!(s.get(), "Kladde");
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub struct PersistableStringGuard<'r, B> {
-    inner: &'r mut PersistableString,
+pub struct DurableStringGuard<'r, B> {
+    inner: &'r mut DurableString,
     region: Region<'r, B>,
 }
 
-impl<B: Backend> PersistableStringGuard<'_, B> {
+impl<B: Backend> DurableStringGuard<'_, B> {
     /// Replaces the bytes in `range` with `text`. See
-    /// [`PersistableStringGuard`] for an example.
+    /// [`DurableStringGuard`] for an example.
     pub fn replace_range(&mut self, range: Range<usize>, text: &str) -> Result<(), Error> {
         let s = &self.inner.0;
         if range.start > range.end
@@ -187,7 +187,7 @@ impl<B: Backend> PersistableStringGuard<'_, B> {
         Ok(())
     }
 
-    /// Appends `text`. See [`PersistableStringGuard`] for an example.
+    /// Appends `text`. See [`DurableStringGuard`] for an example.
     pub fn push_str(&mut self, text: &str) -> Result<(), Error> {
         let end = self.inner.0.len();
         self.replace_range(end..end, text)
@@ -197,9 +197,9 @@ impl<B: Backend> PersistableStringGuard<'_, B> {
     ///
     /// ```
     /// use kladde::Kladde;
-    /// use kladde_types::PersistableString;
+    /// use kladde_types::DurableString;
     ///
-    /// let mut s = Kladde::new(PersistableString::from("ac"));
+    /// let mut s = Kladde::new(DurableString::from("ac"));
     /// s.guard().insert_str(1, "b")?;
     /// assert_eq!(s.get(), "abc");
     /// # Ok::<(), kladde::Error>(())
@@ -209,7 +209,7 @@ impl<B: Backend> PersistableStringGuard<'_, B> {
     }
 
     /// Removes everything from byte `len` on. See
-    /// [`PersistableStringGuard`] for an example.
+    /// [`DurableStringGuard`] for an example.
     pub fn truncate(&mut self, len: usize) -> Result<(), Error> {
         let end = self.inner.0.len();
         if len >= end {
@@ -222,9 +222,9 @@ impl<B: Backend> PersistableStringGuard<'_, B> {
     ///
     /// ```
     /// use kladde::Kladde;
-    /// use kladde_types::PersistableString;
+    /// use kladde_types::DurableString;
     ///
-    /// let mut s = Kladde::new(PersistableString::from("draft"));
+    /// let mut s = Kladde::new(DurableString::from("draft"));
     /// s.guard().set("final")?;
     /// assert_eq!(s.get(), "final");
     /// # Ok::<(), kladde::Error>(())
@@ -238,18 +238,18 @@ impl<B: Backend> PersistableStringGuard<'_, B> {
     }
 }
 
-impl<B> Guard for PersistableStringGuard<'_, B> {
-    type Persistable = PersistableString;
+impl<B> Guard for DurableStringGuard<'_, B> {
+    type Durable = DurableString;
 
-    fn as_persistable(&self) -> &PersistableString {
+    fn as_durable(&self) -> &DurableString {
         self.inner
     }
 }
 
-impl<B> Deref for PersistableStringGuard<'_, B> {
-    type Target = PersistableString;
+impl<B> Deref for DurableStringGuard<'_, B> {
+    type Target = DurableString;
 
-    fn deref(&self) -> &PersistableString {
+    fn deref(&self) -> &DurableString {
         self.inner
     }
 }

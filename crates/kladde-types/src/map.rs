@@ -1,4 +1,4 @@
-//! [`PersistableMap<K, V>`]: a map, encoded as its count and its entries,
+//! [`DurableMap<K, V>`]: a map, encoded as its count and its entries,
 //! in the order its index keeps them.
 
 use std::collections::hash_map::RandomState;
@@ -6,14 +6,14 @@ use std::hash::{BuildHasher, Hash};
 use std::ops::Deref;
 
 use kladde_persist::{
-    varint_len, Backend, Decoder, Encoder, Error, Field, Guard, Node, Persistable, Region,
+    varint_len, Backend, Decoder, Durable, Encoder, Error, Field, Guard, Node, Region,
     SchemaBuilder, TypeDescriptor,
 };
 
 use crate::index::Sizes;
 use crate::vec::write_count;
 
-/// A map from persistable keys to persistable values: the number of entries
+/// A map from durable keys to durable values: the number of entries
 /// as a varint, then each entry's key and value, in the order the map keeps
 /// them.
 ///
@@ -27,9 +27,9 @@ use crate::vec::write_count;
 ///
 /// ```
 /// use kladde::Kladde;
-/// use kladde_types::{PersistableMap, PersistableString};
+/// use kladde_types::{DurableMap, DurableString};
 ///
-/// let mut loans = Kladde::new(PersistableMap::<PersistableString, u32>::new());
+/// let mut loans = Kladde::new(DurableMap::<DurableString, u32>::new());
 /// let mut guard = loans.guard();
 /// guard.insert("Emma".into(), 3)?;
 /// guard.insert("Persuasion".into(), 1)?;
@@ -38,7 +38,7 @@ use crate::vec::write_count;
 /// assert_eq!(loans.get().get(&"Emma".into()), Some(&4));
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub struct PersistableMap<K, V> {
+pub struct DurableMap<K, V> {
     entries: Vec<(K, V)>,
     table: Table,
     sizes: Sizes,
@@ -135,15 +135,15 @@ impl Table {
     }
 }
 
-fn entry_len<K: Persistable, V: Persistable>(entry: &(K, V)) -> usize {
+fn entry_len<K: Durable, V: Durable>(entry: &(K, V)) -> usize {
     entry.0.encoded_len() + entry.1.encoded_len()
 }
 
-impl<K: Persistable + Hash + Eq, V: Persistable> PersistableMap<K, V> {
+impl<K: Durable + Hash + Eq, V: Durable> DurableMap<K, V> {
     /// An empty map.
     ///
     /// ```
-    /// assert!(kladde_types::PersistableMap::<u8, u8>::new().is_empty());
+    /// assert!(kladde_types::DurableMap::<u8, u8>::new().is_empty());
     /// ```
     pub fn new() -> Self {
         Self::from_entries(Vec::new())
@@ -156,7 +156,7 @@ impl<K: Persistable + Hash + Eq, V: Persistable> PersistableMap<K, V> {
     /// The map of `entries`, of which a later one with the same key replaces
     /// an earlier one, in place.
     fn from_entries(entries: Vec<(K, V)>) -> Self {
-        let mut map = PersistableMap {
+        let mut map = DurableMap {
             entries: Vec::with_capacity(entries.len()),
             table: Table::default(),
             sizes: Sizes::default(),
@@ -234,21 +234,21 @@ impl<K: Persistable + Hash + Eq, V: Persistable> PersistableMap<K, V> {
     }
 }
 
-impl<K: Persistable + Hash + Eq, V: Persistable> Default for PersistableMap<K, V> {
+impl<K: Durable + Hash + Eq, V: Durable> Default for DurableMap<K, V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: Persistable + Hash + Eq, V: Persistable> FromIterator<(K, V)> for PersistableMap<K, V> {
+impl<K: Durable + Hash + Eq, V: Durable> FromIterator<(K, V)> for DurableMap<K, V> {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
         Self::from_entries(iter.into_iter().collect())
     }
 }
 
-impl<K: Clone, V: Clone> Clone for PersistableMap<K, V> {
+impl<K: Clone, V: Clone> Clone for DurableMap<K, V> {
     fn clone(&self) -> Self {
-        PersistableMap {
+        DurableMap {
             entries: self.entries.clone(),
             table: self.table.clone(),
             sizes: self.sizes.clone(),
@@ -256,7 +256,7 @@ impl<K: Clone, V: Clone> Clone for PersistableMap<K, V> {
     }
 }
 
-impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for PersistableMap<K, V> {
+impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for DurableMap<K, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map()
             .entries(self.entries.iter().map(|(k, v)| (k, v)))
@@ -264,7 +264,7 @@ impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for PersistableMap<
     }
 }
 
-impl<K: Persistable + Hash + Eq, V: Persistable> Persistable for PersistableMap<K, V> {
+impl<K: Durable + Hash + Eq, V: Durable> Durable for DurableMap<K, V> {
     const FIXED_SIZE: Option<usize> = None;
 
     fn encoded_len(&self) -> usize {
@@ -293,12 +293,12 @@ impl<K: Persistable + Hash + Eq, V: Persistable> Persistable for PersistableMap<
     }
 
     type Guard<'r, B: Backend + 'r>
-        = PersistableMapGuard<'r, K, V, B>
+        = DurableMapGuard<'r, K, V, B>
     where
         Self: 'r;
 
     fn guard<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Guard<'r, B> {
-        PersistableMapGuard {
+        DurableMapGuard {
             inner: self,
             region,
         }
@@ -328,14 +328,14 @@ impl<K: Persistable + Hash + Eq, V: Persistable> Persistable for PersistableMap<
     }
 }
 
-/// The [`Guard`] of a [`PersistableMap`]: insert, remove, and reach each
-/// value's own guard. See [`PersistableMap`] for an example.
-pub struct PersistableMapGuard<'r, K, V, B> {
-    inner: &'r mut PersistableMap<K, V>,
+/// The [`Guard`] of a [`DurableMap`]: insert, remove, and reach each
+/// value's own guard. See [`DurableMap`] for an example.
+pub struct DurableMapGuard<'r, K, V, B> {
+    inner: &'r mut DurableMap<K, V>,
     region: Region<'r, B>,
 }
 
-impl<K: Persistable + Hash + Eq, V: Persistable, B: Backend> PersistableMapGuard<'_, K, V, B> {
+impl<K: Durable + Hash + Eq, V: Durable, B: Backend> DurableMapGuard<'_, K, V, B> {
     /// The guard of `key`'s value, or `None` if the map does not hold it. A
     /// change of the value's size updates the entry's size in the map's
     /// Fenwick tree.
@@ -343,8 +343,8 @@ impl<K: Persistable + Hash + Eq, V: Persistable, B: Backend> PersistableMapGuard
         let (_, i) = self.inner.table.find(&self.inner.entries, key);
         let i = i?;
         let at = self.inner.offset_of(i) + self.inner.entries[i].0.encoded_len() as u64;
-        let fixed = PersistableMap::<K, V>::fixed();
-        let PersistableMap { entries, sizes, .. } = &mut *self.inner;
+        let fixed = DurableMap::<K, V>::fixed();
+        let DurableMap { entries, sizes, .. } = &mut *self.inner;
         let value = &mut entries[i].1;
         let len = value.encoded_len() as u64;
         let node: Option<&dyn Node> = if fixed { None } else { Some(&*sizes) };
@@ -362,7 +362,7 @@ impl<K: Persistable + Hash + Eq, V: Persistable, B: Backend> PersistableMapGuard
                 let bytes = value.to_bytes();
                 self.region.splice(at, old_len, &bytes)?;
                 let map = &mut *self.inner;
-                if !PersistableMap::<K, V>::fixed() {
+                if !DurableMap::<K, V>::fixed() {
                     map.sizes.add(i, bytes.len() as i64 - old_len as i64);
                 }
                 Ok(Some(std::mem::replace(&mut map.entries[i].1, value)))
@@ -382,7 +382,7 @@ impl<K: Persistable + Hash + Eq, V: Persistable, B: Backend> PersistableMapGuard
                 map.table.slots[slot] = n as u32;
                 map.entries.push((key, value));
                 map.grow_table();
-                if !PersistableMap::<K, V>::fixed() {
+                if !DurableMap::<K, V>::fixed() {
                     map.sizes.push(bytes.len());
                     map.sizes.set_base(varint_len(n as u64 + 1) as u64);
                 }
@@ -416,7 +416,7 @@ impl<K: Persistable + Hash + Eq, V: Persistable, B: Backend> PersistableMapGuard
             map.table.renumber(moved, last, i);
         }
         let (_, value) = map.entries.swap_remove(i);
-        if !PersistableMap::<K, V>::fixed() {
+        if !DurableMap::<K, V>::fixed() {
             if i != last {
                 map.sizes.add(i, last_len as i64 - len as i64);
                 map.sizes.pop(last_len as usize);
@@ -435,27 +435,27 @@ impl<K: Persistable + Hash + Eq, V: Persistable, B: Backend> PersistableMapGuard
 
     /// Removes every entry.
     pub fn clear(&mut self) -> Result<(), Error> {
-        self.set(PersistableMap::new())
+        self.set(DurableMap::new())
     }
 
     /// Replaces the whole map.
-    pub fn set(&mut self, value: PersistableMap<K, V>) -> Result<(), Error> {
+    pub fn set(&mut self, value: DurableMap<K, V>) -> Result<(), Error> {
         kladde_persist::replace(self.inner, value, &self.region)
     }
 }
 
-impl<K, V, B> Guard for PersistableMapGuard<'_, K, V, B> {
-    type Persistable = PersistableMap<K, V>;
+impl<K, V, B> Guard for DurableMapGuard<'_, K, V, B> {
+    type Durable = DurableMap<K, V>;
 
-    fn as_persistable(&self) -> &PersistableMap<K, V> {
+    fn as_durable(&self) -> &DurableMap<K, V> {
         self.inner
     }
 }
 
-impl<K, V, B> Deref for PersistableMapGuard<'_, K, V, B> {
-    type Target = PersistableMap<K, V>;
+impl<K, V, B> Deref for DurableMapGuard<'_, K, V, B> {
+    type Target = DurableMap<K, V>;
 
-    fn deref(&self) -> &PersistableMap<K, V> {
+    fn deref(&self) -> &DurableMap<K, V> {
         self.inner
     }
 }
@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn the_table_finds_every_key_through_removals() {
         let mut model = std::collections::HashMap::new();
-        let mut map: PersistableMap<u32, u32> = PersistableMap::new();
+        let mut map: DurableMap<u32, u32> = DurableMap::new();
         let mut seed = 1u64;
         for _ in 0..5000 {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);

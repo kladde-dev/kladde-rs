@@ -26,7 +26,7 @@ What the code does not do yet, or does less well than kladde-docs or its own goa
 - **None of the three refinements of `impl/consolidation.md` is implemented**: evacuation writes a victim's spans as they are, splitting the one that crosses the end of the page it fills, and merges no neighbours; the walk merges runs of cold spans and renumbers nothing; and the churn floor, budget controller and free filling are the address-table design's, unchanged, over pages of spans.
 - **The header's eviction ranks by heat alone**, rather than evicting the coldest runs contiguous in id, and merges each evicted span with its neighbours in the sequence, extending each run while a neighbour whose entry also goes to a leaf makes a pair shorter than the bound.
 - **A value is encoded into a buffer of its own, which the store copies into the record**, a copy that a store method taking an encoding closure would save.
-- **Cuts exist on the vector only**: `PersistableVec`'s `cut`, `insert_cut` and `push_cut`; the map, fields, `Option` and enums neither make nor take them.
+- **Cuts exist on the vector only**: `DurableVec`'s `cut`, `insert_cut` and `push_cut`; the map, fields, `Option` and enums neither make nor take them.
 - **`split_at_mut` and the count of changes are not implemented**, only `parts()`, for derived structs and enums and for tuples.
   `split_at_mut` was left out only because the evaluation needs it nowhere; the vector's Fenwick tree lies in cells and answers any element's offset, so it would serve as the two runs' index as it is.
 - **`parts()` on a temporary guard works in a `match` but not in a `let … else`**, which drops the temporary at the end of the statement.

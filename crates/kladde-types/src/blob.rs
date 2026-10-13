@@ -1,13 +1,13 @@
-//! [`PersistableBlob<T>`] -- persist any `serde`-serializable value as an
+//! [`DurableBlob<T>`] -- persist any `serde`-serializable value as an
 //! opaque blob.
 //!
 //! The escape hatch for a foreign type that can get neither a derive nor a
-//! hand-written `Persistable`: the value is serialized with `postcard`, and
+//! hand-written `Durable`: the value is serialized with `postcard`, and
 //! written again in full on every change. Available only with this crate's
 //! `serde` feature.
 
 use kladde_persist::{
-    varint_len, Backend, Decoder, Encoder, Error, Guard, Persistable, Region, SchemaBuilder,
+    varint_len, Backend, Decoder, Durable, Encoder, Error, Guard, Region, SchemaBuilder,
     TypeDescriptor,
 };
 use std::ops::Deref;
@@ -16,16 +16,16 @@ use std::ops::Deref;
 /// `postcard` serialization, prefixed with its length.
 ///
 /// Read the value through `Deref<Target = T>`; change it through a
-/// [`PersistableBlobGuard`], with [`set`](PersistableBlobGuard::set) or
-/// [`update`](PersistableBlobGuard::update).
+/// [`DurableBlobGuard`], with [`set`](DurableBlobGuard::set) or
+/// [`update`](DurableBlobGuard::update).
 ///
 /// It is deliberately the least attractive option: written again in full on
-/// every change, and opaque to tooling -- every `PersistableBlob<_>` has the
+/// every change, and opaque to tooling -- every `DurableBlob<_>` has the
 /// same schema descriptor, whatever `T` is.
 ///
 /// ```
 /// use kladde::Kladde;
-/// use kladde_types::PersistableBlob;
+/// use kladde_types::DurableBlob;
 ///
 /// #[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
 /// struct Config {
@@ -33,13 +33,13 @@ use std::ops::Deref;
 ///     name: String,
 /// }
 ///
-/// let mut db = Kladde::new(PersistableBlob::new(Config::default()));
+/// let mut db = Kladde::new(DurableBlob::new(Config::default()));
 /// db.guard().set(Config { retries: 3, name: "primary".into() })?;
 /// assert_eq!(db.get().retries, 3);
 /// # Ok::<(), kladde::Error>(())
 /// ```
 #[derive(Debug, PartialEq)]
-pub struct PersistableBlob<T> {
+pub struct DurableBlob<T> {
     /// The value, for reading.
     value: T,
     /// Its `postcard` serialization, which is what is persisted.
@@ -50,28 +50,28 @@ fn serialize<T: serde::Serialize>(value: &T) -> Vec<u8> {
     postcard::to_allocvec(value).expect("postcard serializes every in-memory value")
 }
 
-impl<T: serde::Serialize> PersistableBlob<T> {
+impl<T: serde::Serialize> DurableBlob<T> {
     /// Wraps `value`.
     ///
     /// ```
-    /// use kladde_types::PersistableBlob;
+    /// use kladde_types::DurableBlob;
     ///
-    /// let blob = PersistableBlob::new(vec![1u8, 2, 3]);
+    /// let blob = DurableBlob::new(vec![1u8, 2, 3]);
     /// assert_eq!(blob.len(), 3);
     /// ```
     pub fn new(value: T) -> Self {
         let serialized = serialize(&value);
-        PersistableBlob { value, serialized }
+        DurableBlob { value, serialized }
     }
 }
 
-impl<T: serde::Serialize + Default> Default for PersistableBlob<T> {
+impl<T: serde::Serialize + Default> Default for DurableBlob<T> {
     fn default() -> Self {
         Self::new(T::default())
     }
 }
 
-impl<T> Deref for PersistableBlob<T> {
+impl<T> Deref for DurableBlob<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -79,7 +79,7 @@ impl<T> Deref for PersistableBlob<T> {
     }
 }
 
-impl<T> Persistable for PersistableBlob<T>
+impl<T> Durable for DurableBlob<T>
 where
     T: serde::Serialize + serde::de::DeserializeOwned,
 {
@@ -100,30 +100,30 @@ where
         input.bytes_into(len, &mut serialized)?;
         let value = postcard::from_bytes(&serialized)
             .map_err(|e| input.corrupt(format!("a blob that does not deserialize: {e}")))?;
-        Ok(PersistableBlob { value, serialized })
+        Ok(DurableBlob { value, serialized })
     }
 
     type Guard<'r, B: Backend + 'r>
-        = PersistableBlobGuard<'r, T, B>
+        = DurableBlobGuard<'r, T, B>
     where
         Self: 'r;
 
     fn guard<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Guard<'r, B> {
-        PersistableBlobGuard {
+        DurableBlobGuard {
             inner: self,
             region,
         }
     }
 
-    // `T` is a foreign type that is not itself `Persistable`, so its structure
-    // cannot be described: every `PersistableBlob<_>` shares one descriptor.
+    // `T` is a foreign type that is not itself `Durable`, so its structure
+    // cannot be described: every `DurableBlob<_>` shares one descriptor.
     fn describe_local(_builder: &mut SchemaBuilder) -> TypeDescriptor
     where
         Self: 'static,
     {
         TypeDescriptor::Opaque {
             library_name: "kladde-types".into(),
-            type_name: "PersistableBlob".into(),
+            type_name: "DurableBlob".into(),
             version: crate::library_version(),
             fixed_size: None,
             parameters: vec![],
@@ -131,39 +131,39 @@ where
     }
 }
 
-/// The mutation-capable view onto a [`PersistableBlob`]: replace the value
+/// The mutation-capable view onto a [`DurableBlob`]: replace the value
 /// with [`set`](Self::set), or change it in place with
 /// [`update`](Self::update). Either writes the whole serialization again.
 ///
 /// ```
 /// use kladde::Kladde;
-/// use kladde_types::PersistableBlob;
+/// use kladde_types::DurableBlob;
 ///
-/// let mut db = Kladde::new(PersistableBlob::new(1u32));
+/// let mut db = Kladde::new(DurableBlob::new(1u32));
 /// db.guard().set(2)?;
 /// db.guard().update(|n| *n += 1)?;
 /// assert_eq!(**db.get(), 3);
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub struct PersistableBlobGuard<'r, T, B> {
-    inner: &'r mut PersistableBlob<T>,
+pub struct DurableBlobGuard<'r, T, B> {
+    inner: &'r mut DurableBlob<T>,
     region: Region<'r, B>,
 }
 
-impl<T, B> PersistableBlobGuard<'_, T, B>
+impl<T, B> DurableBlobGuard<'_, T, B>
 where
     T: serde::Serialize + serde::de::DeserializeOwned,
     B: Backend,
 {
-    /// Replaces the value with `value`. See [`PersistableBlobGuard`] for an
+    /// Replaces the value with `value`. See [`DurableBlobGuard`] for an
     /// example.
     pub fn set(&mut self, value: T) -> Result<(), Error> {
-        kladde_persist::replace(self.inner, PersistableBlob::new(value), &self.region)
+        kladde_persist::replace(self.inner, DurableBlob::new(value), &self.region)
     }
 
     /// Changes the value with `f`, then persists it; if persisting fails,
     /// the value is restored from its old serialization. See
-    /// [`PersistableBlobGuard`] for an example.
+    /// [`DurableBlobGuard`] for an example.
     pub fn update(&mut self, f: impl FnOnce(&mut T)) -> Result<(), Error> {
         f(&mut self.inner.value);
         let new = serialize(&self.inner.value);
@@ -185,18 +185,18 @@ where
     }
 }
 
-impl<T, B> Guard for PersistableBlobGuard<'_, T, B> {
-    type Persistable = PersistableBlob<T>;
+impl<T, B> Guard for DurableBlobGuard<'_, T, B> {
+    type Durable = DurableBlob<T>;
 
-    fn as_persistable(&self) -> &PersistableBlob<T> {
+    fn as_durable(&self) -> &DurableBlob<T> {
         self.inner
     }
 }
 
-impl<T, B> Deref for PersistableBlobGuard<'_, T, B> {
-    type Target = PersistableBlob<T>;
+impl<T, B> Deref for DurableBlobGuard<'_, T, B> {
+    type Target = DurableBlob<T>;
 
-    fn deref(&self) -> &PersistableBlob<T> {
+    fn deref(&self) -> &DurableBlob<T> {
         self.inner
     }
 }

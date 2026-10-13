@@ -1,6 +1,6 @@
 //! SVG drawings as durable data structures: a realistic workload for kladde.
 //!
-//! [`model`] defines one `#[derive(Persistable)]` type per kind of SVG object,
+//! [`model`] defines one `#[derive(Durable)]` type per kind of SVG object,
 //! with every decimal stored as a [`Number`]. [`parse()`] reads SVG text into
 //! a [`Document`], and [`write()`] writes one back as SVG text. Anything the
 //! model does not type is kept verbatim, so every SVG document converts.

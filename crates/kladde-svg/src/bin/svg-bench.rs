@@ -46,7 +46,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use kladde::{Backend, FileStorage, Kladde, Options, Persistable};
+use kladde::{Backend, Durable, FileStorage, Kladde, Options};
 use kladde_bench::{row, save, Rng};
 use kladde_svg::model::{
     Attr, AttrParts, Color, Element, ElementGuard, ElementKind, ElementKindParts, Node, NodeParts,

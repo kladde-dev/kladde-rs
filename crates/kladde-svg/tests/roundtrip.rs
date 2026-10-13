@@ -284,28 +284,19 @@ fn statistics_count_precision_and_coverage() {
 #[cfg(not(feature = "f64"))]
 #[test]
 fn sizes_are_what_the_plan_estimated() {
-    use kladde::Persistable;
+    use kladde::Durable;
     // Path segments differ in size, by their number of coordinates.
-    assert_eq!(<PathSegment as Persistable>::FIXED_SIZE, None);
-    assert_eq!(<Length as Persistable>::FIXED_SIZE, Some(5));
-    assert_eq!(
-        <kladde_svg::model::Point as Persistable>::FIXED_SIZE,
-        Some(8)
-    );
-    assert_eq!(
-        <kladde_svg::model::Element as Persistable>::FIXED_SIZE,
-        None
-    );
-    assert_eq!(<Node as Persistable>::FIXED_SIZE, None);
+    assert_eq!(<PathSegment as Durable>::FIXED_SIZE, None);
+    assert_eq!(<Length as Durable>::FIXED_SIZE, Some(5));
+    assert_eq!(<kladde_svg::model::Point as Durable>::FIXED_SIZE, Some(8));
+    assert_eq!(<kladde_svg::model::Element as Durable>::FIXED_SIZE, None);
+    assert_eq!(<Node as Durable>::FIXED_SIZE, None);
 }
 
 #[cfg(feature = "f64")]
 #[test]
 fn sizes_with_f64() {
-    use kladde::Persistable;
-    assert_eq!(<Length as Persistable>::FIXED_SIZE, Some(9));
-    assert_eq!(
-        <kladde_svg::model::Point as Persistable>::FIXED_SIZE,
-        Some(16)
-    );
+    use kladde::Durable;
+    assert_eq!(<Length as Durable>::FIXED_SIZE, Some(9));
+    assert_eq!(<kladde_svg::model::Point as Durable>::FIXED_SIZE, Some(16));
 }

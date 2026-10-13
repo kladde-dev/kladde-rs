@@ -18,7 +18,7 @@
 //!   [`TypeTable::measure`] compute from the descriptors alone what a
 //!   writer's types know about their encodings.
 //!
-//! The connection to real Rust types (turning a `Persistable` type into a
+//! The connection to real Rust types (turning a `Durable` type into a
 //! `TypeTable`) lives in `kladde-persist`, not here.
 
 mod descriptor;

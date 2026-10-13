@@ -1,10 +1,10 @@
-//! `#[derive(Persistable)]`: turns a struct or enum composed of
-//! `Persistable` fields into a persistable type. Applications reach it
+//! `#[derive(Durable)]`: turns a struct or enum composed of
+//! `Durable` fields into a durable type. Applications reach it
 //! through the `kladde` crate, which re-exports it.
 //!
 //! For a type `T`, it generates
 //!
-//! - a `Persistable` implementation: the encoding (`encoded_len`, `encode`,
+//! - a `Durable` implementation: the encoding (`encoded_len`, `encode`,
 //!   `decode`), the size `FIXED_SIZE`, and the schema descriptor;
 //! - for a type marked `#[kladde(bounded)]`, a `Bounded` implementation:
 //!   the fixed form (`encode_fixed`, `decode_fixed`) and its size
@@ -32,7 +32,7 @@
 //! - A single-field struct marked `#[kladde(transparent)]` is persisted
 //!   exactly as its field: same bytes and same fingerprint. Its guard has a
 //!   `get_mut()` returning the field's guard.
-//! - Type parameters get a `Persistable` bound, as `#[derive(Debug)]` does,
+//! - Type parameters get a `Durable` bound, as `#[derive(Debug)]` does,
 //!   and a `Bounded` one in the `Bounded` implementation; lifetime and const
 //!   parameters are rejected.
 //!
@@ -43,9 +43,9 @@
 //! that a field before them may change size meanwhile:
 //!
 //! ```
-//! use kladde::{Kladde, Persistable};
+//! use kladde::{Kladde, Durable};
 //!
-//! #[derive(Persistable)]
+//! #[derive(Durable)]
 //! struct Counts {
 //!     small: u32, // a varint
 //!     flag: bool,
@@ -60,14 +60,14 @@
 //! # Ok::<(), kladde::Error>(())
 //! ```
 //!
-//! **Every field must be `Persistable`.** Plain `String` is not, and the
+//! **Every field must be `Durable`.** Plain `String` is not, and the
 //! compile error is the point: a field that would silently persist nothing
 //! does not compile.
 //!
 //! ```compile_fail
-//! #[derive(kladde::Persistable)]
+//! #[derive(kladde::Durable)]
 //! struct Contact {
-//!     name: String, // error[E0277]: the trait bound `String: Persistable` is not satisfied
+//!     name: String, // error[E0277]: the trait bound `String: Durable` is not satisfied
 //! }
 //! ```
 //!
@@ -75,7 +75,7 @@
 //! `kladde-types`, compiles:
 //!
 //! ```
-//! #[derive(kladde::Persistable)]
+//! #[derive(kladde::Durable)]
 //! struct Contact {
 //!     age: u16,
 //! }
@@ -84,7 +84,7 @@
 //! `#[kladde(transparent)]` requires exactly one field:
 //!
 //! ```compile_fail
-//! #[derive(kladde::Persistable)]
+//! #[derive(kladde::Durable)]
 //! #[kladde(transparent)]
 //! struct TwoFields {
 //!     a: i32,
@@ -93,7 +93,7 @@
 //! ```
 //!
 //! ```
-//! #[derive(kladde::Persistable)]
+//! #[derive(kladde::Durable)]
 //! #[kladde(transparent)]
 //! struct Meters(i32);
 //! ```
@@ -104,29 +104,29 @@
 //! such types, or another type marked so.
 //!
 //! ```
-//! use kladde::{Bounded, Fixed, Persistable};
+//! use kladde::{Bounded, Fixed, Durable};
 //!
-//! #[derive(Persistable)]
+//! #[derive(Durable)]
 //! #[kladde(bounded)]
 //! struct Range {
 //!     start: u32, // a varint, but four bytes in the fixed form
 //!     len: u16,
 //! }
 //!
-//! assert_eq!(<Range as Persistable>::FIXED_SIZE, None);
+//! assert_eq!(<Range as Durable>::FIXED_SIZE, None);
 //! assert_eq!(<Range as Bounded>::FIXED_FORM_SIZE, 6);
-//! assert_eq!(<Fixed<Range> as Persistable>::FIXED_SIZE, Some(6));
+//! assert_eq!(<Fixed<Range> as Durable>::FIXED_SIZE, Some(6));
 //! ```
 //!
 //! A field without a fixed form fails at the type's definition:
 //!
 //! ```compile_fail
-//! #[derive(kladde::Persistable)]
+//! #[derive(kladde::Durable)]
 //! struct Inner {
 //!     a: u32,
 //! }
 //!
-//! #[derive(kladde::Persistable)]
+//! #[derive(kladde::Durable)]
 //! #[kladde(bounded)]
 //! struct Outer {
 //!     inner: Inner, // error[E0277]: `Inner` has no fixed form
@@ -136,12 +136,12 @@
 //! and so does a `Fixed` of a type without one:
 //!
 //! ```compile_fail
-//! #[derive(kladde::Persistable)]
+//! #[derive(kladde::Durable)]
 //! struct Inner {
 //!     a: u32,
 //! }
 //!
-//! #[derive(kladde::Persistable)]
+//! #[derive(kladde::Durable)]
 //! struct Holder {
 //!     inner: kladde::Fixed<Inner>, // error[E0277]: `Inner` has no fixed form
 //! }
@@ -150,9 +150,9 @@
 //! **Enums.** `parts()` reaches into the current variant:
 //!
 //! ```
-//! use kladde::{Bounded, Kladde, Persistable};
+//! use kladde::{Bounded, Kladde, Durable};
 //!
-//! #[derive(Persistable)]
+//! #[derive(Durable)]
 //! #[kladde(bounded)]
 //! enum Shape {
 //!     Origin,
@@ -170,7 +170,7 @@
 //!
 //! // The variants differ in size, so the enum is not fixed-size; its fixed
 //! // form takes a one-byte discriminant and the largest variant.
-//! assert_eq!(<Shape as Persistable>::FIXED_SIZE, None);
+//! assert_eq!(<Shape as Durable>::FIXED_SIZE, None);
 //! assert_eq!(<Shape as Bounded>::FIXED_FORM_SIZE, 1 + 8);
 //! # Ok::<(), kladde::Error>(())
 //! ```
@@ -178,9 +178,9 @@
 //! The variant cannot be switched while a field's guard is alive:
 //!
 //! ```compile_fail
-//! use kladde::{Kladde, Persistable};
+//! use kladde::{Kladde, Durable};
 //!
-//! #[derive(Persistable)]
+//! #[derive(Durable)]
 //! enum Shape {
 //!     Origin,
 //!     Circle(i32),
@@ -201,20 +201,20 @@
 //! stored unsigned:
 //!
 //! ```
-//! #[derive(kladde::Persistable)]
+//! #[derive(kladde::Durable)]
 //! #[kladde(bounded)]
 //! #[repr(u32)]
 //! enum Pinned {
 //!     A,
 //!     B,
 //! }
-//! assert_eq!(<Pinned as kladde::Persistable>::FIXED_SIZE, Some(1));
+//! assert_eq!(<Pinned as kladde::Durable>::FIXED_SIZE, Some(1));
 //! assert_eq!(<Pinned as kladde::Bounded>::FIXED_FORM_SIZE, 4);
 //! ```
 //!
 //! ```compile_fail
-//! #[derive(kladde::Persistable)]
-//! #[repr(i8)] // error: #[derive(Persistable)] supports only the integer reprs `u8`, ...
+//! #[derive(kladde::Durable)]
+//! #[repr(i8)] // error: #[derive(Durable)] supports only the integer reprs `u8`, ...
 //! enum Signed {
 //!     A,
 //!     B,
@@ -222,9 +222,9 @@
 //! ```
 //!
 //! ```compile_fail
-//! #[derive(kladde::Persistable)]
+//! #[derive(kladde::Durable)]
 //! enum Negative {
-//!     A = -1, // error: #[derive(Persistable)] does not support negative discriminants
+//!     A = -1, // error: #[derive(Durable)] does not support negative discriminants
 //!     B,
 //! }
 //! ```
@@ -240,8 +240,8 @@ use syn::{parse_macro_input, parse_quote, Data, DeriveInput, Fields, GenericPara
 
 type Tokens = proc_macro2::TokenStream;
 
-#[proc_macro_derive(Persistable, attributes(kladde))]
-pub fn derive_persistable(input: TokenStream) -> TokenStream {
+#[proc_macro_derive(Durable, attributes(kladde))]
+pub fn derive_durable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
     let TypeAttrs {
@@ -266,7 +266,7 @@ pub fn derive_persistable(input: TokenStream) -> TokenStream {
             Data::Enum(data) => derive_enum(&input, data, &ctx),
             Data::Union(data) => syn::Error::new_spanned(
                 data.union_token,
-                "#[derive(Persistable)] does not support unions",
+                "#[derive(Durable)] does not support unions",
             )
             .to_compile_error(),
         }
@@ -278,7 +278,7 @@ pub fn derive_persistable(input: TokenStream) -> TokenStream {
 /// The generics plumbing every derive path shares, precomputed once from the
 /// input type's own generic parameters:
 ///
-/// - the *type*'s own `impl`/type/where fragments, with a `Persistable` bound
+/// - the *type*'s own `impl`/type/where fragments, with a `Durable` bound
 ///   added to each type parameter (the `#[derive(Debug)]` heuristic); and
 /// - the generated *guard*'s generic lists, which extend the type's own
 ///   parameters with a fresh lifetime `'__r` and backend `__B`, given
@@ -288,8 +288,8 @@ pub fn derive_persistable(input: TokenStream) -> TokenStream {
 /// Only type parameters are supported; lifetime and const parameters are
 /// rejected in [`build`](Ctx::build).
 struct Ctx {
-    /// The `impl` generics of the `Persistable` impl: the type's own
-    /// parameters, each bounded by `Persistable`.
+    /// The `impl` generics of the `Durable` impl: the type's own
+    /// parameters, each bounded by `Durable`.
     impl_generics: Tokens,
     /// The type's type generics, e.g. `<T>` (empty for a non-generic type).
     type_generics: Tokens,
@@ -326,13 +326,13 @@ impl Ctx {
                 GenericParam::Lifetime(lt) => {
                     return Err(syn::Error::new_spanned(
                         lt,
-                        "#[derive(Persistable)] does not support lifetime parameters",
+                        "#[derive(Durable)] does not support lifetime parameters",
                     ));
                 }
                 GenericParam::Const(c) => {
                     return Err(syn::Error::new_spanned(
                         c,
-                        "#[derive(Persistable)] does not support const generic parameters",
+                        "#[derive(Durable)] does not support const generic parameters",
                     ));
                 }
             }
@@ -340,7 +340,7 @@ impl Ctx {
 
         let mut bounded = input.generics.clone();
         for tp in bounded.type_params_mut() {
-            tp.bounds.push(parse_quote!(#krate::Persistable));
+            tp.bounds.push(parse_quote!(#krate::Durable));
         }
         let (_, type_generics, where_clause) = bounded.split_for_impl();
 
@@ -475,9 +475,9 @@ impl FieldInfo {
     }
 }
 
-/// `<ty as Persistable>`, the path every generated call goes through.
-fn persistable(ty: &syn::Type, krate: &syn::Path) -> Tokens {
-    quote!(<#ty as #krate::Persistable>)
+/// `<ty as Durable>`, the path every generated call goes through.
+fn durable(ty: &syn::Type, krate: &syn::Path) -> Tokens {
+    quote!(<#ty as #krate::Durable>)
 }
 
 /// `<ty as Bounded>`, spanned at the field's type, so that a field whose
@@ -488,7 +488,7 @@ fn bounded(ty: &syn::Type, krate: &syn::Path) -> Tokens {
 
 /// The `Option<usize>` constant expression summing the fields' `FIXED_SIZE`.
 fn fixed_size(fields: &[FieldInfo], krate: &syn::Path) -> Tokens {
-    let paths: Vec<Tokens> = fields.iter().map(|f| persistable(&f.ty, krate)).collect();
+    let paths: Vec<Tokens> = fields.iter().map(|f| durable(&f.ty, krate)).collect();
     quote!(#krate::sum_sizes(&[#(#paths::FIXED_SIZE),*]))
 }
 
@@ -532,9 +532,9 @@ fn guard_scaffold(
         impl #guard_impl_generics #krate::Guard
             for #guard_ident #guard_use_generics #where_clause
         {
-            type Persistable = #ident #type_generics;
+            type Durable = #ident #type_generics;
 
-            fn as_persistable(&self) -> &#ident #type_generics {
+            fn as_durable(&self) -> &#ident #type_generics {
                 self.inner
             }
         }
@@ -551,7 +551,7 @@ fn guard_scaffold(
 }
 
 /// The `Guard` associated type and `guard()` constructor every derived
-/// `Persistable` impl shares.
+/// `Durable` impl shares.
 fn guard_assoc(ctx: &Ctx, guard_ident: &syn::Ident) -> Tokens {
     let krate = &ctx.krate;
     let guard_use_generics = &ctx.guard_use_generics;
@@ -667,7 +667,7 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> Tokens {
         return err.to_compile_error();
     }
 
-    let field_ty = persistable(&field.ty, krate);
+    let field_ty = durable(&field.ty, krate);
     let (member, construct): (syn::Member, Tokens) = match &field.ident {
         Some(name) => (
             syn::Member::Named(name.clone()),
@@ -719,7 +719,7 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> Tokens {
 
         #bounded_impl
 
-        impl #impl_generics #krate::Persistable for #ident #type_generics #where_clause {
+        impl #impl_generics #krate::Durable for #ident #type_generics #where_clause {
             const FIXED_SIZE: ::std::option::Option<usize> = #field_ty::FIXED_SIZE;
 
             #guard_assoc
@@ -766,7 +766,7 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
         Ok(fields) => fields,
         Err(err) => return err.to_compile_error(),
     };
-    let ty: Vec<Tokens> = fields.iter().map(|f| persistable(&f.ty, krate)).collect();
+    let ty: Vec<Tokens> = fields.iter().map(|f| durable(&f.ty, krate)).collect();
     let member: Vec<syn::Member> = data
         .fields
         .iter()
@@ -941,7 +941,7 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
 
         #bounded_impl
 
-        impl #impl_generics #krate::Persistable for #ident #type_generics #where_clause {
+        impl #impl_generics #krate::Durable for #ident #type_generics #where_clause {
             const FIXED_SIZE: ::std::option::Option<usize> = #fixed_size;
 
             #guard_assoc
@@ -1075,7 +1075,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
     if data.variants.is_empty() {
         return syn::Error::new_spanned(
             &data.variants,
-            "#[derive(Persistable)] does not support enums with no variants",
+            "#[derive(Durable)] does not support enums with no variants",
         )
         .to_compile_error();
     }
@@ -1128,9 +1128,8 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
             d
         }
     };
-    let negative_msg = format!(
-        "#[derive(Persistable)] does not support negative discriminants (in enum `{ident}`)"
-    );
+    let negative_msg =
+        format!("#[derive(Durable)] does not support negative discriminants (in enum `{ident}`)");
     let width_expr = match &repr {
         Some((_, width)) => quote!(#width),
         None => quote! {
@@ -1172,7 +1171,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
             pattern,
             ..
         } = variant;
-        let ty: Vec<Tokens> = fields.iter().map(|f| persistable(&f.ty, krate)).collect();
+        let ty: Vec<Tokens> = fields.iter().map(|f| durable(&f.ty, krate)).collect();
         let bty: Vec<Tokens> = fields.iter().map(|f| bounded(&f.ty, krate)).collect();
         let form = fixed_form_size(fields, krate);
         fixed_sizes.push(fixed_size(fields, krate));
@@ -1402,7 +1401,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
             const __KLADDE_DISCRIMINANT_WIDTH: usize = #width_expr;
         }
 
-        impl #impl_generics #krate::Persistable for #ident #type_generics #where_clause {
+        impl #impl_generics #krate::Durable for #ident #type_generics #where_clause {
             const FIXED_SIZE: ::std::option::Option<usize> =
                 #krate::enum_fixed_size(&#discriminants, &[#(#fixed_sizes),*]);
 
@@ -1470,7 +1469,7 @@ fn enum_repr(attrs: &[syn::Attribute]) -> syn::Result<Option<(syn::Ident, usize)
                     "u64" => Some(8),
                     "i8" | "i16" | "i32" | "i64" | "i128" | "u128" | "isize" | "usize" => {
                         return Err(meta.error(
-                            "#[derive(Persistable)] supports only the integer reprs `u8`, `u16`, \
+                            "#[derive(Durable)] supports only the integer reprs `u8`, `u16`, \
                              `u32` and `u64` on enums, since discriminants are stored unsigned \
                              and at a fixed width",
                         ));

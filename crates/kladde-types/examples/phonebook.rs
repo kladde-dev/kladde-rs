@@ -1,19 +1,19 @@
-//! A small interactive contact book on a real file: a `#[derive(Persistable)]`
-//! struct and enum, nested in a `PersistableVec` and a `PersistableMap`,
+//! A small interactive contact book on a real file: a `#[derive(Durable)]`
+//! struct and enum, nested in a `DurableVec` and a `DurableMap`,
 //! mutated through the generated guards.
 //!
 //! Run with `cargo run -p kladde-types --example phonebook -- [path]`. Every
 //! command that changes the book is in the file when it has printed its
 //! answer: kill the process at any point, run it again, and the book is there.
 
-use kladde::{Kladde, Persistable};
-use kladde_types::{PersistableMap, PersistableString, PersistableVec};
+use kladde::{Durable, Kladde};
+use kladde_types::{DurableMap, DurableString, DurableVec};
 use std::io::{self, Write};
 
-#[derive(Persistable, Debug)]
+#[derive(Durable, Debug)]
 enum PhoneNumber {
-    Mobile(PersistableString),
-    Landline(PersistableString),
+    Mobile(DurableString),
+    Landline(DurableString),
 }
 
 impl std::fmt::Display for PhoneNumber {
@@ -25,15 +25,15 @@ impl std::fmt::Display for PhoneNumber {
     }
 }
 
-#[derive(Persistable, Debug)]
+#[derive(Durable, Debug)]
 struct Contact {
-    email: PersistableString,
-    phones: PersistableVec<PhoneNumber>,
+    email: DurableString,
+    phones: DurableVec<PhoneNumber>,
 }
 
-#[derive(Persistable)]
+#[derive(Durable)]
 struct AddressBook {
-    contacts: PersistableMap<PersistableString, Contact>,
+    contacts: DurableMap<DurableString, Contact>,
 }
 
 fn main() -> kladde::Result<()> {
@@ -47,7 +47,7 @@ fn main() -> kladde::Result<()> {
         Kladde::create(
             &path,
             AddressBook {
-                contacts: PersistableMap::new(),
+                contacts: DurableMap::new(),
             },
         )?
     };
@@ -71,18 +71,18 @@ fn main() -> kladde::Result<()> {
             ("help", _) => print_help(),
             ("add", [name, email]) => {
                 let contact = Contact {
-                    email: PersistableString::from(*email),
-                    phones: PersistableVec::new(),
+                    email: DurableString::from(*email),
+                    phones: DurableVec::new(),
                 };
                 book.guard()
                     .contacts_mut()
-                    .insert(PersistableString::from(*name), contact)?;
+                    .insert(DurableString::from(*name), contact)?;
                 println!("added {name}");
             }
             ("set-email", [name, email]) => {
                 let mut guard = book.guard();
                 let mut contacts = guard.contacts_mut();
-                match contacts.get_mut(&PersistableString::from(*name)) {
+                match contacts.get_mut(&DurableString::from(*name)) {
                     Some(mut contact) => {
                         contact.email_mut().set(*email)?;
                         println!("updated {name}");
@@ -92,8 +92,8 @@ fn main() -> kladde::Result<()> {
             }
             ("add-phone", [name, kind, number]) => {
                 let phone = match *kind {
-                    "mobile" => PhoneNumber::Mobile(PersistableString::from(*number)),
-                    "landline" => PhoneNumber::Landline(PersistableString::from(*number)),
+                    "mobile" => PhoneNumber::Mobile(DurableString::from(*number)),
+                    "landline" => PhoneNumber::Landline(DurableString::from(*number)),
                     other => {
                         println!("unknown phone kind {other:?}, expected mobile|landline");
                         continue;
@@ -101,7 +101,7 @@ fn main() -> kladde::Result<()> {
                 };
                 let mut guard = book.guard();
                 let mut contacts = guard.contacts_mut();
-                match contacts.get_mut(&PersistableString::from(*name)) {
+                match contacts.get_mut(&DurableString::from(*name)) {
                     Some(mut contact) => {
                         // Two field guards at once, through `parts()`.
                         let ContactParts { mut phones, .. } = contact.parts();
@@ -115,14 +115,14 @@ fn main() -> kladde::Result<()> {
                 if book
                     .guard()
                     .contacts_mut()
-                    .delete(&PersistableString::from(*name))?
+                    .delete(&DurableString::from(*name))?
                 {
                     println!("removed {name}");
                 } else {
                     println!("no such contact: {name}");
                 }
             }
-            ("show", [name]) => match book.get().contacts.get(&PersistableString::from(*name)) {
+            ("show", [name]) => match book.get().contacts.get(&DurableString::from(*name)) {
                 Some(contact) => {
                     println!("{name}: {}", contact.email);
                     for phone in contact.phones.iter() {

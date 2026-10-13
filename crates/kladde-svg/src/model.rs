@@ -1,4 +1,4 @@
-//! The durable SVG document model: one `#[derive(Persistable)]` type per kind
+//! The durable SVG document model: one `#[derive(Durable)]` type per kind
 //! of SVG object.
 //!
 //! An [`Element`] carries its tag's core geometry in [`ElementKind`], its
@@ -7,44 +7,44 @@
 //! children. Anything the model does not type is kept verbatim as
 //! [`Attr::Other`] or [`ElementKind::Other`], so every SVG document fits.
 //!
-//! Every list is a `PersistableVec` and every string a `PersistableString`,
+//! Every list is a `DurableVec` and every string a `DurableString`,
 //! inline in its parent, as everything is in the file's one sequence. Lists
 //! of points and lengths have fixed-size elements and keep no index; lists of
 //! children, attributes, transforms and path data keep a Fenwick tree of
 //! their elements' sizes.
 
-use kladde::Persistable;
-use kladde_types::{PersistableString, PersistableVec};
+use kladde::Durable;
+use kladde_types::{DurableString, DurableVec};
 
 use crate::Number;
 
 /// A list of child nodes.
-pub type Nodes = PersistableVec<Node>;
+pub type Nodes = DurableVec<Node>;
 
 /// A transform list.
-pub type Transforms = PersistableVec<TransformOp>;
+pub type Transforms = DurableVec<TransformOp>;
 
 /// A list of attributes.
-pub type Attrs = PersistableVec<Attr>;
+pub type Attrs = DurableVec<Attr>;
 
 /// Path data.
-pub type PathData = PersistableVec<PathSegment>;
+pub type PathData = DurableVec<PathSegment>;
 
 /// A list of points, whose elements all have one size.
-pub type Points = PersistableVec<Point>;
+pub type Points = DurableVec<Point>;
 
 /// A list of lengths, whose elements all have one size.
-pub type Lengths = PersistableVec<Length>;
+pub type Lengths = DurableVec<Length>;
 
 /// An element's `id`.
-pub type Id = PersistableString;
+pub type Id = DurableString;
 
 /// Every other string: text, names, values, URLs.
-pub type Str = PersistableString;
+pub type Str = DurableString;
 
 /// A whole SVG document: the root element, and the comments and processing
 /// instructions around it.
-#[derive(Persistable, Debug, Clone)]
+#[derive(Durable, Debug, Clone)]
 pub struct Document {
     /// Comments and processing instructions before the root element.
     pub prolog: Nodes,
@@ -58,7 +58,7 @@ pub struct Document {
 // An element is far larger in memory than a string; but an element's
 // children are mostly elements anyway.
 #[allow(clippy::large_enum_variant)]
-#[derive(Persistable, Debug, Clone)]
+#[derive(Durable, Debug, Clone)]
 pub enum Node {
     /// An element.
     Element(Element),
@@ -76,7 +76,7 @@ pub enum Node {
 }
 
 /// An element: its kind, its attributes, and its children.
-#[derive(Persistable, Debug, Clone)]
+#[derive(Durable, Debug, Clone)]
 pub struct Element {
     /// The tag, with the geometry specific to it.
     pub kind: ElementKind,
@@ -99,7 +99,7 @@ pub struct Element {
 /// value (zero) where the attribute is absent; the writer leaves out a field
 /// that is zero. Geometry whose absence means something other than zero, such
 /// as an ellipse's `rx` or a rect's `rx`, is an [`Attr`] instead.
-#[derive(Persistable, Debug, Clone)]
+#[derive(Durable, Debug, Clone)]
 pub enum ElementKind {
     Svg,
     G,
@@ -175,7 +175,7 @@ pub enum ElementKind {
 
 /// One segment of path data, as the `d` attribute writes it: absolute or
 /// relative, and one of the ten commands.
-#[derive(Persistable, Debug, Clone, Copy, PartialEq)]
+#[derive(Durable, Debug, Clone, Copy, PartialEq)]
 pub enum PathSegment {
     MoveTo {
         abs: bool,
@@ -240,7 +240,7 @@ pub enum PathSegment {
 
 /// One entry of a transform list. A `rotate` about a center is stored as the
 /// translate, rotate, translate it stands for.
-#[derive(Persistable, Debug, Clone, Copy, PartialEq)]
+#[derive(Durable, Debug, Clone, Copy, PartialEq)]
 pub enum TransformOp {
     Matrix {
         a: Number,
@@ -270,14 +270,14 @@ pub enum TransformOp {
 }
 
 /// A point of a `points` list.
-#[derive(Persistable, Debug, Clone, Copy, PartialEq)]
+#[derive(Durable, Debug, Clone, Copy, PartialEq)]
 pub struct Point {
     pub x: Number,
     pub y: Number,
 }
 
 /// A length or coordinate: a number and its unit.
-#[derive(Persistable, Debug, Clone, Copy, PartialEq)]
+#[derive(Durable, Debug, Clone, Copy, PartialEq)]
 pub struct Length {
     pub value: Number,
     pub unit: LengthUnit,
@@ -305,7 +305,7 @@ impl Length {
 }
 
 /// The unit of a [`Length`].
-#[derive(Persistable, Debug, Clone, Copy, PartialEq)]
+#[derive(Durable, Debug, Clone, Copy, PartialEq)]
 pub enum LengthUnit {
     /// User units: a bare number.
     None,
@@ -321,7 +321,7 @@ pub enum LengthUnit {
 }
 
 /// An sRGB color with alpha.
-#[derive(Persistable, Debug, Clone, Copy, PartialEq)]
+#[derive(Durable, Debug, Clone, Copy, PartialEq)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
@@ -330,7 +330,7 @@ pub struct Color {
 }
 
 /// The value of `fill` or `stroke`.
-#[derive(Persistable, Debug, Clone)]
+#[derive(Durable, Debug, Clone)]
 pub enum Paint {
     None,
     CurrentColor,
@@ -342,7 +342,7 @@ pub enum Paint {
 }
 
 /// The value of `stroke-linecap`.
-#[derive(Persistable, Debug, Clone, Copy, PartialEq)]
+#[derive(Durable, Debug, Clone, Copy, PartialEq)]
 pub enum LineCap {
     Butt,
     Round,
@@ -350,7 +350,7 @@ pub enum LineCap {
 }
 
 /// The value of `stroke-linejoin`.
-#[derive(Persistable, Debug, Clone, Copy, PartialEq)]
+#[derive(Durable, Debug, Clone, Copy, PartialEq)]
 pub enum LineJoin {
     Miter,
     MiterClip,
@@ -360,7 +360,7 @@ pub enum LineJoin {
 }
 
 /// The value of `fill-rule` or `clip-rule`.
-#[derive(Persistable, Debug, Clone, Copy, PartialEq)]
+#[derive(Durable, Debug, Clone, Copy, PartialEq)]
 pub enum FillRule {
     NonZero,
     EvenOdd,
@@ -368,7 +368,7 @@ pub enum FillRule {
 
 /// An attribute, or a declaration of an inline `style`: typed where the model
 /// knows the attribute and its value parses, [`Attr::Other`] otherwise.
-#[derive(Persistable, Debug, Clone)]
+#[derive(Durable, Debug, Clone)]
 pub enum Attr {
     Id(Id),
     Class(Str),

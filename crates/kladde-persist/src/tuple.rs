@@ -1,13 +1,13 @@
-//! [`Persistable`] for tuples of `Persistable` types, `(A, B, ...)`, up to
+//! [`Durable`] for tuples of `Durable` types, `(A, B, ...)`, up to
 //! arity 12 and including the empty tuple `()`, and [`Bounded`] for tuples
 //! of `Bounded` types, so a tuple can be used
-//! wherever a `Persistable` field, element, or value is expected -- e.g.
-//! `PersistableVec<(i32, bool)>` or `PersistableMap<K, ()>`.
+//! wherever a `Durable` field, element, or value is expected -- e.g.
+//! `DurableVec<(i32, bool)>` or `DurableMap<K, ()>`.
 //!
 //! A tuple is encoded exactly like a tuple struct with the same fields: its
 //! components back to back. Its schema descriptor is a
 //! [`TypeDescriptor::Struct`] with positional field names (`"0"`, `"1"`,
-//! ...) -- structurally identical to what `#[derive(Persistable)]` produces
+//! ...) -- structurally identical to what `#[derive(Durable)]` produces
 //! for a tuple struct `struct S(A, B)`, differing only in the type *name*
 //! (`"Tuple2"` vs. `"S"`), which the fingerprint ignores.
 
@@ -15,7 +15,7 @@ use kladde_schema::{Field, TypeDescriptor};
 use kladde_store::Error;
 
 use crate::codec::{Decoder, Encoder};
-use crate::persistable::{replace, Bounded, Guard, Persistable};
+use crate::durable::{replace, Bounded, Durable, Guard};
 use crate::region::{Backend, FieldSizes, Region};
 use crate::schema::SchemaBuilder;
 use crate::sizes::sum_sizes;
@@ -24,7 +24,7 @@ use crate::sizes::sum_sizes;
 /// `parts`, to mutate the components one by one.
 ///
 /// ```
-/// use kladde_persist::{Persistable, Region};
+/// use kladde_persist::{Durable, Region};
 /// use kladde_store::{MemoryStorage, Store, WriteBackend};
 ///
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
@@ -49,9 +49,9 @@ pub struct TupleGuard<'r, T, B> {
 }
 
 impl<T, B> Guard for TupleGuard<'_, T, B> {
-    type Persistable = T;
+    type Durable = T;
 
-    fn as_persistable(&self) -> &T {
+    fn as_durable(&self) -> &T {
         self.inner
     }
 }
@@ -64,10 +64,10 @@ impl<T, B> std::ops::Deref for TupleGuard<'_, T, B> {
     }
 }
 
-/// Generates one `impl Persistable for (T0, T1, ...)`. `$name` is the
+/// Generates one `impl Durable for (T0, T1, ...)`. `$name` is the
 /// schema type name; each `$T $idx $v` triple is a component's type
 /// parameter, its tuple index, and a name for its guard.
-macro_rules! impl_persistable_tuple {
+macro_rules! impl_durable_tuple {
     ($name:literal; $($T:ident $idx:tt $v:ident),*) => {
         impl<$($T: Bounded,)*> Bounded for ($($T,)*) {
             const FIXED_FORM_SIZE: usize = 0 $(+ $T::FIXED_FORM_SIZE)*;
@@ -85,7 +85,7 @@ macro_rules! impl_persistable_tuple {
             }
         }
 
-        impl<$($T: Persistable,)*> Persistable for ($($T,)*) {
+        impl<$($T: Durable,)*> Durable for ($($T,)*) {
             const FIXED_SIZE: Option<usize> = sum_sizes(&[$($T::FIXED_SIZE,)*]);
 
             #[inline]
@@ -120,13 +120,13 @@ macro_rules! impl_persistable_tuple {
                     name: $name.into(),
                     fields: vec![$(Field {
                         name: stringify!($idx).into(),
-                        ty: <$T as Persistable>::describe(builder),
+                        ty: <$T as Durable>::describe(builder),
                     },)*],
                 }
             }
         }
 
-        impl<'r, $($T: Persistable,)* B: Backend> TupleGuard<'r, ($($T,)*), B> {
+        impl<'r, $($T: Durable,)* B: Backend> TupleGuard<'r, ($($T,)*), B> {
             /// A guard for every component at once. Each finds where it
             /// starts whenever it writes, so a component before it may
             /// change size meanwhile. See [`TupleGuard`] for an example.
@@ -147,19 +147,19 @@ macro_rules! impl_persistable_tuple {
     };
 }
 
-impl_persistable_tuple!("Tuple0";);
-impl_persistable_tuple!("Tuple1"; A 0 a);
-impl_persistable_tuple!("Tuple2"; A 0 a, B1 1 b);
-impl_persistable_tuple!("Tuple3"; A 0 a, B1 1 b, C 2 c);
-impl_persistable_tuple!("Tuple4"; A 0 a, B1 1 b, C 2 c, D 3 d);
-impl_persistable_tuple!("Tuple5"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e);
-impl_persistable_tuple!("Tuple6"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e, F 5 f);
-impl_persistable_tuple!("Tuple7"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e, F 5 f, G 6 g);
-impl_persistable_tuple!("Tuple8"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e, F 5 f, G 6 g, H 7 h);
-impl_persistable_tuple!("Tuple9"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e, F 5 f, G 6 g, H 7 h, I 8 i);
-impl_persistable_tuple!("Tuple10"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e, F 5 f, G 6 g, H 7 h, I 8 i, J 9 j);
-impl_persistable_tuple!("Tuple11"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e, F 5 f, G 6 g, H 7 h, I 8 i, J 9 j, K 10 k);
-impl_persistable_tuple!("Tuple12"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e, F 5 f, G 6 g, H 7 h, I 8 i, J 9 j, K 10 k, L 11 l);
+impl_durable_tuple!("Tuple0";);
+impl_durable_tuple!("Tuple1"; A 0 a);
+impl_durable_tuple!("Tuple2"; A 0 a, B1 1 b);
+impl_durable_tuple!("Tuple3"; A 0 a, B1 1 b, C 2 c);
+impl_durable_tuple!("Tuple4"; A 0 a, B1 1 b, C 2 c, D 3 d);
+impl_durable_tuple!("Tuple5"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e);
+impl_durable_tuple!("Tuple6"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e, F 5 f);
+impl_durable_tuple!("Tuple7"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e, F 5 f, G 6 g);
+impl_durable_tuple!("Tuple8"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e, F 5 f, G 6 g, H 7 h);
+impl_durable_tuple!("Tuple9"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e, F 5 f, G 6 g, H 7 h, I 8 i);
+impl_durable_tuple!("Tuple10"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e, F 5 f, G 6 g, H 7 h, I 8 i, J 9 j);
+impl_durable_tuple!("Tuple11"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e, F 5 f, G 6 g, H 7 h, I 8 i, J 9 j, K 10 k);
+impl_durable_tuple!("Tuple12"; A 0 a, B1 1 b, C 2 c, D 3 d, E 4 e, F 5 f, G 6 g, H 7 h, I 8 i, J 9 j, K 10 k, L 11 l);
 
 #[cfg(test)]
 mod tests {

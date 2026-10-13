@@ -1,26 +1,26 @@
 //! Turning live Rust types into a [`TypeTable`]: the build-time bridge between
-//! [`Persistable`](crate::Persistable) and the language-neutral `kladde-schema`
+//! [`Durable`](crate::Durable) and the language-neutral `kladde-schema`
 //! model.
 
-use crate::Persistable;
+use crate::Durable;
 use kladde_schema::{TypeDescriptor, TypeRef, TypeTable};
 use std::any::TypeId;
 use std::collections::HashMap;
 
 /// Accumulates the descriptors of a type graph while
-/// [`Persistable::describe`](crate::Persistable::describe) walks it.
+/// [`Durable::describe`](crate::Durable::describe) walks it.
 ///
-/// You rarely touch this directly -- [`Persistable::schema`] and
-/// [`Persistable::fingerprint`] drive it for you, and `#[derive(Persistable)]`
-/// generates the [`Persistable::describe_local`] bodies whose field references
+/// You rarely touch this directly -- [`Durable::schema`] and
+/// [`Durable::fingerprint`] drive it for you, and `#[derive(Durable)]`
+/// generates the [`Durable::describe_local`] bodies whose field references
 /// call [`describe`]. Both entry points deduplicate by Rust type identity and,
 /// by reserving a type's slot *before* recursing into its fields, let recursive
 /// and mutually-recursive types refer back to themselves without looping:
 ///
 /// - [`describe::<T>()`][`describe`] is the common case -- register `T` under
 ///   its own `TypeId`, building its descriptor from
-///   [`Persistable::describe_local`]. This is what a field/element/parameter
-///   reference resolves to (via [`Persistable::describe`]'s default).
+///   [`Durable::describe_local`]. This is what a field/element/parameter
+///   reference resolves to (via [`Durable::describe`]'s default).
 /// - [`describe_with`] is the low-level primitive it's built on: register under
 ///   a caller-supplied `TypeId` with a caller-supplied closure. Reach for it
 ///   only for something the generic form can't express -- e.g. two Rust types
@@ -36,10 +36,10 @@ use std::collections::HashMap;
 /// assert_eq!(table.descriptors().len(), 2); // the tuple, and `u8` once
 /// ```
 ///
-/// [`Persistable::schema`]: crate::Persistable::schema
-/// [`Persistable::fingerprint`]: crate::Persistable::fingerprint
-/// [`Persistable::describe`]: crate::Persistable::describe
-/// [`Persistable::describe_local`]: crate::Persistable::describe_local
+/// [`Durable::schema`]: crate::Durable::schema
+/// [`Durable::fingerprint`]: crate::Durable::fingerprint
+/// [`Durable::describe`]: crate::Durable::describe
+/// [`Durable::describe_local`]: crate::Durable::describe_local
 /// [`describe`]: SchemaBuilder::describe
 /// [`describe_with`]: SchemaBuilder::describe_with
 #[derive(Default)]
@@ -59,12 +59,12 @@ impl SchemaBuilder {
     /// Registers `T` and returns a reference to its descriptor -- the
     /// common-case entry point. Deduplicates by `TypeId::of::<T>()` and, the
     /// first time `T` is seen, builds its descriptor from
-    /// [`Persistable::describe_local`]; later calls (including a recursive
+    /// [`Durable::describe_local`]; later calls (including a recursive
     /// one made *while* that build is still running) return the existing
     /// reference, so cycles terminate. See [`SchemaBuilder`] for an example.
     ///
-    /// [`Persistable::describe_local`]: crate::Persistable::describe_local
-    pub fn describe<T: Persistable + 'static>(&mut self) -> TypeRef {
+    /// [`Durable::describe_local`]: crate::Durable::describe_local
+    pub fn describe<T: Durable + 'static>(&mut self) -> TypeRef {
         self.describe_with(TypeId::of::<T>(), |builder| T::describe_local(builder))
     }
 
@@ -105,10 +105,10 @@ impl SchemaBuilder {
 
     /// Finalizes the accumulated descriptors into a [`TypeTable`] rooted at
     /// `root`. `root` must be the first type described (index 0), which is
-    /// automatically the case when [`Persistable::schema`] drives the builder,
+    /// automatically the case when [`Durable::schema`] drives the builder,
     /// and panics otherwise. See [`SchemaBuilder`] for an example.
     ///
-    /// [`Persistable::schema`]: crate::Persistable::schema
+    /// [`Durable::schema`]: crate::Durable::schema
     pub fn finish(self, root: TypeRef) -> TypeTable {
         assert_eq!(
             root.0, 0,

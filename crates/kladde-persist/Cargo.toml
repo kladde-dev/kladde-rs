@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 # Kladde's serialization layer on top of `kladde-store`: `Location`, the
-# `Persistable` trait and its guards, the scalar and tuple implementations, and
+# `Durable` trait and its guards, the scalar and tuple implementations, and
 # the schema binding. Everything here is kladde-specific; the store knows none
 # of it.
 

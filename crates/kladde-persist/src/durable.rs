@@ -1,4 +1,4 @@
-//! [`Persistable`]: a type that encodes itself into the sequence, decodes
+//! [`Durable`]: a type that encodes itself into the sequence, decodes
 //! itself from it, and hands out a [`Guard`] that mutates its region.
 
 use kladde_schema::{Fingerprint, TypeDescriptor, TypeRef, TypeTable};
@@ -13,45 +13,45 @@ use crate::schema::SchemaBuilder;
 /// its [`Guard`]. It never allocates, frees, or knows where it lies.
 ///
 /// Scalars, tuples, [`Option`], [`Box`], [`Fixed`](crate::Fixed), the
-/// containers of `kladde-types`, and every `#[derive(Persistable)]` type
+/// containers of `kladde-types`, and every `#[derive(Durable)]` type
 /// implement it. A type that also has a fixed form implements [`Bounded`].
 ///
 /// A hand-written implementation owes four things: `FIXED_SIZE` and
-/// [`encoded_len`](Persistable::encoded_len) match what
-/// [`encode`](Persistable::encode) writes; `encode` and
-/// [`decode`](Persistable::decode) are inverses; every guard method leaves
+/// [`encoded_len`](Durable::encoded_len) match what
+/// [`encode`](Durable::encode) writes; `encode` and
+/// [`decode`](Durable::decode) are inverses; every guard method leaves
 /// its region holding the value's encoding when its transaction ends; and
 /// the descriptor matches the bytes.
 ///
 /// ```
-/// use kladde_persist::Persistable;
+/// use kladde_persist::Durable;
 ///
 /// let bytes = (300u32, true).to_bytes();
 /// assert_eq!(bytes, [0xac, 0x02, 1]);
 /// assert_eq!(<(u32, bool)>::from_bytes(&bytes)?, (300, true));
 /// # Ok::<(), kladde_store::Error>(())
 /// ```
-pub trait Persistable: Sized {
+pub trait Durable: Sized {
     /// `Some(n)` if every value encodes to `n` bytes: then the type's
     /// containers find their elements by multiplication and keep no index,
     /// and writing a value is always an overwrite in place.
     ///
     /// ```
-    /// use kladde_persist::Persistable;
+    /// use kladde_persist::Durable;
     ///
-    /// assert_eq!(<f32 as Persistable>::FIXED_SIZE, Some(4));
-    /// assert_eq!(<u32 as Persistable>::FIXED_SIZE, None); // a varint
+    /// assert_eq!(<f32 as Durable>::FIXED_SIZE, Some(4));
+    /// assert_eq!(<u32 as Durable>::FIXED_SIZE, None); // a varint
     /// ```
     const FIXED_SIZE: Option<usize>;
 
-    /// How many bytes [`encode`](Persistable::encode) writes for this
+    /// How many bytes [`encode`](Durable::encode) writes for this
     /// value.
     ///
     /// Takes time independent of the value's size for every type of this
     /// workspace: containers keep their total.
     ///
     /// ```
-    /// use kladde_persist::Persistable;
+    /// use kladde_persist::Durable;
     ///
     /// assert_eq!(300u32.encoded_len(), 2);
     /// ```
@@ -60,7 +60,7 @@ pub trait Persistable: Sized {
     /// Appends this value's encoding to `out`.
     ///
     /// ```
-    /// use kladde_persist::{Encoder, Persistable};
+    /// use kladde_persist::{Encoder, Durable};
     ///
     /// let mut bytes = Vec::new();
     /// (-1i64).encode(&mut Encoder::new(&mut bytes));
@@ -74,7 +74,7 @@ pub trait Persistable: Sized {
     /// including an encoding that is not canonical.
     ///
     /// ```
-    /// use kladde_persist::{Decoder, Persistable};
+    /// use kladde_persist::{Decoder, Durable};
     ///
     /// let mut input = Decoder::new(&[0xac, 0x02]);
     /// assert_eq!(u32::decode(&mut input)?, 300);
@@ -86,7 +86,7 @@ pub trait Persistable: Sized {
     /// records through `B`. See [`Guard`].
     ///
     /// A type persisted as another, such as `Box<T>`, may use the other's
-    /// guard, so the guard's [`Guard::Persistable`] need not be `Self`.
+    /// guard, so the guard's [`Guard::Durable`] need not be `Self`.
     type Guard<'r, B: Backend + 'r>: Guard
     where
         Self: 'r;
@@ -96,7 +96,7 @@ pub trait Persistable: Sized {
     /// mutations are recorded and applied.
     ///
     /// ```
-    /// use kladde_persist::{Persistable, Region};
+    /// use kladde_persist::{Durable, Region};
     /// use kladde_store::{MemoryStorage, Store, WriteBackend};
     ///
     /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
@@ -112,7 +112,7 @@ pub trait Persistable: Sized {
     /// This value's encoding, as a fresh buffer.
     ///
     /// ```
-    /// use kladde_persist::Persistable;
+    /// use kladde_persist::Durable;
     ///
     /// assert_eq!(258u16.to_bytes(), [0x82, 0x02]);
     /// ```
@@ -125,7 +125,7 @@ pub trait Persistable: Sized {
     /// The value `bytes` encodes, which must hold nothing else.
     ///
     /// ```
-    /// use kladde_persist::Persistable;
+    /// use kladde_persist::Durable;
     ///
     /// assert_eq!(u16::from_bytes(&[0x82, 0x02])?, 258);
     /// assert!(u16::from_bytes(&[0x82, 0x02, 0]).is_err());
@@ -141,21 +141,21 @@ pub trait Persistable: Sized {
     }
 
     /// Builds this type's own descriptor node -- the common-case schema hook.
-    /// `#[derive(Persistable)]` generates it; a hand-written impl returns a
+    /// `#[derive(Durable)]` generates it; a hand-written impl returns a
     /// fresh [`TypeDescriptor`] describing the bytes it actually reads and
     /// writes, obtaining references to its field, element, and parameter types
-    /// by calling [`describe`](Persistable::describe) on each of them.
+    /// by calling [`describe`](Durable::describe) on each of them.
     ///
     /// A type that instead wants to be **schema-transparent** -- reusing
     /// another type's descriptor rather than owning one -- overrides
-    /// [`describe`](Persistable::describe) directly and leaves this method
+    /// [`describe`](Durable::describe) directly and leaves this method
     /// unimplemented (it is then never called). Implementing *neither* panics.
     ///
     /// ```
-    /// use kladde_persist::{Persistable, Primitive, SchemaBuilder, TypeDescriptor};
+    /// use kladde_persist::{Durable, Primitive, SchemaBuilder, TypeDescriptor};
     ///
     /// let mut builder = SchemaBuilder::new();
-    /// let d = <u32 as Persistable>::describe_local(&mut builder);
+    /// let d = <u32 as Durable>::describe_local(&mut builder);
     /// assert_eq!(d, TypeDescriptor::Primitive(Primitive::U32));
     /// ```
     fn describe_local(builder: &mut SchemaBuilder) -> TypeDescriptor
@@ -171,20 +171,20 @@ pub trait Persistable: Sized {
     }
 
     /// Records this type's encoding into `builder`, returning a reference
-    /// to its descriptor. You usually call [`schema`](Persistable::schema)
-    /// or [`fingerprint`](Persistable::fingerprint) instead.
+    /// to its descriptor. You usually call [`schema`](Durable::schema)
+    /// or [`fingerprint`](Durable::fingerprint) instead.
     ///
     /// The default registers a node built from
-    /// [`describe_local`](Persistable::describe_local), deduplicated by
+    /// [`describe_local`](Durable::describe_local), deduplicated by
     /// `Self`'s `TypeId` and reserving the slot before recursing so cyclic
     /// types terminate. Override it only to be schema-transparent.
     ///
     /// ```
-    /// use kladde_persist::{Persistable, SchemaBuilder};
+    /// use kladde_persist::{Durable, SchemaBuilder};
     ///
     /// let mut builder = SchemaBuilder::new();
-    /// let a = <u8 as Persistable>::describe(&mut builder);
-    /// let b = <u8 as Persistable>::describe(&mut builder);
+    /// let a = <u8 as Durable>::describe(&mut builder);
+    /// let b = <u8 as Durable>::describe(&mut builder);
     /// assert_eq!(a, b); // one table entry per type
     /// ```
     fn describe(builder: &mut SchemaBuilder) -> TypeRef
@@ -198,9 +198,9 @@ pub trait Persistable: Sized {
     /// description of its encoding, rooted at index 0.
     ///
     /// ```
-    /// use kladde_persist::Persistable;
+    /// use kladde_persist::Durable;
     ///
-    /// let table = <(u8, bool) as Persistable>::schema();
+    /// let table = <(u8, bool) as Durable>::schema();
     /// assert_eq!(table.descriptors().len(), 3); // the tuple, `u8`, and `bool`
     /// ```
     fn schema() -> TypeTable
@@ -208,7 +208,7 @@ pub trait Persistable: Sized {
         Self: 'static,
     {
         let mut builder = SchemaBuilder::new();
-        let root = <Self as Persistable>::describe(&mut builder);
+        let root = <Self as Durable>::describe(&mut builder);
         builder.finish(root)
     }
 
@@ -217,20 +217,20 @@ pub trait Persistable: Sized {
     /// root type so that opening it as another type is refused.
     ///
     /// ```
-    /// use kladde_persist::Persistable;
+    /// use kladde_persist::Durable;
     ///
-    /// assert_eq!(<u32 as Persistable>::fingerprint(), <u32 as Persistable>::fingerprint());
-    /// assert_ne!(<u32 as Persistable>::fingerprint(), <i32 as Persistable>::fingerprint());
+    /// assert_eq!(<u32 as Durable>::fingerprint(), <u32 as Durable>::fingerprint());
+    /// assert_ne!(<u32 as Durable>::fingerprint(), <i32 as Durable>::fingerprint());
     /// ```
     fn fingerprint() -> Fingerprint
     where
         Self: 'static,
     {
-        <Self as Persistable>::schema().fingerprint()
+        <Self as Durable>::schema().fingerprint()
     }
 }
 
-/// A [`Persistable`] type with a fixed form: an encoding of the same size for
+/// A [`Durable`] type with a fixed form: an encoding of the same size for
 /// every value, which [`Fixed<Self>`](crate::Fixed) stores.
 ///
 /// In the fixed form every integer takes its full width, every `char` four
@@ -262,7 +262,7 @@ pub trait Persistable: Sized {
             have one, and so has a derived type marked `#[kladde(bounded)]`, whose fields' \
             types must all have one"
 )]
-pub trait Bounded: Persistable {
+pub trait Bounded: Durable {
     /// The size of every value's fixed form.
     ///
     /// See [`Bounded`] for an example.
@@ -296,7 +296,7 @@ pub trait Bounded: Persistable {
     fn decode_fixed(input: &mut Decoder<'_>) -> Result<Self, Error>;
 }
 
-/// A live, mutation-capable view onto a persistable value and its region.
+/// A live, mutation-capable view onto a durable value and its region.
 ///
 /// Every mutating method of a guard records the change in the store's
 /// journal and then mutates the in-memory value, in that order, and returns
@@ -304,7 +304,7 @@ pub trait Bounded: Persistable {
 /// dereference to the value, so read-only methods stay available.
 ///
 /// ```
-/// use kladde_persist::{Guard, Persistable, Region};
+/// use kladde_persist::{Guard, Durable, Region};
 /// use kladde_store::{MemoryStorage, Store, WriteBackend};
 ///
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
@@ -312,23 +312,23 @@ pub trait Bounded: Persistable {
 /// store.splice(0, 0, &flag.to_bytes())?;
 /// let mut guard = flag.guard(Region::root(&store));
 /// guard.set(true)?;
-/// assert!(*guard.as_persistable());
+/// assert!(*guard.as_durable());
 /// # Ok::<(), kladde_store::Error>(())
 /// ```
 pub trait Guard {
     /// The value this guard mutates.
-    type Persistable;
+    type Durable;
 
     /// The value, for reading.
-    fn as_persistable(&self) -> &Self::Persistable;
+    fn as_durable(&self) -> &Self::Durable;
 }
 
 /// The guard of a value that changes only as a whole: a scalar, a
 /// [`Fixed`](crate::Fixed) value, or anything else whose
-/// [`Persistable::Guard`] offers nothing but [`set`](SetGuard::set).
+/// [`Durable::Guard`] offers nothing but [`set`](SetGuard::set).
 ///
 /// ```
-/// use kladde_persist::{Persistable, Region};
+/// use kladde_persist::{Durable, Region};
 /// use kladde_store::{MemoryStorage, Store, WriteBackend};
 ///
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
@@ -345,7 +345,7 @@ pub struct SetGuard<'r, T, B> {
     region: Region<'r, B>,
 }
 
-impl<'r, T: Persistable, B: Backend> SetGuard<'r, T, B> {
+impl<'r, T: Durable, B: Backend> SetGuard<'r, T, B> {
     /// The guard of `value` at `region`.
     pub fn new(value: &'r mut T, region: Region<'r, B>) -> Self {
         SetGuard { value, region }
@@ -360,9 +360,9 @@ impl<'r, T: Persistable, B: Backend> SetGuard<'r, T, B> {
 }
 
 impl<T, B> Guard for SetGuard<'_, T, B> {
-    type Persistable = T;
+    type Durable = T;
 
-    fn as_persistable(&self) -> &T {
+    fn as_durable(&self) -> &T {
         self.value
     }
 }
@@ -383,7 +383,7 @@ impl<T, B> std::ops::Deref for SetGuard<'_, T, B> {
 /// hand-written ones. If the write fails, `*current` is left as it was.
 ///
 /// ```
-/// use kladde_persist::{replace, Persistable, Region};
+/// use kladde_persist::{replace, Durable, Region};
 /// use kladde_store::{MemoryStorage, Store, WriteBackend};
 ///
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
@@ -394,7 +394,7 @@ impl<T, B> std::ops::Deref for SetGuard<'_, T, B> {
 /// assert_eq!(store.len(), 3);
 /// # Ok::<(), kladde_store::Error>(())
 /// ```
-pub fn replace<T: Persistable, B: Backend>(
+pub fn replace<T: Durable, B: Backend>(
     current: &mut T,
     new: T,
     region: &Region<'_, B>,

@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 
-use kladde::{Kladde, MemoryStorage, Options, Persistable, TypeRef};
-use kladde_types::{PersistableMap, PersistableString, PersistableVec};
+use kladde::{Durable, Kladde, MemoryStorage, Options, TypeRef};
+use kladde_types::{DurableMap, DurableString, DurableVec};
 
 struct Rng(u64);
 
@@ -28,18 +28,18 @@ impl Rng {
     }
 }
 
-#[derive(Persistable, Debug, Clone, PartialEq)]
+#[derive(Durable, Debug, Clone, PartialEq)]
 struct Item {
-    name: PersistableString,
-    tags: PersistableVec<u32>,
-    points: PersistableVec<(f32, f32)>,
+    name: DurableString,
+    tags: DurableVec<u32>,
+    points: DurableVec<(f32, f32)>,
 }
 
-#[derive(Persistable, Debug, Clone, PartialEq)]
+#[derive(Durable, Debug, Clone, PartialEq)]
 struct Doc {
-    title: PersistableString,
-    items: PersistableVec<Item>,
-    archive: PersistableVec<Item>,
+    title: DurableString,
+    items: DurableVec<Item>,
+    archive: DurableVec<Item>,
 }
 
 fn item(rng: &mut Rng) -> Item {
@@ -53,7 +53,7 @@ fn item(rng: &mut Rng) -> Item {
 }
 
 /// Checks the file against the value, and every vector's index.
-fn check<T: Persistable + 'static>(k: &mut Kladde<T>, storage: &MemoryStorage, what: &str) {
+fn check<T: Durable + 'static>(k: &mut Kladde<T>, storage: &MemoryStorage, what: &str) {
     k.flush().unwrap();
     k.store().check();
     let bytes = k.store().read_all().unwrap();
@@ -222,7 +222,7 @@ fn random_edits_of_nested_containers() {
         let doc = Doc {
             title: "doc".into(),
             items: (0..3).map(|_| item(&mut rng)).collect(),
-            archive: PersistableVec::new(),
+            archive: DurableVec::new(),
         };
         let mut model = doc.clone();
         let mut k = Kladde::create_in(Box::new(storage.clone()), doc, Options::default()).unwrap();
@@ -243,7 +243,7 @@ fn a_map_keeps_its_keys_through_swap_removals() {
     let storage = MemoryStorage::new();
     let mut k = Kladde::create_in(
         Box::new(storage.clone()),
-        PersistableMap::<u32, PersistableString>::new(),
+        DurableMap::<u32, DurableString>::new(),
         Options::default(),
     )
     .unwrap();
@@ -287,10 +287,10 @@ fn a_map_keeps_its_keys_through_swap_removals() {
 #[test]
 fn moving_an_element_writes_none_of_its_bytes() {
     let storage = MemoryStorage::new();
-    let big: PersistableString = "x".repeat(20_000).into();
+    let big: DurableString = "x".repeat(20_000).into();
     let mut k = Kladde::create_in(
         Box::new(storage.clone()),
-        PersistableVec::from(vec![big, "a".into(), "b".into()]),
+        DurableVec::from(vec![big, "a".into(), "b".into()]),
         Options::default(),
     )
     .unwrap();
@@ -309,7 +309,7 @@ fn a_dropped_cut_removes_its_value_for_good() {
     let storage = MemoryStorage::new();
     let mut k = Kladde::create_in(
         Box::new(storage.clone()),
-        PersistableVec::<PersistableString>::from(vec!["a".into(), "b".into()]),
+        DurableVec::<DurableString>::from(vec!["a".into(), "b".into()]),
         Options::default(),
     )
     .unwrap();

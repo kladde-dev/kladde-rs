@@ -1,16 +1,16 @@
 mod support;
 
-use kladde::{Bounded, Fixed, Persistable};
+use kladde::{Bounded, Durable, Fixed};
 use support::Fixture;
 
-#[derive(Persistable, Debug, PartialEq)]
+#[derive(Durable, Debug, PartialEq)]
 #[kladde(bounded)]
 struct Tagged<T> {
     tag: u8,
     value: T,
 }
 
-#[derive(Persistable, Debug, PartialEq)]
+#[derive(Durable, Debug, PartialEq)]
 #[kladde(bounded)]
 enum Either<L, R> {
     Left(L),
@@ -19,8 +19,8 @@ enum Either<L, R> {
 
 #[test]
 fn generic_types_take_their_parameters_sizes_and_schemas() {
-    assert_eq!(<Tagged<f64> as Persistable>::FIXED_SIZE, Some(9));
-    assert_eq!(<Tagged<u64> as Persistable>::FIXED_SIZE, None);
+    assert_eq!(<Tagged<f64> as Durable>::FIXED_SIZE, Some(9));
+    assert_eq!(<Tagged<u64> as Durable>::FIXED_SIZE, None);
     assert_ne!(Tagged::<u8>::fingerprint(), Tagged::<u16>::fingerprint());
     assert_eq!(
         Either::<u8, f32>::Right(1.0).to_bytes(),
@@ -41,7 +41,7 @@ fn a_bounded_generic_type_has_a_fixed_form_where_its_parameters_have() {
         <Fixed<Tagged<u32>>>::from_bytes(&fixed.to_bytes()).unwrap(),
         fixed
     );
-    // A parameter without a fixed form leaves the type persistable.
+    // A parameter without a fixed form leaves the type durable.
     let boxed = Tagged {
         tag: 1,
         value: Box::new(2u8),
@@ -75,7 +75,7 @@ fn generic_guards_work_like_any_other() {
 }
 
 /// A parameter named like the generated code's own does not clash.
-#[derive(Persistable)]
+#[derive(Durable)]
 struct Clash<B> {
     b: B,
 }

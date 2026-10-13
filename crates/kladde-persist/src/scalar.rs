@@ -1,4 +1,4 @@
-//! [`Persistable`] and [`Bounded`] for the primitive types, whose guards are
+//! [`Durable`] and [`Bounded`] for the primitive types, whose guards are
 //! [`SetGuard`]s.
 //!
 //! | type | encoding | fixed form |
@@ -9,14 +9,14 @@
 //! | `f32`, `f64` | IEEE-754, little-endian | the same bytes |
 //! | `char` | UTF-8 | the scalar value as a little-endian `u32` |
 //!
-//! These live here, in the crate that defines `Persistable`, since the
-//! orphan rules forbid `impl Persistable for i32` anywhere else.
+//! These live here, in the crate that defines `Durable`, since the
+//! orphan rules forbid `impl Durable for i32` anywhere else.
 
 use kladde_schema::{Primitive, TypeDescriptor};
 use kladde_store::Error;
 
 use crate::codec::{Decoder, Encoder};
-use crate::persistable::{Bounded, Persistable, SetGuard};
+use crate::durable::{Bounded, Durable, SetGuard};
 use crate::region::{Backend, Region};
 use crate::schema::SchemaBuilder;
 
@@ -45,7 +45,7 @@ macro_rules! scalar {
             }
         }
 
-        impl Persistable for $ty {
+        impl Durable for $ty {
             const FIXED_SIZE: Option<usize> = $fixed;
 
             #[inline]

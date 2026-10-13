@@ -9,7 +9,7 @@ publish.workspace = true
 # described by an address table of statements and mutated through a journal of
 # byte-level records, with copy-on-write flushes and consolidation. See
 # kladde-docs' `spec/` for the format and `impl/` for the algorithms.
-# Type-agnostic: it knows nothing about `Persistable` or schemas.
+# Type-agnostic: it knows nothing about `Durable` or schemas.
 
 [dependencies]
 kladde-varint = { workspace = true }

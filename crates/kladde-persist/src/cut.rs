@@ -10,8 +10,8 @@ use crate::region::Backend;
 /// store's open transaction, which the `Cut` holds open, nested in any the
 /// application opened, for as long as it lives.
 ///
-/// Containers make cuts (`PersistableVec::cut`, say) and take them where
-/// they take values (`PersistableVec::insert_cut`); a paste writes none of
+/// Containers make cuts (`DurableVec::cut`, say) and take them where
+/// they take values (`DurableVec::insert_cut`); a paste writes none of
 /// the value's bytes, and the flush states a few spans for the cut and the
 /// paste together, however large the value.
 ///
@@ -31,7 +31,7 @@ use crate::region::Backend;
 /// a cut is for a move within one operation, not for a clipboard.
 ///
 /// ```
-/// use kladde_persist::{Cut, Persistable, Region};
+/// use kladde_persist::{Cut, Durable, Region};
 /// use kladde_store::{MemoryStorage, Store, WriteBackend};
 ///
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;

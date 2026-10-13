@@ -9,21 +9,21 @@ It was written almost entirely by an AI coding agent from the [specification and
 
 ```rust
 use kladde::Kladde;
-use kladde::Persistable;
-use kladde_types::{PersistableString, PersistableVec};
+use kladde::Durable;
+use kladde_types::{DurableString, DurableVec};
 
-#[derive(Persistable)]
+#[derive(Durable)]
 struct Notes {
-    title: PersistableString,
-    lines: PersistableVec<PersistableString>,
+    title: DurableString,
+    lines: DurableVec<DurableString>,
 }
 
 let mut notes = Kladde::new(Notes {
-    title: PersistableString::from("today"),
-    lines: PersistableVec::new(),
+    title: DurableString::from("today"),
+    lines: DurableVec::new(),
 });
 
-notes.guard().lines_mut().push(PersistableString::from("wrote a doc"))?;
+notes.guard().lines_mut().push(DurableString::from("wrote a doc"))?;
 ```
 
 The `push` updates the in-memory vector and appends the change to the journal before it returns.
@@ -38,8 +38,8 @@ The file holds the root value's encoding as one byte sequence, kept on copy-on-w
 | --- | --- |
 | `kladde` | the application-facing entry point: creating and opening files, the root value, transactions and batches |
 | `kladde-types` | the built-in containers: vector, map, string, blob |
-| `kladde-derive` | the `#[derive(Persistable)]` macro, reached through `kladde` |
-| `kladde-persist` | the serialization layer: `Persistable`, `Bounded`, `Guard`, `Region`, `Fixed`, cuts, and the schema binding |
+| `kladde-derive` | the `#[derive(Durable)]` macro, reached through `kladde` |
+| `kladde-persist` | the serialization layer: `Durable`, `Bounded`, `Guard`, `Region`, `Fixed`, cuts, and the schema binding |
 | `kladde-schema` | type descriptors, their canonical encoding, and fingerprints |
 | `kladde-store` | the storage layer: pages, the span table, the journal, the flush, and consolidation |
 | `kladde-varint` | LEB128 varints |

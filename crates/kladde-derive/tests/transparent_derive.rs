@@ -1,13 +1,13 @@
 mod support;
 
-use kladde::{Bounded, Fixed, Persistable};
+use kladde::{Bounded, Durable, Fixed};
 use support::Fixture;
 
-#[derive(Persistable, Debug, PartialEq)]
+#[derive(Durable, Debug, PartialEq)]
 #[kladde(transparent, bounded)]
 struct Meters(i32);
 
-#[derive(Persistable, Debug, PartialEq)]
+#[derive(Durable, Debug, PartialEq)]
 #[kladde(transparent)]
 struct Named {
     inner: (u8, u16),
