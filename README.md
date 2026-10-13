@@ -60,8 +60,7 @@ To use kladde-rs in an application, start with the **[tutorial](https://kladde-d
 The [kladde-rs section](https://kladde-dev.github.io/rust/) of the documentation covers the rest of this implementation.
 It builds on the language-independent [specification](https://kladde-dev.github.io/spec/) and [reference algorithms](https://kladde-dev.github.io/impl/).
 
-[`implementation-notes.md`](implementation-notes.md) records where this implementation departs from the documentation, and what it chose where the documentation leaves a question open.
-[`later.md`](later.md) lists deferred work and ideas, and [`journal-semantics3.md`](journal-semantics3.md) is a working note from an earlier iteration of the design.
+Where this implementation departs from the documentation, and what it chose where the documentation leaves a question open, is recorded in the documentation's [implementation notes](https://kladde-dev.github.io/impl/implementation-notes/), and deferred work beside the pages it concerns.
 
 ## License
 
