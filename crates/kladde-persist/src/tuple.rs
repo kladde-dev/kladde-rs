@@ -1,5 +1,6 @@
 //! [`Persistable`] for tuples of `Persistable` types, `(A, B, ...)`, up to
-//! arity 12 and including the empty tuple `()`, so a tuple can be used
+//! arity 12 and including the empty tuple `()`, and [`Bounded`] for tuples
+//! of `Bounded` types, so a tuple can be used
 //! wherever a `Persistable` field, element, or value is expected -- e.g.
 //! `PersistableVec<(i32, bool)>` or `PersistableMap<K, ()>`.
 //!
@@ -14,7 +15,7 @@ use kladde_schema::{Field, TypeDescriptor};
 use kladde_store::Error;
 
 use crate::codec::{Decoder, Encoder};
-use crate::persistable::{replace, Guard, Persistable};
+use crate::persistable::{replace, Bounded, Guard, Persistable};
 use crate::region::{Backend, FieldSizes, Region};
 use crate::schema::SchemaBuilder;
 use crate::sizes::sum_sizes;
@@ -68,9 +69,24 @@ impl<T, B> std::ops::Deref for TupleGuard<'_, T, B> {
 /// parameter, its tuple index, and a name for its guard.
 macro_rules! impl_persistable_tuple {
     ($name:literal; $($T:ident $idx:tt $v:ident),*) => {
+        impl<$($T: Bounded,)*> Bounded for ($($T,)*) {
+            const FIXED_FORM_SIZE: usize = 0 $(+ $T::FIXED_FORM_SIZE)*;
+
+            #[inline]
+            #[allow(unused_variables)]
+            fn encode_fixed(&self, out: &mut Encoder<'_>) {
+                $(self.$idx.encode_fixed(out);)*
+            }
+
+            #[inline]
+            #[allow(unused_variables)]
+            fn decode_fixed(input: &mut Decoder<'_>) -> Result<Self, Error> {
+                Ok(($($T::decode_fixed(input)?,)*))
+            }
+        }
+
         impl<$($T: Persistable,)*> Persistable for ($($T,)*) {
             const FIXED_SIZE: Option<usize> = sum_sizes(&[$($T::FIXED_SIZE,)*]);
-            const FIXED_FORM_SIZE: Option<usize> = sum_sizes(&[$($T::FIXED_FORM_SIZE,)*]);
 
             #[inline]
             fn encoded_len(&self) -> usize {
@@ -87,18 +103,6 @@ macro_rules! impl_persistable_tuple {
             #[allow(unused_variables)]
             fn decode(input: &mut Decoder<'_>) -> Result<Self, Error> {
                 Ok(($($T::decode(input)?,)*))
-            }
-
-            #[inline]
-            #[allow(unused_variables)]
-            fn encode_fixed(&self, out: &mut Encoder<'_>) {
-                $(self.$idx.encode_fixed(out);)*
-            }
-
-            #[inline]
-            #[allow(unused_variables)]
-            fn decode_fixed(input: &mut Decoder<'_>) -> Result<Self, Error> {
-                Ok(($($T::decode_fixed(input)?,)*))
             }
 
             type Guard<'r, B: Backend + 'r> = TupleGuard<'r, Self, B> where Self: 'r;
@@ -166,7 +170,8 @@ mod tests {
     fn sizes_combine() {
         assert_eq!(<(u8, f32)>::FIXED_SIZE, Some(5));
         assert_eq!(<(u8, u32)>::FIXED_SIZE, None);
-        assert_eq!(<(u8, u32)>::FIXED_FORM_SIZE, Some(5));
+        assert_eq!(<(u8, u32)>::FIXED_FORM_SIZE, 5);
+        assert_eq!(<()>::FIXED_FORM_SIZE, 0);
         assert_eq!(<()>::FIXED_SIZE, Some(0));
         assert!(().to_bytes().is_empty());
     }

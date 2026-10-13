@@ -1,6 +1,6 @@
 //! Constant arithmetic on encoding sizes, for the `FIXED_SIZE` and
-//! `FIXED_FORM_SIZE` of composite types: `None` -- no such size -- absorbs
-//! everything it is combined with.
+//! `FIXED_FORM_SIZE` of composite types. For `FIXED_SIZE`, `None` -- no such
+//! size -- absorbs everything it is combined with.
 
 use crate::codec::varint_len;
 
@@ -53,27 +53,24 @@ pub const fn enum_fixed_size(discriminants: &[u64], variants: &[Option<usize>]) 
     common
 }
 
-/// An enum's fixed form size: its discriminant at `width` bytes, and its
-/// largest variant.
+/// An enum's fixed form size from its variants' fixed forms: its
+/// discriminant at `width` bytes, and its largest variant.
 ///
 /// ```
 /// use kladde_persist::enum_fixed_form_size;
 ///
-/// assert_eq!(enum_fixed_form_size(2, &[Some(4), Some(0)]), Some(6));
-/// assert_eq!(enum_fixed_form_size(1, &[Some(4), None]), None);
+/// assert_eq!(enum_fixed_form_size(2, &[4, 0]), 6);
 /// ```
-pub const fn enum_fixed_form_size(width: usize, variants: &[Option<usize>]) -> Option<usize> {
+pub const fn enum_fixed_form_size(width: usize, variants: &[usize]) -> usize {
     let mut largest = 0;
     let mut i = 0;
     while i < variants.len() {
-        match variants[i] {
-            Some(size) if size > largest => largest = size,
-            Some(_) => {}
-            None => return None,
+        if variants[i] > largest {
+            largest = variants[i];
         }
         i += 1;
     }
-    Some(width + largest)
+    width + largest
 }
 
 /// The smallest of 1, 2, 4 and 8 bytes that holds `largest`, the width of an

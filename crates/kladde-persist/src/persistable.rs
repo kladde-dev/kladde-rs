@@ -14,7 +14,7 @@ use crate::schema::SchemaBuilder;
 ///
 /// Scalars, tuples, [`Option`], [`Box`], [`Fixed`](crate::Fixed), the
 /// containers of `kladde-types`, and every `#[derive(Persistable)]` type
-/// implement it.
+/// implement it. A type that also has a fixed form implements [`Bounded`].
 ///
 /// A hand-written implementation owes four things: `FIXED_SIZE` and
 /// [`encoded_len`](Persistable::encoded_len) match what
@@ -43,19 +43,6 @@ pub trait Persistable: Sized {
     /// assert_eq!(<u32 as Persistable>::FIXED_SIZE, None); // a varint
     /// ```
     const FIXED_SIZE: Option<usize>;
-
-    /// The size of the type's fixed form, which
-    /// [`Fixed<Self>`](crate::Fixed) encodes it in, or `None` if it has
-    /// none: a type holding text, a sequence, an opaque value without a
-    /// fixed size, or itself.
-    ///
-    /// ```
-    /// use kladde_persist::Persistable;
-    ///
-    /// assert_eq!(<u32 as Persistable>::FIXED_FORM_SIZE, Some(4));
-    /// assert_eq!(<Option<u32> as Persistable>::FIXED_FORM_SIZE, Some(5));
-    /// ```
-    const FIXED_FORM_SIZE: Option<usize> = None;
 
     /// How many bytes [`encode`](Persistable::encode) writes for this
     /// value.
@@ -94,31 +81,6 @@ pub trait Persistable: Sized {
     /// # Ok::<(), kladde_store::Error>(())
     /// ```
     fn decode(input: &mut Decoder<'_>) -> Result<Self, Error>;
-
-    /// Appends this value's fixed form, of
-    /// [`FIXED_FORM_SIZE`](Persistable::FIXED_FORM_SIZE) bytes. Called only
-    /// for a type that has one; the default panics.
-    ///
-    /// ```
-    /// use kladde_persist::{Encoder, Persistable};
-    ///
-    /// let mut bytes = Vec::new();
-    /// 300u32.encode_fixed(&mut Encoder::new(&mut bytes));
-    /// assert_eq!(bytes, [0x2c, 0x01, 0, 0]);
-    /// ```
-    fn encode_fixed(&self, out: &mut Encoder<'_>) {
-        let _ = out;
-        panic!("{} has no fixed form", std::any::type_name::<Self>())
-    }
-
-    /// Reads this type's fixed form from the front of `input`. Called only
-    /// for a type that has one; the default fails.
-    fn decode_fixed(input: &mut Decoder<'_>) -> Result<Self, Error> {
-        Err(input.corrupt(format!(
-            "{} has no fixed form",
-            std::any::type_name::<Self>()
-        )))
-    }
 
     /// The mutation-capable view onto this type, over a value whose region
     /// records through `B`. See [`Guard`].
@@ -266,6 +228,72 @@ pub trait Persistable: Sized {
     {
         <Self as Persistable>::schema().fingerprint()
     }
+}
+
+/// A [`Persistable`] type with a fixed form: an encoding of the same size for
+/// every value, which [`Fixed<Self>`](crate::Fixed) stores.
+///
+/// In the fixed form every integer takes its full width, every `char` four
+/// bytes, and every enum its discriminant at a fixed width and its variant
+/// padded with zeros to the largest, so that every field lies at a constant
+/// offset whatever the value.
+///
+/// The scalars, [`Fixed`](crate::Fixed), and the [`Option`]s and tuples of
+/// `Bounded` types implement it, and so does a type derived with
+/// `#[kladde(bounded)]`, which every one of its fields' types must implement
+/// too. Text, containers, opaque values and [`Box`] have no fixed form.
+///
+/// A hand-written implementation owes that
+/// [`encode_fixed`](Bounded::encode_fixed) writes exactly
+/// [`FIXED_FORM_SIZE`](Bounded::FIXED_FORM_SIZE) bytes, that
+/// [`decode_fixed`](Bounded::decode_fixed) is its inverse, and that its
+/// descriptor's fixed form is these bytes.
+///
+/// ```
+/// use kladde_persist::Bounded;
+///
+/// assert_eq!(<u32 as Bounded>::FIXED_FORM_SIZE, 4);
+/// assert_eq!(<Option<u32> as Bounded>::FIXED_FORM_SIZE, 5);
+/// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` has no fixed form",
+    label = "`Fixed` and `#[kladde(bounded)]` need a fixed form here",
+    note = "the scalars, `Fixed<T>`, and the `Option`s and tuples of types with a fixed form \
+            have one, and so has a derived type marked `#[kladde(bounded)]`, whose fields' \
+            types must all have one"
+)]
+pub trait Bounded: Persistable {
+    /// The size of every value's fixed form.
+    ///
+    /// See [`Bounded`] for an example.
+    const FIXED_FORM_SIZE: usize;
+
+    /// Appends this value's fixed form, of
+    /// [`FIXED_FORM_SIZE`](Bounded::FIXED_FORM_SIZE) bytes.
+    ///
+    /// ```
+    /// use kladde_persist::{Bounded, Encoder};
+    ///
+    /// let mut bytes = Vec::new();
+    /// 300u32.encode_fixed(&mut Encoder::new(&mut bytes));
+    /// assert_eq!(bytes, [0x2c, 0x01, 0, 0]);
+    /// ```
+    fn encode_fixed(&self, out: &mut Encoder<'_>);
+
+    /// Reads a value's fixed form from the front of `input`, advancing past
+    /// it.
+    ///
+    /// Fails with [`Error::Corrupt`] on bytes that no value's fixed form is,
+    /// including padding that is not zero.
+    ///
+    /// ```
+    /// use kladde_persist::{Bounded, Decoder};
+    ///
+    /// let mut input = Decoder::new(&[0x2c, 0x01, 0, 0]);
+    /// assert_eq!(u32::decode_fixed(&mut input)?, 300);
+    /// # Ok::<(), kladde_store::Error>(())
+    /// ```
+    fn decode_fixed(input: &mut Decoder<'_>) -> Result<Self, Error>;
 }
 
 /// A live, mutation-capable view onto a persistable value and its region.

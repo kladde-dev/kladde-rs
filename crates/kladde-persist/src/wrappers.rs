@@ -5,9 +5,43 @@ use kladde_schema::{Field, TypeDescriptor, TypeRef, Variant};
 use kladde_store::Error;
 
 use crate::codec::{Decoder, Encoder};
-use crate::persistable::{replace, Guard, Persistable, SetGuard};
+use crate::persistable::{replace, Bounded, Guard, Persistable, SetGuard};
 use crate::region::{Backend, Region};
 use crate::schema::SchemaBuilder;
+
+/// The fixed form: the discriminant, then `T`'s fixed form, or as many zeros
+/// for `None`.
+impl<T: Bounded> Bounded for Option<T> {
+    const FIXED_FORM_SIZE: usize = 1 + T::FIXED_FORM_SIZE;
+
+    fn encode_fixed(&self, out: &mut Encoder<'_>) {
+        match self {
+            None => {
+                out.byte(0);
+                out.zeros(T::FIXED_FORM_SIZE);
+            }
+            Some(v) => {
+                out.byte(1);
+                v.encode_fixed(out);
+            }
+        }
+    }
+
+    fn decode_fixed(input: &mut Decoder<'_>) -> Result<Self, Error> {
+        match input.byte()? {
+            0 => {
+                for _ in 0..T::FIXED_FORM_SIZE {
+                    if input.byte()? != 0 {
+                        return Err(input.corrupt("padding that is not zero"));
+                    }
+                }
+                Ok(None)
+            }
+            1 => T::decode_fixed(input).map(Some),
+            d => Err(input.corrupt(format!("{d} is no variant of Option"))),
+        }
+    }
+}
 
 /// `None` as the discriminant 0, `Some(v)` as 1 followed by `v`: an enum,
 /// described as one.
@@ -15,10 +49,6 @@ impl<T: Persistable> Persistable for Option<T> {
     const FIXED_SIZE: Option<usize> = match T::FIXED_SIZE {
         Some(0) => Some(1),
         _ => None,
-    };
-    const FIXED_FORM_SIZE: Option<usize> = match T::FIXED_FORM_SIZE {
-        Some(n) => Some(1 + n),
-        None => None,
     };
 
     fn encoded_len(&self) -> usize {
@@ -39,34 +69,6 @@ impl<T: Persistable> Persistable for Option<T> {
         match input.byte()? {
             0 => Ok(None),
             1 => T::decode(input).map(Some),
-            d => Err(input.corrupt(format!("{d} is no variant of Option"))),
-        }
-    }
-
-    fn encode_fixed(&self, out: &mut Encoder<'_>) {
-        match self {
-            None => {
-                out.byte(0);
-                out.zeros(T::FIXED_FORM_SIZE.expect("a fixed form"));
-            }
-            Some(v) => {
-                out.byte(1);
-                v.encode_fixed(out);
-            }
-        }
-    }
-
-    fn decode_fixed(input: &mut Decoder<'_>) -> Result<Self, Error> {
-        match input.byte()? {
-            0 => {
-                for _ in 0..T::FIXED_FORM_SIZE.unwrap_or(0) {
-                    if input.byte()? != 0 {
-                        return Err(input.corrupt("padding that is not zero"));
-                    }
-                }
-                Ok(None)
-            }
-            1 => T::decode_fixed(input).map(Some),
             d => Err(input.corrupt(format!("{d} is no variant of Option"))),
         }
     }
@@ -179,7 +181,8 @@ impl<T, B> std::ops::Deref for OptionGuard<'_, T, B> {
 ///
 /// Its `FIXED_SIZE` is `None` whatever `T`'s, which costs a container of
 /// boxes its multiplication and nothing else, and keeps a type that holds
-/// itself through a box from asking its own size of itself.
+/// itself through a box from asking its own size of itself, a cycle the
+/// compiler would refuse. For the same reason it has no fixed form.
 ///
 /// ```
 /// use kladde_persist::Persistable;
@@ -242,14 +245,14 @@ impl<T: Persistable> Persistable for Box<T> {
 ///
 /// A `Fixed<T>` never changes size, so writing it is always an overwrite in
 /// place, and a container of them finds its elements by multiplication. It
-/// exists for every `T` with a
-/// [fixed form](Persistable::FIXED_FORM_SIZE); using it with any other `T`
-/// fails to compile. It applies to all of `T`: `Fixed<Option<u32>>` takes
-/// five bytes for every value, while `Option<Fixed<u32>>` takes one for
-/// `None` and five for `Some`.
+/// exists for every `T` that is [`Bounded`], that is, has a fixed form;
+/// naming it with any other `T` fails to compile. It applies to all of `T`:
+/// `Fixed<Option<u32>>` takes five bytes for every value, while
+/// `Option<Fixed<u32>>` takes one for `None` and five for `Some`.
 ///
-/// Its guard replaces the value whole, since a guard of one of `T`'s fields
-/// would have to write it in the fixed form.
+/// Its guard is a [`SetGuard`]: it replaces the value whole, and offers no
+/// guard of one of `T`'s fields, since such a guard would have to write the
+/// field in its fixed form.
 ///
 /// ```
 /// use kladde_persist::{Fixed, Persistable, Region};
@@ -266,22 +269,25 @@ impl<T: Persistable> Persistable for Box<T> {
 /// # Ok::<(), kladde_store::Error>(())
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct Fixed<T>(pub T);
+pub struct Fixed<T: Bounded>(pub T);
 
-impl<T: Persistable> Fixed<T> {
-    /// The size of every value.
-    const SIZE: usize = match T::FIXED_FORM_SIZE {
-        Some(size) => size,
-        None => panic!("Fixed<T> needs a T with a fixed form"),
-    };
+impl<T: Bounded> Bounded for Fixed<T> {
+    const FIXED_FORM_SIZE: usize = T::FIXED_FORM_SIZE;
+
+    fn encode_fixed(&self, out: &mut Encoder<'_>) {
+        self.0.encode_fixed(out)
+    }
+
+    fn decode_fixed(input: &mut Decoder<'_>) -> Result<Self, Error> {
+        T::decode_fixed(input).map(Fixed)
+    }
 }
 
-impl<T: Persistable> Persistable for Fixed<T> {
-    const FIXED_SIZE: Option<usize> = Some(Self::SIZE);
-    const FIXED_FORM_SIZE: Option<usize> = Some(Self::SIZE);
+impl<T: Bounded> Persistable for Fixed<T> {
+    const FIXED_SIZE: Option<usize> = Some(T::FIXED_FORM_SIZE);
 
     fn encoded_len(&self) -> usize {
-        Self::SIZE
+        T::FIXED_FORM_SIZE
     }
 
     fn encode(&self, out: &mut Encoder<'_>) {
@@ -289,14 +295,6 @@ impl<T: Persistable> Persistable for Fixed<T> {
     }
 
     fn decode(input: &mut Decoder<'_>) -> Result<Self, Error> {
-        T::decode_fixed(input).map(Fixed)
-    }
-
-    fn encode_fixed(&self, out: &mut Encoder<'_>) {
-        self.0.encode_fixed(out)
-    }
-
-    fn decode_fixed(input: &mut Decoder<'_>) -> Result<Self, Error> {
         T::decode_fixed(input).map(Fixed)
     }
 
@@ -317,7 +315,7 @@ impl<T: Persistable> Persistable for Fixed<T> {
     }
 }
 
-impl<T> std::ops::Deref for Fixed<T> {
+impl<T: Bounded> std::ops::Deref for Fixed<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -325,13 +323,13 @@ impl<T> std::ops::Deref for Fixed<T> {
     }
 }
 
-impl<T> std::ops::DerefMut for Fixed<T> {
+impl<T: Bounded> std::ops::DerefMut for Fixed<T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.0
     }
 }
 
-impl<T> From<T> for Fixed<T> {
+impl<T: Bounded> From<T> for Fixed<T> {
     fn from(value: T) -> Self {
         Fixed(value)
     }

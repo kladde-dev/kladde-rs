@@ -1,6 +1,6 @@
 mod support;
 
-use kladde::{Fixed, Persistable};
+use kladde::{Bounded, Fixed, Persistable};
 use support::Fixture;
 
 #[derive(Persistable, Debug, PartialEq, Clone)]
@@ -65,6 +65,7 @@ fn nested_fields_find_their_starts() {
 
 /// Integers whose encodings are varints.
 #[derive(Persistable, Debug, PartialEq, Clone, Copy)]
+#[kladde(bounded)]
 struct Counts {
     small: u32,
     signed: i64,
@@ -79,7 +80,7 @@ fn a_struct_is_its_fields_back_to_back() {
         flag: true,
     };
     assert_eq!(<Counts as Persistable>::FIXED_SIZE, None);
-    assert_eq!(<Counts as Persistable>::FIXED_FORM_SIZE, Some(4 + 8 + 1));
+    assert_eq!(<Counts as Bounded>::FIXED_FORM_SIZE, 4 + 8 + 1);
     assert_eq!(counts.encoded_len(), 3);
     assert_eq!(counts.to_bytes(), [5, 5, 1]);
     assert_eq!(Counts::from_bytes(&[5, 5, 1]).unwrap(), counts);

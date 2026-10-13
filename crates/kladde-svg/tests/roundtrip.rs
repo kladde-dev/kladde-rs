@@ -285,11 +285,8 @@ fn statistics_count_precision_and_coverage() {
 #[test]
 fn sizes_are_what_the_plan_estimated() {
     use kladde::Persistable;
-    // Path segments differ in size, by their number of coordinates; their
-    // fixed form is the largest, a curve's six, with `abs` and the
-    // discriminant.
+    // Path segments differ in size, by their number of coordinates.
     assert_eq!(<PathSegment as Persistable>::FIXED_SIZE, None);
-    assert_eq!(<PathSegment as Persistable>::FIXED_FORM_SIZE, Some(26));
     assert_eq!(<Length as Persistable>::FIXED_SIZE, Some(5));
     assert_eq!(
         <kladde_svg::model::Point as Persistable>::FIXED_SIZE,
@@ -306,6 +303,9 @@ fn sizes_are_what_the_plan_estimated() {
 #[test]
 fn sizes_with_f64() {
     use kladde::Persistable;
-    assert_eq!(<PathSegment as Persistable>::FIXED_FORM_SIZE, Some(50));
     assert_eq!(<Length as Persistable>::FIXED_SIZE, Some(9));
+    assert_eq!(
+        <kladde_svg::model::Point as Persistable>::FIXED_SIZE,
+        Some(16)
+    );
 }

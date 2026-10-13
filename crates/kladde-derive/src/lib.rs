@@ -5,8 +5,10 @@
 //! For a type `T`, it generates
 //!
 //! - a `Persistable` implementation: the encoding (`encoded_len`, `encode`,
-//!   `decode`), the fixed form (`encode_fixed`, `decode_fixed`), the sizes
-//!   `FIXED_SIZE` and `FIXED_FORM_SIZE`, and the schema descriptor;
+//!   `decode`), the size `FIXED_SIZE`, and the schema descriptor;
+//! - for a type marked `#[kladde(bounded)]`, a `Bounded` implementation:
+//!   the fixed form (`encode_fixed`, `decode_fixed`) and its size
+//!   `FIXED_FORM_SIZE`;
 //! - a guard type `TGuard`, with a `{field}_mut()` accessor per field
 //!   (`field_{i}_mut()` for a tuple struct's positional fields), a `parts()`
 //!   method handing out a guard for every field at once, and a whole-value
@@ -19,10 +21,10 @@
 //!   every field is.
 //! - An enum is its discriminant as a varint, then its variant's fields. It
 //!   is fixed-size if every discriminant is below 128 and every variant
-//!   takes the same fixed size. Its fixed form, which `Fixed<T>` holds, puts
-//!   the discriminant at the width an integer `#[repr(u8 | u16 | u32 |
-//!   u64)]` says, or else at the smallest of 1, 2, 4 and 8 bytes that holds
-//!   the largest discriminant, and pads every variant with zeros to the
+//!   takes the same fixed size. Its fixed form, if it is bounded, puts the
+//!   discriminant at the width an integer `#[repr(u8 | u16 | u32 | u64)]`
+//!   says, or else at the smallest of 1, 2, 4 and 8 bytes that holds the
+//!   largest discriminant, and pads every variant with zeros to the
 //!   largest. Its guard's `parts()` returns a generated `{Enum}Parts` enum
 //!   holding the guards of the current variant's fields, for mutating them
 //!   in place; `set` replaces the whole value, which is how the variant
@@ -30,8 +32,9 @@
 //! - A single-field struct marked `#[kladde(transparent)]` is persisted
 //!   exactly as its field: same bytes and same fingerprint. Its guard has a
 //!   `get_mut()` returning the field's guard.
-//! - Type parameters get a `Persistable` bound, as `#[derive(Debug)]` does;
-//!   lifetime and const parameters are rejected.
+//! - Type parameters get a `Persistable` bound, as `#[derive(Debug)]` does,
+//!   and a `Bounded` one in the `Bounded` implementation; lifetime and const
+//!   parameters are rejected.
 //!
 //! A field guard made by its accessor holds where its field starts: at a
 //! constant offset up to the first field whose size depends on its value,
@@ -95,12 +98,62 @@
 //! struct Meters(i32);
 //! ```
 //!
+//! **Fixed forms.** A type has a fixed form, and can be wrapped in
+//! `Fixed<T>`, if it is marked `#[kladde(bounded)]`, which every one of its
+//! fields' types must have too: a scalar, a `Fixed`, an `Option` or tuple of
+//! such types, or another type marked so.
+//!
+//! ```
+//! use kladde::{Bounded, Fixed, Persistable};
+//!
+//! #[derive(Persistable)]
+//! #[kladde(bounded)]
+//! struct Range {
+//!     start: u32, // a varint, but four bytes in the fixed form
+//!     len: u16,
+//! }
+//!
+//! assert_eq!(<Range as Persistable>::FIXED_SIZE, None);
+//! assert_eq!(<Range as Bounded>::FIXED_FORM_SIZE, 6);
+//! assert_eq!(<Fixed<Range> as Persistable>::FIXED_SIZE, Some(6));
+//! ```
+//!
+//! A field without a fixed form fails at the type's definition:
+//!
+//! ```compile_fail
+//! #[derive(kladde::Persistable)]
+//! struct Inner {
+//!     a: u32,
+//! }
+//!
+//! #[derive(kladde::Persistable)]
+//! #[kladde(bounded)]
+//! struct Outer {
+//!     inner: Inner, // error[E0277]: `Inner` has no fixed form
+//! }
+//! ```
+//!
+//! and so does a `Fixed` of a type without one:
+//!
+//! ```compile_fail
+//! #[derive(kladde::Persistable)]
+//! struct Inner {
+//!     a: u32,
+//! }
+//!
+//! #[derive(kladde::Persistable)]
+//! struct Holder {
+//!     inner: kladde::Fixed<Inner>, // error[E0277]: `Inner` has no fixed form
+//! }
+//! ```
+//!
 //! **Enums.** `parts()` reaches into the current variant:
 //!
 //! ```
-//! use kladde::{Kladde, Persistable};
+//! use kladde::{Bounded, Kladde, Persistable};
 //!
 //! #[derive(Persistable)]
+//! #[kladde(bounded)]
 //! enum Shape {
 //!     Origin,
 //!     Circle(f32),
@@ -118,7 +171,7 @@
 //! // The variants differ in size, so the enum is not fixed-size; its fixed
 //! // form takes a one-byte discriminant and the largest variant.
 //! assert_eq!(<Shape as Persistable>::FIXED_SIZE, None);
-//! assert_eq!(<Shape as Persistable>::FIXED_FORM_SIZE, Some(1 + 8));
+//! assert_eq!(<Shape as Bounded>::FIXED_FORM_SIZE, 1 + 8);
 //! # Ok::<(), kladde::Error>(())
 //! ```
 //!
@@ -142,18 +195,21 @@
 //! ```
 //!
 //! An integer `#[repr]` fixes the discriminant's width in the fixed form,
-//! and only unsigned ones of up to 64 bits are accepted, since
-//! discriminants are stored unsigned:
+//! so that it stays when variants are added, which is the one way a
+//! fixed-size type's fixed form can be larger than its encoding; only
+//! unsigned ones of up to 64 bits are accepted, since discriminants are
+//! stored unsigned:
 //!
 //! ```
 //! #[derive(kladde::Persistable)]
+//! #[kladde(bounded)]
 //! #[repr(u32)]
 //! enum Pinned {
 //!     A,
 //!     B,
 //! }
 //! assert_eq!(<Pinned as kladde::Persistable>::FIXED_SIZE, Some(1));
-//! assert_eq!(<Pinned as kladde::Persistable>::FIXED_FORM_SIZE, Some(4));
+//! assert_eq!(<Pinned as kladde::Bounded>::FIXED_FORM_SIZE, 4);
 //! ```
 //!
 //! ```compile_fail
@@ -178,7 +234,8 @@
 //! facade redirects it with `#[kladde(crate = "kladde_persist")]`.
 
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
+use quote::{format_ident, quote, quote_spanned};
+use syn::spanned::Spanned;
 use syn::{parse_macro_input, parse_quote, Data, DeriveInput, Fields, GenericParam};
 
 type Tokens = proc_macro2::TokenStream;
@@ -187,12 +244,16 @@ type Tokens = proc_macro2::TokenStream;
 pub fn derive_persistable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
-    let TypeAttrs { transparent, krate } = match kladde_attrs(&input.attrs) {
+    let TypeAttrs {
+        transparent,
+        bounded,
+        krate,
+    } = match kladde_attrs(&input.attrs) {
         Ok(parsed) => parsed,
         Err(err) => return err.to_compile_error().into(),
     };
 
-    let ctx = match Ctx::build(&input, krate) {
+    let ctx = match Ctx::build(&input, krate, bounded) {
         Ok(ctx) => ctx,
         Err(err) => return err.to_compile_error().into(),
     };
@@ -247,10 +308,18 @@ struct Ctx {
     /// The crate every generated path is rooted at -- `::kladde` unless
     /// `#[kladde(crate = "...")]` says otherwise.
     krate: syn::Path,
+    /// Whether the type is marked `#[kladde(bounded)]`, so that it gets a
+    /// `Bounded` impl.
+    bounded: bool,
+    /// The `where`-clause of the `Bounded` impl: the user's own predicates,
+    /// and `Bounded` for every type parameter, as `#[derive(Debug)]` asks
+    /// `Debug` of each. A field's type that is not `Bounded` then fails
+    /// where the impl's items name it, at the type's definition.
+    bounded_where: Tokens,
 }
 
 impl Ctx {
-    fn build(input: &DeriveInput, krate: syn::Path) -> syn::Result<Ctx> {
+    fn build(input: &DeriveInput, krate: syn::Path, is_bounded: bool) -> syn::Result<Ctx> {
         for param in &input.generics.params {
             match param {
                 GenericParam::Type(_) => {}
@@ -285,6 +354,9 @@ impl Ctx {
             let preds = &w.predicates;
             quote!(#preds,)
         });
+        let bounded_where = quote! {
+            where #user_where_preds #(#param_idents: #krate::Bounded,)*
+        };
 
         Ok(Ctx {
             impl_generics: quote! { <#(#bounded_params,)*> },
@@ -298,6 +370,8 @@ impl Ctx {
             param_idents,
             user_where_preds,
             krate,
+            bounded: is_bounded,
+            bounded_where,
         })
     }
 
@@ -321,11 +395,13 @@ impl Ctx {
 }
 
 /// Parses the type's `#[kladde(...)]` attributes: whether it is
-/// `transparent`, and the `crate` generated paths are rooted at. Errors on
-/// anything else, so that a typo is a compile error rather than a no-op.
+/// `transparent`, whether it is `bounded`, and the `crate` generated paths
+/// are rooted at. Errors on anything else, so that a typo is a compile error
+/// rather than a no-op.
 fn kladde_attrs(attrs: &[syn::Attribute]) -> syn::Result<TypeAttrs> {
     let mut parsed = TypeAttrs {
         transparent: false,
+        bounded: false,
         krate: syn::parse_quote!(::kladde),
     };
     for attr in attrs {
@@ -336,13 +412,17 @@ fn kladde_attrs(attrs: &[syn::Attribute]) -> syn::Result<TypeAttrs> {
             if meta.path.is_ident("transparent") {
                 parsed.transparent = true;
                 Ok(())
+            } else if meta.path.is_ident("bounded") {
+                parsed.bounded = true;
+                Ok(())
             } else if meta.path.is_ident("crate") {
                 let lit: syn::LitStr = meta.value()?.parse()?;
                 parsed.krate = lit.parse()?;
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unknown `#[kladde(...)]` option; supported are `transparent` and `crate`",
+                    "unknown `#[kladde(...)]` option; supported are `transparent`, `bounded` \
+                     and `crate`",
                 ))
             }
         })?;
@@ -353,6 +433,7 @@ fn kladde_attrs(attrs: &[syn::Attribute]) -> syn::Result<TypeAttrs> {
 /// The type's own `#[kladde(...)]` options.
 struct TypeAttrs {
     transparent: bool,
+    bounded: bool,
     krate: syn::Path,
 }
 
@@ -399,14 +480,22 @@ fn persistable(ty: &syn::Type, krate: &syn::Path) -> Tokens {
     quote!(<#ty as #krate::Persistable>)
 }
 
-/// The `Option<usize>` constant expressions summing the fields' `FIXED_SIZE`
-/// and `FIXED_FORM_SIZE`.
-fn field_sizes(fields: &[FieldInfo], krate: &syn::Path) -> (Tokens, Tokens) {
+/// `<ty as Bounded>`, spanned at the field's type, so that a field whose
+/// type has no fixed form is reported where it is written.
+fn bounded(ty: &syn::Type, krate: &syn::Path) -> Tokens {
+    quote_spanned!(ty.span()=> <#ty as #krate::Bounded>)
+}
+
+/// The `Option<usize>` constant expression summing the fields' `FIXED_SIZE`.
+fn fixed_size(fields: &[FieldInfo], krate: &syn::Path) -> Tokens {
     let paths: Vec<Tokens> = fields.iter().map(|f| persistable(&f.ty, krate)).collect();
-    (
-        quote!(#krate::sum_sizes(&[#(#paths::FIXED_SIZE),*])),
-        quote!(#krate::sum_sizes(&[#(#paths::FIXED_FORM_SIZE),*])),
-    )
+    quote!(#krate::sum_sizes(&[#(#paths::FIXED_SIZE),*]))
+}
+
+/// The `usize` constant expression summing the fields' `FIXED_FORM_SIZE`.
+fn fixed_form_size(fields: &[FieldInfo], krate: &syn::Path) -> Tokens {
+    let paths: Vec<Tokens> = fields.iter().map(|f| bounded(&f.ty, krate)).collect();
+    quote!(0usize #(+ #paths::FIXED_FORM_SIZE)*)
 }
 
 /// The guard type every derive kind shares: a `{ inner, region, fields }`
@@ -486,7 +575,8 @@ fn guard_assoc(ctx: &Ctx, guard_ident: &syn::Ident) -> Tokens {
     }
 }
 
-/// The signatures every derive kind spells the same way.
+/// The signatures every derive kind spells the same way: `encode` and
+/// `decode`, and `encode_fixed` and `decode_fixed`.
 fn codec_sigs(krate: &syn::Path) -> [Tokens; 4] {
     [
         quote! {
@@ -593,6 +683,24 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> Tokens {
     let guard_assoc = guard_assoc(ctx, &guard_ident);
     let set = set_method(ctx, ident, vis);
     let [encode_sig, decode_sig, encode_fixed_sig, decode_fixed_sig] = codec_sigs(krate);
+    let bounded_impl = ctx.bounded.then(|| {
+        let field_bounded = bounded(&field.ty, krate);
+        let bounded_where = &ctx.bounded_where;
+        quote! {
+            impl #impl_generics #krate::Bounded for #ident #type_generics #bounded_where {
+                const FIXED_FORM_SIZE: usize = #field_bounded::FIXED_FORM_SIZE;
+
+                #encode_fixed_sig {
+                    #field_bounded::encode_fixed(&self.#member, __out)
+                }
+
+                #decode_fixed_sig {
+                    let __value = #field_bounded::decode_fixed(__input)?;
+                    ::std::result::Result::Ok(#construct)
+                }
+            }
+        }
+    });
 
     quote! {
         #scaffold
@@ -609,9 +717,10 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> Tokens {
             }
         }
 
+        #bounded_impl
+
         impl #impl_generics #krate::Persistable for #ident #type_generics #where_clause {
             const FIXED_SIZE: ::std::option::Option<usize> = #field_ty::FIXED_SIZE;
-            const FIXED_FORM_SIZE: ::std::option::Option<usize> = #field_ty::FIXED_FORM_SIZE;
 
             #guard_assoc
 
@@ -626,15 +735,6 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> Tokens {
 
             #decode_sig {
                 let __value = #field_ty::decode(__input)?;
-                ::std::result::Result::Ok(#construct)
-            }
-
-            #encode_fixed_sig {
-                #field_ty::encode_fixed(&self.#member, __out)
-            }
-
-            #decode_fixed_sig {
-                let __value = #field_ty::decode_fixed(__input)?;
                 ::std::result::Result::Ok(#construct)
             }
 
@@ -693,7 +793,7 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
         .map(|f| format!("The guard of field `{}`.", f.schema_name))
         .collect();
     let schema_name: Vec<&String> = fields.iter().map(|f| &f.schema_name).collect();
-    let (fixed_size, fixed_form_size) = field_sizes(&fields, krate);
+    let fixed_size = fixed_size(&fields, krate);
 
     // `S { a, b }`, `S(a, b)` or `S`, built from or bound to `values`.
     let shape = |values: &[Tokens]| match &data.fields {
@@ -705,12 +805,7 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
         Fields::Unit => quote! { #ident },
     };
     let decoded: Vec<Tokens> = ty.iter().map(|t| quote!(#t::decode(__input)?)).collect();
-    let decoded_fixed: Vec<Tokens> = ty
-        .iter()
-        .map(|t| quote!(#t::decode_fixed(__input)?))
-        .collect();
     let decode_body = shape(&decoded);
-    let decode_fixed_body = shape(&decoded_fixed);
     let bindings: Vec<Tokens> = binding.iter().map(|b| quote!(#b)).collect();
     let pattern = shape(&bindings);
 
@@ -801,6 +896,29 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
     let set = set_method(ctx, ident, vis);
     let [encode_sig, decode_sig, encode_fixed_sig, decode_fixed_sig] = codec_sigs(krate);
     let field_describe = ty.iter().map(|t| quote!(#t::describe(__builder)));
+    let bounded_impl = ctx.bounded.then(|| {
+        let bty: Vec<Tokens> = fields.iter().map(|f| bounded(&f.ty, krate)).collect();
+        let decoded_fixed: Vec<Tokens> = bty
+            .iter()
+            .map(|t| quote!(#t::decode_fixed(__input)?))
+            .collect();
+        let decode_fixed_body = shape(&decoded_fixed);
+        let fixed_form_size = fixed_form_size(&fields, krate);
+        let bounded_where = &ctx.bounded_where;
+        quote! {
+            impl #impl_generics #krate::Bounded for #ident #type_generics #bounded_where {
+                const FIXED_FORM_SIZE: usize = #fixed_form_size;
+
+                #encode_fixed_sig {
+                    #( #bty::encode_fixed(&self.#member, __out); )*
+                }
+
+                #decode_fixed_sig {
+                    ::std::result::Result::Ok(#decode_fixed_body)
+                }
+            }
+        }
+    });
 
     quote! {
         #scaffold
@@ -821,9 +939,10 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
             #parts_method
         }
 
+        #bounded_impl
+
         impl #impl_generics #krate::Persistable for #ident #type_generics #where_clause {
             const FIXED_SIZE: ::std::option::Option<usize> = #fixed_size;
-            const FIXED_FORM_SIZE: ::std::option::Option<usize> = #fixed_form_size;
 
             #guard_assoc
 
@@ -838,14 +957,6 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
 
             #decode_sig {
                 ::std::result::Result::Ok(#decode_body)
-            }
-
-            #encode_fixed_sig {
-                #( #ty::encode_fixed(&self.#member, __out); )*
-            }
-
-            #decode_fixed_sig {
-                ::std::result::Result::Ok(#decode_fixed_body)
             }
 
             fn describe_local(
@@ -1062,8 +1173,9 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
             ..
         } = variant;
         let ty: Vec<Tokens> = fields.iter().map(|f| persistable(&f.ty, krate)).collect();
-        let (fixed, form) = field_sizes(fields, krate);
-        fixed_sizes.push(fixed);
+        let bty: Vec<Tokens> = fields.iter().map(|f| bounded(&f.ty, krate)).collect();
+        let form = fixed_form_size(fields, krate);
+        fixed_sizes.push(fixed_size(fields, krate));
         fixed_form_sizes.push(form.clone());
 
         len_arms.push(quote! {
@@ -1078,9 +1190,9 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
         encode_fixed_arms.push(quote! {
             #pattern => {
                 __out.bytes(&#discriminants[#i].to_le_bytes()[..#disc_width]);
-                #( #ty::encode_fixed(#bindings, __out); )*
-                let __used = #disc_width + #form.unwrap_or(0);
-                __out.zeros(Self::FIXED_FORM_SIZE.unwrap_or(__used) - __used);
+                #( #bty::encode_fixed(#bindings, __out); )*
+                let __used = #disc_width + #form;
+                __out.zeros(<Self as #krate::Bounded>::FIXED_FORM_SIZE - __used);
             }
         });
         let decoded: Vec<Tokens> = ty.iter().map(|t| quote!(#t::decode(__input)?)).collect();
@@ -1088,7 +1200,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
         decode_arms.push(quote! {
             __d if __d == #discriminants[#i] => #construct
         });
-        let decoded_fixed: Vec<Tokens> = ty
+        let decoded_fixed: Vec<Tokens> = bty
             .iter()
             .map(|t| quote!(#t::decode_fixed(__input)?))
             .collect();
@@ -1096,8 +1208,8 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
         decode_fixed_arms.push(quote! {
             __d if __d == #discriminants[#i] => {
                 let __value = #construct_fixed;
-                let __used = #disc_width + #form.unwrap_or(0);
-                for _ in __used..Self::FIXED_FORM_SIZE.unwrap_or(__used) {
+                let __used = #disc_width + #form;
+                for _ in __used..<Self as #krate::Bounded>::FIXED_FORM_SIZE {
                     if __input.byte()? != 0 {
                         return ::std::result::Result::Err(__input.corrupt("padding that is not zero"));
                     }
@@ -1214,6 +1326,37 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
     let guard_assoc = guard_assoc(ctx, &guard_ident);
     let set = set_method(ctx, ident, vis);
     let [encode_sig, decode_sig, encode_fixed_sig, decode_fixed_sig] = codec_sigs(krate);
+    let bounded_impl = ctx.bounded.then(|| {
+        let bounded_where = &ctx.bounded_where;
+        quote! {
+            impl #impl_generics #krate::Bounded for #ident #type_generics #bounded_where {
+                const FIXED_FORM_SIZE: usize =
+                    #krate::enum_fixed_form_size(#disc_width, &[#(#fixed_form_sizes),*]);
+
+                #encode_fixed_sig {
+                    match self {
+                        #(#encode_fixed_arms)*
+                    }
+                }
+
+                #decode_fixed_sig {
+                    let mut __buf = [0u8; 8];
+                    for __b in &mut __buf[..#disc_width] {
+                        *__b = __input.byte()?;
+                    }
+                    let __discriminant = u64::from_le_bytes(__buf);
+                    ::std::result::Result::Ok(match __discriminant {
+                        #(#decode_fixed_arms,)*
+                        _ => return ::std::result::Result::Err(__input.corrupt(::std::format!(
+                            "unknown discriminant {} of {}",
+                            __discriminant,
+                            ::std::stringify!(#ident),
+                        ))),
+                    })
+                }
+            }
+        }
+    });
 
     quote! {
         #scaffold
@@ -1223,6 +1366,8 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
         impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
             #set
         }
+
+        #bounded_impl
 
         // Rejected here rather than wrapped: a descriptor stores discriminants
         // unsigned. A free constant is evaluated even where nothing uses the
@@ -1260,8 +1405,6 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
         impl #impl_generics #krate::Persistable for #ident #type_generics #where_clause {
             const FIXED_SIZE: ::std::option::Option<usize> =
                 #krate::enum_fixed_size(&#discriminants, &[#(#fixed_sizes),*]);
-            const FIXED_FORM_SIZE: ::std::option::Option<usize> =
-                #krate::enum_fixed_form_size(#disc_width, &[#(#fixed_form_sizes),*]);
 
             #guard_assoc
 
@@ -1282,28 +1425,6 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
                 let __discriminant = __input.varint()?;
                 ::std::result::Result::Ok(match __discriminant {
                     #(#decode_arms,)*
-                    _ => return ::std::result::Result::Err(__input.corrupt(::std::format!(
-                        "unknown discriminant {} of {}",
-                        __discriminant,
-                        ::std::stringify!(#ident),
-                    ))),
-                })
-            }
-
-            #encode_fixed_sig {
-                match self {
-                    #(#encode_fixed_arms)*
-                }
-            }
-
-            #decode_fixed_sig {
-                let mut __buf = [0u8; 8];
-                for __b in &mut __buf[..#disc_width] {
-                    *__b = __input.byte()?;
-                }
-                let __discriminant = u64::from_le_bytes(__buf);
-                ::std::result::Result::Ok(match __discriminant {
-                    #(#decode_fixed_arms,)*
                     _ => return ::std::result::Result::Err(__input.corrupt(::std::format!(
                         "unknown discriminant {} of {}",
                         __discriminant,

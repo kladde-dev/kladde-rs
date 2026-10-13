@@ -1,4 +1,4 @@
-//! [`Persistable`] for the primitive types, whose guards are
+//! [`Persistable`] and [`Bounded`] for the primitive types, whose guards are
 //! [`SetGuard`]s.
 //!
 //! | type | encoding | fixed form |
@@ -16,7 +16,7 @@ use kladde_schema::{Primitive, TypeDescriptor};
 use kladde_store::Error;
 
 use crate::codec::{Decoder, Encoder};
-use crate::persistable::{Persistable, SetGuard};
+use crate::persistable::{Bounded, Persistable, SetGuard};
 use crate::region::{Backend, Region};
 use crate::schema::SchemaBuilder;
 
@@ -30,9 +30,23 @@ macro_rules! scalar {
         encode_fixed: |$fv:ident, $fout:ident| $encode_fixed:expr,
         decode_fixed: |$finput:ident| $decode_fixed:expr $(,)?
     ) => {
+        impl Bounded for $ty {
+            const FIXED_FORM_SIZE: usize = $form;
+
+            #[inline]
+            fn encode_fixed(&self, $fout: &mut Encoder<'_>) {
+                let $fv = *self;
+                $encode_fixed
+            }
+
+            #[inline]
+            fn decode_fixed($finput: &mut Decoder<'_>) -> Result<Self, Error> {
+                $decode_fixed
+            }
+        }
+
         impl Persistable for $ty {
             const FIXED_SIZE: Option<usize> = $fixed;
-            const FIXED_FORM_SIZE: Option<usize> = Some($form);
 
             #[inline]
             fn encoded_len(&self) -> usize {
@@ -49,17 +63,6 @@ macro_rules! scalar {
             #[inline]
             fn decode($input: &mut Decoder<'_>) -> Result<Self, Error> {
                 $decode
-            }
-
-            #[inline]
-            fn encode_fixed(&self, $fout: &mut Encoder<'_>) {
-                let $fv = *self;
-                $encode_fixed
-            }
-
-            #[inline]
-            fn decode_fixed($finput: &mut Decoder<'_>) -> Result<Self, Error> {
-                $decode_fixed
             }
 
             type Guard<'r, B: Backend + 'r> = SetGuard<'r, $ty, B>;
@@ -184,7 +187,7 @@ mod tests {
     use super::*;
     use kladde_store::{MemoryStorage, Store, WriteBackend};
 
-    fn fixed<T: Persistable>(value: T) -> Vec<u8> {
+    fn fixed<T: Bounded>(value: T) -> Vec<u8> {
         let mut out = Vec::new();
         value.encode_fixed(&mut Encoder::new(&mut out));
         out
@@ -209,12 +212,12 @@ mod tests {
 
     #[test]
     fn every_scalar_round_trips_in_both_forms() {
-        fn both<T: Persistable + PartialEq + std::fmt::Debug + Copy + 'static>(values: &[T]) {
+        fn both<T: Bounded + PartialEq + std::fmt::Debug + Copy + 'static>(values: &[T]) {
             for &v in values {
                 assert_eq!(T::from_bytes(&v.to_bytes()).unwrap(), v);
                 assert_eq!(v.to_bytes().len(), v.encoded_len());
                 let f = fixed(v);
-                assert_eq!(Some(f.len()), T::FIXED_FORM_SIZE);
+                assert_eq!(f.len(), T::FIXED_FORM_SIZE);
                 assert_eq!(T::decode_fixed(&mut Decoder::new(&f)).unwrap(), v);
                 assert_eq!(
                     T::schema().measure(kladde_schema::TypeRef(0), &v.to_bytes()),

@@ -9,7 +9,8 @@
 //!   writes and splices relative to its start; [`Node`] and [`FieldSizes`]:
 //!   what a value keeps to find its children, which a child's change of
 //!   size updates.
-//! - [`Fixed`]: a type's values at a fixed size; [`Option`] and [`Box`],
+//! - [`Fixed`]: a type's values at a fixed size, for every type with a fixed
+//!   form, which is [`Bounded`]; [`Option`] and [`Box`],
 //!   the latter persisted as what it holds; tuples, and the scalars, whose
 //!   guard is a [`SetGuard`].
 //! - [`Cut`]: a value cut out of one container, to be pasted into another
@@ -51,7 +52,7 @@ mod wrappers;
 
 pub use codec::{varint_len, Decoder, Encoder, TERMINATOR};
 pub use cut::Cut;
-pub use persistable::{replace, Guard, Persistable, SetGuard};
+pub use persistable::{replace, Bounded, Guard, Persistable, SetGuard};
 pub use region::{Backend, FieldSizes, Node, Region};
 pub use schema::SchemaBuilder;
 pub use sizes::{discriminant_width, enum_fixed_form_size, enum_fixed_size, sum_sizes};

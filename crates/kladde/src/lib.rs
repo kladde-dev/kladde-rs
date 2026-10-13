@@ -48,8 +48,9 @@ pub use kladde_derive::Persistable;
 // dependency, and never two incompatible copies of the same trait.
 pub use kladde_persist::{
     discriminant_width, enum_fixed_form_size, enum_fixed_size, replace, sum_sizes, varint_len,
-    Backend, Cut, CutId, Decoder, Encoder, Error, FieldSizes, Fixed, Guard, Node, OptionGuard,
-    Persistable, Region, Result, SchemaBuilder, SetGuard, TupleGuard, WriteBackend, TERMINATOR,
+    Backend, Bounded, Cut, CutId, Decoder, Encoder, Error, FieldSizes, Fixed, Guard, Node,
+    OptionGuard, Persistable, Region, Result, SchemaBuilder, SetGuard, TupleGuard, WriteBackend,
+    TERMINATOR,
 };
 
 // The schema and fingerprint surface, so an application can inspect its root

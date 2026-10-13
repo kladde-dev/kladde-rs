@@ -1,15 +1,17 @@
 mod support;
 
-use kladde::Persistable;
+use kladde::{Bounded, Fixed, Persistable};
 use support::Fixture;
 
 #[derive(Persistable, Debug, PartialEq)]
+#[kladde(bounded)]
 struct Tagged<T> {
     tag: u8,
     value: T,
 }
 
 #[derive(Persistable, Debug, PartialEq)]
+#[kladde(bounded)]
 enum Either<L, R> {
     Left(L),
     Right(R),
@@ -24,6 +26,27 @@ fn generic_types_take_their_parameters_sizes_and_schemas() {
         Either::<u8, f32>::Right(1.0).to_bytes(),
         [1, 0, 0, 0x80, 0x3f]
     );
+}
+
+#[test]
+fn a_bounded_generic_type_has_a_fixed_form_where_its_parameters_have() {
+    assert_eq!(<Tagged<u64> as Bounded>::FIXED_FORM_SIZE, 9);
+    assert_eq!(<Either<u8, u32> as Bounded>::FIXED_FORM_SIZE, 1 + 4);
+    let fixed = Fixed(Tagged {
+        tag: 1,
+        value: 7u32,
+    });
+    assert_eq!(fixed.to_bytes(), [1, 7, 0, 0, 0]);
+    assert_eq!(
+        <Fixed<Tagged<u32>>>::from_bytes(&fixed.to_bytes()).unwrap(),
+        fixed
+    );
+    // A parameter without a fixed form leaves the type persistable.
+    let boxed = Tagged {
+        tag: 1,
+        value: Box::new(2u8),
+    };
+    assert_eq!(boxed.to_bytes(), [1, 2]);
 }
 
 #[test]

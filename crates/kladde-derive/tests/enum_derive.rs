@@ -1,9 +1,10 @@
 mod support;
 
-use kladde::{Fixed, Persistable, TypeDescriptor, TypeRef};
+use kladde::{Bounded, Fixed, Persistable, TypeDescriptor, TypeRef};
 use support::Fixture;
 
 #[derive(Persistable, Debug, PartialEq, Clone)]
+#[kladde(bounded)]
 enum Shape {
     Origin,
     Circle(f32),
@@ -79,12 +80,14 @@ enum Unit {
 }
 
 #[derive(Persistable, Debug, PartialEq, Clone, Copy)]
+#[kladde(bounded)]
 enum Wide {
     A,
     B = 128,
 }
 
 #[derive(Persistable, Debug, PartialEq, Clone, Copy)]
+#[kladde(bounded)]
 #[repr(u16)]
 enum Pinned {
     A = 3,
@@ -97,9 +100,9 @@ fn discriminants_are_rusts_and_fix_the_size_below_128() {
     assert_eq!(Unit::C.to_bytes(), [127]);
     assert_eq!(<Wide as Persistable>::FIXED_SIZE, None);
     assert_eq!(Wide::B.to_bytes(), [0x80, 0x01]);
-    assert_eq!(<Wide as Persistable>::FIXED_FORM_SIZE, Some(1));
+    assert_eq!(<Wide as Bounded>::FIXED_FORM_SIZE, 1);
     assert_eq!(Fixed(Wide::B).to_bytes(), [128]);
-    assert_eq!(<Pinned as Persistable>::FIXED_FORM_SIZE, Some(2));
+    assert_eq!(<Pinned as Bounded>::FIXED_FORM_SIZE, 2);
     assert_eq!(Fixed(Pinned::B).to_bytes(), [4, 0]);
     let TypeDescriptor::Enum {
         discriminant_width,
@@ -132,7 +135,6 @@ fn a_recursive_enum_holds_itself_inline() {
     let list = List::Cons(1, Box::new(List::Cons(2, Box::new(List::Nil))));
     assert_eq!(list.to_bytes(), [1, 1, 1, 2, 0]);
     assert_eq!(<List as Persistable>::FIXED_SIZE, None);
-    assert_eq!(<List as Persistable>::FIXED_FORM_SIZE, None);
     let table = List::schema();
     assert_eq!(table.validate(), Ok(()));
     let mut f = Fixture::new(list);

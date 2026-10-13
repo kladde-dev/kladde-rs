@@ -1,10 +1,10 @@
 mod support;
 
-use kladde::Persistable;
+use kladde::{Bounded, Fixed, Persistable};
 use support::Fixture;
 
 #[derive(Persistable, Debug, PartialEq)]
-#[kladde(transparent)]
+#[kladde(transparent, bounded)]
 struct Meters(i32);
 
 #[derive(Persistable, Debug, PartialEq)]
@@ -19,7 +19,8 @@ fn a_transparent_type_is_its_field_on_file() {
     assert_eq!(Meters::fingerprint(), i32::fingerprint());
     assert_eq!(Meters::schema(), i32::schema());
     assert_eq!(Named::fingerprint(), <(u8, u16)>::fingerprint());
-    assert_eq!(<Meters as Persistable>::FIXED_FORM_SIZE, Some(4));
+    assert_eq!(<Meters as Bounded>::FIXED_FORM_SIZE, 4);
+    assert_eq!(Fixed(Meters(-3)).to_bytes(), Fixed(-3i32).to_bytes());
 }
 
 #[test]
