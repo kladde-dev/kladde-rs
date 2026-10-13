@@ -238,10 +238,11 @@ pub trait Durable: Sized {
 /// padded with zeros to the largest, so that every field lies at a constant
 /// offset whatever the value.
 ///
-/// The scalars, [`Fixed`](crate::Fixed), and the [`Option`]s and tuples of
-/// `Bounded` types implement it, and so does a type derived with
+/// The scalars, [`Fixed`](crate::Fixed), and the [`Option`]s, [`Box`]es and
+/// tuples of `Bounded` types implement it, and so does a type derived with
 /// `#[kladde(bounded)]`, which every one of its fields' types must implement
-/// too. Text, containers, opaque values and [`Box`] have no fixed form.
+/// too. Text, containers, and opaque values without a fixed size have no
+/// fixed form, and neither has a type that holds itself.
 ///
 /// A hand-written implementation owes that
 /// [`encode_fixed`](Bounded::encode_fixed) writes exactly
@@ -258,7 +259,7 @@ pub trait Durable: Sized {
 #[diagnostic::on_unimplemented(
     message = "`{Self}` has no fixed form",
     label = "`Fixed` and `#[kladde(bounded)]` need a fixed form here",
-    note = "the scalars, `Fixed<T>`, and the `Option`s and tuples of types with a fixed form \
+    note = "the scalars, `Fixed<T>`, and the `Option`s, `Box`es and tuples of types with a fixed form \
             have one, and so has a derived type marked `#[kladde(bounded)]`, whose fields' \
             types must all have one"
 )]

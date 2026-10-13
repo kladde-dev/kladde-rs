@@ -145,3 +145,65 @@ fn a_recursive_enum_holds_itself_inline() {
     assert_eq!(*f.kladde.get(), List::Cons(9, Box::new(List::Nil)));
     f.check();
 }
+
+/// `Shape` again, with its rectangle's fields in a struct of their own.
+#[derive(Durable, Debug, PartialEq, Clone)]
+#[kladde(bounded)]
+struct Rect {
+    width: u32,
+    height: u32,
+}
+
+#[derive(Durable, Debug, PartialEq, Clone)]
+#[kladde(bounded)]
+enum Unboxed {
+    Origin,
+    Circle(f32),
+    Rectangle(Rect),
+}
+
+#[derive(Durable, Debug, PartialEq, Clone)]
+#[kladde(bounded)]
+enum Boxed {
+    Origin,
+    Circle(f32),
+    Rectangle(Box<Rect>),
+}
+
+#[test]
+fn boxing_a_variant_changes_nothing_on_file() {
+    // Equal but for the enum's own name, which is not fingerprinted.
+    assert_eq!(Boxed::fingerprint(), Unboxed::fingerprint());
+    let mut schema = Boxed::schema().descriptors().to_vec();
+    if let TypeDescriptor::Enum { name, .. } = &mut schema[0] {
+        *name = "Unboxed".into();
+    }
+    assert_eq!(schema, Unboxed::schema().descriptors());
+    let rect = Rect {
+        width: 300,
+        height: 2,
+    };
+    let boxed = Boxed::Rectangle(Box::new(rect.clone()));
+    let unboxed = Unboxed::Rectangle(rect);
+    assert_eq!(boxed.to_bytes(), unboxed.to_bytes());
+    // The fixed form survives the box too.
+    assert_eq!(
+        <Boxed as Bounded>::FIXED_FORM_SIZE,
+        <Unboxed as Bounded>::FIXED_FORM_SIZE
+    );
+    assert_eq!(
+        Fixed(boxed.clone()).to_bytes(),
+        Fixed(unboxed.clone()).to_bytes()
+    );
+    assert_eq!(
+        <Fixed<Boxed>>::from_bytes(&Fixed(unboxed).to_bytes()).unwrap(),
+        Fixed(boxed.clone())
+    );
+    // The boxed variant's guard is the struct's own.
+    let mut f = Fixture::new(boxed);
+    if let BoxedParts::Rectangle(mut r) = f.kladde.guard().parts() {
+        r.width_mut().set(70_000).unwrap();
+    }
+    assert!(matches!(f.kladde.get(), Boxed::Rectangle(r) if r.width == 70_000));
+    f.check();
+}

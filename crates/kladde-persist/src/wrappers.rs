@@ -182,7 +182,8 @@ impl<T, B> std::ops::Deref for OptionGuard<'_, T, B> {
 /// Its `FIXED_SIZE` is `None` whatever `T`'s, which costs a container of
 /// boxes its multiplication and nothing else, and keeps a type that holds
 /// itself through a box from asking its own size of itself, a cycle the
-/// compiler would refuse. For the same reason it has no fixed form.
+/// compiler would refuse. It is [`Bounded`] wherever `T` is, with `T`'s
+/// fixed form, so that boxing a field keeps `Fixed` of what holds it.
 ///
 /// ```
 /// use kladde_persist::Durable;
@@ -236,6 +237,26 @@ impl<T: Durable> Durable for Box<T> {
         Self: 'static,
     {
         T::describe(builder)
+    }
+}
+
+/// A box's fixed form is that of the `T` it holds, as its encoding is.
+///
+/// ```
+/// use kladde_persist::{Bounded, Durable, Fixed};
+///
+/// assert_eq!(<Box<u32> as Bounded>::FIXED_FORM_SIZE, 4);
+/// assert_eq!(Fixed(Box::new(7u32)).to_bytes(), Fixed(7u32).to_bytes());
+/// ```
+impl<T: Bounded> Bounded for Box<T> {
+    const FIXED_FORM_SIZE: usize = T::FIXED_FORM_SIZE;
+
+    fn encode_fixed(&self, out: &mut Encoder<'_>) {
+        (**self).encode_fixed(out)
+    }
+
+    fn decode_fixed(input: &mut Decoder<'_>) -> Result<Self, Error> {
+        T::decode_fixed(input).map(Box::new)
     }
 }
 
