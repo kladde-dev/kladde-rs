@@ -229,6 +229,110 @@
 //! }
 //! ```
 //!
+//! **Trait objects, as an enum.** A file can hold only values whose types
+//! it can name, so where an application would hold a `Box<dyn Shape>`, it
+//! holds an enum of the shapes instead, which forwards the trait's methods
+//! to its variants: mark the trait `#[kladde::dispatch]`, and the enum
+//! `#[kladde(dispatch(Shape))]`. The enum is an ordinary durable enum, with
+//! a variant per implementation, and converts `From` each variant's value.
+//! A variant may hold its value in a `Box`, to keep a large variant from
+//! making every value of the enum large: a box is persisted as what it
+//! holds, so boxing a variant, or unboxing it, changes nothing on file.
+//!
+//! ```
+//! use kladde::{Durable, Kladde};
+//!
+//! #[kladde::dispatch]
+//! trait Shape {
+//!     fn area(&self) -> f32;
+//! }
+//!
+//! #[derive(Durable, Clone)]
+//! struct Circle { r: f32 }
+//! impl Shape for Circle {
+//!     fn area(&self) -> f32 { 3.0 * self.r * self.r }
+//! }
+//!
+//! #[derive(Durable, Clone)]
+//! struct Rect { w: f32, h: f32 }
+//! impl Shape for Rect {
+//!     fn area(&self) -> f32 { self.w * self.h }
+//! }
+//!
+//! #[derive(Durable, Clone)]
+//! struct ComplicatedVariantWithManyFields {
+//!     outer: Rect,
+//!     hole: Rect,
+//!     angle: f32,
+//!     label: u32,
+//! }
+//! impl Shape for ComplicatedVariantWithManyFields {
+//!     fn area(&self) -> f32 { self.outer.area() - self.hole.area() }
+//! }
+//!
+//! #[derive(Durable)]
+//! #[kladde(dispatch(Shape))]
+//! #[repr(u32)]
+//! enum AnyShape {
+//!     Circle(Circle) = 1,
+//!     Rect(Rect) = 2,
+//!     ComplicatedVariantWithManyFields(Box<ComplicatedVariantWithManyFields>) = 3,
+//! }
+//!
+//! let mut shape = Kladde::new(AnyShape::from(Rect { w: 2.0, h: 3.0 }));
+//! assert_eq!(shape.get().area(), 6.0);
+//!
+//! // `From` the boxed variant's value, boxing it.
+//! let frame = ComplicatedVariantWithManyFields {
+//!     outer: Rect { w: 3.0, h: 3.0 },
+//!     hole: Rect { w: 1.0, h: 1.0 },
+//!     angle: 0.0,
+//!     label: 7,
+//! };
+//! shape.guard().set(frame.into())?;
+//! assert_eq!(shape.get().area(), 8.0);
+//!
+//! // The boxed variant's guard is its value's own.
+//! if let AnyShapeParts::ComplicatedVariantWithManyFields(mut c) = shape.guard().parts() {
+//!     c.hole_mut().w_mut().set(2.0)?;
+//! }
+//! assert_eq!(shape.get().area(), 7.0);
+//! # Ok::<(), kladde::Error>(())
+//! ```
+//!
+//! The discriminants are optional, as on every enum; explicit ones keep a
+//! file readable when variants are added or reordered. Every variant holds
+//! one value, whose type implements the trait, or fails to compile at the
+//! enum:
+//!
+//! ```compile_fail
+//! #[kladde::dispatch]
+//! trait Shape { fn area(&self) -> f32; }
+//!
+//! #[derive(kladde::Durable)]
+//! struct Square { side: f32 } // no `impl Shape for Square`
+//!
+//! #[derive(kladde::Durable)]
+//! #[kladde(dispatch(Shape))]
+//! enum AnyShape {
+//!     Square(Square), // error[E0277]: the trait bound `Square: Shape` is not satisfied
+//! }
+//! ```
+//!
+//! The trait's methods take `self`, `&self` or `&mut self`, and mention
+//! `Self` nowhere else in their signatures, since each variant would need a
+//! value of its own type there:
+//!
+//! ```compile_fail
+//! #[kladde::dispatch]
+//! trait Merge {
+//!     fn merge(&self, other: &Self) -> Self; // error: cannot forward a method that takes `Self` ...
+//! }
+//! ```
+//!
+//! The trait and the enum must be in one crate; the enum may be in any
+//! module, before or after the trait.
+//!
 //! **Paths.** Generated code names everything through `::kladde`, which
 //! re-exports what it needs. A library built on `kladde-persist` without the
 //! facade redirects it with `#[kladde(crate = "kladde_persist")]`.
@@ -240,6 +344,8 @@ use syn::{parse_macro_input, parse_quote, Data, DeriveInput, Fields, GenericPara
 
 type Tokens = proc_macro2::TokenStream;
 
+mod dispatch;
+
 #[proc_macro_derive(Durable, attributes(kladde))]
 pub fn derive_durable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -248,6 +354,7 @@ pub fn derive_durable(input: TokenStream) -> TokenStream {
         transparent,
         bounded,
         krate,
+        dispatch,
     } = match kladde_attrs(&input.attrs) {
         Ok(parsed) => parsed,
         Err(err) => return err.to_compile_error().into(),
@@ -258,7 +365,7 @@ pub fn derive_durable(input: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error().into(),
     };
 
-    let expanded = if transparent {
+    let mut expanded = if transparent {
         derive_transparent(&input, &ctx)
     } else {
         match &input.data {
@@ -271,8 +378,25 @@ pub fn derive_durable(input: TokenStream) -> TokenStream {
             .to_compile_error(),
         }
     };
+    if !dispatch.is_empty() {
+        expanded.extend(dispatch::dispatch_impls(&input, &dispatch));
+    }
 
     expanded.into()
+}
+
+/// Makes a trait one that an enum can implement by forwarding to its
+/// variants, with `#[derive(Durable)]` and `#[kladde(dispatch(Trait))]`.
+///
+/// The trait itself is unchanged. Every method must take `self`, `&self` or
+/// `&mut self`, and mention `Self` nowhere else in its signature; the trait
+/// may not be generic or have associated types or constants. The enum must
+/// be in the trait's crate. See the [crate documentation](crate) for an
+/// example.
+#[proc_macro_attribute]
+pub fn dispatch(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let item = parse_macro_input!(item as syn::ItemTrait);
+    dispatch::dispatch_trait(attr.into(), item).into()
 }
 
 /// The generics plumbing every derive path shares, precomputed once from the
@@ -395,14 +519,15 @@ impl Ctx {
 }
 
 /// Parses the type's `#[kladde(...)]` attributes: whether it is
-/// `transparent`, whether it is `bounded`, and the `crate` generated paths
-/// are rooted at. Errors on anything else, so that a typo is a compile error
-/// rather than a no-op.
+/// `transparent`, whether it is `bounded`, the `crate` generated paths are
+/// rooted at, and the traits it `dispatch`es. Errors on anything else, so
+/// that a typo is a compile error rather than a no-op.
 fn kladde_attrs(attrs: &[syn::Attribute]) -> syn::Result<TypeAttrs> {
     let mut parsed = TypeAttrs {
         transparent: false,
         bounded: false,
         krate: syn::parse_quote!(::kladde),
+        dispatch: Vec::new(),
     };
     for attr in attrs {
         if !attr.path().is_ident("kladde") {
@@ -419,10 +544,15 @@ fn kladde_attrs(attrs: &[syn::Attribute]) -> syn::Result<TypeAttrs> {
                 let lit: syn::LitStr = meta.value()?.parse()?;
                 parsed.krate = lit.parse()?;
                 Ok(())
+            } else if meta.path.is_ident("dispatch") {
+                meta.parse_nested_meta(|tr| {
+                    parsed.dispatch.push(tr.path.clone());
+                    Ok(())
+                })
             } else {
                 Err(meta.error(
-                    "unknown `#[kladde(...)]` option; supported are `transparent`, `bounded` \
-                     and `crate`",
+                    "unknown `#[kladde(...)]` option; supported are `transparent`, `bounded`, \
+                     `dispatch(...)` and `crate`",
                 ))
             }
         })?;
@@ -435,6 +565,8 @@ struct TypeAttrs {
     transparent: bool,
     bounded: bool,
     krate: syn::Path,
+    /// The traits the enum implements by forwarding to its variants.
+    dispatch: Vec<syn::Path>,
 }
 
 /// Refuses `#[kladde(...)]` on a field: fields take no options.
