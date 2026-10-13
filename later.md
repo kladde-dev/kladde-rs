@@ -2,15 +2,16 @@
 
 ## High priority
 
-- **⚠️ Data loss, on branch `one-sequence`: a file whose span table outgrows the header's references to leaves can no longer be flushed, and so no longer opened.**
-  The branch writes a span table of two levels, the header and the leaves it names, and no interior table pages, which the format allows (`drafts/one-sequence.md#encoding-of-entries`).
+- **⚠️ Data loss: a file whose span table outgrows the header's references to leaves can no longer be flushed, and so no longer opened.**
+  kladde-rs writes a span table of two levels, the header and the leaves it names, and no interior table pages, which the format allows (`spec/span-table.md#physical-format`).
   The header holds the leaves' page numbers, delta-encoded in one or two bytes each, so beyond some 2,000 to 4,000 leaves, one to two million spans, the references alone outgrow it.
   The flush then fails with `OutOfBounds` and poisons the store; opening replays the journal with a flush, which fails the same way, so the file's content since its last good flush, and the file itself, are lost to this implementation.
   Before the commit that added this entry, the cut looped without end instead.
   No workload measured comes near the bound: the world map's sequence of 942 KiB takes 21 to 26 leaves.
   Fix: write interior table pages when the leaves' references outgrow the header, and read them at open, which `load.rs` refuses today; test with the header's capacity settable from tests.
 
-- **⚠️ Data loss: a flush drops the statements of a non-header address-table page that also has child references.**
+- **⚠️ Data loss, on branch `address-table` only: a flush drops the statements of a non-header address-table page that also has child references.**
+  The present design refuses, at open, a leaf that names table pages of its own (see the entry above), so it loses nothing to such a file; the entry stays for the branch, whose design its paths below refer to, as kladde-docs had it up to commit `bf13c73`.
   The spec lets any address-table page hold both `child_ref`s and statements (`spec/address-table.md#physical-format`), and `impl/consolidation.md#unlinking-an-emptied-page` says an implementation must not rely on the tree shape it writes itself.
   kladde-rs writes such a page only as the header, and its cut rebuilds everything above the leaves in every flush: it keeps or rewrites leaves only, and drops the header's children that have children of their own without taking their statements.
   A file from another writer that has such a page therefore opens correctly, but its first flush drops those statements, and the next open fails on their allocations with `DanglingPointer`.
@@ -19,7 +20,7 @@
   Related, from reading the code and not tested: a page with children below the header's children is neither kept nor dropped by the cut, and stays allocated in memory until the file is reopened.
   Fix: implement the path copy of `impl/consolidation.md#unlinking-an-emptied-page` — keep every table page whose child list does not change, rewrite the ancestors of each dropped page up to the header, take a rewritten page's live statements into the flush first, and give the surviving children of a dropped page a new parent.
   Test it with the tree limits (600 children in the header, 800 per interior page) settable from tests, and with hand-built files: take a file kladde-rs wrote, move one allocation's statements into a non-header page that names a leaf, open it, flush, and reopen.
-  Recorded in `implementation-notes.md` under Flush.
+  Recorded in that branch's `implementation-notes.md` under Flush.
 
 ## Potential major redesigns
 
