@@ -39,7 +39,7 @@ impl TypeTable {
     /// assert_eq!(point.fixed_size(TypeRef(0)), Some(8));
     /// ```
     pub fn fixed_size(&self, reference: TypeRef) -> Option<u64> {
-        let mut memo = vec![Memo::Unknown; self.descriptors().len()];
+        let mut memo = vec![Memo::Unknown; 2 * self.descriptors().len()];
         self.sized(reference.0, false, &mut memo)
     }
 
@@ -73,20 +73,22 @@ impl TypeTable {
     /// assert_eq!(option.fixed_form_size(TypeRef(0)), Some(5));
     /// ```
     pub fn fixed_form_size(&self, reference: TypeRef) -> Option<u64> {
-        let mut memo = vec![Memo::Unknown; self.descriptors().len()];
+        let mut memo = vec![Memo::Unknown; 2 * self.descriptors().len()];
         self.sized(reference.0, true, &mut memo)
     }
 
     /// The fixed size of the type at `index` (its fixed form's, if `form`),
-    /// memoized; a type reached again while it is being sized is part of a
-    /// cycle, and has none.
+    /// memoized per type and form, since a type met inside a `Fixed` and
+    /// outside one has two sizes; a type reached again while it is being
+    /// sized is part of a cycle, and has none.
     fn sized(&self, index: usize, form: bool, memo: &mut [Memo]) -> Option<u64> {
-        match memo[index] {
+        let slot = 2 * index + form as usize;
+        match memo[slot] {
             Memo::Known(size) => return size,
             Memo::InProgress => return None,
             Memo::Unknown => {}
         }
-        memo[index] = Memo::InProgress;
+        memo[slot] = Memo::InProgress;
         let size = match &self.descriptors()[index] {
             TypeDescriptor::Primitive(p) if form => Some(p.fixed_form_size()),
             TypeDescriptor::Primitive(p) => p.fixed_size(),
@@ -121,7 +123,7 @@ impl TypeTable {
             TypeDescriptor::Sequence(_) | TypeDescriptor::Map { .. } | TypeDescriptor::Text => None,
             TypeDescriptor::Fixed(target) => self.sized(target.0, true, memo),
         };
-        memo[index] = Memo::Known(size);
+        memo[slot] = Memo::Known(size);
         size
     }
 
@@ -413,6 +415,19 @@ mod tests {
             name: name.into(),
             fields,
         }
+    }
+
+    #[test]
+    fn a_type_met_inside_and_outside_a_fixed_keeps_both_sizes() {
+        // `struct S { b: Fixed(u32), a: u32 }`: the `u32` is four bytes in
+        // `b` and a varint in `a`, so `S` has no fixed size.
+        let table = TypeTable::new(vec![
+            strukt("S", vec![field("b", 1), field("a", 2)]),
+            TypeDescriptor::Fixed(TypeRef(2)),
+            TypeDescriptor::Primitive(Primitive::U32),
+        ]);
+        assert_eq!(table.fixed_size(TypeRef(0)), None);
+        assert_eq!(table.fixed_form_size(TypeRef(0)), Some(8));
     }
 
     fn nesting_error(table: &TypeTable) -> &'static str {

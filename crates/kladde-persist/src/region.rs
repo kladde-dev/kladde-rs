@@ -253,17 +253,16 @@ impl<'r, B: Backend> Region<'r, B> {
         }
     }
 
-    /// Overwrites `bytes.len()` bytes at `at`. Inside a transaction, returns
-    /// the cut of the overwritten bytes, as [`WriteBackend::write`] does.
+    /// Overwrites `bytes.len()` bytes at `at`, and returns the cut of the
+    /// overwritten bytes, as [`WriteBackend::write`] does.
     pub fn write(&self, at: u64, bytes: &[u8]) -> Result<Option<CutId>, Error> {
         self.check(at, bytes.len() as u64)?;
         self.backend.write(self.start() + at, bytes)
     }
 
     /// Replaces the `removed` bytes at `at` with `bytes`, shifting what
-    /// follows, or overwriting them if the lengths agree. Inside a
-    /// transaction, returns the cut of the removed bytes, as
-    /// [`WriteBackend::splice`] does.
+    /// follows, or overwriting them if the lengths agree, and returns the cut
+    /// of the removed bytes, as [`WriteBackend::splice`] does.
     ///
     /// ```
     /// use kladde_persist::Region;
