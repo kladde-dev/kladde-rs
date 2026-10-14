@@ -937,13 +937,16 @@ impl Inner {
         if from == to {
             return Ok(to);
         }
+        self.ensure_journal_page()?;
         let mut payload = Vec::with_capacity((to.bytes - from.bytes) as usize);
         let mut cursor = self.journal.cursor;
-        let mut cuts = self.journal_cuts.clone();
+        // The journal's cuts take the transaction's in place: copying them
+        // would make every append cost as much as the journal has cuts. A
+        // failure from here on poisons the store, which then needs them no
+        // more.
         self.ops
-            .encode(from, to, &mut cursor, &mut cuts, &mut payload);
+            .encode(from, to, &mut cursor, &mut self.journal_cuts, &mut payload);
         self.ops.mark_start(from.at);
-        self.ensure_journal_page()?;
         let Inner {
             storage,
             journal,
@@ -962,7 +965,6 @@ impl Inner {
             return Err(e);
         }
         self.journal.cursor = cursor;
-        self.journal_cuts = cuts;
         self.stats.journal_bytes += self.journal.bytes - before;
         self.stats.transactions += 1;
         Ok(to)
