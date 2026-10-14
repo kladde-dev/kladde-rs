@@ -28,6 +28,10 @@ pub enum DecodeError {
     Empty,
     /// Bytes remained after the last descriptor.
     TrailingBytes,
+    /// The bytes decode, but are not the canonical encoding of what they
+    /// decode to: a varint longer than it needs to be, or enum variants out
+    /// of ascending discriminant order or sharing one.
+    NotCanonical(&'static str),
     /// Descriptor `index` breaks a rule of nesting: a `Fixed` wrapper around
     /// a type without a fixed form, or a type that reaches itself without
     /// passing through an enum or a sequence. See
@@ -52,6 +56,7 @@ impl std::fmt::Display for DecodeError {
             }
             DecodeError::Empty => f.write_str("schema has no descriptors"),
             DecodeError::TrailingBytes => f.write_str("trailing bytes after schema"),
+            DecodeError::NotCanonical(what) => write!(f, "schema is not canonical: {what}"),
             DecodeError::InvalidNesting { index, reason } => {
                 write!(f, "descriptor {index}: {reason}")
             }
@@ -217,7 +222,14 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn varint(&mut self) -> Result<u64, DecodeError> {
-        let (value, rest) = kladde_varint::decode(self.data)?;
+        let (value, rest) = match kladde_varint::decode_minimal(self.data) {
+            Err(kladde_varint::Error::Overlong) => {
+                return Err(DecodeError::NotCanonical(
+                    "a varint longer than it needs to be",
+                ))
+            }
+            r => r?,
+        };
         self.data = rest;
         Ok(value)
     }
@@ -280,6 +292,14 @@ fn decode_descriptor(reader: &mut Reader) -> Result<TypeDescriptor, DecodeError>
             let mut variants = Vec::with_capacity(variant_count);
             for _ in 0..variant_count {
                 let discriminant = reader.varint()?;
+                if variants
+                    .last()
+                    .is_some_and(|v: &Variant| v.discriminant >= discriminant)
+                {
+                    return Err(DecodeError::NotCanonical(
+                        "enum variants out of ascending discriminant order",
+                    ));
+                }
                 let name = reader.string()?;
                 let payload = reader.reference()?;
                 variants.push(Variant {
@@ -548,6 +568,31 @@ mod tests {
             unit,
         ]);
         assert_eq!(ascending.encode(), descending.encode());
+    }
+
+    #[test]
+    fn rejects_what_is_not_canonical() {
+        // One Text descriptor, its count as a two-byte varint.
+        assert!(matches!(
+            TypeTable::decode(&[0x81, 0x00, 134]),
+            Err(super::DecodeError::NotCanonical(_))
+        ));
+        // An enum whose variants come in descending order, then twice the
+        // same discriminant; each holds the unit struct at [1].
+        let enum_of = |d0: u8, d1: u8| {
+            vec![
+                2, 129, 1, b'E', 1, 2, d0, 1, b'A', 1, d1, 1, b'B', 1, 128, 0, 0,
+            ]
+        };
+        assert!(TypeTable::decode(&enum_of(0, 1)).is_ok());
+        assert!(matches!(
+            TypeTable::decode(&enum_of(1, 0)),
+            Err(super::DecodeError::NotCanonical(_))
+        ));
+        assert!(matches!(
+            TypeTable::decode(&enum_of(1, 1)),
+            Err(super::DecodeError::NotCanonical(_))
+        ));
     }
 
     #[test]
