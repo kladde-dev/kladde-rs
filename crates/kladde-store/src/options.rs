@@ -30,7 +30,8 @@ pub struct Options {
     /// without waiting for the disk, and the next ones append to the next
     /// journal meanwhile. It does so only after sealing, and only with a
     /// storage that [`Storage::try_clone`](crate::Storage::try_clone)
-    /// supports; an explicit flush, a read, and the next flush wait for it.
+    /// supports; an explicit flush, the next flush, and dropping the store
+    /// wait for it.
     pub sync_on_worker: bool,
     /// New runs of bytes up to this many bytes are kept inline in their
     /// span's entry, up to the format's ceiling of 126 bytes.

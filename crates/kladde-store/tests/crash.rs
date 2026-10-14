@@ -128,7 +128,9 @@ fn run(seed: u64, opts: &Options, mixed: bool) {
     ];
     for _ in 0..4 {
         let keep: Vec<bool> = (0..n).map(|_| rng.below(2) == 0).collect();
-        images.push(storage.crash_image(|i| keep[i]));
+        // A commit on a worker may still be writing: what it writes after
+        // the count is lost, as a power cut now would lose it.
+        images.push(storage.crash_image(|i| keep.get(i).copied().unwrap_or(false)));
     }
     for image in images {
         let got = recovered(image, opts);

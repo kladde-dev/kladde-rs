@@ -178,8 +178,12 @@ impl Inner {
             return Ok(());
         };
         if self.first_flush {
+            // Durable before the seal names it: a power cut that kept the
+            // seal and lost the zeros would let a lost journal of the same
+            // epoch left on the page validate after the seal.
             self.storage
                 .write_at(&new_page()[..], jp as u64 * PAGE_SIZE as u64)?;
+            self.storage.sync()?;
         }
         self.state.pages[jp as usize] = Page::Journal;
         let payload = crate::journal::seal_payload(jp);
