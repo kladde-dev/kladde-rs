@@ -7,14 +7,14 @@
 //! children. Anything the model does not type is kept verbatim as
 //! [`Attr::Other`] or [`ElementKind::Other`], so every SVG document fits.
 //!
-//! Every list is a `DurableVec` and every string a `DurableString`,
-//! inline in its parent, as everything is in the file's one sequence. Lists
-//! of points and lengths have fixed-size elements and keep no index; lists of
-//! children, attributes, transforms and path data keep a Fenwick tree of
-//! their elements' sizes.
+//! Every string is a `String` and every list a vector, inline in its parent,
+//! as everything is in the file's one sequence. Lists of points and lengths
+//! have fixed-size elements and are plain `Vec`s; lists of children,
+//! attributes, transforms and path data are `DurableVec`s, which keep a
+//! Fenwick tree of their elements' sizes.
 
 use kladde::Durable;
-use kladde_types::{DurableString, DurableVec};
+use kladde_types::DurableVec;
 
 use crate::Number;
 
@@ -31,16 +31,16 @@ pub type Attrs = DurableVec<Attr>;
 pub type PathData = DurableVec<PathSegment>;
 
 /// A list of points, whose elements all have one size.
-pub type Points = DurableVec<Point>;
+pub type Points = Vec<Point>;
 
 /// A list of lengths, whose elements all have one size.
-pub type Lengths = DurableVec<Length>;
+pub type Lengths = Vec<Length>;
 
 /// An element's `id`.
-pub type Id = DurableString;
+pub type Id = String;
 
 /// Every other string: text, names, values, URLs.
-pub type Str = DurableString;
+pub type Str = String;
 
 /// A whole SVG document: the root element, and the comments and processing
 /// instructions around it.

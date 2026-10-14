@@ -13,7 +13,7 @@ struct Point {
 fn a_guard_has_a_mut_accessor_per_field() {
     let mut f = Fixture::new(Point { x: 1.0, y: 2.0 });
     {
-        let mut guard = f.kladde.guard();
+        let mut guard = f.kladde.get_mut();
         guard.x_mut().set(10.0).unwrap();
         guard.y_mut().set(20.0).unwrap();
         // Deref gives read-only access to the plain value.
@@ -27,7 +27,7 @@ fn a_guard_has_a_mut_accessor_per_field() {
 #[test]
 fn set_replaces_the_whole_value() {
     let mut f = Fixture::new(Point { x: 1.0, y: 2.0 });
-    f.kladde.guard().set(Point { x: 3.0, y: 4.0 }).unwrap();
+    f.kladde.get_mut().set(Point { x: 3.0, y: 4.0 }).unwrap();
     assert_eq!(*f.kladde.get(), Point { x: 3.0, y: 4.0 });
     f.check();
 }
@@ -38,7 +38,7 @@ struct Empty;
 #[test]
 fn a_unit_struct_takes_no_bytes() {
     let mut f = Fixture::new(Empty);
-    let _guard = f.kladde.guard();
+    let _guard = f.kladde.get_mut();
     assert_eq!(<Empty as Durable>::FIXED_SIZE, Some(0));
     assert!(Empty.to_bytes().is_empty());
 }
@@ -55,10 +55,10 @@ fn nested_fields_find_their_starts() {
         label: 1,
         point: Point { x: 0.0, y: 0.0 },
     });
-    f.kladde.guard().point_mut().y_mut().set(7.0).unwrap();
+    f.kladde.get_mut().point_mut().y_mut().set(7.0).unwrap();
     // The label grows to two bytes, which moves the point.
-    f.kladde.guard().label_mut().set(1000).unwrap();
-    f.kladde.guard().point_mut().x_mut().set(5.0).unwrap();
+    f.kladde.get_mut().label_mut().set(1000).unwrap();
+    f.kladde.get_mut().point_mut().x_mut().set(5.0).unwrap();
     assert_eq!(f.kladde.get().point, Point { x: 5.0, y: 7.0 });
     f.check();
 }
@@ -98,15 +98,15 @@ fn fields_made_together_find_themselves_after_a_sibling_grows() {
         flag: false,
     });
     {
-        let mut guard = f.kladde.guard();
+        let mut guard = f.kladde.get_mut();
         let mut parts = guard.parts();
         parts.small.set(1 << 30).unwrap(); // five bytes now
         parts.flag.set(true).unwrap();
         parts.signed.set(-1000).unwrap(); // two bytes now
         parts.small.set(1).unwrap();
     }
-    f.kladde.guard().signed_mut().set(i64::MIN).unwrap();
-    f.kladde.guard().flag_mut().set(false).unwrap();
+    f.kladde.get_mut().signed_mut().set(i64::MIN).unwrap();
+    f.kladde.get_mut().flag_mut().set(false).unwrap();
     assert_eq!(
         *f.kladde.get(),
         Counts {
@@ -124,10 +124,10 @@ struct Pair(u32, Fixed<u32>);
 #[test]
 fn a_tuple_struct_names_its_accessors_by_position() {
     let mut f = Fixture::new(Pair(1, Fixed(2)));
-    f.kladde.guard().field_0_mut().set(300).unwrap();
-    f.kladde.guard().field_1_mut().set(Fixed(400)).unwrap();
+    f.kladde.get_mut().field_0_mut().set(300).unwrap();
+    f.kladde.get_mut().field_1_mut().set(Fixed(400)).unwrap();
     {
-        let mut guard = f.kladde.guard();
+        let mut guard = f.kladde.get_mut();
         let PairParts(mut a, mut b) = guard.parts();
         a.set(5).unwrap();
         b.set(Fixed(6)).unwrap();
@@ -206,7 +206,7 @@ fn remote_cousins_write_where_they_start_after_each_other_grows() {
         b: level1(100),
     });
     {
-        let mut root = f.kladde.guard();
+        let mut root = f.kladde.get_mut();
         let RootParts { mut a, mut b } = root.parts();
         let mut a1 = a.down_mut();
         let mut a2 = a1.down_mut();
@@ -240,9 +240,9 @@ fn remote_cousins_write_where_they_start_after_each_other_grows() {
     assert_eq!(root.b.down.down.y.down.value, u32::MAX);
     f.check();
     // The guards made afterwards find the same starts as a fresh walk.
-    f.kladde.guard().b_mut().pad_mut().set(1 << 30).unwrap();
+    f.kladde.get_mut().b_mut().pad_mut().set(1 << 30).unwrap();
     f.kladde
-        .guard()
+        .get_mut()
         .b_mut()
         .down_mut()
         .down_mut()

@@ -1,34 +1,36 @@
 //! The trait the serialization layer records mutations through.
 //!
-//! [`WriteBackend`] takes `&self` so that a parent guard can hand one backend
-//! to all of its children's guards by reborrow.
+//! [`WriteBackend`] takes `&self` so that a parent `Mut` can hand one backend
+//! to all of its children's `Mut`s by reborrow.
 
 use crate::error::Error;
 
-/// The bytes a write overwrote or a splice removed inside a transaction,
-/// which a [`paste`](WriteBackend::paste) of the same transaction can insert
-/// elsewhere, once, without carrying them.
+/// The bytes a write overwrote or a splice removed, which a
+/// [`paste`](WriteBackend::paste) can insert elsewhere, once, without
+/// carrying them, for as long as the journal that holds the write or splice
+/// has not been folded.
 ///
-/// It is neither `Copy` nor `Clone`, so it is pasted at most once.
+/// A cut is a weak promise: once a flush has folded its journal, a paste of
+/// it writes the bytes it is given instead. It is neither `Copy` nor
+/// `Clone`, so it is pasted at most once.
 ///
 /// ```
 /// use kladde_store::{MemoryStorage, Store, WriteBackend};
 ///
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
 /// store.splice(0, 0, b"abcdef")?;
-/// store.atomically(|| {
-///     let cut = store.splice(1, 2, b"")?.expect("a cut");
-///     assert_eq!(cut.len(), 2);
-///     store.paste(3, 0, cut)
-/// })?;
+/// let cut = store.splice(1, 2, b"")?.expect("a cut");
+/// assert_eq!(cut.len(), 2);
+/// assert!(store.is_alive(&cut));
+/// store.paste(3, 0, cut, b"bc")?; // in the journal of its cut: a paste
 /// store.flush()?;
 /// assert_eq!(store.read_all()?, b"adebcf");
 /// # Ok::<(), kladde_store::Error>(())
 /// ```
 #[derive(Debug, PartialEq, Eq)]
 pub struct CutId {
-    pub(crate) serial: u64,
-    pub(crate) index: u32,
+    /// The number, in the session, of the record that made the cut.
+    pub(crate) record: u64,
     pub(crate) len: u64,
 }
 
@@ -47,7 +49,7 @@ impl CutId {
     }
 }
 
-/// Recording mutations of the sequence, as guards do.
+/// Recording mutations of the sequence, as `Mut`s do.
 ///
 /// Outside a transaction or batch, every method appends to the journal before
 /// it returns, so a mutation that returned `Ok` survives an application
@@ -84,21 +86,17 @@ pub trait WriteBackend {
         self.len() == 0
     }
 
-    /// Overwrites `bytes.len()` bytes at `pos`.
-    ///
-    /// Inside a transaction, what it overwrites is a cut, which it returns
-    /// for a later [`paste`](Self::paste); otherwise, or if `bytes` is
-    /// empty, it returns `None`.
+    /// Overwrites `bytes.len()` bytes at `pos`, and returns the cut of what
+    /// it overwrote, for a later [`paste`](Self::paste), or `None` if
+    /// `bytes` is empty.
     ///
     /// ```
     /// use kladde_store::{MemoryStorage, Store, WriteBackend};
     ///
     /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
     /// store.splice(0, 0, b"abcd")?;
-    /// store.atomically(|| {
-    ///     let old = store.write(0, b"xy")?.expect("a cut");
-    ///     store.paste(4, 0, old)
-    /// })?;
+    /// let old = store.write(0, b"xy")?.expect("a cut");
+    /// store.paste(4, 0, old, b"ab")?;
     /// store.flush()?;
     /// assert_eq!(store.read_all()?, b"xycdab");
     /// # Ok::<(), kladde_store::Error>(())
@@ -109,22 +107,30 @@ pub trait WriteBackend {
     /// follows; with `removed == bytes.len()`, it is a
     /// [`write`](Self::write).
     ///
-    /// Inside a transaction, what it removes is a cut, which it returns for
-    /// a later [`paste`](Self::paste); otherwise, or if it removes nothing,
-    /// it returns `None`.
+    /// Returns the cut of what it removed, for a later
+    /// [`paste`](Self::paste), or `None` if it removed nothing.
     fn splice(&self, pos: u64, removed: u64, bytes: &[u8]) -> Result<Option<CutId>, Error>;
 
     /// Cuts `[from, from + len)` and inserts it at `to`, a position in the
     /// sequence without the cut bytes. Writes none of the moved bytes.
     fn move_range(&self, from: u64, len: u64, to: u64) -> Result<(), Error>;
 
-    /// Replaces the `removed` bytes at `pos` with the bytes of `cut`, which a
-    /// write or splice of the open transaction made. See [`CutId`] for an
-    /// example.
+    /// Replaces the `removed` bytes at `pos` with the bytes of `cut`, whose
+    /// encoding `bytes` is. See [`CutId`] for an example.
     ///
-    /// Fails with [`Error::Corrupt`], recording nothing, if `cut` comes from
-    /// another transaction.
-    fn paste(&self, pos: u64, removed: u64, cut: CutId) -> Result<(), Error>;
+    /// While the journal that made the cut lasts, the paste records a
+    /// `Paste`, which writes none of the bytes; once a flush has folded that
+    /// journal, it writes `bytes` instead, which is also what happens if
+    /// that flush comes between this call and the append of its
+    /// transaction. Either way the sequence ends up the same.
+    ///
+    /// Fails with [`Error::Corrupt`], recording nothing, if `bytes` is not
+    /// as long as the cut, or if the cut was pasted already.
+    fn paste(&self, pos: u64, removed: u64, cut: CutId, bytes: &[u8]) -> Result<(), Error>;
+
+    /// Whether a [`paste`](Self::paste) of `cut` would record a `Paste`
+    /// now: whether the journal that made it has not been folded yet.
+    fn is_alive(&self, cut: &CutId) -> bool;
 
     /// Runs `f` as one transaction: the operations it records reach the
     /// journal together once it returns `Ok`, and a crash keeps all of them
@@ -136,8 +142,7 @@ pub trait WriteBackend {
     fn atomically<R>(&self, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error>;
 
     /// Opens a transaction, as [`atomically`](Self::atomically) does around
-    /// its closure; for a caller that holds one open across calls, such as
-    /// a cut.
+    /// its closure; for a caller that holds one open across calls.
     fn begin_transaction(&self) -> Result<(), Error>;
 
     /// Ends the transaction [`begin_transaction`](Self::begin_transaction)
@@ -150,9 +155,9 @@ pub trait WriteBackend {
     fn poison(&self);
 }
 
-/// A shared reference records through what it refers to, so that a guard
+/// A shared reference records through what it refers to, so that a `Mut`
 /// can hold `&Store` by value and hand copies of it to whatever outlives
-/// the guard, such as a cut.
+/// the `Mut`, such as a cut.
 ///
 /// ```
 /// use kladde_store::{MemoryStorage, Store, WriteBackend};
@@ -178,8 +183,11 @@ impl<B: WriteBackend> WriteBackend for &B {
     fn move_range(&self, from: u64, len: u64, to: u64) -> Result<(), Error> {
         (**self).move_range(from, len, to)
     }
-    fn paste(&self, pos: u64, removed: u64, cut: CutId) -> Result<(), Error> {
-        (**self).paste(pos, removed, cut)
+    fn paste(&self, pos: u64, removed: u64, cut: CutId, bytes: &[u8]) -> Result<(), Error> {
+        (**self).paste(pos, removed, cut, bytes)
+    }
+    fn is_alive(&self, cut: &CutId) -> bool {
+        (**self).is_alive(cut)
     }
     fn atomically<R>(&self, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
         (**self).atomically(f)

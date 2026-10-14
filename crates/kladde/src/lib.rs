@@ -4,8 +4,8 @@
 //! A [`Kladde<T>`] pairs a root value with the file that backs it. The file
 //! holds one byte sequence, the root value's encoding, with every value
 //! inline in its parent. Reading is ordinary reading, through
-//! [`get`](Kladde::get). Mutating goes through [`guard`](Kladde::guard),
-//! whose methods append the change to the file's journal before they
+//! [`get`](Kladde::get). Mutating goes through [`get_mut`](Kladde::get_mut),
+//! whose `Mut`'s methods append the change to the file's journal before they
 //! return, so there is no save call.
 //!
 //! ```
@@ -24,7 +24,7 @@
 //! }
 //!
 //! let mut settings = Kladde::new(Settings { volume: 3, theme: Theme::Light });
-//! settings.guard().theme_mut().set(Theme::Dark)?;
+//! settings.get_mut().theme_mut().set(Theme::Dark)?;
 //! assert_eq!(settings.get().theme, Theme::Dark);
 //! # Ok::<(), kladde::Error>(())
 //! ```
@@ -83,9 +83,10 @@ pub use kladde_derive::dispatch;
 // who hand-writes an impl finds the same items here, so there is never a second
 // dependency, and never two incompatible copies of the same trait.
 pub use kladde_persist::{
-    discriminant_width, enum_fixed_form_size, enum_fixed_size, replace, sum_sizes, varint_len,
-    Backend, Bounded, Cut, CutId, Decoder, Durable, Encoder, Error, FieldSizes, Fixed, Guard, Node,
-    OptionGuard, Region, Result, SchemaBuilder, SetGuard, TupleGuard, WriteBackend, TERMINATOR,
+    discriminant_width, enum_fixed_form_size, enum_fixed_size, replace, splice_changed, sum_sizes,
+    varint_len, Backend, Bounded, Cut, CutId, Decoder, Durable, Encoder, Error, FieldSizes, Fixed,
+    Mut, Node, OptionMut, Region, Result, SchemaBuilder, SetMut, StringMut, TupleMut, VecMut,
+    WriteBackend, TERMINATOR,
 };
 
 // The schema and fingerprint surface, so an application can inspect its root
@@ -94,41 +95,43 @@ pub use kladde_persist::{
     Field, Fingerprint, Primitive, TypeDescriptor, TypeRef, TypeTable, Variant, Version,
 };
 
-// The storage layer's application-facing items: the backend guards run
+// The storage layer's application-facing items: the backend `Mut`s run
 // against, how it is tuned, what it reports, and where its bytes live.
 pub use kladde_store::{FileStorage, MemoryStorage, Options, Stats, Storage, Store};
 
-/// The guard of a root value of type `T`, as [`Kladde::guard`] hands it out.
+/// The `Mut` of a root value of type `T`, as [`Kladde::get_mut`] hands it
+/// out.
 ///
 /// ```
-/// use kladde::{Kladde, RootGuard};
+/// use kladde::{Kladde, RootMut};
 ///
-/// fn bump(mut guard: RootGuard<'_, u32>) -> kladde::Result<()> {
-///     let next = *guard + 1;
-///     guard.set(next)
+/// fn bump(mut n: RootMut<'_, u32>) -> kladde::Result<()> {
+///     let next = *n + 1;
+///     n.set(next)
 /// }
 /// let mut k = Kladde::new(1u32);
-/// bump(k.guard())?;
+/// bump(k.get_mut())?;
 /// assert_eq!(*k.get(), 2);
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub type RootGuard<'a, T> = <T as Durable>::Guard<'a, &'a Store>;
+pub type RootMut<'a, T> = <T as Durable>::Mut<'a, &'a Store>;
 
 /// A root [`Durable`] value paired with the file that backs it.
 ///
 /// Everything reachable from the root is backed. Reads go through
 /// [`get`](Self::get) and cost what reading the plain value costs; mutations
-/// go through [`guard`](Self::guard), and each one is in the file's journal
+/// go through [`get_mut`](Self::get_mut), and each one is in the file's journal
 /// once it returns `Ok`. The file is brought up to date with the journal by
 /// flushes, which happen by themselves as the journal grows, and on
-/// [`flush`](Self::flush) and [`close`](Self::close).
+/// [`flush`](Self::flush), [`flush_if_journal_exceeds`](Self::flush_if_journal_exceeds)
+/// and [`close`](Self::close).
 ///
 /// ```
 /// use kladde::Kladde;
 ///
 /// let path = std::env::temp_dir().join("kladde-doc-kladde.kladde");
 /// let mut k = Kladde::create(&path, (0u32, false))?;
-/// k.guard().set((7, true))?;
+/// k.get_mut().set((7, true))?;
 /// k.close()?;
 /// let k = Kladde::<(u32, bool)>::open(&path)?;
 /// assert_eq!(*k.get(), (7, true));
@@ -148,7 +151,7 @@ impl<T: Durable + 'static> Kladde<T> {
     /// use kladde::Kladde;
     ///
     /// let mut n = Kladde::new(0u64);
-    /// n.guard().set(5)?;
+    /// n.get_mut().set(5)?;
     /// assert_eq!(*n.get(), 5);
     /// # Ok::<(), kladde::Error>(())
     /// ```
@@ -252,27 +255,27 @@ impl<T: Durable + 'static> Kladde<T> {
         &self.root
     }
 
-    /// The root value's guard, through which every mutation is recorded and
+    /// The root value's `Mut`, through which every mutation is recorded and
     /// applied.
     ///
-    /// A guard borrows the root, so nothing else can touch the structure while
+    /// A `Mut` borrows the root, so nothing else can touch the structure while
     /// it lives; hold it only as long as it is needed.
     ///
     /// ```
     /// use kladde::Kladde;
     ///
     /// let mut k = Kladde::new((0u8, false));
-    /// let mut guard = k.guard();
-    /// let (mut n, mut flag) = guard.parts();
+    /// let mut pair = k.get_mut();
+    /// let (mut n, mut flag) = pair.parts();
     /// n.set(4)?;
     /// flag.set(true)?;
     /// assert_eq!(*k.get(), (4, true));
     /// # Ok::<(), kladde::Error>(())
     /// ```
-    pub fn guard(&mut self) -> RootGuard<'_, T> {
+    pub fn get_mut(&mut self) -> RootMut<'_, T> {
         let Kladde { store, root } = self;
         debug_assert_eq!(root.encoded_len() as u64, store.len());
-        root.guard(Region::root(&*store))
+        root.mutate(Region::root(&*store))
     }
 
     /// Folds the journal into the file now, which also makes every mutation
@@ -285,13 +288,38 @@ impl<T: Durable + 'static> Kladde<T> {
     /// use kladde::Kladde;
     ///
     /// let mut k = Kladde::new(0u32);
-    /// k.guard().set(1)?;
+    /// k.get_mut().set(1)?;
     /// k.flush()?;
     /// assert_eq!(k.stats().flushes, 2); // the one at creation, and this one
     /// # Ok::<(), kladde::Error>(())
     /// ```
     pub fn flush(&mut self) -> Result<()> {
         self.store.flush()
+    }
+
+    /// Flushes if the journal holds at least `fraction` of its budget,
+    /// [`Options::journal_budget_pages`], and does nothing otherwise; returns
+    /// whether it flushed.
+    ///
+    /// The check costs a subtraction, so an interactive application calls
+    /// this from its event loop's idle callback: flushing while the user
+    /// pauses keeps the flush a full journal forces, whose `fsync` blocks the
+    /// mutation that triggers it, out of the middle of a gesture. Keep the
+    /// fraction well above zero, such as `0.5`: a flush ends the journal, and
+    /// with it every [`Cut`] still waiting to be pasted, which is then
+    /// encoded again.
+    ///
+    /// ```
+    /// use kladde::Kladde;
+    ///
+    /// let mut k = Kladde::new(0u32);
+    /// k.get_mut().set(1)?;
+    /// // In the idle callback: a few bytes of journal are no reason to flush.
+    /// assert!(!k.flush_if_journal_exceeds(0.5)?);
+    /// # Ok::<(), kladde::Error>(())
+    /// ```
+    pub fn flush_if_journal_exceeds(&mut self, fraction: f64) -> Result<bool> {
+        self.store.flush_if_journal_exceeds(fraction)
     }
 
     /// Flushes, then truncates the file after its last live page.
@@ -317,8 +345,8 @@ impl<T: Durable + 'static> Kladde<T> {
     ///
     /// let mut accounts = Kladde::new((100i64, 0i64));
     /// let mut tx = accounts.transaction();
-    /// let mut guard = tx.guard();
-    /// let (mut from, mut to) = guard.parts();
+    /// let mut both = tx.get_mut();
+    /// let (mut from, mut to) = both.parts();
     /// from.set(70)?;
     /// to.set(30)?;
     /// tx.commit()?;
@@ -351,7 +379,7 @@ impl<T: Durable + 'static> Kladde<T> {
     /// let mut n = Kladde::new(0u32);
     /// let mut batch = n.batch();
     /// for i in 0..1000 {
-    ///     batch.guard().set(i)?;
+    ///     batch.get_mut().set(i)?;
     /// }
     /// batch.end()?;
     /// assert_eq!(*n.get(), 999);
@@ -409,10 +437,10 @@ pub struct Transaction<'k, T: Durable + 'static> {
 }
 
 impl<T: Durable + 'static> Transaction<'_, T> {
-    /// The root value's guard; mutations through it belong to the
+    /// The root value's `Mut`; mutations through it belong to the
     /// transaction. See [`Kladde::transaction`] for an example.
-    pub fn guard(&mut self) -> RootGuard<'_, T> {
-        self.kladde.guard()
+    pub fn get_mut(&mut self) -> RootMut<'_, T> {
+        self.kladde.get_mut()
     }
 
     /// The root value, for reading.
@@ -464,10 +492,10 @@ pub struct Batch<'k, T: Durable + 'static> {
 }
 
 impl<T: Durable + 'static> Batch<'_, T> {
-    /// The root value's guard; mutations through it belong to the batch. See
+    /// The root value's `Mut`; mutations through it belong to the batch. See
     /// [`Kladde::batch`] for an example.
-    pub fn guard(&mut self) -> RootGuard<'_, T> {
-        self.kladde.guard()
+    pub fn get_mut(&mut self) -> RootMut<'_, T> {
+        self.kladde.get_mut()
     }
 
     /// The root value, for reading.
@@ -494,8 +522,8 @@ impl<T: Durable + 'static> Batch<'_, T> {
     /// let mut pair = Kladde::new((0u8, 0u8));
     /// let mut batch = pair.batch();
     /// let mut tx = batch.transaction();
-    /// let mut guard = tx.guard();
-    /// let (mut a, mut b) = guard.parts();
+    /// let mut both = tx.get_mut();
+    /// let (mut a, mut b) = both.parts();
     /// a.set(1)?;
     /// b.set(2)?;
     /// tx.commit()?;
@@ -547,10 +575,10 @@ mod tests {
             Ok(Counter(u32::from_le_bytes(input.array()?)))
         }
 
-        type Guard<'r, B: Backend + 'r> = CounterGuard<'r, B>;
+        type Mut<'r, B: Backend + 'r> = CounterMut<'r, B>;
 
-        fn guard<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Guard<'r, B> {
-            CounterGuard {
+        fn mutate<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Mut<'r, B> {
+            CounterMut {
                 inner: self,
                 region,
             }
@@ -561,12 +589,12 @@ mod tests {
         }
     }
 
-    struct CounterGuard<'r, B> {
+    struct CounterMut<'r, B> {
         inner: &'r mut Counter,
         region: Region<'r, B>,
     }
 
-    impl<B: Backend> CounterGuard<'_, B> {
+    impl<B: Backend> CounterMut<'_, B> {
         fn set(&mut self, value: u32) -> Result<()> {
             self.region.write(0, &value.to_le_bytes())?;
             self.inner.0 = value;
@@ -574,7 +602,7 @@ mod tests {
         }
     }
 
-    impl<B> Guard for CounterGuard<'_, B> {
+    impl<B> Mut for CounterMut<'_, B> {
         type Durable = Counter;
 
         fn as_durable(&self) -> &Counter {
@@ -592,7 +620,7 @@ mod tests {
         let storage = MemoryStorage::new();
         let mut k =
             Kladde::create_in(Box::new(storage.clone()), Counter(0), Options::default()).unwrap();
-        k.guard().set(42).unwrap();
+        k.get_mut().set(42).unwrap();
         assert_eq!(k.get().0, 42);
         assert_eq!(reopen::<Counter>(&storage).get().0, 42);
     }
@@ -604,12 +632,12 @@ mod tests {
             Kladde::create_in(Box::new(storage.clone()), Counter(1), Options::default()).unwrap();
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut tx = k.transaction();
-            tx.guard().set(2).unwrap();
+            tx.get_mut().set(2).unwrap();
             panic!("mid-transaction");
         }));
         assert!(unwound.is_err());
         assert!(k.store().is_poisoned());
-        assert!(matches!(k.guard().set(3), Err(Error::Poisoned)));
+        assert!(matches!(k.get_mut().set(3), Err(Error::Poisoned)));
         assert_eq!(reopen::<Counter>(&storage).get().0, 1);
     }
 
@@ -620,7 +648,7 @@ mod tests {
             Kladde::create_in(Box::new(storage.clone()), Counter(1), Options::default()).unwrap();
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut batch = k.batch();
-            batch.guard().set(2).unwrap();
+            batch.get_mut().set(2).unwrap();
             panic!("mid-batch");
         }));
         assert!(unwound.is_err());

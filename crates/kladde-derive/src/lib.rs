@@ -9,11 +9,11 @@
 //! - for a type marked `#[kladde(bounded)]`, a `Bounded` implementation:
 //!   the fixed form (`encode_fixed`, `decode_fixed`) and its size
 //!   `FIXED_FORM_SIZE`;
-//! - a guard type `TGuard`, with a `{field}_mut()` accessor per field
+//! - a `Mut` type `TMut`, with a `{field}_mut()` accessor per field
 //!   (`field_{i}_mut()` for a tuple struct's positional fields), a `parts()`
-//!   method handing out a guard for every field at once, and a whole-value
+//!   method handing out a `Mut` for every field at once, and a whole-value
 //!   `set`;
-//! - `Deref` on the guard, so read-only methods stay available.
+//! - `Deref` on the `Mut`, so read-only methods stay available.
 //!
 //! Encoding:
 //!
@@ -25,20 +25,22 @@
 //!   discriminant at the width an integer `#[repr(u8 | u16 | u32 | u64)]`
 //!   says, or else at the smallest of 1, 2, 4 and 8 bytes that holds the
 //!   largest discriminant, and pads every variant with zeros to the
-//!   largest. Its guard's `parts()` returns a generated `{Enum}Parts` enum
-//!   holding the guards of the current variant's fields, for mutating them
+//!   largest. Its `Mut`'s `parts()` returns a generated `{Enum}Parts` enum
+//!   holding the `Mut`s of the current variant's fields, for mutating them
 //!   in place; `set` replaces the whole value, which is how the variant
-//!   changes.
+//!   changes. In the schema, every variant holds one value: a unit variant
+//!   the empty tuple, a variant of one unnamed field that field, and any
+//!   other variant a struct of its fields named after the variant.
 //! - A single-field struct marked `#[kladde(transparent)]` is persisted
-//!   exactly as its field: same bytes and same fingerprint. Its guard has a
-//!   `get_mut()` returning the field's guard.
+//!   exactly as its field: same bytes and same fingerprint. Its `Mut` has a
+//!   `get_mut()` returning the field's `Mut`.
 //! - Type parameters get a `Durable` bound, as `#[derive(Debug)]` does,
 //!   and a `Bounded` one in the `Bounded` implementation; lifetime and const
 //!   parameters are rejected.
 //!
-//! A field guard made by its accessor holds where its field starts: at a
+//! A field's `Mut` made by its accessor holds where its field starts: at a
 //! constant offset up to the first field whose size depends on its value,
-//! and after that at the sum of the sizes of the fields before it. Guards
+//! and after that at the sum of the sizes of the fields before it. `Mut`s
 //! made together by `parts()` find where they start whenever they write, so
 //! that a field before them may change size meanwhile:
 //!
@@ -52,31 +54,32 @@
 //! }
 //!
 //! let mut counts = Kladde::new(Counts { small: 5, flag: false });
-//! let mut guard = counts.guard();
-//! let mut parts = guard.parts();
+//! let mut counts_mut = counts.get_mut();
+//! let mut parts = counts_mut.parts();
 //! parts.small.set(1 << 30)?; // five bytes now, so `flag` moves
 //! parts.flag.set(true)?;
 //! assert_eq!(counts.get().small, 1 << 30);
 //! # Ok::<(), kladde::Error>(())
 //! ```
 //!
-//! **Every field must be `Durable`.** Plain `String` is not, and the
-//! compile error is the point: a field that would silently persist nothing
-//! does not compile.
+//! **Every field must be `Durable`.** A `PathBuf` is not, and the compile
+//! error is the point: a field that would silently persist nothing does not
+//! compile.
 //!
 //! ```compile_fail
 //! #[derive(kladde::Durable)]
 //! struct Contact {
-//!     name: String, // error[E0277]: the trait bound `String: Durable` is not satisfied
+//!     photo: std::path::PathBuf, // error[E0277]: the trait bound `PathBuf: Durable` is not satisfied
 //! }
 //! ```
 //!
-//! A type that does implement it, such as a scalar or a container of
-//! `kladde-types`, compiles:
+//! A type that does implement it, such as a scalar, a `String`, or a
+//! container of `kladde-types`, compiles:
 //!
 //! ```
 //! #[derive(kladde::Durable)]
 //! struct Contact {
+//!     name: String,
 //!     age: u16,
 //! }
 //! ```
@@ -161,7 +164,7 @@
 //! }
 //!
 //! let mut shape = Kladde::new(Shape::Rectangle { width: 1.0, height: 2.0 });
-//! match shape.guard().parts() {
+//! match shape.get_mut().parts() {
 //!     ShapeParts::Rectangle { mut width, .. } => width.set(3.0)?,
 //!     ShapeParts::Circle(mut radius) => radius.set(3.0)?,
 //!     ShapeParts::Origin => {}
@@ -175,7 +178,7 @@
 //! # Ok::<(), kladde::Error>(())
 //! ```
 //!
-//! The variant cannot be switched while a field's guard is alive:
+//! The variant cannot be switched while a field's `Mut` is alive:
 //!
 //! ```compile_fail
 //! use kladde::{Kladde, Durable};
@@ -187,9 +190,9 @@
 //! }
 //!
 //! let mut shape = Kladde::new(Shape::Circle(1));
-//! let mut guard = shape.guard();
-//! if let ShapeParts::Circle(mut radius) = guard.parts() {
-//!     guard.set(Shape::Origin).unwrap(); // error[E0499]: cannot borrow `guard` as mutable more than once
+//! let mut shape_mut = shape.get_mut();
+//! if let ShapeParts::Circle(mut radius) = shape_mut.parts() {
+//!     shape_mut.set(Shape::Origin).unwrap(); // error[E0499]: cannot borrow `shape_mut` as mutable more than once
 //!     radius.set(2).unwrap();
 //! }
 //! ```
@@ -289,11 +292,11 @@
 //!     angle: 0.0,
 //!     label: 7,
 //! };
-//! shape.guard().set(frame.into())?;
+//! shape.get_mut().set(frame.into())?;
 //! assert_eq!(shape.get().area(), 8.0);
 //!
-//! // The boxed variant's guard is its value's own.
-//! if let AnyShapeParts::ComplicatedVariantWithManyFields(mut c) = shape.guard().parts() {
+//! // The boxed variant's `Mut` is its value's own.
+//! if let AnyShapeParts::ComplicatedVariantWithManyFields(mut c) = shape.get_mut().parts() {
 //!     c.hole_mut().w_mut().set(2.0)?;
 //! }
 //! assert_eq!(shape.get().area(), 7.0);
@@ -420,9 +423,9 @@ struct Ctx {
     /// The type's own `where`-clause, verbatim (empty if none).
     where_clause: Tokens,
     /// Generic list for declaring the guard struct and its `impl` blocks.
-    guard_impl_generics: Tokens,
+    mut_impl_generics: Tokens,
     /// Generic list for *naming* the guard type (bare parameter names).
-    guard_use_generics: Tokens,
+    mut_use_generics: Tokens,
     /// The type's type parameters rendered with their bounds.
     bounded_params: Vec<Tokens>,
     /// The type's type parameters as bare idents.
@@ -486,10 +489,10 @@ impl Ctx {
             impl_generics: quote! { <#(#bounded_params,)*> },
             type_generics: quote!(#type_generics),
             where_clause: quote!(#where_clause),
-            guard_impl_generics: quote! {
+            mut_impl_generics: quote! {
                 <'__r, #(#bounded_params,)* __B: #krate::Backend>
             },
-            guard_use_generics: quote! { <'__r, #(#param_idents,)* __B> },
+            mut_use_generics: quote! { <'__r, #(#param_idents,)* __B> },
             bounded_params,
             param_idents,
             user_where_preds,
@@ -509,7 +512,7 @@ impl Ctx {
         let user_where_preds = &self.user_where_preds;
         let decl = quote! { <'__f, #(#bounded_params,)* __B: #krate::Backend + '__f> };
         let ret = quote! { <'_, #(#param_idents,)* __B> };
-        // The `Parts` types hold `Guard<'__f, __B>` associated types, whose
+        // The `Parts` types hold `Mut<'__f, __B>` associated types, whose
         // GAT bounds need `Param: '__f`.
         let where_ = quote! {
             where #user_where_preds #(#param_idents: '__f,)*
@@ -630,30 +633,30 @@ fn fixed_form_size(fields: &[FieldInfo], krate: &syn::Path) -> Tokens {
     quote!(0usize #(+ #paths::FIXED_FORM_SIZE)*)
 }
 
-/// The guard type every derive kind shares: a `{ inner, region, fields }`
-/// struct, and its `Guard` and `Deref` impls. Each kind adds `set` and
+/// The `Mut` type every derive kind shares: a `{ inner, region, fields }`
+/// struct, and its `Mut` and `Deref` impls. Each kind adds `set` and
 /// accessors of its own.
-fn guard_scaffold(
+fn mut_scaffold(
     ctx: &Ctx,
     ident: &syn::Ident,
     vis: &syn::Visibility,
-    guard_ident: &syn::Ident,
+    mut_ident: &syn::Ident,
 ) -> Tokens {
     let krate = &ctx.krate;
     let Ctx {
         type_generics,
         where_clause,
-        guard_impl_generics,
-        guard_use_generics,
+        mut_impl_generics,
+        mut_use_generics,
         ..
     } = ctx;
     let doc = format!(
-        "The guard of [`{ident}`]: records and applies mutations of a persisted `{ident}`."
+        "The `Mut` of [`{ident}`]: records and applies mutations of a persisted `{ident}`."
     );
 
     quote! {
         #[doc = #doc]
-        #vis struct #guard_ident #guard_impl_generics #where_clause {
+        #vis struct #mut_ident #mut_impl_generics #where_clause {
             inner: &'__r mut #ident #type_generics,
             region: #krate::Region<'__r, __B>,
             /// The fields' sizes, for guards that `parts` makes together.
@@ -661,8 +664,8 @@ fn guard_scaffold(
             fields: #krate::FieldSizes,
         }
 
-        impl #guard_impl_generics #krate::Guard
-            for #guard_ident #guard_use_generics #where_clause
+        impl #mut_impl_generics #krate::Mut
+            for #mut_ident #mut_use_generics #where_clause
         {
             type Durable = #ident #type_generics;
 
@@ -671,8 +674,8 @@ fn guard_scaffold(
             }
         }
 
-        impl #guard_impl_generics ::std::ops::Deref
-            for #guard_ident #guard_use_generics #where_clause
+        impl #mut_impl_generics ::std::ops::Deref
+            for #mut_ident #mut_use_generics #where_clause
         {
             type Target = #ident #type_generics;
             fn deref(&self) -> &#ident #type_generics {
@@ -682,23 +685,23 @@ fn guard_scaffold(
     }
 }
 
-/// The `Guard` associated type and `guard()` constructor every derived
+/// The `Mut` associated type and `mutate()` constructor every derived
 /// `Durable` impl shares.
-fn guard_assoc(ctx: &Ctx, guard_ident: &syn::Ident) -> Tokens {
+fn mut_assoc(ctx: &Ctx, mut_ident: &syn::Ident) -> Tokens {
     let krate = &ctx.krate;
-    let guard_use_generics = &ctx.guard_use_generics;
+    let mut_use_generics = &ctx.mut_use_generics;
     quote! {
-        type Guard<'__r, __B: #krate::Backend + '__r>
-            = #guard_ident #guard_use_generics
+        type Mut<'__r, __B: #krate::Backend + '__r>
+            = #mut_ident #mut_use_generics
         where
             Self: '__r;
 
         #[inline]
-        fn guard<'__r, __B: #krate::Backend + '__r>(
+        fn mutate<'__r, __B: #krate::Backend + '__r>(
             &'__r mut self,
             region: #krate::Region<'__r, __B>,
-        ) -> Self::Guard<'__r, __B> {
-            #guard_ident {
+        ) -> Self::Mut<'__r, __B> {
+            #mut_ident {
                 inner: self,
                 region,
                 fields: #krate::FieldSizes::new(),
@@ -756,13 +759,13 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> Tokens {
     let krate = &ctx.krate;
     let ident = &input.ident;
     let vis = &input.vis;
-    let guard_ident = format_ident!("{}Guard", ident);
+    let mut_ident = format_ident!("{}Mut", ident);
     let Ctx {
         impl_generics,
         type_generics,
         where_clause,
-        guard_impl_generics,
-        guard_use_generics,
+        mut_impl_generics,
+        mut_use_generics,
         ..
     } = ctx;
 
@@ -811,8 +814,8 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> Tokens {
         ),
     };
 
-    let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident);
-    let guard_assoc = guard_assoc(ctx, &guard_ident);
+    let scaffold = mut_scaffold(ctx, ident, vis, &mut_ident);
+    let mut_assoc = mut_assoc(ctx, &mut_ident);
     let set = set_method(ctx, ident, vis);
     let [encode_sig, decode_sig, encode_fixed_sig, decode_fixed_sig] = codec_sigs(krate);
     let bounded_impl = ctx.bounded.then(|| {
@@ -837,15 +840,15 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> Tokens {
     quote! {
         #scaffold
 
-        impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
+        impl #mut_impl_generics #mut_ident #mut_use_generics #where_clause {
             #set
 
-            /// The guard of the wrapped value, which fills the wrapper's own
+            /// The `Mut` of the wrapped value, which fills the wrapper's own
             /// region: its whole mutation API, passed through.
             #[inline]
-            #vis fn get_mut(&mut self) -> #field_ty::Guard<'_, __B> {
+            #vis fn get_mut(&mut self) -> #field_ty::Mut<'_, __B> {
                 let __len = self.region.len();
-                #field_ty::guard(&mut self.inner.#member, self.region.child(0, __len, None, 0))
+                #field_ty::mutate(&mut self.inner.#member, self.region.child(0, __len, None, 0))
             }
         }
 
@@ -854,7 +857,7 @@ fn derive_transparent(input: &DeriveInput, ctx: &Ctx) -> Tokens {
         impl #impl_generics #krate::Durable for #ident #type_generics #where_clause {
             const FIXED_SIZE: ::std::option::Option<usize> = #field_ty::FIXED_SIZE;
 
-            #guard_assoc
+            #mut_assoc
 
             #[inline]
             fn encoded_len(&self) -> usize {
@@ -884,13 +887,13 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
     let krate = &ctx.krate;
     let ident = &input.ident;
     let vis = &input.vis;
-    let guard_ident = format_ident!("{}Guard", ident);
+    let mut_ident = format_ident!("{}Mut", ident);
     let Ctx {
         impl_generics,
         type_generics,
         where_clause,
-        guard_impl_generics,
-        guard_use_generics,
+        mut_impl_generics,
+        mut_use_generics,
         ..
     } = ctx;
 
@@ -922,7 +925,7 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
         .collect();
     let accessor_doc: Vec<String> = fields
         .iter()
-        .map(|f| format!("The guard of field `{}`.", f.schema_name))
+        .map(|f| format!("The `Mut` of field `{}`.", f.schema_name))
         .collect();
     let schema_name: Vec<&String> = fields.iter().map(|f| &f.schema_name).collect();
     let fixed_size = fixed_size(&fields, krate);
@@ -956,7 +959,7 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
                 )*;
                 let __len = #t::encoded_len(&self.inner.#m);
                 let Self { inner, region, .. } = self;
-                #t::guard(&mut inner.#m, region.child(__offset as u64, __len as u64, None, #i))
+                #t::mutate(&mut inner.#m, region.child(__offset as u64, __len as u64, None, #i))
             }
         })
         .collect();
@@ -965,11 +968,11 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
     // *every* field at once, each borrowing a disjoint part of `self.inner`.
     let parts_ident = format_ident!("{}Parts", ident);
     let (parts_decl_generics, parts_ret_generics, parts_where) = ctx.parts_generics();
-    let parts_doc = format!("The guards of every field of [`{ident}`] at once.");
-    let field_guard: Vec<Tokens> = (0..fields.len())
+    let parts_doc = format!("The `Mut`s of every field of [`{ident}`] at once.");
+    let field_mut: Vec<Tokens> = (0..fields.len())
         .map(|i| {
             let (t, b) = (&ty[i], &binding[i]);
-            quote!(#t::guard(#b, __region.field(__fields, #i)))
+            quote!(#t::mutate(#b, __region.field(__fields, #i)))
         })
         .collect();
     let (parts_struct, parts_ctor) = match &data.fields {
@@ -985,27 +988,27 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
                     #vis struct #parts_ident #parts_decl_generics #parts_where {
                         #(
                             #[doc = #accessor_doc]
-                            #vis #names: #ty::Guard<'__f, __B>,
+                            #vis #names: #ty::Mut<'__f, __B>,
                         )*
                     }
                 },
-                quote! { #parts_ident { #( #names: #field_guard, )* } },
+                quote! { #parts_ident { #( #names: #field_mut, )* } },
             )
         }
         Fields::Unnamed(_) => (
             quote! {
                 #[doc = #parts_doc]
                 #vis struct #parts_ident #parts_decl_generics (
-                    #( #vis #ty::Guard<'__f, __B>, )*
+                    #( #vis #ty::Mut<'__f, __B>, )*
                 ) #parts_where;
             },
-            quote! { #parts_ident( #( #field_guard, )* ) },
+            quote! { #parts_ident( #( #field_mut, )* ) },
         ),
         Fields::Unit => (Tokens::new(), Tokens::new()),
     };
     let parts_method = (!matches!(data.fields, Fields::Unit)).then(|| {
         quote! {
-            /// A guard for every field at once, so that all fields can be
+            /// A `Mut` for every field at once, so that all fields can be
             /// mutated simultaneously; each finds where it starts whenever
             /// it writes.
             #[inline]
@@ -1023,8 +1026,8 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
         }
     });
 
-    let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident);
-    let guard_assoc = guard_assoc(ctx, &guard_ident);
+    let scaffold = mut_scaffold(ctx, ident, vis, &mut_ident);
+    let mut_assoc = mut_assoc(ctx, &mut_ident);
     let set = set_method(ctx, ident, vis);
     let [encode_sig, decode_sig, encode_fixed_sig, decode_fixed_sig] = codec_sigs(krate);
     let field_describe = ty.iter().map(|t| quote!(#t::describe(__builder)));
@@ -1057,13 +1060,13 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
 
         #parts_struct
 
-        impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
+        impl #mut_impl_generics #mut_ident #mut_use_generics #where_clause {
             #set
 
             #(
                 #[doc = #accessor_doc]
                 #[inline]
-                #vis fn #accessor_ident(&mut self) -> #ty::Guard<'_, __B> {
+                #vis fn #accessor_ident(&mut self) -> #ty::Mut<'_, __B> {
                     #accessor_body
                 }
             )*
@@ -1076,7 +1079,7 @@ fn derive_struct(input: &DeriveInput, data: &syn::DataStruct, ctx: &Ctx) -> Toke
         impl #impl_generics #krate::Durable for #ident #type_generics #where_clause {
             const FIXED_SIZE: ::std::option::Option<usize> = #fixed_size;
 
-            #guard_assoc
+            #mut_assoc
 
             #[inline]
             fn encoded_len(&self) -> usize {
@@ -1194,13 +1197,13 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
     let krate = &ctx.krate;
     let ident = &input.ident;
     let vis = &input.vis;
-    let guard_ident = format_ident!("{}Guard", ident);
+    let mut_ident = format_ident!("{}Mut", ident);
     let Ctx {
         impl_generics,
         type_generics,
         where_clause,
-        guard_impl_generics,
-        guard_use_generics,
+        mut_impl_generics,
+        mut_use_generics,
         ..
     } = ctx;
 
@@ -1348,28 +1351,41 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
                 __value
             }
         });
+        // The variant's payload: the empty Struct for a unit variant, the
+        // field's own type for a tuple variant of one field, and a Struct of
+        // the fields, named after the variant, otherwise.
         let field_name: Vec<&String> = fields.iter().map(|f| &f.schema_name).collect();
+        let payload = match (&variant.kind, ty.as_slice()) {
+            (VariantKind::Unit, _) => quote! { <() as #krate::Durable>::describe(__builder) },
+            (VariantKind::Unnamed, [single]) => quote! { #single::describe(__builder) },
+            _ => quote! {
+                __builder.describe_anonymous(|__builder| #krate::TypeDescriptor::Struct {
+                    name: ::std::string::ToString::to_string(::std::stringify!(#v_ident)),
+                    fields: ::std::vec![
+                        #(
+                            #krate::Field {
+                                name: ::std::string::ToString::to_string(#field_name),
+                                ty: #ty::describe(__builder),
+                            },
+                        )*
+                    ],
+                })
+            },
+        };
         describe_variants.push(quote! {
             #krate::Variant {
                 discriminant: #discriminants[#i],
                 name: ::std::string::ToString::to_string(::std::stringify!(#v_ident)),
-                fields: ::std::vec![
-                    #(
-                        #krate::Field {
-                            name: ::std::string::ToString::to_string(#field_name),
-                            ty: #ty::describe(__builder),
-                        },
-                    )*
-                ],
+                payload: #payload,
             }
         });
 
         // `parts()`: the guards of the current variant's fields, made
         // together, past the discriminant.
-        let guards: Vec<Tokens> = (0..fields.len())
+        let muts: Vec<Tokens> = (0..fields.len())
             .map(|k| {
                 let (t, b) = (&ty[k], &bindings[k]);
-                quote!(#t::guard(#b, __region.field(__fields, #k)))
+                quote!(#t::mutate(#b, __region.field(__fields, #k)))
             })
             .collect();
         let fill = quote! {
@@ -1380,32 +1396,32 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
             );
             let (__fields, __region) = (&*fields, &*region);
         };
-        let doc = format!("The guards of the fields of [`{ident}::{v_ident}`].");
+        let doc = format!("The `Mut`s of the fields of [`{ident}::{v_ident}`].");
         match &variant.kind {
             VariantKind::Named(names) => {
                 let field_docs = names
                     .iter()
-                    .map(|name| format!("The guard of field `{name}`."));
+                    .map(|name| format!("The `Mut` of field `{name}`."));
                 parts_variants.push(quote! {
                     #[doc = #doc]
                     #v_ident {
                         #(
                             #[doc = #field_docs]
-                            #names: #ty::Guard<'__f, __B>,
+                            #names: #ty::Mut<'__f, __B>,
                         )*
                     }
                 });
                 parts_arms.push(quote! {
-                    #pattern => { #fill #parts_ident::#v_ident { #(#names: #guards,)* } }
+                    #pattern => { #fill #parts_ident::#v_ident { #(#names: #muts,)* } }
                 });
             }
             VariantKind::Unnamed => {
                 parts_variants.push(quote! {
                     #[doc = #doc]
-                    #v_ident( #(#ty::Guard<'__f, __B>,)* )
+                    #v_ident( #(#ty::Mut<'__f, __B>,)* )
                 });
                 parts_arms.push(quote! {
-                    #pattern => { #fill #parts_ident::#v_ident(#(#guards,)*) }
+                    #pattern => { #fill #parts_ident::#v_ident(#(#muts,)*) }
                 });
             }
             VariantKind::Unit => {
@@ -1428,8 +1444,8 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
     let parts = has_fields.then(|| {
         let (parts_decl_generics, parts_ret_generics, parts_where) = ctx.parts_generics();
         let parts_doc = format!(
-            "The guards of the fields of the current variant of a persisted [`{ident}`], \
-             handed out by its guard's `parts()`."
+            "The `Mut`s of the fields of the current variant of a persisted [`{ident}`], \
+             handed out by its `Mut`'s `parts()`."
         );
         quote! {
             #[doc = #parts_doc]
@@ -1437,8 +1453,8 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
                 #(#parts_variants,)*
             }
 
-            impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
-                /// The guards of the current variant's fields, for mutating
+            impl #mut_impl_generics #mut_ident #mut_use_generics #where_clause {
+                /// The `Mut`s of the current variant's fields, for mutating
                 /// them in place; match on the result to reach them. To
                 /// switch to another variant, use `set`.
                 #[inline]
@@ -1453,8 +1469,8 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
         }
     });
 
-    let scaffold = guard_scaffold(ctx, ident, vis, &guard_ident);
-    let guard_assoc = guard_assoc(ctx, &guard_ident);
+    let scaffold = mut_scaffold(ctx, ident, vis, &mut_ident);
+    let mut_assoc = mut_assoc(ctx, &mut_ident);
     let set = set_method(ctx, ident, vis);
     let [encode_sig, decode_sig, encode_fixed_sig, decode_fixed_sig] = codec_sigs(krate);
     let bounded_impl = ctx.bounded.then(|| {
@@ -1494,7 +1510,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
 
         #parts
 
-        impl #guard_impl_generics #guard_ident #guard_use_generics #where_clause {
+        impl #mut_impl_generics #mut_ident #mut_use_generics #where_clause {
             #set
         }
 
@@ -1537,7 +1553,7 @@ fn derive_enum(input: &DeriveInput, data: &syn::DataEnum, ctx: &Ctx) -> Tokens {
             const FIXED_SIZE: ::std::option::Option<usize> =
                 #krate::enum_fixed_size(&#discriminants, &[#(#fixed_sizes),*]);
 
-            #guard_assoc
+            #mut_assoc
 
             #[inline]
             fn encoded_len(&self) -> usize {

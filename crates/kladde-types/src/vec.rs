@@ -3,7 +3,7 @@
 use std::ops::Deref;
 
 use kladde_persist::{
-    varint_len, Backend, Cut, Decoder, Durable, Encoder, Error, Guard, Node, Region, SchemaBuilder,
+    varint_len, Backend, Cut, Decoder, Durable, Encoder, Error, Mut, Node, Region, SchemaBuilder,
     TypeDescriptor,
 };
 
@@ -14,20 +14,20 @@ use crate::index::Sizes;
 ///
 /// In memory, a `Vec<T>`, and for a `T` whose size depends on its value a
 /// Fenwick tree of the elements' encoded sizes, four bytes per element, so
-/// that the guard of element `i` finds where it starts in `O(log m)`. For a
+/// that the `Mut` of element `i` finds where it starts in `O(log m)`. For a
 /// fixed-size `T` the element starts at `i` times its size, and the vector
 /// keeps nothing more.
 ///
 /// Read it as a slice, through `Deref<Target = [T]>`; change it through a
-/// [`DurableVecGuard`].
+/// [`DurableVecMut`].
 ///
 /// ```
 /// use kladde::Kladde;
-/// use kladde_types::{DurableString, DurableVec};
+/// use kladde_types::DurableVec;
 ///
-/// let mut lines = Kladde::new(DurableVec::<DurableString>::new());
-/// lines.guard().push("hello".into())?;
-/// lines.guard().get_mut(0).unwrap().push_str(", world")?;
+/// let mut lines = Kladde::new(DurableVec::<String>::new());
+/// lines.get_mut().push("hello".into())?;
+/// lines.get_mut().get_mut(0).unwrap().push_str(", world")?;
 /// assert_eq!(lines.get()[0], "hello, world");
 /// # Ok::<(), kladde::Error>(())
 /// ```
@@ -105,7 +105,7 @@ impl<T: Durable> DurableVec<T> {
     }
 
     /// Checks that the sizes the vector keeps match its elements, panicking
-    /// otherwise: for tests of guards that change elements' sizes.
+    /// otherwise: for tests of `Mut`s that change elements' sizes.
     ///
     /// ```
     /// let v: kladde_types::DurableVec<u32> = vec![1, 300].into();
@@ -213,13 +213,13 @@ impl<T: Durable> Durable for DurableVec<T> {
         Ok(Self::from_items(items))
     }
 
-    type Guard<'r, B: Backend + 'r>
-        = DurableVecGuard<'r, T, B>
+    type Mut<'r, B: Backend + 'r>
+        = DurableVecMut<'r, T, B>
     where
         Self: 'r;
 
-    fn guard<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Guard<'r, B> {
-        DurableVecGuard {
+    fn mutate<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Mut<'r, B> {
+        DurableVecMut {
             inner: self,
             region,
         }
@@ -245,8 +245,8 @@ pub(crate) fn write_count<B: Backend>(
     Ok(())
 }
 
-/// The [`Guard`] of a [`DurableVec`]: insert, remove, reorder and cut
-/// elements, and reach each element's own guard.
+/// The [`Mut`] of a [`DurableVec`]: insert, remove, reorder and cut
+/// elements, and reach each element's own `Mut`.
 ///
 /// An insertion or a removal is one transaction of two records, the element
 /// and the count; a reordering is one `Move`, which writes none of the
@@ -257,20 +257,20 @@ pub(crate) fn write_count<B: Backend>(
 /// use kladde_types::DurableVec;
 ///
 /// let mut v = Kladde::new(DurableVec::<u32>::from(vec![1, 2, 3]));
-/// let mut guard = v.guard();
-/// guard.push(4)?;
-/// guard.move_element(3, 0)?;
-/// assert_eq!(guard.remove(1)?, 1);
-/// guard.get_mut(0).unwrap().set(400)?;
+/// let mut v_mut = v.get_mut();
+/// v_mut.push(4)?;
+/// v_mut.move_element(3, 0)?;
+/// assert_eq!(v_mut.remove(1)?, 1);
+/// v_mut.get_mut(0).unwrap().set(400)?;
 /// assert_eq!(v.get().as_slice(), [400, 2, 3]);
 /// # Ok::<(), kladde::Error>(())
 /// ```
-pub struct DurableVecGuard<'r, T, B> {
+pub struct DurableVecMut<'r, T, B> {
     inner: &'r mut DurableVec<T>,
     region: Region<'r, B>,
 }
 
-impl<'r, T: Durable, B: Backend> DurableVecGuard<'r, T, B> {
+impl<'r, T: Durable, B: Backend> DurableVecMut<'r, T, B> {
     fn check_index(&self, index: usize, len: usize) -> Result<(), Error> {
         if index < len {
             Ok(())
@@ -279,10 +279,10 @@ impl<'r, T: Durable, B: Backend> DurableVecGuard<'r, T, B> {
         }
     }
 
-    /// The guard of element `index`, or `None` past the end. Finds where the
+    /// The `Mut` of element `index`, or `None` past the end. Finds where the
     /// element starts in `O(log m)`, or by a multiplication for a fixed-size
-    /// `T`. See [`DurableVecGuard`] for an example.
-    pub fn get_mut(&mut self, index: usize) -> Option<T::Guard<'_, B>> {
+    /// `T`. See [`DurableVecMut`] for an example.
+    pub fn get_mut(&mut self, index: usize) -> Option<T::Mut<'_, B>> {
         if index >= self.inner.items.len() {
             return None;
         }
@@ -294,10 +294,10 @@ impl<'r, T: Durable, B: Backend> DurableVecGuard<'r, T, B> {
             Some(_) => None,
             None => Some(&*sizes),
         };
-        Some(item.guard(self.region.child(offset, len, node, index)))
+        Some(item.mutate(self.region.child(offset, len, node, index)))
     }
 
-    /// Appends `value`. See [`DurableVecGuard`] for an example.
+    /// Appends `value`. See [`DurableVecMut`] for an example.
     pub fn push(&mut self, value: T) -> Result<(), Error> {
         let n = self.inner.items.len();
         self.insert(n, value)
@@ -311,7 +311,7 @@ impl<'r, T: Durable, B: Backend> DurableVecGuard<'r, T, B> {
     /// use kladde_types::DurableVec;
     ///
     /// let mut v = Kladde::new(DurableVec::<i32>::from(vec![1, 3]));
-    /// v.guard().insert(1, 2)?;
+    /// v.get_mut().insert(1, 2)?;
     /// assert_eq!(v.get().as_slice(), [1, 2, 3]);
     /// # Ok::<(), kladde::Error>(())
     /// ```
@@ -343,7 +343,7 @@ impl<'r, T: Durable, B: Backend> DurableVecGuard<'r, T, B> {
     /// use kladde_types::DurableVec;
     ///
     /// let mut v = Kladde::new(DurableVec::<u8>::from(vec![1, 2]));
-    /// assert_eq!(v.guard().pop()?, Some(2));
+    /// assert_eq!(v.get_mut().pop()?, Some(2));
     /// # Ok::<(), kladde::Error>(())
     /// ```
     pub fn pop(&mut self) -> Result<Option<T>, Error> {
@@ -354,7 +354,7 @@ impl<'r, T: Durable, B: Backend> DurableVecGuard<'r, T, B> {
     }
 
     /// Removes element `index` and returns it, shifting the elements after
-    /// it. See [`DurableVecGuard`] for an example.
+    /// it. See [`DurableVecMut`] for an example.
     pub fn remove(&mut self, index: usize) -> Result<T, Error> {
         let n = self.inner.items.len();
         self.check_index(index, n)?;
@@ -389,7 +389,7 @@ impl<'r, T: Durable, B: Backend> DurableVecGuard<'r, T, B> {
     /// use kladde_types::DurableVec;
     ///
     /// let mut v = Kladde::new(DurableVec::<u8>::from(vec![1, 2]));
-    /// v.guard().delete(0)?;
+    /// v.get_mut().delete(0)?;
     /// assert_eq!(v.get().as_slice(), [2]);
     /// # Ok::<(), kladde::Error>(())
     /// ```
@@ -399,7 +399,7 @@ impl<'r, T: Durable, B: Backend> DurableVecGuard<'r, T, B> {
 
     /// Moves element `from` to position `to`, shifting the elements between:
     /// one `Move` in the file, which writes none of the element's bytes,
-    /// however large it is. See [`DurableVecGuard`] for an example.
+    /// however large it is. See [`DurableVecMut`] for an example.
     pub fn move_element(&mut self, from: usize, to: usize) -> Result<(), Error> {
         let n = self.inner.items.len();
         self.check_index(from, n)?;
@@ -430,7 +430,7 @@ impl<'r, T: Durable, B: Backend> DurableVecGuard<'r, T, B> {
     /// use kladde_types::DurableVec;
     ///
     /// let mut v = Kladde::new(DurableVec::<u8>::from(vec![1, 2]));
-    /// v.guard().clear()?;
+    /// v.get_mut().clear()?;
     /// assert!(v.get().is_empty());
     /// # Ok::<(), kladde::Error>(())
     /// ```
@@ -443,28 +443,27 @@ impl<'r, T: Durable, B: Backend> DurableVecGuard<'r, T, B> {
         kladde_persist::replace(self.inner, value, &self.region)
     }
 
-    /// Cuts element `index` out, for a paste elsewhere in the same
-    /// operation without encoding it again: see [`Cut`]. The cut holds a
-    /// transaction open until it is pasted, committed or dropped.
+    /// Cuts element `index` out, for a paste elsewhere without encoding it
+    /// again, as long as the journal that removed it lasts: see [`Cut`].
     ///
     /// ```
     /// use kladde::{Kladde, Durable};
-    /// use kladde_types::{DurableString, DurableVec};
+    /// use kladde_types::DurableVec;
     ///
     /// #[derive(Durable)]
     /// struct Groups {
-    ///     a: DurableVec<DurableString>,
-    ///     b: DurableVec<DurableString>,
+    ///     a: DurableVec<String>,
+    ///     b: DurableVec<String>,
     /// }
     ///
     /// let mut groups = Kladde::new(Groups {
     ///     a: vec!["circle".into(), "square".into()].into(),
     ///     b: DurableVec::new(),
     /// });
-    /// let mut guard = groups.guard();
-    /// let cut = guard.a_mut().cut(1)?;
+    /// let mut groups_mut = groups.get_mut();
+    /// let cut = groups_mut.a_mut().cut(1)?;
     /// assert_eq!(*cut, "square");
-    /// guard.b_mut().push_cut(cut)?;
+    /// groups_mut.b_mut().push_cut(cut)?;
     /// assert_eq!(groups.get().b[0], "square");
     /// # Ok::<(), kladde::Error>(())
     /// ```
@@ -474,33 +473,26 @@ impl<'r, T: Durable, B: Backend> DurableVecGuard<'r, T, B> {
         let at = self.inner.offset_of(index);
         let len = self.inner.items[index].encoded_len() as u64;
         let backend = self.region.backend();
-        backend.begin_transaction()?;
         let id = self.region.transaction(|r| {
             let id = r.splice(at, len, &[])?;
             write_count(r, n, n - 1)?;
             Ok(id)
-        });
-        match id {
-            Ok(id) => Ok(Cut::new(self.take(index), id, backend)),
-            Err(e) => {
-                let _ = backend.end_transaction();
-                Err(e)
-            }
-        }
+        })?;
+        Ok(Cut::new(self.take(index), id, backend))
     }
 
     /// Inserts the value `cut` holds before element `index`, pasting its
-    /// bytes rather than encoding it again, and ends the transaction the
-    /// cut held open. See [`cut`](Self::cut) for an example.
+    /// bytes while the journal that cut it lasts, and encoding it again
+    /// otherwise. See [`cut`](Self::cut) for an example.
     pub fn insert_cut(&mut self, index: usize, cut: Cut<T, B>) -> Result<(), Error> {
         let n = self.inner.items.len();
         self.check_index(index, n + 1)?;
         let at = self.inner.offset_of(index);
         let region = &self.region;
-        let value = cut.paste_with(|id| {
+        let value = cut.paste_with(|id, bytes| {
             region.transaction(|r| {
                 if let Some(id) = id {
-                    r.paste(at, 0, id)?;
+                    r.paste(at, 0, id, bytes)?;
                 }
                 write_count(r, n, n + 1)
             })
@@ -518,7 +510,7 @@ impl<'r, T: Durable, B: Backend> DurableVecGuard<'r, T, B> {
     }
 }
 
-impl<T, B> Guard for DurableVecGuard<'_, T, B> {
+impl<T, B> Mut for DurableVecMut<'_, T, B> {
     type Durable = DurableVec<T>;
 
     fn as_durable(&self) -> &DurableVec<T> {
@@ -526,7 +518,7 @@ impl<T, B> Guard for DurableVecGuard<'_, T, B> {
     }
 }
 
-impl<T, B> Deref for DurableVecGuard<'_, T, B> {
+impl<T, B> Deref for DurableVecMut<'_, T, B> {
     type Target = DurableVec<T>;
 
     fn deref(&self) -> &DurableVec<T> {

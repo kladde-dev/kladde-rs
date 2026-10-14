@@ -1,11 +1,11 @@
 //! [`Durable`] for the wrappers: [`Option`], an enum; [`Box`], persisted
 //! as what it holds; and [`Fixed`], a type's values at a fixed size.
 
-use kladde_schema::{Field, TypeDescriptor, TypeRef, Variant};
+use kladde_schema::{TypeDescriptor, TypeRef, Variant};
 use kladde_store::Error;
 
 use crate::codec::{Decoder, Encoder};
-use crate::durable::{replace, Bounded, Durable, Guard, SetGuard};
+use crate::durable::{replace, Bounded, Durable, Mut, SetMut};
 use crate::region::{Backend, Region};
 use crate::schema::SchemaBuilder;
 
@@ -73,13 +73,13 @@ impl<T: Durable> Durable for Option<T> {
         }
     }
 
-    type Guard<'r, B: Backend + 'r>
-        = OptionGuard<'r, T, B>
+    type Mut<'r, B: Backend + 'r>
+        = OptionMut<'r, T, B>
     where
         Self: 'r;
 
-    fn guard<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Guard<'r, B> {
-        OptionGuard {
+    fn mutate<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Mut<'r, B> {
+        OptionMut {
             inner: self,
             region,
         }
@@ -96,22 +96,19 @@ impl<T: Durable> Durable for Option<T> {
                 Variant {
                     discriminant: 0,
                     name: "None".into(),
-                    fields: vec![],
+                    payload: <() as Durable>::describe(builder),
                 },
                 Variant {
                     discriminant: 1,
                     name: "Some".into(),
-                    fields: vec![Field {
-                        name: "0".into(),
-                        ty: T::describe(builder),
-                    }],
+                    payload: T::describe(builder),
                 },
             ],
         }
     }
 }
 
-/// The [`Guard`] of an [`Option`]: replace it whole, or mutate what it
+/// The [`Mut`] of an [`Option`]: replace it whole, or mutate what it
 /// holds.
 ///
 /// ```
@@ -121,22 +118,22 @@ impl<T: Durable> Durable for Option<T> {
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
 /// let mut size: Option<u32> = None;
 /// store.splice(0, 0, &size.to_bytes())?;
-/// let mut guard = size.guard(Region::root(&store));
-/// guard.set(Some(7))?;
-/// guard.as_mut().unwrap().set(700)?;
-/// drop(guard);
+/// let mut size_mut = size.mutate(Region::root(&store));
+/// size_mut.set(Some(7))?;
+/// size_mut.as_mut().unwrap().set(700)?;
+/// drop(size_mut);
 /// assert_eq!(size, Some(700));
 /// store.flush()?;
 /// assert_eq!(store.read_all()?, Some(700u32).to_bytes());
 /// # Ok::<(), kladde_store::Error>(())
 /// ```
-pub struct OptionGuard<'r, T, B> {
+pub struct OptionMut<'r, T, B> {
     inner: &'r mut Option<T>,
     region: Region<'r, B>,
 }
 
-impl<T: Durable, B: Backend> OptionGuard<'_, T, B> {
-    /// Replaces the whole value. See [`OptionGuard`] for an example.
+impl<T: Durable, B: Backend> OptionMut<'_, T, B> {
+    /// Replaces the whole value. See [`OptionMut`] for an example.
     pub fn set(&mut self, value: Option<T>) -> Result<(), Error> {
         replace(self.inner, value, &self.region)
     }
@@ -150,16 +147,16 @@ impl<T: Durable, B: Backend> OptionGuard<'_, T, B> {
         Ok(self.inner.take())
     }
 
-    /// The guard of the value inside, if there is one. See [`OptionGuard`]
+    /// The `Mut` of the value inside, if there is one. See [`OptionMut`]
     /// for an example.
-    pub fn as_mut(&mut self) -> Option<T::Guard<'_, B>> {
+    pub fn as_mut(&mut self) -> Option<T::Mut<'_, B>> {
         let value = self.inner.as_mut()?;
         let len = value.encoded_len() as u64;
-        Some(value.guard(self.region.child(1, len, None, 0)))
+        Some(value.mutate(self.region.child(1, len, None, 0)))
     }
 }
 
-impl<T, B> Guard for OptionGuard<'_, T, B> {
+impl<T, B> Mut for OptionMut<'_, T, B> {
     type Durable = Option<T>;
 
     fn as_durable(&self) -> &Option<T> {
@@ -167,7 +164,7 @@ impl<T, B> Guard for OptionGuard<'_, T, B> {
     }
 }
 
-impl<T, B> std::ops::Deref for OptionGuard<'_, T, B> {
+impl<T, B> std::ops::Deref for OptionMut<'_, T, B> {
     type Target = Option<T>;
 
     fn deref(&self) -> &Option<T> {
@@ -199,9 +196,9 @@ impl<T, B> std::ops::Deref for OptionGuard<'_, T, B> {
 /// #     fn decode(input: &mut kladde_persist::Decoder<'_>) -> kladde_persist::Result<Self> {
 /// #         Ok(match input.byte()? { 0 => List::Nil, _ => List::Cons(input.byte()?, Box::decode(input)?) })
 /// #     }
-/// #     type Guard<'r, B: kladde_persist::Backend + 'r> = kladde_persist::SetGuard<'r, Self, B>;
-/// #     fn guard<'r, B: kladde_persist::Backend + 'r>(&'r mut self, region: kladde_persist::Region<'r, B>) -> Self::Guard<'r, B> {
-/// #         kladde_persist::SetGuard::new(self, region)
+/// #     type Mut<'r, B: kladde_persist::Backend + 'r> = kladde_persist::SetMut<'r, Self, B>;
+/// #     fn mutate<'r, B: kladde_persist::Backend + 'r>(&'r mut self, region: kladde_persist::Region<'r, B>) -> Self::Mut<'r, B> {
+/// #         kladde_persist::SetMut::new(self, region)
 /// #     }
 /// # }
 /// let list = List::Cons(1, Box::new(List::Cons(2, Box::new(List::Nil))));
@@ -223,13 +220,13 @@ impl<T: Durable> Durable for Box<T> {
         T::decode(input).map(Box::new)
     }
 
-    type Guard<'r, B: Backend + 'r>
-        = T::Guard<'r, B>
+    type Mut<'r, B: Backend + 'r>
+        = T::Mut<'r, B>
     where
         Self: 'r;
 
-    fn guard<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Guard<'r, B> {
-        (**self).guard(region)
+    fn mutate<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Mut<'r, B> {
+        (**self).mutate(region)
     }
 
     fn describe(builder: &mut SchemaBuilder) -> TypeRef
@@ -271,8 +268,8 @@ impl<T: Bounded> Bounded for Box<T> {
 /// `Fixed<Option<u32>>` takes five bytes for every value, while
 /// `Option<Fixed<u32>>` takes one for `None` and five for `Some`.
 ///
-/// Its guard is a [`SetGuard`]: it replaces the value whole, and offers no
-/// guard of one of `T`'s fields, since such a guard would have to write the
+/// Its `Mut` is a [`SetMut`]: it replaces the value whole, and offers no
+/// `Mut` of one of `T`'s fields, since such a `Mut` would have to write the
 /// field in its fixed form.
 ///
 /// ```
@@ -285,7 +282,7 @@ impl<T: Bounded> Bounded for Box<T> {
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
 /// let mut counter = Fixed(0u32);
 /// store.splice(0, 0, &counter.to_bytes())?;
-/// counter.guard(Region::root(&store)).set(Fixed(1 << 20))?;
+/// counter.mutate(Region::root(&store)).set(Fixed(1 << 20))?;
 /// assert_eq!(store.len(), 4); // no splice: the size stays
 /// # Ok::<(), kladde_store::Error>(())
 /// ```
@@ -319,13 +316,13 @@ impl<T: Bounded> Durable for Fixed<T> {
         T::decode_fixed(input).map(Fixed)
     }
 
-    type Guard<'r, B: Backend + 'r>
-        = SetGuard<'r, Self, B>
+    type Mut<'r, B: Backend + 'r>
+        = SetMut<'r, Self, B>
     where
         Self: 'r;
 
-    fn guard<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Guard<'r, B> {
-        SetGuard::new(self, region)
+    fn mutate<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Mut<'r, B> {
+        SetMut::new(self, region)
     }
 
     fn describe_local(builder: &mut SchemaBuilder) -> TypeDescriptor

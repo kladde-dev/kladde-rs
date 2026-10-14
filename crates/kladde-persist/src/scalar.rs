@@ -1,5 +1,5 @@
-//! [`Durable`] and [`Bounded`] for the primitive types, whose guards are
-//! [`SetGuard`]s.
+//! [`Durable`] and [`Bounded`] for the primitive types, whose `Mut`s are
+//! [`SetMut`]s.
 //!
 //! | type | encoding | fixed form |
 //! | --- | --- | --- |
@@ -16,7 +16,7 @@ use kladde_schema::{Primitive, TypeDescriptor};
 use kladde_store::Error;
 
 use crate::codec::{Decoder, Encoder};
-use crate::durable::{Bounded, Durable, SetGuard};
+use crate::durable::{Bounded, Durable, SetMut};
 use crate::region::{Backend, Region};
 use crate::schema::SchemaBuilder;
 
@@ -65,14 +65,14 @@ macro_rules! scalar {
                 $decode
             }
 
-            type Guard<'r, B: Backend + 'r> = SetGuard<'r, $ty, B>;
+            type Mut<'r, B: Backend + 'r> = SetMut<'r, $ty, B>;
 
             #[inline]
-            fn guard<'r, B: Backend + 'r>(
+            fn mutate<'r, B: Backend + 'r>(
                 &'r mut self,
                 region: Region<'r, B>,
-            ) -> Self::Guard<'r, B> {
-                SetGuard::new(self, region)
+            ) -> Self::Mut<'r, B> {
+                SetMut::new(self, region)
             }
 
             fn describe_local(_builder: &mut SchemaBuilder) -> TypeDescriptor {
@@ -259,10 +259,10 @@ mod tests {
         let mut value: u32 = 100;
         store.splice(0, 0, &value.to_bytes()).unwrap();
         {
-            let mut guard = value.guard(Region::root(&store));
-            guard.set(70_000).unwrap();
-            guard.set(5).unwrap();
-            guard.set(70_001).unwrap();
+            let mut value_mut = value.mutate(Region::root(&store));
+            value_mut.set(70_000).unwrap();
+            value_mut.set(5).unwrap();
+            value_mut.set(70_001).unwrap();
         }
         store.flush().unwrap();
         assert_eq!(store.read_all().unwrap(), 70_001u32.to_bytes());

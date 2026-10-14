@@ -1,5 +1,5 @@
 //! [`Durable`]: a type that encodes itself into the sequence, decodes
-//! itself from it, and hands out a [`Guard`] that mutates its region.
+//! itself from it, and hands out a [`Mut`] that mutates its region.
 
 use kladde_schema::{Fingerprint, TypeDescriptor, TypeRef, TypeTable};
 use kladde_store::Error;
@@ -10,7 +10,7 @@ use crate::schema::SchemaBuilder;
 
 /// A type that can live in a kladde file: it encodes itself into one
 /// buffer, decodes itself from the sequence, and mutates its region through
-/// its [`Guard`]. It never allocates, frees, or knows where it lies.
+/// its [`Mut`]. It never allocates, frees, or knows where it lies.
 ///
 /// Scalars, tuples, [`Option`], [`Box`], [`Fixed`](crate::Fixed), the
 /// containers of `kladde-types`, and every `#[derive(Durable)]` type
@@ -19,7 +19,7 @@ use crate::schema::SchemaBuilder;
 /// A hand-written implementation owes four things: `FIXED_SIZE` and
 /// [`encoded_len`](Durable::encoded_len) match what
 /// [`encode`](Durable::encode) writes; `encode` and
-/// [`decode`](Durable::decode) are inverses; every guard method leaves
+/// [`decode`](Durable::decode) are inverses; every [`Mut`] method leaves
 /// its region holding the value's encoding when its transaction ends; and
 /// the descriptor matches the bytes.
 ///
@@ -83,16 +83,16 @@ pub trait Durable: Sized {
     fn decode(input: &mut Decoder<'_>) -> Result<Self, Error>;
 
     /// The mutation-capable view onto this type, over a value whose region
-    /// records through `B`. See [`Guard`].
+    /// records through `B`. See [`Mut`].
     ///
     /// A type persisted as another, such as `Box<T>`, may use the other's
-    /// guard, so the guard's [`Guard::Durable`] need not be `Self`.
-    type Guard<'r, B: Backend + 'r>: Guard
+    /// `Mut`, so the `Mut`'s [`Mut::Durable`] need not be `Self`.
+    type Mut<'r, B: Backend + 'r>: Mut
     where
         Self: 'r;
 
     /// Borrows `self` with its `region`, the substring of the sequence
-    /// that holds its encoding, producing a [`Guard`] through which
+    /// that holds its encoding, producing a [`Mut`] through which
     /// mutations are recorded and applied.
     ///
     /// ```
@@ -102,12 +102,12 @@ pub trait Durable: Sized {
     /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
     /// let mut count = 5u32;
     /// store.splice(0, 0, &count.to_bytes())?;
-    /// count.guard(Region::root(&store)).set(500)?;
+    /// count.mutate(Region::root(&store)).set(500)?;
     /// store.flush()?;
     /// assert_eq!(store.read_all()?, [0xf4, 0x03]); // the varint grew
     /// # Ok::<(), kladde_store::Error>(())
     /// ```
-    fn guard<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Guard<'r, B>;
+    fn mutate<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Mut<'r, B>;
 
     /// This value's encoding, as a fresh buffer.
     ///
@@ -299,34 +299,34 @@ pub trait Bounded: Durable {
 
 /// A live, mutation-capable view onto a durable value and its region.
 ///
-/// Every mutating method of a guard records the change in the store's
+/// Every mutating method of a `Mut` records the change in the store's
 /// journal and then mutates the in-memory value, in that order, and returns
-/// a `Result`: a failed recording leaves the value as it was. Guards also
-/// dereference to the value, so read-only methods stay available.
+/// a `Result`: a failed recording leaves the value as it was. A `Mut` also
+/// dereferences to the value, so read-only methods stay available.
 ///
 /// ```
-/// use kladde_persist::{Guard, Durable, Region};
+/// use kladde_persist::{Mut, Durable, Region};
 /// use kladde_store::{MemoryStorage, Store, WriteBackend};
 ///
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
 /// let mut flag = false;
 /// store.splice(0, 0, &flag.to_bytes())?;
-/// let mut guard = flag.guard(Region::root(&store));
-/// guard.set(true)?;
-/// assert!(*guard.as_durable());
+/// let mut flag_mut = flag.mutate(Region::root(&store));
+/// flag_mut.set(true)?;
+/// assert!(*flag_mut.as_durable());
 /// # Ok::<(), kladde_store::Error>(())
 /// ```
-pub trait Guard {
-    /// The value this guard mutates.
+pub trait Mut {
+    /// The value this `Mut` mutates.
     type Durable;
 
     /// The value, for reading.
     fn as_durable(&self) -> &Self::Durable;
 }
 
-/// The guard of a value that changes only as a whole: a scalar, a
+/// The `Mut` of a value that changes only as a whole: a scalar, a
 /// [`Fixed`](crate::Fixed) value, or anything else whose
-/// [`Durable::Guard`] offers nothing but [`set`](SetGuard::set).
+/// [`Durable::Mut`] offers nothing but [`set`](SetMut::set).
 ///
 /// ```
 /// use kladde_persist::{Durable, Region};
@@ -335,32 +335,32 @@ pub trait Guard {
 /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
 /// let mut c = 'a';
 /// store.splice(0, 0, &c.to_bytes())?;
-/// c.guard(Region::root(&store)).set('€')?;
+/// c.mutate(Region::root(&store)).set('€')?;
 /// assert_eq!(c, '€');
 /// store.flush()?;
 /// assert_eq!(store.read_all()?, "€".as_bytes());
 /// # Ok::<(), kladde_store::Error>(())
 /// ```
-pub struct SetGuard<'r, T, B> {
+pub struct SetMut<'r, T, B> {
     value: &'r mut T,
     region: Region<'r, B>,
 }
 
-impl<'r, T: Durable, B: Backend> SetGuard<'r, T, B> {
-    /// The guard of `value` at `region`.
+impl<'r, T: Durable, B: Backend> SetMut<'r, T, B> {
+    /// The `Mut` of `value` at `region`.
     pub fn new(value: &'r mut T, region: Region<'r, B>) -> Self {
-        SetGuard { value, region }
+        SetMut { value, region }
     }
 
     /// Replaces the value: an overwrite in place if the encoding keeps its
     /// size, otherwise a splice that the values around hear about. See
-    /// [`SetGuard`] for an example.
+    /// [`SetMut`] for an example.
     pub fn set(&mut self, value: T) -> Result<(), Error> {
         replace(self.value, value, &self.region)
     }
 }
 
-impl<T, B> Guard for SetGuard<'_, T, B> {
+impl<T, B> Mut for SetMut<'_, T, B> {
     type Durable = T;
 
     fn as_durable(&self) -> &T {
@@ -368,7 +368,7 @@ impl<T, B> Guard for SetGuard<'_, T, B> {
     }
 }
 
-impl<T, B> std::ops::Deref for SetGuard<'_, T, B> {
+impl<T, B> std::ops::Deref for SetMut<'_, T, B> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -380,7 +380,7 @@ impl<T, B> std::ops::Deref for SetGuard<'_, T, B> {
 /// `new`'s encoding over the old one, in place if the size stays, and only
 /// then updates `*current`.
 ///
-/// This is the whole-value `set` of every generated guard and of most
+/// This is the whole-value `set` of every generated `Mut` and of most
 /// hand-written ones. If the write fails, `*current` is left as it was.
 ///
 /// ```

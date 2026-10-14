@@ -178,7 +178,7 @@ impl Parser {
         let mut kind = in_svg
             .then(|| kind_for(tag.name()))
             .flatten()
-            .unwrap_or_else(|| ElementKind::Other { name: name.into() });
+            .unwrap_or(ElementKind::Other { name });
         use ElementKind as K;
         let in_text = in_text
             || matches!(
@@ -201,7 +201,7 @@ impl Parser {
                 None => "xmlns".to_string(),
             };
             attrs.push(Attr::Other {
-                name: name.into(),
+                name,
                 value: ns.uri().into(),
             });
         }

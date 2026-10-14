@@ -1,13 +1,13 @@
 //! [`Store`]: one sequence of bytes, durable at every recorded operation.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::{CutId, WriteBackend};
 use crate::consts::*;
 use crate::error::{corrupt, Error};
 use crate::hash::IdMap;
-use crate::journal::{recover, Bytes, Cursor, JournalWriter, Record, Records};
+use crate::journal::{recover, Bytes, Cursor, JournalCuts, JournalWriter, Record, Records};
 use crate::load::{load, pick_header};
 use crate::options::Options;
 use crate::page::{encode_page, new_page, HeaderFields, PageBuf};
@@ -70,20 +70,6 @@ impl Tx {
             },
         }
     }
-
-    fn in_transaction(&self) -> bool {
-        matches!(self, Tx::InTransaction { .. } | Tx::InTxInBatch { .. })
-    }
-}
-
-/// The cuts of the open transaction.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Cuts {
-    /// Which transaction they belong to: a count of the outermost
-    /// transactions opened in this session.
-    pub serial: u64,
-    /// Each cut's length, oldest first, and whether it was pasted.
-    pub list: Vec<(u64, bool)>,
 }
 
 pub(crate) struct Inner {
@@ -114,7 +100,11 @@ pub(crate) struct Inner {
     pub tx: Tx,
     /// The sequence's length as every operation so far leaves it.
     pub len: u64,
-    pub cuts: Cuts,
+    /// The cuts of the journal being appended to, as written so far.
+    pub journal_cuts: JournalCuts,
+    /// The cuts of the journal pasted so far, by the number of the record
+    /// that made each, with the number of the paste's record.
+    pub pasted: BTreeMap<u64, u64>,
     pub first_flush: bool,
     /// Data pages read at open, which decoding the sequence reads from;
     /// dropped by `end_load`.
@@ -250,7 +240,8 @@ impl Store {
             ops: recovered.records,
             tx: Tx::Immediate,
             len,
-            cuts: Cuts::default(),
+            journal_cuts: JournalCuts::default(),
+            pasted: BTreeMap::new(),
             first_flush: true,
             mirror: loaded.mirror,
             cache: IdMap::default(),
@@ -298,6 +289,32 @@ impl Store {
     /// ```
     pub fn flush(&self) -> Result<(), Error> {
         self.with(|i| i.flush_now())
+    }
+
+    /// Flushes as [`flush`](Self::flush) does if the journal pages hold at
+    /// least `fraction` of [`Options::journal_budget_pages`], counting what
+    /// the flush would append to them, and does nothing otherwise; returns
+    /// whether it flushed.
+    ///
+    /// The check costs a subtraction. It is for an interactive
+    /// application's idle callback: flushing while the user pauses keeps the
+    /// flush that a full journal forces, whose `fsync` blocks the mutation
+    /// that triggers it, out of the middle of a gesture. A fraction well
+    /// above zero, such as `0.5`, keeps the journal, and with it the cuts
+    /// its records made, from ending at every pause.
+    ///
+    /// ```
+    /// use kladde_store::{MemoryStorage, Store, WriteBackend};
+    ///
+    /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
+    /// store.splice(0, 0, b"hi")?;
+    /// assert!(!store.flush_if_journal_exceeds(0.5)?); // a few bytes: no flush
+    /// assert!(store.flush_if_journal_exceeds(0.0)?);
+    /// assert_eq!(store.read_all()?, b"hi");
+    /// # Ok::<(), kladde_store::Error>(())
+    /// ```
+    pub fn flush_if_journal_exceeds(&self, fraction: f64) -> Result<bool, Error> {
+        self.with(|i| i.flush_if_journal_exceeds(fraction))
     }
 
     /// Flushes, then shrinks the file to end at its last page that the
@@ -536,10 +553,7 @@ impl Store {
     /// [`end_transaction`](Self::end_transaction) reach the journal as one,
     /// so a crash keeps all of them or none.
     ///
-    /// Transactions nest, and only the outermost end appends. A splice
-    /// inside a transaction makes a cut of what it removes, which a
-    /// [`paste`](WriteBackend::paste) of the same transaction can insert
-    /// elsewhere.
+    /// Transactions nest, and only the outermost end appends.
     ///
     /// ```
     /// use kladde_store::{MemoryStorage, Store, WriteBackend};
@@ -558,10 +572,6 @@ impl Store {
     /// ```
     pub fn begin_transaction(&self) -> Result<(), Error> {
         self.with(|i| {
-            if !i.tx.in_transaction() {
-                i.cuts.serial += 1;
-                i.cuts.list.clear();
-            }
             i.tx = match i.tx {
                 Tx::Immediate => Tx::InTransaction {
                     depth: 1,
@@ -600,8 +610,7 @@ impl Store {
     }
 
     /// Ends the innermost transaction; ending the outermost appends its
-    /// operations to the journal, unless a batch holds them back, and ends
-    /// its cuts.
+    /// operations to the journal, unless a batch holds them back.
     ///
     /// Fails if no transaction is open, or if a batch opened inside the
     /// transaction is still open. See
@@ -616,7 +625,6 @@ impl Store {
                 } => {
                     i.close(committed, committed, false)?;
                     i.tx = Tx::Immediate;
-                    i.cuts.list.clear();
                 }
                 Tx::InTransaction { depth: 1, .. } => {
                     return Err(Error::Corrupt(
@@ -642,7 +650,6 @@ impl Store {
                 } => {
                     let committed = i.close(committed, ready, true)?;
                     i.tx = Tx::InBatch { batch, committed };
-                    i.cuts.list.clear();
                 }
                 Tx::InTxInBatch {
                     depth,
@@ -691,7 +698,7 @@ impl Store {
             Tx::InTransaction { committed, .. } => committed,
             _ => i.ops.end(),
         };
-        i.ops.truncate(keep);
+        i.truncate_ops(keep);
         i.poisoned = true;
     }
 
@@ -853,18 +860,19 @@ impl Inner {
         }
     }
 
-    /// The cut of `n` bytes that the record about to be recorded makes, if a
-    /// transaction is open; outside one nothing could paste it.
-    fn new_cut(&mut self, n: u64) -> Option<CutId> {
-        if !self.tx.in_transaction() {
-            return None;
-        }
-        self.cuts.list.push((n, false));
-        Some(CutId {
-            serial: self.cuts.serial,
-            index: (self.cuts.list.len() - 1) as u32,
+    /// The cut of `n` bytes that the record about to be recorded makes.
+    fn new_cut(&self, n: u64) -> CutId {
+        CutId {
+            record: self.ops.end().at,
             len: n,
-        })
+        }
+    }
+
+    /// Discards the records from `to` on, and forgets the pastes among
+    /// them.
+    pub(crate) fn truncate_ops(&mut self, to: Cursor) {
+        self.ops.truncate(to);
+        self.pasted.retain(|_, &mut paste| paste < to.at);
     }
 
     /// Appends, holds back, and flushes as
@@ -902,7 +910,9 @@ impl Inner {
         }
         let mut payload = Vec::with_capacity((to.bytes - from.bytes) as usize);
         let mut cursor = self.journal.cursor;
-        self.ops.encode(from, to, &mut cursor, &mut payload);
+        let mut cuts = self.journal_cuts.clone();
+        self.ops
+            .encode(from, to, &mut cursor, &mut cuts, &mut payload);
         self.ops.mark_start(from.at);
         self.ensure_journal_page()?;
         let Inner {
@@ -923,6 +933,7 @@ impl Inner {
             return Err(e);
         }
         self.journal.cursor = cursor;
+        self.journal_cuts = cuts;
         self.stats.journal_bytes += self.journal.bytes - before;
         self.stats.transactions += 1;
         Ok(to)
@@ -1127,7 +1138,7 @@ impl WriteBackend for Store {
             let bytes = i.ops.stash(bytes);
             let cut = i.new_cut(bytes.len as u64);
             i.record(Record::Write { pos, bytes })?;
-            Ok(cut)
+            Ok(Some(cut))
         })
     }
 
@@ -1139,11 +1150,7 @@ impl WriteBackend for Store {
             i.check_range(pos, removed)?;
             let len = i.grown(removed, bytes.len() as u64)?;
             let stashed: Bytes = i.ops.stash(bytes);
-            let cut = if removed > 0 {
-                i.new_cut(removed)
-            } else {
-                None
-            };
+            let cut = (removed > 0).then(|| i.new_cut(removed));
             i.len = len;
             i.record(Record::Splice {
                 pos,
@@ -1167,39 +1174,45 @@ impl WriteBackend for Store {
         })
     }
 
-    fn paste(&self, pos: u64, removed: u64, cut: CutId) -> Result<(), Error> {
+    fn paste(&self, pos: u64, removed: u64, cut: CutId, bytes: &[u8]) -> Result<(), Error> {
+        if bytes.len() as u64 != cut.len {
+            return Err(Error::Corrupt(
+                "a paste's bytes are not as long as its cut".into(),
+            ));
+        }
+        if !self.is_alive(&cut) {
+            // Its journal is folded: what it held is the value's encoding,
+            // written anew.
+            return self.splice(pos, removed, bytes).map(|_| ());
+        }
         self.with(|i| {
-            if !i.tx.in_transaction() || cut.serial != i.cuts.serial {
-                return Err(Error::Corrupt(
-                    "a cut is pasted outside the transaction that made it".into(),
-                ));
-            }
-            let entry = i
-                .cuts
-                .list
-                .get(cut.index as usize)
-                .copied()
-                .ok_or_else(|| Error::Corrupt("no such cut".into()))?;
-            if entry.1 {
+            if i.pasted.contains_key(&cut.record) {
                 return Err(Error::Corrupt("a cut is pasted twice".into()));
             }
+            if i.ops.get(cut.record).and_then(Record::cut_len) != Some(cut.len) {
+                return Err(Error::Corrupt("no such cut".into()));
+            }
             i.check_range(pos, removed)?;
-            let len = i.grown(removed, entry.0)?;
-            let distance = (i.cuts.list.len() - 1 - cut.index as usize) as u32;
-            i.cuts.list[cut.index as usize].1 = true;
+            let len = i.grown(removed, cut.len)?;
+            let fallback = i.ops.stash(bytes);
+            i.pasted.insert(cut.record, i.ops.end().at);
             i.len = len;
             i.record(Record::Paste {
                 pos,
                 removed,
-                cut: distance,
-                len: entry.0,
+                cut: cut.record,
+                len: cut.len,
+                fallback: Some(fallback),
             })
         })
     }
 
+    fn is_alive(&self, cut: &CutId) -> bool {
+        cut.record >= self.inner.borrow().ops.front().at
+    }
+
     fn atomically<R>(&self, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
-        let (mark, tx, len, cuts) =
-            self.with(|i| Ok((i.ops.end(), i.tx, i.len, i.cuts.clone())))?;
+        let (mark, tx, len) = self.with(|i| Ok((i.ops.end(), i.tx, i.len)))?;
         self.begin_transaction()?;
         match f() {
             Ok(r) => {
@@ -1212,7 +1225,7 @@ impl WriteBackend for Store {
                 // file is concerned.
                 let mut i = self.inner.borrow_mut();
                 if !i.poisoned {
-                    i.ops.truncate(mark);
+                    i.truncate_ops(mark);
                     let committed = match i.tx {
                         Tx::Immediate => mark,
                         Tx::InBatch { committed, .. }
@@ -1221,7 +1234,6 @@ impl WriteBackend for Store {
                     };
                     i.tx = tx.with_committed(committed);
                     i.len = len;
-                    i.cuts = cuts;
                 }
                 Err(e)
             }

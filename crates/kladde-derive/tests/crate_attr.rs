@@ -29,7 +29,7 @@ fn generated_code_names_the_crate_it_is_told() {
     };
     store.splice(0, 0, &sample.to_bytes()).unwrap();
     sample
-        .guard(Region::root(&store))
+        .mutate(Region::root(&store))
         .count_mut()
         .set(500)
         .unwrap();

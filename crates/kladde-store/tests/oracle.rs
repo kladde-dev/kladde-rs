@@ -1,8 +1,8 @@
 //! Differential tests: random writes, splices, moves, and cuts pasted within
-//! transactions, against a plain byte vector, with flushes, reopenings and
-//! new schema chains in between.
+//! transactions and across them, against a plain byte vector, with flushes,
+//! reopenings and new schema chains in between.
 
-use kladde_store::{MemoryStorage, Options, Store, WriteBackend};
+use kladde_store::{CutId, MemoryStorage, Options, Store, WriteBackend};
 
 struct Rng(u64);
 
@@ -28,6 +28,8 @@ struct World {
     model: Vec<u8>,
     schema: Vec<u8>,
     opts: Options,
+    /// A cut held across operations, and the bytes it holds.
+    held: Option<(CutId, Vec<u8>)>,
 }
 
 impl World {
@@ -40,6 +42,7 @@ impl World {
             model: Vec::new(),
             schema: Vec::new(),
             opts,
+            held: None,
         }
     }
 
@@ -63,6 +66,8 @@ impl World {
     }
 
     fn reopen(&mut self) {
+        // A cut belongs to its session; what it held stays removed.
+        self.held = None;
         let image = self.storage.image();
         let storage = MemoryStorage::from_image(image);
         self.store = Store::open(Box::new(storage.clone()), self.opts.clone()).unwrap();
@@ -97,11 +102,21 @@ impl World {
                 };
                 let n = if len - removed + n > max_len { 0 } else { n };
                 let bytes = rng.bytes(n as usize);
-                self.model.splice(
-                    pos as usize..(pos + removed) as usize,
-                    bytes.iter().copied(),
-                );
-                store.splice(pos, removed, &bytes).unwrap();
+                let gone: Vec<u8> = self
+                    .model
+                    .splice(
+                        pos as usize..(pos + removed) as usize,
+                        bytes.iter().copied(),
+                    )
+                    .collect();
+                let cut = store.splice(pos, removed, &bytes).unwrap();
+                // Now and then, hold on to the cut, to paste it in a later
+                // transaction, perhaps after a flush has ended it.
+                if let Some(cut) = cut {
+                    if self.held.is_none() && rng.below(3) == 0 {
+                        self.held = Some((cut, gone));
+                    }
+                }
             }
             7 if len > 0 => {
                 let from = rng.below(len);
@@ -141,18 +156,18 @@ impl World {
                         let cut_w = store.write(w, &new)?.unwrap();
                         let len = model.len() as u64;
                         let p = rng.below(len + 1);
-                        model.splice(p as usize..p as usize, ca);
-                        store.paste(p, 0, cut_a)?;
+                        model.splice(p as usize..p as usize, ca.iter().copied());
+                        store.paste(p, 0, cut_a, &ca)?;
                         let len = model.len() as u64;
                         let s = rng.below(len + 1);
-                        model.splice(s as usize..s as usize, cw);
-                        store.paste(s, 0, cut_w)?;
+                        model.splice(s as usize..s as usize, cw.iter().copied());
+                        store.paste(s, 0, cut_w, &cw)?;
                         if let Some(cut_b) = cut_b {
                             let len = model.len() as u64;
                             let q = rng.below(len + 1);
                             let r = rng.below((len - q).min(10) + 1);
-                            model.splice(q as usize..(q + r) as usize, cb);
-                            store.paste(q, r, cut_b)?;
+                            model.splice(q as usize..(q + r) as usize, cb.iter().copied());
+                            store.paste(q, r, cut_b, &cb)?;
                         }
                         Ok(())
                     })
@@ -168,6 +183,13 @@ impl World {
                 self.verify("after a flush");
             }
             _ => {
+                if let Some((cut, bytes)) = self.held.take() {
+                    let len = self.model.len() as u64;
+                    let pos = rng.below(len + 1);
+                    self.model
+                        .splice(pos as usize..pos as usize, bytes.iter().copied());
+                    store.paste(pos, 0, cut, &bytes).unwrap();
+                }
                 if rng.below(3) == 0 {
                     store.flush().unwrap();
                     self.reopen();
@@ -245,20 +267,54 @@ fn with_eager_merges_and_a_tiny_header() {
 }
 
 #[test]
-fn a_cut_from_another_transaction_is_refused() {
-    let store = Store::create(Box::new(MemoryStorage::new()), Options::default()).unwrap();
+fn a_cut_lives_as_long_as_its_journal() {
+    let storage = MemoryStorage::new();
+    let store = Store::create(Box::new(storage.clone()), Options::default()).unwrap();
     store.splice(0, 0, b"abcdef").unwrap();
-    store.begin_transaction().unwrap();
-    let cut = store.splice(0, 2, b"").unwrap().unwrap();
-    store.end_transaction().unwrap();
-    store.begin_transaction().unwrap();
-    assert!(store.paste(0, 0, cut).is_err());
-    store.end_transaction().unwrap();
-    // Outside a transaction, a splice or a write makes no cut.
-    assert!(store.splice(0, 1, b"").unwrap().is_none());
-    assert!(store.write(0, b"D").unwrap().is_none());
     store.flush().unwrap();
-    assert_eq!(store.read_all().unwrap(), b"Def");
+    // Cut in one transaction, pasted in another: a paste, which writes none
+    // of the cut's bytes.
+    let cut = store.splice(0, 2, b"").unwrap().unwrap();
+    store.write(0, b"C").unwrap();
+    assert!(store.is_alive(&cut));
+    let written = store.stats().journal_bytes;
+    store.paste(4, 0, cut, b"ab").unwrap();
+    assert!(store.stats().journal_bytes - written < 2 + 9);
+    store.flush().unwrap();
+    assert_eq!(store.read_all().unwrap(), b"Cdefab");
+    // A flush ends the cuts of the journal it folds; a paste then writes
+    // the bytes it was given.
+    let cut = store.splice(0, 1, b"").unwrap().unwrap();
+    store.flush().unwrap();
+    assert!(!store.is_alive(&cut));
+    store.paste(5, 0, cut, b"C").unwrap();
+    store.flush().unwrap();
+    assert_eq!(store.read_all().unwrap(), b"defabC");
+    // A write's cut, pasted outside any transaction.
+    let cut = store.write(0, b"D").unwrap().unwrap();
+    store.paste(6, 0, cut, b"d").unwrap();
+    drop(store);
+    let store = Store::open(Box::new(storage), Options::default()).unwrap();
+    assert_eq!(store.read_all().unwrap(), b"DefabCd");
+}
+
+#[test]
+fn a_paste_whose_cut_ends_before_its_transaction_is_appended_writes_its_bytes() {
+    let storage = MemoryStorage::new();
+    let store = Store::create(Box::new(storage.clone()), Options::default()).unwrap();
+    store.splice(0, 0, b"abcdef").unwrap();
+    let cut = store.splice(0, 2, b"").unwrap().unwrap();
+    // The paste is recorded while its cut lives, in a transaction that an
+    // explicit flush holds back past the journal it folds.
+    store.begin_transaction().unwrap();
+    store.paste(4, 0, cut, b"ab").unwrap();
+    store.flush().unwrap();
+    store.end_transaction().unwrap();
+    store.flush().unwrap();
+    assert_eq!(store.read_all().unwrap(), b"cdefab");
+    drop(store);
+    let store = Store::open(Box::new(storage), Options::default()).unwrap();
+    assert_eq!(store.read_all().unwrap(), b"cdefab");
 }
 
 #[test]
@@ -269,7 +325,7 @@ fn a_splice_of_equal_lengths_cuts_what_it_overwrites() {
         .atomically(|| {
             let old = store.splice(1, 2, b"XY")?.unwrap();
             assert_eq!(store.len(), 6);
-            store.paste(6, 0, old)
+            store.paste(6, 0, old, b"bc")
         })
         .unwrap();
     store.flush().unwrap();

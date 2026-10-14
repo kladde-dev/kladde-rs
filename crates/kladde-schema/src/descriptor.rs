@@ -45,11 +45,9 @@ impl Version {
     }
 }
 
-/// One named field of a [`TypeDescriptor::Struct`] or of an [`Enum`]
-/// variant. A tuple (positional) field's `name` is the decimal rendering
-/// of its position (`"0"`, `"1"`, …).
-///
-/// [`Enum`]: TypeDescriptor::Enum
+/// One named field of a [`TypeDescriptor::Struct`]. A tuple (positional)
+/// field's `name` is the decimal rendering of its position (`"0"`, `"1"`,
+/// …).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
     pub name: String,
@@ -57,12 +55,16 @@ pub struct Field {
 }
 
 /// One variant of a [`TypeDescriptor::Enum`]: the discriminant value that
-/// selects it in the stored bytes, its name, and its own fields.
+/// selects it in the stored bytes, its name, and the type of the one value
+/// it holds, its payload.
+///
+/// A variant that holds nothing holds the empty Struct, and one that holds
+/// several fields a Struct of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Variant {
     pub discriminant: u64,
     pub name: String,
-    pub fields: Vec<Field>,
+    pub payload: TypeRef,
 }
 
 /// A scalar primitive. The `#[repr(u8)]` discriminant *is* the descriptor's
@@ -167,9 +169,10 @@ impl Primitive {
 /// | `f32`, `f64` | IEEE-754, little-endian |
 /// | `char` | UTF-8 |
 /// | Struct | its fields' encodings, concatenated |
-/// | Enum | the discriminant as LEB128, then the variant's fields |
+/// | Enum | the discriminant as LEB128, then the variant's payload |
 /// | Array | `len` elements |
 /// | Sequence | the number of elements as LEB128, then the elements |
+/// | Map | the number of entries as LEB128, then each entry's key and value |
 /// | Text | UTF-8, then the byte `0xFF` |
 /// | Opaque | its bytes, prefixed with their number as LEB128 unless the type declares a fixed size |
 /// | Fixed | the wrapped type's values at a fixed size: see [`TypeTable::fixed_form_size`] |
@@ -179,7 +182,7 @@ pub enum TypeDescriptor {
     Primitive(Primitive),
     /// An ordered set of named fields, encoded back to back.
     Struct { name: String, fields: Vec<Field> },
-    /// A discriminated union: the discriminant, then the fields of the
+    /// A discriminated union: the discriminant, then the payload of the
     /// variant it selects. `discriminant_width` is the discriminant's width
     /// in bytes inside a [`Fixed`](TypeDescriptor::Fixed) value.
     Enum {
@@ -201,6 +204,8 @@ pub enum TypeDescriptor {
     Array { element: TypeRef, len: u64 },
     /// A count, then that many values of the element type.
     Sequence(TypeRef),
+    /// A count, then that many entries, each a key and a value.
+    Map { key: TypeRef, value: TypeRef },
     /// Text: UTF-8, then the byte `0xFF`, which UTF-8 never contains.
     Text,
     /// The wrapped type's values, each encoded at the same size.
@@ -215,6 +220,8 @@ pub const TAG_ENUM: u8 = 129;
 pub const TAG_OPAQUE: u8 = 130;
 /// Kind-tag byte for [`TypeDescriptor::Array`].
 pub const TAG_ARRAY: u8 = 131;
+/// Kind-tag byte for [`TypeDescriptor::Map`].
+pub const TAG_MAP: u8 = 132;
 /// Kind-tag byte for [`TypeDescriptor::Sequence`].
 pub const TAG_SEQUENCE: u8 = 133;
 /// Kind-tag byte for [`TypeDescriptor::Text`].
@@ -224,18 +231,19 @@ pub const TAG_FIXED: u8 = 135;
 
 impl TypeDescriptor {
     /// This descriptor's outgoing references, in canonical order — struct
-    /// and variant fields in declaration order, enum variants in ascending
-    /// discriminant order, Opaque parameters as given. Used by both
-    /// serialization and fingerprinting so they always agree on traversal
-    /// order.
+    /// fields in declaration order, enum payloads in ascending discriminant
+    /// order, a map's key before its value, Opaque parameters as given.
+    /// Used by both serialization and fingerprinting so they always agree
+    /// on traversal order.
     pub(crate) fn references(&self) -> Vec<TypeRef> {
         match self {
             TypeDescriptor::Primitive(_) | TypeDescriptor::Text => Vec::new(),
             TypeDescriptor::Struct { fields, .. } => fields.iter().map(|f| f.ty).collect(),
             TypeDescriptor::Enum { variants, .. } => canonical_variants(variants)
                 .into_iter()
-                .flat_map(|v| v.fields.iter().map(|f| f.ty))
+                .map(|v| v.payload)
                 .collect(),
+            TypeDescriptor::Map { key, value } => vec![*key, *value],
             TypeDescriptor::Opaque { parameters, .. } => parameters.clone(),
             TypeDescriptor::Array { element, .. } => vec![*element],
             TypeDescriptor::Sequence(target) | TypeDescriptor::Fixed(target) => vec![*target],

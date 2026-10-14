@@ -55,12 +55,12 @@ fn generic_guards_work_like_any_other() {
         tag: 1,
         value: Either::<u32, bool>::Left(5),
     });
-    if let EitherParts::Left(mut n) = f.kladde.guard().value_mut().parts() {
+    if let EitherParts::Left(mut n) = f.kladde.get_mut().value_mut().parts() {
         n.set(1 << 20).unwrap();
     }
-    f.kladde.guard().tag_mut().set(2).unwrap();
+    f.kladde.get_mut().tag_mut().set(2).unwrap();
     f.kladde
-        .guard()
+        .get_mut()
         .value_mut()
         .set(Either::Right(true))
         .unwrap();
@@ -83,6 +83,6 @@ struct Clash<B> {
 #[test]
 fn a_parameter_named_b_compiles() {
     let mut f = Fixture::new(Clash { b: 1u8 });
-    f.kladde.guard().b_mut().set(2).unwrap();
+    f.kladde.get_mut().b_mut().set(2).unwrap();
     f.check();
 }

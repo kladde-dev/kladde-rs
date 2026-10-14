@@ -5,7 +5,7 @@
 
 use crate::descriptor::{
     canonical_variants, Field, Primitive, TypeDescriptor, TypeRef, TypeTable, Variant, Version,
-    TAG_ARRAY, TAG_ENUM, TAG_FIXED, TAG_OPAQUE, TAG_SEQUENCE, TAG_STRUCT, TAG_TEXT,
+    TAG_ARRAY, TAG_ENUM, TAG_FIXED, TAG_MAP, TAG_OPAQUE, TAG_SEQUENCE, TAG_STRUCT, TAG_TEXT,
 };
 
 /// Why a byte string could not be decoded into a [`TypeTable`].
@@ -161,10 +161,7 @@ fn encode_descriptor(descriptor: &TypeDescriptor, out: &mut Vec<u8>) {
             for variant in canonical_variants(variants) {
                 kladde_varint::encode(variant.discriminant, out);
                 encode_string(&variant.name, out);
-                kladde_varint::encode(variant.fields.len() as u64, out);
-                for field in &variant.fields {
-                    encode_field(field, out);
-                }
+                encode_reference(variant.payload, out);
             }
         }
         TypeDescriptor::Opaque {
@@ -194,6 +191,11 @@ fn encode_descriptor(descriptor: &TypeDescriptor, out: &mut Vec<u8>) {
         TypeDescriptor::Sequence(element) => {
             out.push(TAG_SEQUENCE);
             encode_reference(*element, out);
+        }
+        TypeDescriptor::Map { key, value } => {
+            out.push(TAG_MAP);
+            encode_reference(*key, out);
+            encode_reference(*value, out);
         }
         TypeDescriptor::Text => out.push(TAG_TEXT),
         TypeDescriptor::Fixed(target) => {
@@ -279,11 +281,11 @@ fn decode_descriptor(reader: &mut Reader) -> Result<TypeDescriptor, DecodeError>
             for _ in 0..variant_count {
                 let discriminant = reader.varint()?;
                 let name = reader.string()?;
-                let fields = reader.fields()?;
+                let payload = reader.reference()?;
                 variants.push(Variant {
                     discriminant,
                     name,
-                    fields,
+                    payload,
                 });
             }
             Ok(TypeDescriptor::Enum {
@@ -319,6 +321,10 @@ fn decode_descriptor(reader: &mut Reader) -> Result<TypeDescriptor, DecodeError>
             len: reader.varint()?,
         }),
         TAG_SEQUENCE => Ok(TypeDescriptor::Sequence(reader.reference()?)),
+        TAG_MAP => Ok(TypeDescriptor::Map {
+            key: reader.reference()?,
+            value: reader.reference()?,
+        }),
         TAG_TEXT => Ok(TypeDescriptor::Text),
         TAG_FIXED => Ok(TypeDescriptor::Fixed(reader.reference()?)),
         other => Err(DecodeError::UnknownKind(other)),
@@ -361,23 +367,22 @@ mod tests {
                     Variant {
                         discriminant: 0,
                         name: "Nil".into(),
-                        fields: vec![],
+                        payload: TypeRef(3),
                     },
                     Variant {
                         discriminant: 1,
                         name: "Num".into(),
-                        fields: vec![Field {
-                            name: "0".into(),
-                            ty: TypeRef(1),
-                        }],
+                        payload: TypeRef(1),
                     },
                     Variant {
                         discriminant: 2,
                         name: "List".into(),
-                        fields: vec![Field {
-                            name: "0".into(),
-                            ty: TypeRef(2),
-                        }],
+                        payload: TypeRef(2),
+                    },
+                    Variant {
+                        discriminant: 3,
+                        name: "Dict".into(),
+                        payload: TypeRef(4),
                     },
                 ],
             },
@@ -393,9 +398,32 @@ mod tests {
                 fixed_size: None,
                 parameters: vec![TypeRef(0)],
             },
+            TypeDescriptor::Struct {
+                name: "Unit".into(),
+                fields: vec![],
+            },
+            TypeDescriptor::Map {
+                key: TypeRef(5),
+                value: TypeRef(0),
+            },
+            TypeDescriptor::Text,
         ]);
         let bytes = table.encode();
         assert_eq!(TypeTable::decode(&bytes).unwrap(), table);
+    }
+
+    #[test]
+    fn a_map_is_its_tag_and_two_references() {
+        let table = TypeTable::new(vec![
+            TypeDescriptor::Map {
+                key: TypeRef(1),
+                value: TypeRef(2),
+            },
+            TypeDescriptor::Text,
+            TypeDescriptor::Primitive(Primitive::U32),
+        ]);
+        assert_eq!(table.encode(), [3, 132, 1, 2, 134, 2]);
+        assert_eq!(TypeTable::decode(&table.encode()).unwrap(), table);
     }
 
     #[test]
@@ -477,46 +505,56 @@ mod tests {
 
     #[test]
     fn variant_order_does_not_affect_encoding() {
-        let ascending = TypeTable::new(vec![TypeDescriptor::Enum {
-            name: "E".into(),
-            discriminant_width: 4,
-            variants: vec![
-                Variant {
-                    discriminant: 0,
-                    name: "A".into(),
-                    fields: vec![],
-                },
-                Variant {
-                    discriminant: 1,
-                    name: "B".into(),
-                    fields: vec![],
-                },
-            ],
-        }]);
-        let descending = TypeTable::new(vec![TypeDescriptor::Enum {
-            name: "E".into(),
-            discriminant_width: 4,
-            variants: vec![
-                Variant {
-                    discriminant: 1,
-                    name: "B".into(),
-                    fields: vec![],
-                },
-                Variant {
-                    discriminant: 0,
-                    name: "A".into(),
-                    fields: vec![],
-                },
-            ],
-        }]);
+        let unit = TypeDescriptor::Struct {
+            name: "Unit".into(),
+            fields: vec![],
+        };
+        let ascending = TypeTable::new(vec![
+            TypeDescriptor::Enum {
+                name: "E".into(),
+                discriminant_width: 4,
+                variants: vec![
+                    Variant {
+                        discriminant: 0,
+                        name: "A".into(),
+                        payload: TypeRef(1),
+                    },
+                    Variant {
+                        discriminant: 1,
+                        name: "B".into(),
+                        payload: TypeRef(1),
+                    },
+                ],
+            },
+            unit.clone(),
+        ]);
+        let descending = TypeTable::new(vec![
+            TypeDescriptor::Enum {
+                name: "E".into(),
+                discriminant_width: 4,
+                variants: vec![
+                    Variant {
+                        discriminant: 1,
+                        name: "B".into(),
+                        payload: TypeRef(1),
+                    },
+                    Variant {
+                        discriminant: 0,
+                        name: "A".into(),
+                        payload: TypeRef(1),
+                    },
+                ],
+            },
+            unit,
+        ]);
         assert_eq!(ascending.encode(), descending.encode());
     }
 
     #[test]
     fn rejects_unknown_kinds() {
         assert_eq!(
-            TypeTable::decode(&[1, 132]),
-            Err(super::DecodeError::UnknownKind(132))
+            TypeTable::decode(&[1, 136]),
+            Err(super::DecodeError::UnknownKind(136))
         );
     }
 

@@ -15,12 +15,12 @@ use kladde_schema::{Field, TypeDescriptor};
 use kladde_store::Error;
 
 use crate::codec::{Decoder, Encoder};
-use crate::durable::{replace, Bounded, Durable, Guard};
+use crate::durable::{replace, Bounded, Durable, Mut};
 use crate::region::{Backend, FieldSizes, Region};
 use crate::schema::SchemaBuilder;
 use crate::sizes::sum_sizes;
 
-/// The [`Guard`] of a tuple: a whole-value [`set`](TupleGuard::set), and
+/// The [`Mut`] of a tuple: a whole-value [`set`](TupleMut::set), and
 /// `parts`, to mutate the components one by one.
 ///
 /// ```
@@ -31,9 +31,9 @@ use crate::sizes::sum_sizes;
 /// let mut pair = (0u32, false);
 /// store.splice(0, 0, &pair.to_bytes())?;
 /// {
-///     let mut guard = pair.guard(Region::root(&store));
-///     guard.set((1, false))?;
-///     let (mut count, mut flag) = guard.parts();
+///     let mut pair_mut = pair.mutate(Region::root(&store));
+///     pair_mut.set((1, false))?;
+///     let (mut count, mut flag) = pair_mut.parts();
 ///     count.set(1000)?; // grows by a byte, so `flag` moves
 ///     flag.set(true)?;
 /// }
@@ -42,13 +42,13 @@ use crate::sizes::sum_sizes;
 /// assert_eq!(store.read_all()?, (1000u32, true).to_bytes());
 /// # Ok::<(), kladde_store::Error>(())
 /// ```
-pub struct TupleGuard<'r, T, B> {
+pub struct TupleMut<'r, T, B> {
     inner: &'r mut T,
     region: Region<'r, B>,
     fields: FieldSizes,
 }
 
-impl<T, B> Guard for TupleGuard<'_, T, B> {
+impl<T, B> Mut for TupleMut<'_, T, B> {
     type Durable = T;
 
     fn as_durable(&self) -> &T {
@@ -56,7 +56,7 @@ impl<T, B> Guard for TupleGuard<'_, T, B> {
     }
 }
 
-impl<T, B> std::ops::Deref for TupleGuard<'_, T, B> {
+impl<T, B> std::ops::Deref for TupleMut<'_, T, B> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -66,7 +66,7 @@ impl<T, B> std::ops::Deref for TupleGuard<'_, T, B> {
 
 /// Generates one `impl Durable for (T0, T1, ...)`. `$name` is the
 /// schema type name; each `$T $idx $v` triple is a component's type
-/// parameter, its tuple index, and a name for its guard.
+/// parameter, its tuple index, and a name for its `Mut`.
 macro_rules! impl_durable_tuple {
     ($name:literal; $($T:ident $idx:tt $v:ident),*) => {
         impl<$($T: Bounded,)*> Bounded for ($($T,)*) {
@@ -105,10 +105,10 @@ macro_rules! impl_durable_tuple {
                 Ok(($($T::decode(input)?,)*))
             }
 
-            type Guard<'r, B: Backend + 'r> = TupleGuard<'r, Self, B> where Self: 'r;
+            type Mut<'r, B: Backend + 'r> = TupleMut<'r, Self, B> where Self: 'r;
 
-            fn guard<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Guard<'r, B> {
-                TupleGuard { inner: self, region, fields: FieldSizes::new() }
+            fn mutate<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Mut<'r, B> {
+                TupleMut { inner: self, region, fields: FieldSizes::new() }
             }
 
             #[allow(unused_variables)]
@@ -126,20 +126,20 @@ macro_rules! impl_durable_tuple {
             }
         }
 
-        impl<'r, $($T: Durable,)* B: Backend> TupleGuard<'r, ($($T,)*), B> {
-            /// A guard for every component at once. Each finds where it
+        impl<'r, $($T: Durable,)* B: Backend> TupleMut<'r, ($($T,)*), B> {
+            /// A `Mut` for every component at once. Each finds where it
             /// starts whenever it writes, so a component before it may
-            /// change size meanwhile. See [`TupleGuard`] for an example.
+            /// change size meanwhile. See [`TupleMut`] for an example.
             #[allow(clippy::unused_unit, unused_variables)]
-            pub fn parts(&mut self) -> ($($T::Guard<'_, B>,)*) {
-                let TupleGuard { inner, region, fields } = self;
+            pub fn parts(&mut self) -> ($($T::Mut<'_, B>,)*) {
+                let TupleMut { inner, region, fields } = self;
                 fields.fill(0, &[$($T::FIXED_SIZE,)*], &[$(inner.$idx.encoded_len(),)*]);
                 let (fields, region) = (&*fields, &*region);
                 let ($($v,)*) = &mut **inner;
-                ($($v.guard(region.field(fields, $idx)),)*)
+                ($($v.mutate(region.field(fields, $idx)),)*)
             }
 
-            /// Replaces the whole tuple. See [`TupleGuard`] for an example.
+            /// Replaces the whole tuple. See [`TupleMut`] for an example.
             pub fn set(&mut self, value: ($($T,)*)) -> Result<(), Error> {
                 replace(self.inner, value, &self.region)
             }

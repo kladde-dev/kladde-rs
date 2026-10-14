@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use kladde::{Durable, Kladde, MemoryStorage, Options, TypeRef};
-use kladde_types::{DurableMap, DurableString, DurableVec};
+use kladde_types::{DurableMap, DurableVec};
 
 struct Rng(u64);
 
@@ -30,21 +30,21 @@ impl Rng {
 
 #[derive(Durable, Debug, Clone, PartialEq)]
 struct Item {
-    name: DurableString,
+    name: String,
     tags: DurableVec<u32>,
     points: DurableVec<(f32, f32)>,
 }
 
 #[derive(Durable, Debug, Clone, PartialEq)]
 struct Doc {
-    title: DurableString,
+    title: String,
     items: DurableVec<Item>,
     archive: DurableVec<Item>,
 }
 
 fn item(rng: &mut Rng) -> Item {
     Item {
-        name: rng.text().into(),
+        name: rng.text(),
         tags: (0..rng.below(4))
             .map(|_| (rng.next() >> rng.below(64)) as u32)
             .collect(),
@@ -87,7 +87,7 @@ fn check_indexes(doc: &Doc) {
 /// One random edit, through the guards, mirrored on `model`.
 fn step(k: &mut Kladde<Doc>, model: &mut Doc, rng: &mut Rng) {
     let n = model.items.len();
-    let mut g = k.guard();
+    let mut g = k.get_mut();
     match rng.below(12) {
         0 => {
             let it = item(rng);
@@ -133,7 +133,7 @@ fn step(k: &mut Kladde<Doc>, model: &mut Doc, rng: &mut Rng) {
             let it = archive.remove(i);
             model.archive = archive.into();
             if rng.below(3) == 0 {
-                cut.commit().unwrap();
+                drop(cut);
             } else {
                 g.items_mut().push_cut(cut).unwrap();
                 let mut items = model.items.clone().into_vec();
@@ -169,7 +169,7 @@ fn step(k: &mut Kladde<Doc>, model: &mut Doc, rng: &mut Rng) {
                 tags[0] = tag;
             }
             m.tags = tags.into();
-            m.name = format!("{}{text}", m.name).into();
+            m.name = format!("{}{text}", m.name);
             let mut points = m.points.clone().into_vec();
             if let Some(p) = points.first_mut() {
                 p.0 = 2.5;
@@ -187,13 +187,13 @@ fn step(k: &mut Kladde<Doc>, model: &mut Doc, rng: &mut Rng) {
                 .set(name.as_str())
                 .unwrap();
             let mut items = model.items.clone().into_vec();
-            items[i].name = name.into();
+            items[i].name = name;
             model.items = items.into();
         }
         8 => {
             let title = rng.text();
             g.title_mut().set(title.as_str()).unwrap();
-            model.title = title.into();
+            model.title = title;
         }
         9 if n > 0 => {
             let i = rng.below(n);
@@ -243,7 +243,7 @@ fn a_map_keeps_its_keys_through_swap_removals() {
     let storage = MemoryStorage::new();
     let mut k = Kladde::create_in(
         Box::new(storage.clone()),
-        DurableMap::<u32, DurableString>::new(),
+        DurableMap::<u32, String>::new(),
         Options::default(),
     )
     .unwrap();
@@ -251,16 +251,16 @@ fn a_map_keeps_its_keys_through_swap_removals() {
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);
     for s in 0..2000 {
         let key = rng.below(60) as u32;
-        let mut g = k.guard();
+        let mut g = k.get_mut();
         match rng.below(4) {
             0 | 1 => {
                 let v = rng.text();
                 let old = g.insert(key, v.as_str().into()).unwrap();
-                assert_eq!(old.map(String::from), model.insert(key, v));
+                assert_eq!(old, model.insert(key, v));
             }
             2 => {
                 let old = g.remove(&key).unwrap();
-                assert_eq!(old.map(String::from), model.remove(&key));
+                assert_eq!(old, model.remove(&key));
             }
             _ => {
                 let more = rng.text();
@@ -287,7 +287,7 @@ fn a_map_keeps_its_keys_through_swap_removals() {
 #[test]
 fn moving_an_element_writes_none_of_its_bytes() {
     let storage = MemoryStorage::new();
-    let big: DurableString = "x".repeat(20_000).into();
+    let big: String = "x".repeat(20_000);
     let mut k = Kladde::create_in(
         Box::new(storage.clone()),
         DurableVec::from(vec![big, "a".into(), "b".into()]),
@@ -295,7 +295,7 @@ fn moving_an_element_writes_none_of_its_bytes() {
     )
     .unwrap();
     let before = k.stats();
-    k.guard().move_element(0, 2).unwrap();
+    k.get_mut().move_element(0, 2).unwrap();
     k.flush().unwrap();
     let after = k.stats();
     assert!(after.journal_bytes - before.journal_bytes < 64);
@@ -309,12 +309,12 @@ fn a_dropped_cut_removes_its_value_for_good() {
     let storage = MemoryStorage::new();
     let mut k = Kladde::create_in(
         Box::new(storage.clone()),
-        DurableVec::<DurableString>::from(vec!["a".into(), "b".into()]),
+        DurableVec::<String>::from(vec!["a".into(), "b".into()]),
         Options::default(),
     )
     .unwrap();
     {
-        let mut g = k.guard();
+        let mut g = k.get_mut();
         let cut = g.cut(0).unwrap();
         assert_eq!(*cut, "a");
     }

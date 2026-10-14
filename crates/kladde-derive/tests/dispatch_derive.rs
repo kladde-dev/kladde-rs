@@ -168,8 +168,8 @@ fn dispatch_and_a_box_change_nothing_on_file() {
 #[test]
 fn a_dispatch_enum_is_durable_like_any_other() {
     let mut f = Fixture::new(AnyShape::from(Circle { r: 1.0 }));
-    f.kladde.guard().set(frame().into()).unwrap();
-    if let AnyShapeParts::Frame(mut fr) = f.kladde.guard().parts() {
+    f.kladde.get_mut().set(frame().into()).unwrap();
+    if let AnyShapeParts::Frame(mut fr) = f.kladde.get_mut().parts() {
         fr.hole_mut().w_mut().set(2.0).unwrap();
     }
     assert_eq!(f.kladde.get().area(), 7.0);

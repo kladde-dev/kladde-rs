@@ -10,7 +10,7 @@ use crate::entries::{children_len, estimate, Body, EntryOut, PageEncoder, Placed
 use crate::error::{corrupt, Error};
 use crate::fold::{fold, Piece, Src};
 use crate::hash::IdSet;
-use crate::journal::Cursor;
+use crate::journal::{Cursor, JournalCuts};
 use crate::page::{encode_page, new_page, seal_page, PageBuf};
 use crate::state::*;
 use crate::store::{take_page, Inner, Tx};
@@ -83,6 +83,31 @@ impl Inner {
         self.fold_journal(committed)
     }
 
+    /// Flushes as [`flush_now`](Self::flush_now) does if the journal pages,
+    /// with what an explicit flush would append to them, hold at least
+    /// `fraction` of the budget; returns whether it flushed.
+    pub fn flush_if_journal_exceeds(&mut self, fraction: f64) -> Result<bool, Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        let end = self.ops.end();
+        let (committed, ready) = match self.tx {
+            Tx::Immediate => (end, end),
+            Tx::InBatch { committed, .. } => (committed, end),
+            Tx::InTransaction { committed, .. } => (committed, committed),
+            Tx::InTxInBatch {
+                committed, ready, ..
+            } => (committed, ready),
+        };
+        let held = self.journal.bytes + (ready.bytes - committed.bytes);
+        let budget = self.opts.journal_budget_pages as f64 * JOURNAL_STREAM as f64;
+        if (held as f64) < fraction * budget {
+            return Ok(false);
+        }
+        self.flush_now()?;
+        Ok(true)
+    }
+
     /// Folds the operations the journal pages hold, `ops[..committed]`, and
     /// drops them from the buffer. Poisons the store if the flush fails.
     pub(crate) fn fold_journal(&mut self, committed: Cursor) -> Result<(), Error> {
@@ -91,7 +116,11 @@ impl Inner {
         }
         match self.flush_inner(committed) {
             Ok(()) => {
+                // The next journal starts at `committed`; the cuts of the
+                // folded one have ended.
                 self.ops.discard_to(committed);
+                self.journal_cuts = JournalCuts::starting_at(committed.at);
+                self.pasted.retain(|&cut, _| cut >= committed.at);
                 Ok(())
             }
             Err(e) => {
@@ -109,7 +138,8 @@ impl Inner {
 
         // 1. The fold, and the new sequence mapped onto spans.
         let n0 = self.state.seq_len();
-        let pieces = fold(self.ops.range(self.ops.front(), committed), n0)?;
+        let first = self.ops.front().at;
+        let pieces = fold(self.ops.range(self.ops.front(), committed), n0, first)?;
         self.apply_pieces(&pieces, &mut f)?;
         self.write_small_chains(&mut f)?;
 

@@ -46,7 +46,7 @@ fn parts_reach_into_the_current_variant() {
         width: 1,
         height: 2,
     });
-    match f.kladde.guard().parts() {
+    match f.kladde.get_mut().parts() {
         ShapeParts::Rectangle {
             mut width,
             mut height,
@@ -64,8 +64,8 @@ fn parts_reach_into_the_current_variant() {
         }
     );
     f.check();
-    f.kladde.guard().set(Shape::Circle(3.0)).unwrap();
-    if let ShapeParts::Circle(mut r) = f.kladde.guard().parts() {
+    f.kladde.get_mut().set(Shape::Circle(3.0)).unwrap();
+    if let ShapeParts::Circle(mut r) = f.kladde.get_mut().parts() {
         r.set(4.0).unwrap();
     }
     assert_eq!(*f.kladde.get(), Shape::Circle(4.0));
@@ -138,7 +138,7 @@ fn a_recursive_enum_holds_itself_inline() {
     let table = List::schema();
     assert_eq!(table.validate(), Ok(()));
     let mut f = Fixture::new(list);
-    if let ListParts::Cons(mut head, mut tail) = f.kladde.guard().parts() {
+    if let ListParts::Cons(mut head, mut tail) = f.kladde.get_mut().parts() {
         tail.set(List::Nil).unwrap();
         head.set(9).unwrap();
     }
@@ -201,9 +201,46 @@ fn boxing_a_variant_changes_nothing_on_file() {
     );
     // The boxed variant's guard is the struct's own.
     let mut f = Fixture::new(boxed);
-    if let BoxedParts::Rectangle(mut r) = f.kladde.guard().parts() {
+    if let BoxedParts::Rectangle(mut r) = f.kladde.get_mut().parts() {
         r.width_mut().set(70_000).unwrap();
     }
     assert!(matches!(f.kladde.get(), Boxed::Rectangle(r) if r.width == 70_000));
     f.check();
+}
+
+/// `Unboxed`, with its rectangle's fields in the variant itself.
+#[derive(Durable, Debug, PartialEq, Clone)]
+#[kladde(bounded)]
+enum Inline {
+    Origin,
+    Circle(f32),
+    Rectangle { width: u32, height: u32 },
+}
+
+#[test]
+fn a_variant_of_named_fields_holds_the_struct_of_its_fields() {
+    // A variant holds one value: `Inline::Rectangle` a struct of its fields,
+    // and `Unboxed::Rectangle` the struct `Rect` of the same fields, so the
+    // two enums are one type on file.
+    assert_eq!(Inline::fingerprint(), Unboxed::fingerprint());
+    let inline = Inline::Rectangle {
+        width: 300,
+        height: 2,
+    };
+    let unboxed = Unboxed::Rectangle(Rect {
+        width: 300,
+        height: 2,
+    });
+    assert_eq!(inline.to_bytes(), unboxed.to_bytes());
+    assert_eq!(Inline::from_bytes(&unboxed.to_bytes()).unwrap(), inline);
+    // A unit variant holds the empty struct, which takes no bytes.
+    let schema = Inline::schema();
+    let TypeDescriptor::Enum { variants, .. } = &schema.descriptors()[0] else {
+        panic!("an enum's descriptor");
+    };
+    let TypeRef(unit) = variants[0].payload;
+    assert!(matches!(
+        &schema.descriptors()[unit],
+        TypeDescriptor::Struct { fields, .. } if fields.is_empty()
+    ));
 }

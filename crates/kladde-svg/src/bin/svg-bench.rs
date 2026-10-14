@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 use kladde::{Backend, Durable, FileStorage, Kladde, Options};
 use kladde_bench::{row, save, Rng};
 use kladde_svg::model::{
-    Attr, AttrParts, Color, Element, ElementGuard, ElementKind, ElementKindParts, Node, NodeParts,
+    Attr, AttrParts, Color, Element, ElementKind, ElementKindParts, ElementMut, Node, NodeParts,
     Paint, PaintParts, PathSegment, PathSegmentParts, TransformOp, TransformOpParts,
 };
 use kladde_svg::{parse, write, Document, Number};
@@ -172,13 +172,13 @@ fn element<'a>(root: &'a Element, path: &[usize]) -> &'a Element {
     })
 }
 
-/// Runs `f` on the guard of the element at `rest` below child `i` of the
-/// element `g` guards.
+/// Runs `f` on the `Mut` of the element at `rest` below child `i` of the
+/// element `g` mutates.
 fn below<B: Backend, R>(
-    g: &mut ElementGuard<'_, B>,
+    g: &mut ElementMut<'_, B>,
     i: usize,
     rest: &[usize],
-    f: impl FnOnce(&mut ElementGuard<'_, B>) -> R,
+    f: impl FnOnce(&mut ElementMut<'_, B>) -> R,
 ) -> R {
     let mut children = g.children_mut();
     let mut node = children
@@ -193,14 +193,14 @@ fn below<B: Backend, R>(
     }
 }
 
-/// Evaluates `$body` with `$e` bound to the guard of the element at `$path`
-/// below the root element guarded by `$root`.
+/// Evaluates `$body` with `$e` bound to the `Mut` of the element at `$path`
+/// below the root element `$root` mutates.
 macro_rules! on_element {
     ($root:expr, $path:expr, |$e:ident| $body:expr) => {{
         let root = $root;
         let path: &[usize] = $path;
         match path.split_first() {
-            None => (|$e: &mut ElementGuard<'_, _>| $body)(root),
+            None => (|$e: &mut ElementMut<'_, _>| $body)(root),
             Some((&i, rest)) => below(root, i, rest, |$e| $body),
         }
     }};
@@ -211,7 +211,7 @@ macro_rules! mutate {
     ($bench:expr, $path:expr, |$e:ident| $body:expr) => {{
         let t = Instant::now();
         {
-            let mut g = $bench.drawing.guard();
+            let mut g = $bench.drawing.get_mut();
             let mut root = g.root_mut();
             on_element!(&mut root, $path, |$e| $body).expect("an edit");
         }

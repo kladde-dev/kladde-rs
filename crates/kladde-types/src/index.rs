@@ -1,6 +1,6 @@
 //! [`Sizes`]: a Fenwick tree over the encoded sizes of a container's
-//! variable-size elements, in cells, so that an element's guard can report a
-//! change of size while its container's guard is borrowed.
+//! variable-size elements, in cells, so that an element's `Mut` can report a
+//! change of size while its container's `Mut` is borrowed.
 
 use std::cell::Cell;
 

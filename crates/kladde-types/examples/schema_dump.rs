@@ -5,7 +5,7 @@
 //! golden-vector fingerprints.
 
 use kladde::{Durable, TypeDescriptor};
-use kladde_types::{DurableString, DurableVec};
+use kladde_types::DurableVec;
 
 #[derive(kladde::Durable)]
 enum PhoneKind {
@@ -16,9 +16,9 @@ enum PhoneKind {
 
 #[derive(kladde::Durable)]
 struct Contact {
-    name: DurableString,
+    name: String,
     kind: PhoneKind,
-    numbers: DurableVec<DurableString>,
+    numbers: DurableVec<String>,
 }
 
 fn main() {
@@ -50,7 +50,7 @@ fn describe_one(descriptor: &TypeDescriptor) -> String {
         TypeDescriptor::Enum { name, variants, .. } => {
             let variants: Vec<String> = variants
                 .iter()
-                .map(|v| format!("{}={}", v.name, v.discriminant))
+                .map(|v| format!("{}={}: #{}", v.name, v.discriminant, v.payload.0))
                 .collect();
             format!("Enum {name} {{ {} }}", variants.join(", "))
         }
@@ -65,6 +65,7 @@ fn describe_one(descriptor: &TypeDescriptor) -> String {
         }
         TypeDescriptor::Array { element, len } => format!("Array(#{}, {len})", element.0),
         TypeDescriptor::Sequence(element) => format!("Sequence(#{})", element.0),
+        TypeDescriptor::Map { key, value } => format!("Map(#{} -> #{})", key.0, value.0),
         TypeDescriptor::Text => "Text".to_string(),
         TypeDescriptor::Fixed(target) => format!("Fixed(#{})", target.0),
     }

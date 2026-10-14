@@ -26,18 +26,18 @@ fn a_transparent_type_is_its_field_on_file() {
 #[test]
 fn its_guard_passes_the_fields_through() {
     let mut f = Fixture::new(Meters(1));
-    f.kladde.guard().get_mut().set(-70_000).unwrap();
+    f.kladde.get_mut().get_mut().set(-70_000).unwrap();
     assert_eq!(*f.kladde.get(), Meters(-70_000));
     f.check();
     let mut f = Fixture::new(Named { inner: (1, 2) });
     {
-        let mut guard = f.kladde.guard();
+        let mut guard = f.kladde.get_mut();
         let mut inner = guard.get_mut();
         let (mut a, mut b) = inner.parts();
         b.set(1000).unwrap();
         a.set(3).unwrap();
     }
-    f.kladde.guard().set(Named { inner: (4, 5) }).unwrap();
+    f.kladde.get_mut().set(Named { inner: (4, 5) }).unwrap();
     assert_eq!(f.kladde.get().inner, (4, 5));
     f.check();
 }

@@ -7,13 +7,13 @@
 //! answer: kill the process at any point, run it again, and the book is there.
 
 use kladde::{Durable, Kladde};
-use kladde_types::{DurableMap, DurableString, DurableVec};
+use kladde_types::{DurableMap, DurableVec};
 use std::io::{self, Write};
 
 #[derive(Durable, Debug)]
 enum PhoneNumber {
-    Mobile(DurableString),
-    Landline(DurableString),
+    Mobile(String),
+    Landline(String),
 }
 
 impl std::fmt::Display for PhoneNumber {
@@ -27,13 +27,13 @@ impl std::fmt::Display for PhoneNumber {
 
 #[derive(Durable, Debug)]
 struct Contact {
-    email: DurableString,
+    email: String,
     phones: DurableVec<PhoneNumber>,
 }
 
 #[derive(Durable)]
 struct AddressBook {
-    contacts: DurableMap<DurableString, Contact>,
+    contacts: DurableMap<String, Contact>,
 }
 
 fn main() -> kladde::Result<()> {
@@ -71,18 +71,18 @@ fn main() -> kladde::Result<()> {
             ("help", _) => print_help(),
             ("add", [name, email]) => {
                 let contact = Contact {
-                    email: DurableString::from(*email),
+                    email: String::from(*email),
                     phones: DurableVec::new(),
                 };
-                book.guard()
+                book.get_mut()
                     .contacts_mut()
-                    .insert(DurableString::from(*name), contact)?;
+                    .insert(String::from(*name), contact)?;
                 println!("added {name}");
             }
             ("set-email", [name, email]) => {
-                let mut guard = book.guard();
+                let mut guard = book.get_mut();
                 let mut contacts = guard.contacts_mut();
-                match contacts.get_mut(&DurableString::from(*name)) {
+                match contacts.get_mut(&String::from(*name)) {
                     Some(mut contact) => {
                         contact.email_mut().set(*email)?;
                         println!("updated {name}");
@@ -92,16 +92,16 @@ fn main() -> kladde::Result<()> {
             }
             ("add-phone", [name, kind, number]) => {
                 let phone = match *kind {
-                    "mobile" => PhoneNumber::Mobile(DurableString::from(*number)),
-                    "landline" => PhoneNumber::Landline(DurableString::from(*number)),
+                    "mobile" => PhoneNumber::Mobile(String::from(*number)),
+                    "landline" => PhoneNumber::Landline(String::from(*number)),
                     other => {
                         println!("unknown phone kind {other:?}, expected mobile|landline");
                         continue;
                     }
                 };
-                let mut guard = book.guard();
+                let mut guard = book.get_mut();
                 let mut contacts = guard.contacts_mut();
-                match contacts.get_mut(&DurableString::from(*name)) {
+                match contacts.get_mut(&String::from(*name)) {
                     Some(mut contact) => {
                         // Two field guards at once, through `parts()`.
                         let ContactParts { mut phones, .. } = contact.parts();
@@ -112,17 +112,13 @@ fn main() -> kladde::Result<()> {
                 }
             }
             ("remove", [name]) => {
-                if book
-                    .guard()
-                    .contacts_mut()
-                    .delete(&DurableString::from(*name))?
-                {
+                if book.get_mut().contacts_mut().delete(&String::from(*name))? {
                     println!("removed {name}");
                 } else {
                     println!("no such contact: {name}");
                 }
             }
-            ("show", [name]) => match book.get().contacts.get(&DurableString::from(*name)) {
+            ("show", [name]) => match book.get().contacts.get(&String::from(*name)) {
                 Some(contact) => {
                     println!("{name}: {}", contact.email);
                     for phone in contact.phones.iter() {

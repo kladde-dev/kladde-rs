@@ -3,8 +3,10 @@
 //! the new sequence described by committed ranges and new bytes.
 //!
 //! The pieces sit in a counted tree, so each record costs `O(log p)` for the
-//! `p` pieces the journal made, however long the sequence; a transaction's
-//! cuts are kept as trees of their own until the transaction ends.
+//! `p` pieces the journal made, however long the sequence; the journal's
+//! cuts are kept as trees of their own until the fold ends.
+
+use std::collections::HashMap;
 
 use crate::error::{corrupt, Error};
 use crate::journal::Record;
@@ -110,15 +112,19 @@ fn past_end() -> Error {
     corrupt("a journal record reaches past the end of the sequence")
 }
 
-/// Applies `records`, each with whether a journal transaction starts at it,
-/// to a sequence of `committed` bytes, and returns the new sequence as
-/// pieces, adjacent pieces that continue each other merged.
+/// Applies `records`, each with whether a journal transaction starts at it
+/// and its number in the session, to a sequence of `committed` bytes, and
+/// returns the new sequence as pieces, adjacent pieces that continue each
+/// other merged. `first` is the number of the journal's first record: a
+/// paste of a cut that a record before it made is applied as the splice of
+/// its fallback bytes, as the journal holds it.
 ///
 /// Fails on a record whose range does not lie inside the sequence, or on a
-/// paste of a cut its transaction did not make or already pasted.
+/// paste of a cut its journal did not make or already pasted.
 pub fn fold<'a>(
-    records: impl Iterator<Item = (bool, &'a Record)>,
+    records: impl Iterator<Item = (bool, u64, &'a Record)>,
     committed: u64,
+    first: u64,
 ) -> Result<Vec<Piece>, Error> {
     let mut pt = PieceTable {
         t: Treap::new(),
@@ -130,27 +136,19 @@ pub fn fold<'a>(
             len: committed,
         });
     }
-    // The cuts of the current transaction, oldest first: their trees, or
-    // `NIL` once pasted.
-    let mut cuts: Vec<u32> = Vec::new();
-    let end_transaction = |pt: &mut PieceTable, cuts: &mut Vec<u32>| {
-        for c in cuts.drain(..) {
-            pt.t.free_tree(c);
-        }
-    };
-    for (start, r) in records {
-        if start {
-            end_transaction(&mut pt, &mut cuts);
-        }
+    // The journal's cuts, by the number of the record that made each: their
+    // trees, or `NIL` once pasted.
+    let mut cuts: HashMap<u64, u32> = HashMap::new();
+    for (_, at, r) in records {
         let len = pt.len();
-        match *r {
+        match r.as_written(first) {
             Record::Write { pos, bytes } => {
                 let n = bytes.len as u64;
                 if pos.checked_add(n).is_none_or(|e| e > len) {
                     return Err(past_end());
                 }
                 let m = pt.take(pos, n);
-                cuts.push(m);
+                cuts.insert(at, m);
                 pt.insert_piece(
                     pos,
                     Piece {
@@ -169,7 +167,7 @@ pub fn fold<'a>(
                 }
                 if removed > 0 {
                     let m = pt.take(pos, removed);
-                    cuts.push(m);
+                    cuts.insert(at, m);
                 }
                 pt.insert_piece(
                     pos,
@@ -191,14 +189,15 @@ pub fn fold<'a>(
                 removed,
                 cut,
                 len: n,
+                ..
             } => {
                 if pos.checked_add(removed).is_none_or(|e| e > len) {
                     return Err(past_end());
                 }
-                let Some(i) = cuts.len().checked_sub(1 + cut as usize) else {
-                    return Err(corrupt("a paste names a cut its transaction did not make"));
+                let Some(slot) = cuts.get_mut(&cut) else {
+                    return Err(corrupt("a paste names a cut its journal did not make"));
                 };
-                let m = std::mem::replace(&mut cuts[i], NIL);
+                let m = std::mem::replace(slot, NIL);
                 if m == NIL && n > 0 {
                     return Err(corrupt("a paste names a cut already pasted"));
                 }
@@ -211,7 +210,9 @@ pub fn fold<'a>(
             }
         }
     }
-    end_transaction(&mut pt, &mut cuts);
+    for (_, c) in cuts {
+        pt.t.free_tree(c);
+    }
     let mut out: Vec<Piece> = Vec::new();
     for n in pt.t.nodes(pt.root) {
         let p = *pt.t.item(n);
@@ -262,12 +263,14 @@ mod tests {
             let old: Vec<u8> = (0..rng.below(300)).map(|i| i as u8).collect();
             let mut model = old.clone();
             let mut recs = Records::new();
-            let mut cuts: Vec<Option<Vec<u8>>> = Vec::new();
+            // The journal's cuts, by the number of the record that made each;
+            // a paste may name one of any transaction.
+            let mut cuts: Vec<Option<(u64, Vec<u8>)>> = Vec::new();
             for _ in 0..200 {
                 if rng.below(5) == 0 {
                     recs.mark_start(recs.end().at);
-                    cuts.clear();
                 }
+                let at = recs.end().at;
                 let len = model.len() as u64;
                 let r = match rng.below(4) {
                     0 if len > 0 => {
@@ -276,7 +279,7 @@ mod tests {
                         let new: Vec<u8> = (0..n).map(|_| rng.below(256) as u8).collect();
                         let cut = model[pos as usize..(pos + n) as usize].to_vec();
                         model[pos as usize..(pos + n) as usize].copy_from_slice(&new);
-                        cuts.push(Some(cut));
+                        cuts.push(Some((at, cut)));
                         Record::Write {
                             pos,
                             bytes: recs.stash(&new),
@@ -291,7 +294,7 @@ mod tests {
                             .splice(pos as usize..(pos + removed) as usize, new.iter().copied())
                             .collect();
                         if removed > 0 {
-                            cuts.push(Some(cut));
+                            cuts.push(Some((at, cut)));
                         }
                         Record::Splice {
                             pos,
@@ -309,7 +312,7 @@ mod tests {
                     }
                     _ => match cuts.iter().rposition(|c| c.is_some()) {
                         Some(i) => {
-                            let cut = cuts[i].take().unwrap();
+                            let (cut_at, cut) = cuts[i].take().unwrap();
                             let pos = rng.below(len + 1);
                             let removed = rng.below(len - pos + 1);
                             let n = cut.len() as u64;
@@ -317,8 +320,9 @@ mod tests {
                             Record::Paste {
                                 pos,
                                 removed,
-                                cut: (cuts.len() - 1 - i) as u32,
+                                cut: cut_at,
                                 len: n,
+                                fallback: None,
                             }
                         }
                         None => continue,
@@ -326,7 +330,7 @@ mod tests {
                 };
                 recs.push(r);
             }
-            let pieces = fold(recs.range(recs.front(), recs.end()), old.len() as u64).unwrap();
+            let pieces = fold(recs.range(recs.front(), recs.end()), old.len() as u64, 0).unwrap();
             assert_eq!(apply(&pieces, &old, &recs), model, "seed {seed}");
             // Adjacent pieces never continue each other.
             for w in pieces.windows(2) {
@@ -340,12 +344,13 @@ mod tests {
         let mut recs = Records::new();
         let bytes = recs.stash(b"ab");
         recs.push(Record::Write { pos: 9, bytes });
-        assert!(fold(recs.range(recs.front(), recs.end()), 10).is_err());
-        assert!(fold(recs.range(recs.front(), recs.end()), 11).is_ok());
+        assert!(fold(recs.range(recs.front(), recs.end()), 10, 0).is_err());
+        assert!(fold(recs.range(recs.front(), recs.end()), 11, 0).is_ok());
     }
 
     #[test]
-    fn a_cut_from_another_transaction_is_refused() {
+    fn a_cut_from_another_transaction_of_the_journal_is_pasted() {
+        let old = b"abcde";
         let mut recs = Records::new();
         recs.mark_start(0);
         let bytes = recs.stash(b"");
@@ -356,11 +361,34 @@ mod tests {
         });
         recs.mark_start(1);
         recs.push(Record::Paste {
-            pos: 0,
+            pos: 3,
             removed: 0,
             cut: 0,
             len: 2,
+            fallback: None,
         });
-        assert!(fold(recs.range(recs.front(), recs.end()), 5).is_err());
+        let pieces = fold(recs.range(recs.front(), recs.end()), 5, 0).unwrap();
+        assert_eq!(apply(&pieces, old, &recs), b"cdeab");
+        // Nothing of the paste is new bytes: the moved run is committed.
+        assert!(pieces.iter().all(|p| matches!(p.src, Src::Committed(_))));
+    }
+
+    #[test]
+    fn a_paste_of_an_unknown_cut_is_refused_and_an_ended_one_falls_back() {
+        let mut recs = Records::new();
+        let fallback = recs.stash(b"xy");
+        recs.push(Record::Paste {
+            pos: 0,
+            removed: 0,
+            cut: 7,
+            len: 2,
+            fallback: Some(fallback),
+        });
+        // Record 7 is not in this journal, which starts at record 0 ...
+        assert!(fold(recs.range(recs.front(), recs.end()), 3, 0).is_err());
+        // ... but in one that starts at record 8, its cut has ended, and the
+        // paste writes its own bytes.
+        let pieces = fold(recs.range(recs.front(), recs.end()), 3, 8).unwrap();
+        assert_eq!(apply(&pieces, b"abc", &recs), b"xyabc");
     }
 }

@@ -6,8 +6,8 @@ use std::hash::{BuildHasher, Hash};
 use std::ops::Deref;
 
 use kladde_persist::{
-    varint_len, Backend, Decoder, Durable, Encoder, Error, Field, Guard, Node, Region,
-    SchemaBuilder, TypeDescriptor,
+    varint_len, Backend, Decoder, Durable, Encoder, Error, Mut, Node, Region, SchemaBuilder,
+    TypeDescriptor,
 };
 
 use crate::index::Sizes;
@@ -27,14 +27,14 @@ use crate::vec::write_count;
 ///
 /// ```
 /// use kladde::Kladde;
-/// use kladde_types::{DurableMap, DurableString};
+/// use kladde_types::DurableMap;
 ///
-/// let mut loans = Kladde::new(DurableMap::<DurableString, u32>::new());
-/// let mut guard = loans.guard();
-/// guard.insert("Emma".into(), 3)?;
-/// guard.insert("Persuasion".into(), 1)?;
-/// guard.get_mut(&"Emma".into()).unwrap().set(4)?;
-/// assert_eq!(guard.remove(&"Persuasion".into())?, Some(1));
+/// let mut loans = Kladde::new(DurableMap::<String, u32>::new());
+/// let mut loans_mut = loans.get_mut();
+/// loans_mut.insert("Emma".into(), 3)?;
+/// loans_mut.insert("Persuasion".into(), 1)?;
+/// loans_mut.get_mut(&"Emma".into()).unwrap().set(4)?;
+/// assert_eq!(loans_mut.remove(&"Persuasion".into())?, Some(1));
 /// assert_eq!(loans.get().get(&"Emma".into()), Some(&4));
 /// # Ok::<(), kladde::Error>(())
 /// ```
@@ -292,13 +292,13 @@ impl<K: Durable + Hash + Eq, V: Durable> Durable for DurableMap<K, V> {
         Ok(map)
     }
 
-    type Guard<'r, B: Backend + 'r>
-        = DurableMapGuard<'r, K, V, B>
+    type Mut<'r, B: Backend + 'r>
+        = DurableMapMut<'r, K, V, B>
     where
         Self: 'r;
 
-    fn guard<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Guard<'r, B> {
-        DurableMapGuard {
+    fn mutate<'r, B: Backend + 'r>(&'r mut self, region: Region<'r, B>) -> Self::Mut<'r, B> {
+        DurableMapMut {
             inner: self,
             region,
         }
@@ -308,38 +308,25 @@ impl<K: Durable + Hash + Eq, V: Durable> Durable for DurableMap<K, V> {
     where
         Self: 'static,
     {
-        // A sequence of entries, each a struct of a key and a value.
-        let entry = builder.describe_with(std::any::TypeId::of::<(K, V, Self)>(), |b| {
-            TypeDescriptor::Struct {
-                name: "Entry".into(),
-                fields: vec![
-                    Field {
-                        name: "key".into(),
-                        ty: K::describe(b),
-                    },
-                    Field {
-                        name: "value".into(),
-                        ty: V::describe(b),
-                    },
-                ],
-            }
-        });
-        TypeDescriptor::Sequence(entry)
+        TypeDescriptor::Map {
+            key: K::describe(builder),
+            value: V::describe(builder),
+        }
     }
 }
 
-/// The [`Guard`] of a [`DurableMap`]: insert, remove, and reach each
-/// value's own guard. See [`DurableMap`] for an example.
-pub struct DurableMapGuard<'r, K, V, B> {
+/// The [`Mut`] of a [`DurableMap`]: insert, remove, and reach each
+/// value's own `Mut`. See [`DurableMap`] for an example.
+pub struct DurableMapMut<'r, K, V, B> {
     inner: &'r mut DurableMap<K, V>,
     region: Region<'r, B>,
 }
 
-impl<K: Durable + Hash + Eq, V: Durable, B: Backend> DurableMapGuard<'_, K, V, B> {
-    /// The guard of `key`'s value, or `None` if the map does not hold it. A
+impl<K: Durable + Hash + Eq, V: Durable, B: Backend> DurableMapMut<'_, K, V, B> {
+    /// The `Mut` of `key`'s value, or `None` if the map does not hold it. A
     /// change of the value's size updates the entry's size in the map's
     /// Fenwick tree.
-    pub fn get_mut(&mut self, key: &K) -> Option<V::Guard<'_, B>> {
+    pub fn get_mut(&mut self, key: &K) -> Option<V::Mut<'_, B>> {
         let (_, i) = self.inner.table.find(&self.inner.entries, key);
         let i = i?;
         let at = self.inner.offset_of(i) + self.inner.entries[i].0.encoded_len() as u64;
@@ -348,7 +335,7 @@ impl<K: Durable + Hash + Eq, V: Durable, B: Backend> DurableMapGuard<'_, K, V, B
         let value = &mut entries[i].1;
         let len = value.encoded_len() as u64;
         let node: Option<&dyn Node> = if fixed { None } else { Some(&*sizes) };
-        Some(value.guard(self.region.child(at, len, node, i)))
+        Some(value.mutate(self.region.child(at, len, node, i)))
     }
 
     /// Sets `key`'s value: replaces it in place and returns the old one if
@@ -444,7 +431,7 @@ impl<K: Durable + Hash + Eq, V: Durable, B: Backend> DurableMapGuard<'_, K, V, B
     }
 }
 
-impl<K, V, B> Guard for DurableMapGuard<'_, K, V, B> {
+impl<K, V, B> Mut for DurableMapMut<'_, K, V, B> {
     type Durable = DurableMap<K, V>;
 
     fn as_durable(&self) -> &DurableMap<K, V> {
@@ -452,7 +439,7 @@ impl<K, V, B> Guard for DurableMapGuard<'_, K, V, B> {
     }
 }
 
-impl<K, V, B> Deref for DurableMapGuard<'_, K, V, B> {
+impl<K, V, B> Deref for DurableMapMut<'_, K, V, B> {
     type Target = DurableMap<K, V>;
 
     fn deref(&self) -> &DurableMap<K, V> {

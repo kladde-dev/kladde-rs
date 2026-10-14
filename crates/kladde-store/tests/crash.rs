@@ -65,11 +65,11 @@ fn run(seed: u64, opts: &Options, mixed: bool) {
                 let cut: Vec<u8> = seq.drain(a as usize..(a + n) as usize).collect();
                 let wn = (seq.len() as u64 - w).min(3);
                 seq[w as usize..(w + wn) as usize].fill(fill);
-                seq.splice(to as usize..to as usize, cut);
+                seq.splice(to as usize..to as usize, cut.iter().copied());
                 store.atomically(|| {
                     let c = store.splice(a, n, b"")?.unwrap();
                     store.write(w, &vec![fill; wn as usize])?;
-                    store.paste(to, 0, c)
+                    store.paste(to, 0, c, &cut)
                 })
             }
             10 => {

@@ -4,9 +4,17 @@
 //!
 //! The records act on positions of the one sequence: `Write`, `Splice`,
 //! `Move`, and `Paste`, which inserts what a `Write` or `Splice` earlier in
-//! the same transaction cut out. On file each position is written as its
+//! the same journal cut out. On file each position is written as its
 //! distance from where the record before it left off, and the record's kind
 //! rides in the low two bits of that varint.
+//!
+//! In memory, a `Paste` names its cut by the index of the record that made
+//! it, and holds its value's encoding as well: if the record that made the
+//! cut belongs to a journal already folded when the paste is appended, the
+//! cut has ended, and the paste is written as a `Splice` of those bytes
+//! instead. The encoder and the fold apply the same rule, so they agree on
+//! every record; on file, a `Paste` names its cut by how many cuts of the
+//! journal were made after it.
 
 use std::collections::VecDeque;
 
@@ -28,10 +36,10 @@ pub struct Bytes {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Record {
     /// Overwrites `[pos, pos + bytes.len)`; what it overwrites is a cut of
-    /// its transaction.
+    /// its journal.
     Write { pos: u64, bytes: Bytes },
     /// Replaces the `removed` bytes at `pos` with `bytes`; what it removes
-    /// is a cut of its transaction, if anything.
+    /// is a cut of its journal, if anything.
     Splice {
         pos: u64,
         removed: u64,
@@ -40,24 +48,66 @@ pub enum Record {
     /// Cuts `[from, from + len)` and inserts it at `to`, a position in the
     /// sequence without the cut bytes.
     Move { from: u64, len: u64, to: u64 },
-    /// Replaces the `removed` bytes at `pos` with the cut that `cut` cuts
-    /// were made after, in this transaction; the cut is `len` bytes long.
+    /// Replaces the `removed` bytes at `pos` with the cut that the record
+    /// numbered `cut` made; the cut is `len` bytes long. `fallback` holds
+    /// those bytes' encoding, which is what the paste writes if that cut has
+    /// ended by the time the paste is appended; a paste recovered from the
+    /// journal has none, since its cut is in the journal with it.
     Paste {
         pos: u64,
         removed: u64,
-        cut: u32,
+        cut: u64,
         len: u64,
+        fallback: Option<Bytes>,
     },
 }
 
 impl Record {
-    /// The kind, as the low two bits of the head encode it.
+    /// The kind, as the low two bits of the head encode it, for a record
+    /// written as it is.
     fn kind(&self) -> u64 {
         match self {
             Record::Write { .. } => 0,
             Record::Splice { .. } => 1,
             Record::Move { .. } => 2,
             Record::Paste { .. } => 3,
+        }
+    }
+
+    /// The record as written to a journal whose first record is numbered
+    /// `first`: a `Paste` whose cut a record before `first` made has
+    /// ended, and becomes a `Write` or `Splice` of its fallback bytes.
+    pub fn as_written(&self, first: u64) -> Record {
+        match *self {
+            Record::Paste {
+                pos,
+                removed,
+                cut,
+                len,
+                fallback: Some(bytes),
+            } if cut < first => {
+                debug_assert_eq!(bytes.len as u64, len);
+                if removed == len {
+                    Record::Write { pos, bytes }
+                } else {
+                    Record::Splice {
+                        pos,
+                        removed,
+                        bytes,
+                    }
+                }
+            }
+            r => r,
+        }
+    }
+
+    /// The length of the cut this record makes, as written: what a `Write`
+    /// overwrites, or what a `Splice` removes, if anything.
+    pub fn cut_len(&self) -> Option<u64> {
+        match *self {
+            Record::Write { bytes, .. } => Some(bytes.len as u64),
+            Record::Splice { removed, .. } if removed > 0 => Some(removed),
+            _ => None,
         }
     }
 
@@ -148,8 +198,8 @@ impl Records {
 
     /// Appends `r`, whose payload, if any, [`stash`](Self::stash) stored.
     pub fn push(&mut self, r: Record) {
+        self.end.bytes += estimated_len(&r, self.end.seq, self.end.at) as u64;
         self.end.at += 1;
-        self.end.bytes += record_len(&r, self.end.seq) as u64;
         self.end.seq = r.end();
         self.end.arena = self.front.arena + self.arena.len() as u64;
         self.records.push_back(r);
@@ -164,8 +214,8 @@ impl Records {
     }
 
     /// The records in `[from, to)`, each with whether a journal transaction
-    /// starts at it.
-    pub fn range(&self, from: Cursor, to: Cursor) -> impl Iterator<Item = (bool, &Record)> {
+    /// starts at it, and its number in the session.
+    pub fn range(&self, from: Cursor, to: Cursor) -> impl Iterator<Item = (bool, u64, &Record)> {
         let base = self.front.at;
         let starts = &self.starts;
         self.records
@@ -173,8 +223,15 @@ impl Records {
             .enumerate()
             .map(move |(i, r)| {
                 let at = from.at + i as u64;
-                (starts.binary_search(&at).is_ok(), r)
+                (starts.binary_search(&at).is_ok(), at, r)
             })
+    }
+
+    /// The record numbered `at` in the session, if the buffer still holds
+    /// it.
+    pub fn get(&self, at: u64) -> Option<&Record> {
+        let i = at.checked_sub(self.front.at)?;
+        self.records.get(usize::try_from(i).ok()?)
     }
 
     /// Every record held.
@@ -211,11 +268,26 @@ impl Records {
 
     /// Encodes the records in `[from, to)` as a transaction's record bytes,
     /// their positions relative to `cursor`, which ends where they leave
-    /// off.
-    pub fn encode(&self, from: Cursor, to: Cursor, cursor: &mut u64, out: &mut Vec<u8>) {
-        for (_, r) in self.range(from, to) {
-            encode_record(r, *cursor, self, out);
-            *cursor = r.end();
+    /// off, for the journal whose cuts so far `cuts` holds.
+    pub fn encode(
+        &self,
+        from: Cursor,
+        to: Cursor,
+        cursor: &mut u64,
+        cuts: &mut JournalCuts,
+        out: &mut Vec<u8>,
+    ) {
+        for (_, at, r) in self.range(from, to) {
+            let w = r.as_written(cuts.first);
+            let distance = match w {
+                Record::Paste { cut, .. } => cuts.distance(cut),
+                _ => 0,
+            };
+            encode_record(&w, *cursor, distance, self, out);
+            if w.cut_len().is_some() {
+                cuts.made.push(at);
+            }
+            *cursor = w.end();
         }
     }
 
@@ -250,6 +322,39 @@ impl Records {
     }
 }
 
+/// The cuts of the journal being appended to: which records are its own,
+/// and which of them made a cut, in order, so that a `Paste` can be written
+/// with how many cuts were made after its own.
+#[derive(Clone, Debug, Default)]
+pub struct JournalCuts {
+    /// The number of the journal's first record: a cut that a record before
+    /// it made has ended.
+    pub first: u64,
+    /// The numbers of the records appended to the journal that made a cut,
+    /// ascending.
+    pub made: Vec<u64>,
+}
+
+impl JournalCuts {
+    /// The cuts of an empty journal whose first record is numbered `first`.
+    pub fn starting_at(first: u64) -> Self {
+        JournalCuts {
+            first,
+            made: Vec::new(),
+        }
+    }
+
+    /// How many of the journal's cuts were made after the one record `cut`
+    /// made.
+    fn distance(&self, cut: u64) -> u32 {
+        let i = self
+            .made
+            .binary_search(&cut)
+            .expect("a paste is appended to the journal of its cut");
+        (self.made.len() - 1 - i) as u32
+    }
+}
+
 fn zz(v: i64) -> u64 {
     kladde_varint::zigzag(v)
 }
@@ -261,8 +366,9 @@ fn head(r: &Record, cursor: u64) -> u64 {
 }
 
 /// The bytes the encoding of `r` takes after a record that left off at
-/// `cursor`, computed without encoding it.
-pub fn record_len(r: &Record, cursor: u64) -> usize {
+/// `cursor`, if a `Paste` among them names its cut `distance` cuts back,
+/// computed without encoding it.
+pub fn record_len(r: &Record, cursor: u64, distance: u32) -> usize {
     let v = |x: u64| kladde_varint::encoded_len(x);
     v(head(r, cursor))
         + match *r {
@@ -271,8 +377,21 @@ pub fn record_len(r: &Record, cursor: u64) -> usize {
                 v(removed) + v(bytes.len as u64) + bytes.len as usize
             }
             Record::Move { from, len, to } => v(len) + v(zz(to as i64 - from as i64)),
-            Record::Paste { removed, cut, .. } => v(removed) + v(cut as u64),
+            Record::Paste { removed, .. } => v(removed) + v(distance as u64),
         }
+}
+
+/// What the encoding of the record numbered `at` is estimated to take when
+/// it is pushed: a `Paste` as a paste, its distance at most the number of
+/// records since its cut's. The encoding itself can differ, if the paste's
+/// cut ends before it is appended; the estimates only steer when to append
+/// and flush.
+fn estimated_len(r: &Record, cursor: u64, at: u64) -> usize {
+    let distance = match *r {
+        Record::Paste { cut, .. } => u32::try_from(at.saturating_sub(cut)).unwrap_or(u32::MAX),
+        _ => 0,
+    };
+    record_len(r, cursor, distance)
 }
 
 /// The stream bytes a transaction of `n` record bytes takes: its length
@@ -285,7 +404,7 @@ fn put(out: &mut Vec<u8>, v: u64) {
     kladde_varint::encode(v, out);
 }
 
-fn encode_record(r: &Record, cursor: u64, recs: &Records, out: &mut Vec<u8>) {
+fn encode_record(r: &Record, cursor: u64, distance: u32, recs: &Records, out: &mut Vec<u8>) {
     put(out, head(r, cursor));
     match *r {
         Record::Write { bytes, .. } => {
@@ -301,20 +420,31 @@ fn encode_record(r: &Record, cursor: u64, recs: &Records, out: &mut Vec<u8>) {
             put(out, len);
             put(out, zz(to as i64 - from as i64));
         }
-        Record::Paste { removed, cut, .. } => {
+        Record::Paste { removed, .. } => {
             put(out, removed);
-            put(out, cut as u64);
+            put(out, distance as u64);
         }
     }
 }
 
 use crate::consts::MAX_SEQUENCE;
 
+/// The cuts of a journal as recovery decodes it: for each, the number of
+/// the record that made it, its length, and whether it was pasted, oldest
+/// first.
+pub type DecodedCuts = Vec<(u64, u64, bool)>;
+
 /// Decodes the records of one transaction in `input` into `into`, their
-/// positions relative to `cursor`, which ends where they leave off; checks
-/// the bounds and the cuts a `Paste` names, but not whether the positions
-/// lie inside the sequence, which only the fold knows.
-pub fn decode_records(input: &[u8], cursor: &mut u64, into: &mut Records) -> Result<(), Error> {
+/// positions relative to `cursor`, which ends where they leave off, adding
+/// the cuts they make to the journal's `cuts`; checks the bounds and the
+/// cuts a `Paste` names, but not whether the positions lie inside the
+/// sequence, which only the fold knows.
+pub fn decode_records(
+    input: &[u8],
+    cursor: &mut u64,
+    cuts: &mut DecodedCuts,
+    into: &mut Records,
+) -> Result<(), Error> {
     let mut rest = input;
     let get = |rest: &mut &[u8]| -> Result<u64, Error> {
         let (v, r) =
@@ -329,10 +459,8 @@ pub fn decode_records(input: &[u8], cursor: &mut u64, into: &mut Records) -> Res
             Ok(v)
         }
     };
-    // The lengths of the cuts this transaction made, oldest first, and
-    // whether each was pasted.
-    let mut cuts: Vec<(u64, bool)> = Vec::new();
     while !rest.is_empty() {
+        let at = into.end().at;
         let x = kladde_varint::unzigzag(get(&mut rest)?);
         let kind = x & 3;
         let pos = *cursor as i64 + (x >> 2);
@@ -357,11 +485,11 @@ pub fn decode_records(input: &[u8], cursor: &mut u64, into: &mut Records) -> Res
                     if len == 0 {
                         return Err(corrupt("a journal record uses the reserved escape"));
                     }
-                    cuts.push((len, false));
+                    cuts.push((at, len, false));
                     Record::Write { pos, bytes }
                 } else {
                     if removed > 0 {
-                        cuts.push((removed, false));
+                        cuts.push((at, removed, false));
                     }
                     Record::Splice {
                         pos,
@@ -386,18 +514,19 @@ pub fn decode_records(input: &[u8], cursor: &mut u64, into: &mut Records) -> Res
                 let removed = bounded(get(&mut rest)?)?;
                 let cut = get(&mut rest)?;
                 if cut >= cuts.len() as u64 {
-                    return Err(corrupt("a paste names a cut its transaction did not make"));
+                    return Err(corrupt("a paste names a cut its journal did not make"));
                 }
                 let i = cuts.len() - 1 - cut as usize;
-                if cuts[i].1 {
+                if cuts[i].2 {
                     return Err(corrupt("a paste names a cut already pasted"));
                 }
-                cuts[i].1 = true;
+                cuts[i].2 = true;
                 Record::Paste {
                     pos,
                     removed,
-                    cut: cut as u32,
-                    len: cuts[i].0,
+                    cut: cuts[i].0,
+                    len: cuts[i].1,
+                    fallback: None,
                 }
             }
         };
@@ -638,6 +767,7 @@ pub fn recover(storage: &dyn Storage, epoch: u64, first_page: u32) -> Result<Rec
     storage.read_at(&mut r.buf[..], first_page as u64 * PAGE_SIZE as u64)?;
     let mut valid_pages = 1;
     let mut cursor = 0u64;
+    let mut cuts = DecodedCuts::new();
     'transactions: loop {
         // The length prefix, one byte at a time.
         let mut len: u64 = 0;
@@ -675,7 +805,7 @@ pub fn recover(storage: &dyn Storage, epoch: u64, first_page: u32) -> Result<Rec
             break;
         }
         let at = out.records.end().at;
-        decode_records(&payload, &mut cursor, &mut out.records)?;
+        decode_records(&payload, &mut cursor, &mut cuts, &mut out.records)?;
         out.records.mark_start(at);
         out.transactions += 1;
         valid_pages = r.pages.len();
@@ -705,17 +835,19 @@ mod tests {
         }
     }
 
-    /// A transaction of random records, with valid cuts and pastes.
-    fn transaction(rng: &mut Rng, recs: &mut Records) {
-        let mut cuts: Vec<(u64, bool)> = Vec::new();
+    /// A transaction of random records, with valid cuts and pastes; `cuts`
+    /// are the journal's, which a paste may name whichever transaction made
+    /// them.
+    fn transaction(rng: &mut Rng, recs: &mut Records, cuts: &mut DecodedCuts) {
         let start = recs.end().at;
         for _ in 0..rng.next(4) + 1 {
             let bits = rng.next(5) as u32 + 1;
+            let at = recs.end().at;
             let r = match rng.next(3) {
                 0 => {
                     let n = rng.next(8) as usize + 1;
                     let bytes = recs.stash(&vec![rng.next(8) as u8; n]);
-                    cuts.push((n as u64, false));
+                    cuts.push((at, n as u64, false));
                     Record::Write {
                         pos: rng.next(bits),
                         bytes,
@@ -726,7 +858,7 @@ mod tests {
                     let bytes = recs.stash(&vec![rng.next(8) as u8; n]);
                     let removed = rng.next(bits);
                     if removed > 0 {
-                        cuts.push((removed, false));
+                        cuts.push((at, removed, false));
                     }
                     Record::Splice {
                         pos: rng.next(bits),
@@ -739,14 +871,15 @@ mod tests {
                     len: rng.next(bits),
                     to: rng.next(bits),
                 },
-                _ => match cuts.iter().rposition(|c| !c.1) {
+                _ => match cuts.iter().rposition(|c| !c.2) {
                     Some(i) => {
-                        cuts[i].1 = true;
+                        cuts[i].2 = true;
                         Record::Paste {
                             pos: rng.next(bits),
                             removed: rng.next(bits),
-                            cut: (cuts.len() - 1 - i) as u32,
-                            len: cuts[i].0,
+                            cut: cuts[i].0,
+                            len: cuts[i].1,
+                            fallback: None,
                         }
                     }
                     None => Record::Move {
@@ -795,27 +928,31 @@ mod tests {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let mut recs = Records::new();
         let mut txs = Vec::new();
+        let mut cuts = DecodedCuts::new();
         for _ in 0..500 {
             let from = recs.end();
-            transaction(&mut rng, &mut recs);
+            transaction(&mut rng, &mut recs, &mut cuts);
             txs.push((from, recs.end()));
         }
         let mut cursor = 0u64;
+        let mut journal = JournalCuts::starting_at(0);
         let mut decoded = Records::new();
         let mut dcursor = 0u64;
+        let mut dcuts = DecodedCuts::new();
         let mut total = 0u64;
         for &(from, to) in &txs {
             let mut out = Vec::new();
             let before = cursor;
-            recs.encode(from, to, &mut cursor, &mut out);
-            // The estimate assumed the same cursor, so it is exact here.
-            assert_eq!(to.bytes - from.bytes, out.len() as u64, "from {before}");
+            recs.encode(from, to, &mut cursor, &mut journal, &mut out);
+            // The estimate assumed the same cursor, and a paste's distance at
+            // most the records since its cut, so it never falls short.
+            assert!(to.bytes - from.bytes >= out.len() as u64, "from {before}");
             total += out.len() as u64;
             let at = decoded.end().at;
-            decode_records(&out, &mut dcursor, &mut decoded).unwrap();
+            decode_records(&out, &mut dcursor, &mut dcuts, &mut decoded).unwrap();
             decoded.mark_start(at);
         }
-        assert_eq!(total, recs.end().bytes);
+        assert!(total <= recs.end().bytes);
         assert_eq!(contents(&decoded), contents(&recs));
         assert_eq!(dcursor, cursor);
     }
@@ -829,24 +966,27 @@ mod tests {
             removed: 0,
             bytes,
         };
-        assert_eq!(record_len(&r, 1000), 4);
-        assert_eq!(record_len(&r, 999), 4);
-        assert!(record_len(&r, 0) > 4);
+        assert_eq!(record_len(&r, 1000, 0), 4);
+        assert_eq!(record_len(&r, 999, 0), 4);
+        assert!(record_len(&r, 0, 0) > 4);
     }
 
     #[test]
     fn pastes_of_unknown_or_pasted_cuts_and_the_escape_are_refused() {
         let mut out = Vec::new();
-        // A paste in a transaction that cut nothing.
+        let refused = |out: &[u8]| {
+            decode_records(out, &mut 0, &mut DecodedCuts::new(), &mut Records::new()).is_err()
+        };
+        // A paste in a journal that cut nothing.
         put(&mut out, zz(3));
         put(&mut out, 0);
         put(&mut out, 0);
-        assert!(decode_records(&out, &mut 0, &mut Records::new()).is_err());
+        assert!(refused(&out));
         // A write of no bytes.
         let mut out = Vec::new();
         put(&mut out, zz(0));
         put(&mut out, 0);
-        assert!(decode_records(&out, &mut 0, &mut Records::new()).is_err());
+        assert!(refused(&out));
         // A cut pasted twice.
         let mut out = Vec::new();
         put(&mut out, zz(1));
@@ -857,7 +997,64 @@ mod tests {
             put(&mut out, 0);
             put(&mut out, 0);
         }
-        assert!(decode_records(&out, &mut 0, &mut Records::new()).is_err());
+        assert!(refused(&out));
+    }
+
+    #[test]
+    fn a_paste_names_a_cut_of_an_earlier_transaction_of_its_journal() {
+        // A splice that removes two bytes, then, in another transaction, a
+        // paste of the cut it made.
+        let mut first = Vec::new();
+        put(&mut first, zz(1));
+        put(&mut first, 2);
+        put(&mut first, 0);
+        let mut second = Vec::new();
+        put(&mut second, zz(3));
+        put(&mut second, 0);
+        put(&mut second, 0);
+        let (mut cursor, mut cuts, mut recs) = (0, DecodedCuts::new(), Records::new());
+        decode_records(&first, &mut cursor, &mut cuts, &mut recs).unwrap();
+        decode_records(&second, &mut cursor, &mut cuts, &mut recs).unwrap();
+        assert_eq!(
+            recs.iter().nth(1),
+            Some(&Record::Paste {
+                pos: 0,
+                removed: 0,
+                cut: 0,
+                len: 2,
+                fallback: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_paste_whose_cut_has_ended_is_written_as_its_fallback() {
+        let mut recs = Records::new();
+        let gone = recs.stash(b"");
+        recs.push(Record::Splice {
+            pos: 0,
+            removed: 2,
+            bytes: gone,
+        });
+        let fallback = recs.stash(b"xy");
+        recs.push(Record::Paste {
+            pos: 3,
+            removed: 0,
+            cut: 0,
+            len: 2,
+            fallback: Some(fallback),
+        });
+        let paste = recs.range(recs.front(), recs.end()).nth(1).unwrap().2;
+        // In the journal of its cut, it is a paste; in the next, a splice.
+        assert!(matches!(paste.as_written(0), Record::Paste { .. }));
+        assert_eq!(
+            paste.as_written(1),
+            Record::Splice {
+                pos: 3,
+                removed: 0,
+                bytes: fallback
+            }
+        );
     }
 
     #[test]
@@ -871,14 +1068,15 @@ mod tests {
         put(&mut out, 0);
         put(&mut out, 0);
         let mut recs = Records::new();
-        decode_records(&out, &mut 0, &mut recs).unwrap();
+        decode_records(&out, &mut 0, &mut DecodedCuts::new(), &mut recs).unwrap();
         assert_eq!(
             recs.iter().nth(1),
             Some(&Record::Paste {
                 pos: 0,
                 removed: 0,
                 cut: 0,
-                len: 2
+                len: 2,
+                fallback: None,
             })
         );
     }
@@ -888,9 +1086,10 @@ mod tests {
         let mut rng = Rng(0x2545_F491_4F6C_DD1D);
         let mut recs = Records::new();
         let mut marks = Vec::new();
+        let mut cuts = DecodedCuts::new();
         for _ in 0..40 {
             marks.push(recs.end());
-            transaction(&mut rng, &mut recs);
+            transaction(&mut rng, &mut recs, &mut cuts);
         }
         let all = contents(&recs);
         let cut = marks[15];
@@ -899,7 +1098,7 @@ mod tests {
         let starts: Vec<u64> = kept
             .iter()
             .enumerate()
-            .filter(|(_, (s, _))| *s)
+            .filter(|(_, (s, _, _))| *s)
             .map(|(i, _)| cut.at + i as u64)
             .collect();
         assert_eq!(starts, marks[15..].iter().map(|c| c.at).collect::<Vec<_>>());
@@ -908,7 +1107,7 @@ mod tests {
         assert_eq!(recs.end(), marks[30]);
         assert_eq!(
             recs.range(recs.front(), recs.end())
-                .filter(|(s, _)| *s)
+                .filter(|(s, _, _)| *s)
                 .count(),
             15
         );
@@ -927,15 +1126,18 @@ mod tests {
         };
         let mut rng = Rng(77);
         let mut recs = Records::new();
+        let mut cuts = DecodedCuts::new();
+        let mut journal = JournalCuts::starting_at(0);
         for _ in 0..200 {
             let from = recs.end();
-            transaction(&mut rng, &mut recs);
+            transaction(&mut rng, &mut recs, &mut cuts);
             // Payloads large enough to cross pages.
             let bytes = recs.stash(&[7u8; 300]);
+            cuts.push((recs.end().at, 300, false));
             recs.push(Record::Write { pos: 5, bytes });
             let mut payload = Vec::new();
             let mut c = w.cursor;
-            recs.encode(from, recs.end(), &mut c, &mut payload);
+            recs.encode(from, recs.end(), &mut c, &mut journal, &mut payload);
             w.cursor = c;
             w.append(&payload, &mut storage, &mut alloc).unwrap();
         }
@@ -973,7 +1175,8 @@ mod tests {
             recs.push(Record::Write { pos: 0, bytes });
             let mut payload = Vec::new();
             let mut c = 0;
-            recs.encode(from, recs.end(), &mut c, &mut payload);
+            let mut journal = JournalCuts::starting_at(0);
+            recs.encode(from, recs.end(), &mut c, &mut journal, &mut payload);
             w.append(&payload, &mut storage, &mut alloc).unwrap();
         }
         let ops = storage.unsynced_ops();

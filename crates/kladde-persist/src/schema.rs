@@ -103,6 +103,30 @@ impl SchemaBuilder {
         reference
     }
 
+    /// Registers a descriptor that no Rust type stands for, such as the
+    /// payload of an enum's struct variant, and returns a reference to it.
+    /// Unlike [`describe_with`](Self::describe_with), it does not
+    /// deduplicate: every call adds a node.
+    ///
+    /// ```
+    /// use kladde_persist::{SchemaBuilder, TypeDescriptor};
+    ///
+    /// let mut builder = SchemaBuilder::new();
+    /// let a = builder.describe_anonymous(|_| TypeDescriptor::Text);
+    /// let b = builder.describe_anonymous(|_| TypeDescriptor::Text);
+    /// assert_ne!(a, b);
+    /// ```
+    pub fn describe_anonymous(
+        &mut self,
+        build: impl FnOnce(&mut SchemaBuilder) -> TypeDescriptor,
+    ) -> TypeRef {
+        let reference = TypeRef(self.descriptors.len());
+        self.descriptors.push(None);
+        let descriptor = build(self);
+        self.descriptors[reference.0] = Some(descriptor);
+        reference
+    }
+
     /// Finalizes the accumulated descriptors into a [`TypeTable`] rooted at
     /// `root`. `root` must be the first type described (index 0), which is
     /// automatically the case when [`Durable::schema`] drives the builder,

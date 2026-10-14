@@ -37,9 +37,9 @@ The file holds the root value's encoding as one byte sequence, kept on copy-on-w
 | crate | role |
 | --- | --- |
 | `kladde` | the application-facing entry point: creating and opening files, the root value, transactions and batches |
-| `kladde-types` | the built-in containers: vector, map, string, blob |
+| `kladde-types` | the built-in containers: vector, map, blob |
 | `kladde-derive` | the `#[derive(Durable)]` macro, reached through `kladde` |
-| `kladde-persist` | the serialization layer: `Durable`, `Bounded`, `Guard`, `Region`, `Fixed`, cuts, and the schema binding |
+| `kladde-persist` | the serialization layer: `Durable`, `Bounded`, `Mut`, `Region`, `Fixed`, `String`, `Vec` of fixed-size elements, cuts, and the schema binding |
 | `kladde-schema` | type descriptors, their canonical encoding, and fingerprints |
 | `kladde-store` | the storage layer: pages, the span table, the journal, the flush, and consolidation |
 | `kladde-varint` | LEB128 varints |

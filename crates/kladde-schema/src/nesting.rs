@@ -54,7 +54,7 @@ impl TypeTable {
     /// fields or elements in that form.
     ///
     /// ```
-    /// use kladde_schema::{Primitive, TypeDescriptor, TypeRef, TypeTable, Variant, Field};
+    /// use kladde_schema::{Primitive, TypeDescriptor, TypeRef, TypeTable, Variant};
     ///
     /// // `Option<u32>` as an enum with a one-byte discriminant.
     /// let option = TypeTable::new(vec![
@@ -62,15 +62,12 @@ impl TypeTable {
     ///         name: "Option".into(),
     ///         discriminant_width: 1,
     ///         variants: vec![
-    ///             Variant { discriminant: 0, name: "None".into(), fields: vec![] },
-    ///             Variant {
-    ///                 discriminant: 1,
-    ///                 name: "Some".into(),
-    ///                 fields: vec![Field { name: "0".into(), ty: TypeRef(1) }],
-    ///             },
+    ///             Variant { discriminant: 0, name: "None".into(), payload: TypeRef(2) },
+    ///             Variant { discriminant: 1, name: "Some".into(), payload: TypeRef(1) },
     ///         ],
     ///     },
     ///     TypeDescriptor::Primitive(Primitive::U32),
+    ///     TypeDescriptor::Struct { name: "Unit".into(), fields: vec![] },
     /// ]);
     /// assert_eq!(option.fixed_size(TypeRef(0)), None);
     /// assert_eq!(option.fixed_form_size(TypeRef(0)), Some(5));
@@ -103,11 +100,7 @@ impl TypeTable {
             } => {
                 let mut sizes = Vec::with_capacity(variants.len());
                 for v in variants {
-                    let size = v
-                        .fields
-                        .iter()
-                        .try_fold(0u64, |sum, f| Some(sum + self.sized(f.ty.0, form, memo)?));
-                    sizes.push(size);
+                    sizes.push(self.sized(v.payload.0, form, memo));
                 }
                 if variants.is_empty() || sizes.iter().any(Option::is_none) {
                     None
@@ -125,7 +118,7 @@ impl TypeTable {
             TypeDescriptor::Array { element, len } => {
                 Some(self.sized(element.0, form, memo)?.checked_mul(*len)?)
             }
-            TypeDescriptor::Sequence(_) | TypeDescriptor::Text => None,
+            TypeDescriptor::Sequence(_) | TypeDescriptor::Map { .. } | TypeDescriptor::Text => None,
             TypeDescriptor::Fixed(target) => self.sized(target.0, true, memo),
         };
         memo[index] = Memo::Known(size);
@@ -137,9 +130,9 @@ impl TypeTable {
     ///
     /// - a `Fixed` wrapper holds a type with a
     ///   [fixed form](TypeTable::fixed_form_size);
-    /// - a type reaches itself only through an enum or a sequence, whose
-    ///   discriminant or count ends the recursion, and never through structs
-    ///   and arrays alone, whose values would be infinite.
+    /// - a type reaches itself only through an enum, a sequence or a map,
+    ///   whose discriminant or count ends the recursion, and never through
+    ///   structs and arrays alone, whose values would be infinite.
     ///
     /// ```
     /// use kladde_schema::{Field, TypeDescriptor, TypeRef, TypeTable};
@@ -294,9 +287,7 @@ impl TypeTable {
                     varint(bytes, at)?
                 };
                 let variant = variants.iter().find(|v| v.discriminant == discriminant)?;
-                for f in &variant.fields {
-                    self.skip(f.ty.0, form, bytes, at)?;
-                }
+                self.skip(variant.payload.0, form, bytes, at)?;
                 if form {
                     let size = self.fixed_form_size(TypeRef(index))? as usize;
                     let padding = take(bytes, at, (start + size).checked_sub(*at)?)?;
@@ -332,7 +323,15 @@ impl TypeTable {
                 *at = end + 1;
                 Some(())
             }
-            TypeDescriptor::Sequence(_) | TypeDescriptor::Text => None,
+            TypeDescriptor::Map { key, value } if !form => {
+                let count = varint(bytes, at)?;
+                for _ in 0..count {
+                    self.skip(key.0, false, bytes, at)?;
+                    self.skip(value.0, false, bytes, at)?;
+                }
+                Some(())
+            }
+            TypeDescriptor::Sequence(_) | TypeDescriptor::Map { .. } | TypeDescriptor::Text => None,
             TypeDescriptor::Fixed(target) => self.skip(target.0, true, bytes, at),
         }
     }
@@ -401,10 +400,17 @@ mod tests {
         }
     }
 
-    fn variant(discriminant: u64, fields: Vec<Field>) -> Variant {
+    fn variant(discriminant: u64, payload: usize) -> Variant {
         Variant {
             discriminant,
             name: format!("V{discriminant}"),
+            payload: TypeRef(payload),
+        }
+    }
+
+    fn strukt(name: &str, fields: Vec<Field>) -> TypeDescriptor {
+        TypeDescriptor::Struct {
+            name: name.into(),
             fields,
         }
     }
@@ -416,18 +422,17 @@ mod tests {
         }
     }
 
-    /// `enum Shape { Circle(f32), Rect(f32, f32) }` at `[0]`, `f32` at `[1]`.
+    /// `enum Shape { Circle(f32), Rect(f32, f32) }` at `[0]`, `f32` at `[1]`,
+    /// and `Rect`'s payload at `[2]`.
     fn shape() -> Vec<TypeDescriptor> {
         vec![
             TypeDescriptor::Enum {
                 name: "Shape".into(),
                 discriminant_width: 2,
-                variants: vec![
-                    variant(0, vec![field("0", 1)]),
-                    variant(1, vec![field("0", 1), field("1", 1)]),
-                ],
+                variants: vec![variant(0, 1), variant(1, 2)],
             },
             TypeDescriptor::Primitive(Primitive::F32),
+            strukt("Rect", vec![field("0", 1), field("1", 1)]),
         ]
     }
 
@@ -442,10 +447,7 @@ mod tests {
         d[0] = TypeDescriptor::Enum {
             name: "Pair".into(),
             discriminant_width: 4,
-            variants: vec![
-                variant(0, vec![field("0", 1)]),
-                variant(127, vec![field("0", 1)]),
-            ],
+            variants: vec![variant(0, 1), variant(127, 1)],
         };
         assert_eq!(TypeTable::new(d.clone()).fixed_size(TypeRef(0)), Some(5));
         // A discriminant of 128 takes two bytes, so the size depends on it.
@@ -489,12 +491,11 @@ mod tests {
             TypeDescriptor::Enum {
                 name: "List".into(),
                 discriminant_width: 1,
-                variants: vec![
-                    variant(0, vec![]),
-                    variant(1, vec![field("0", 1), field("1", 0)]),
-                ],
+                variants: vec![variant(0, 2), variant(1, 3)],
             },
             TypeDescriptor::Primitive(Primitive::U8),
+            strukt("Unit", vec![]),
+            strukt("Cons", vec![field("0", 1), field("1", 0)]),
         ]);
         assert_eq!(list.validate(), Ok(()));
         assert_eq!(list.fixed_form_size(TypeRef(0)), None);
@@ -503,11 +504,14 @@ mod tests {
 
     #[test]
     fn a_discriminant_must_fit_its_width() {
-        let table = TypeTable::new(vec![TypeDescriptor::Enum {
-            name: "E".into(),
-            discriminant_width: 1,
-            variants: vec![variant(256, vec![])],
-        }]);
+        let table = TypeTable::new(vec![
+            TypeDescriptor::Enum {
+                name: "E".into(),
+                discriminant_width: 1,
+                variants: vec![variant(256, 1)],
+            },
+            strukt("Unit", vec![]),
+        ]);
         assert!(nesting_error(&table).contains("discriminant width"));
     }
 
@@ -518,10 +522,21 @@ mod tests {
         let table = TypeTable::new(d);
         // `Fixed(Shape)`: a two-byte discriminant, then eight bytes.
         let circle = [0, 0, 0, 0, 0x80, 0x3f, 0, 0, 0, 0];
-        assert_eq!(table.measure(TypeRef(2), &circle), Some(10));
+        assert_eq!(table.measure(TypeRef(3), &circle), Some(10));
         let mut bad = circle;
         bad[9] = 1; // padding must be zeros
-        assert_eq!(table.measure(TypeRef(2), &bad), None);
+        assert_eq!(table.measure(TypeRef(3), &bad), None);
+        // A map: two entries of a text and a u8.
+        let map = TypeTable::new(vec![
+            TypeDescriptor::Map {
+                key: TypeRef(1),
+                value: TypeRef(2),
+            },
+            TypeDescriptor::Text,
+            TypeDescriptor::Primitive(Primitive::U8),
+        ]);
+        assert_eq!(map.measure(TypeRef(0), b"\x02a\xff\x01b\xff\x02"), Some(7));
+        assert_eq!(map.fixed_form_size(TypeRef(0)), None);
         // Text needs its terminator and valid UTF-8; a varint must be
         // minimal.
         let text = TypeTable::new(vec![TypeDescriptor::Text]);

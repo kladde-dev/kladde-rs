@@ -120,11 +120,7 @@ impl<'a> Traversal<'a> {
                 for variant in canonical_variants(variants) {
                     kladde_varint::encode(variant.discriminant, hasher);
                     push_string(&variant.name, hasher);
-                    kladde_varint::encode(variant.fields.len() as u64, hasher);
-                    for field in &variant.fields {
-                        push_string(&field.name, hasher);
-                        self.emit_reference(field.ty, depth, hasher);
-                    }
+                    self.emit_reference(variant.payload, depth, hasher);
                 }
             }
             TypeDescriptor::Opaque {
@@ -153,6 +149,11 @@ impl<'a> Traversal<'a> {
             TypeDescriptor::Sequence(element) => {
                 hasher.update([crate::descriptor::TAG_SEQUENCE]);
                 self.emit_reference(*element, depth, hasher);
+            }
+            TypeDescriptor::Map { key, value } => {
+                hasher.update([crate::descriptor::TAG_MAP]);
+                self.emit_reference(*key, depth, hasher);
+                self.emit_reference(*value, depth, hasher);
             }
             TypeDescriptor::Text => hasher.update([crate::descriptor::TAG_TEXT]),
             TypeDescriptor::Fixed(target) => {
@@ -227,22 +228,25 @@ mod tests {
 
     /// `enum Rec { Stop, Go(Rec) }` — a self-recursive enum.
     fn rec_enum() -> TypeTable {
-        TypeTable::new(vec![TypeDescriptor::Enum {
-            name: "Rec".into(),
-            discriminant_width: 4,
-            variants: vec![
-                Variant {
-                    discriminant: 0,
-                    name: "Stop".into(),
-                    fields: vec![],
-                },
-                Variant {
-                    discriminant: 1,
-                    name: "Go".into(),
-                    fields: vec![field("0", 0)],
-                },
-            ],
-        }])
+        TypeTable::new(vec![
+            TypeDescriptor::Enum {
+                name: "Rec".into(),
+                discriminant_width: 4,
+                variants: vec![
+                    Variant {
+                        discriminant: 0,
+                        name: "Stop".into(),
+                        payload: TypeRef(1),
+                    },
+                    Variant {
+                        discriminant: 1,
+                        name: "Go".into(),
+                        payload: TypeRef(0),
+                    },
+                ],
+            },
+            strukt("Unit", vec![]),
+        ])
     }
 
     /// An outer cycle — either a self-referential struct or a mutual
@@ -305,7 +309,8 @@ mod tests {
         ])
     }
 
-    /// `enum List { Nil, Cons(i32, List) }`.
+    /// `enum List { Nil, Cons(i32, List) }`: `Nil` holds the empty Struct,
+    /// and `Cons` a Struct of its two positional fields.
     fn list() -> TypeTable {
         TypeTable::new(vec![
             TypeDescriptor::Enum {
@@ -315,25 +320,18 @@ mod tests {
                     Variant {
                         discriminant: 0,
                         name: "Nil".into(),
-                        fields: vec![],
+                        payload: TypeRef(2),
                     },
                     Variant {
                         discriminant: 1,
                         name: "Cons".into(),
-                        fields: vec![
-                            Field {
-                                name: "0".into(),
-                                ty: TypeRef(1),
-                            },
-                            Field {
-                                name: "1".into(),
-                                ty: TypeRef(0),
-                            },
-                        ],
+                        payload: TypeRef(3),
                     },
                 ],
             },
             primitive(Primitive::I32),
+            strukt("Unit", vec![]),
+            strukt("Cons", vec![field("0", 1), field("1", 0)]),
         ])
     }
 
@@ -576,9 +574,19 @@ mod tests {
             opaque_versioned(1, 2, 3).fingerprint().to_hex(),
             GOLDEN_OPAQUE_1_2_3
         );
+        let map = TypeTable::new(vec![
+            TypeDescriptor::Map {
+                key: TypeRef(1),
+                value: TypeRef(2),
+            },
+            TypeDescriptor::Text,
+            primitive(Primitive::U32),
+        ]);
+        assert_eq!(map.fingerprint().to_hex(), GOLDEN_MAP);
     }
 
     const GOLDEN_POINT: &str = "0d91791f5827efadfa8150af9812fad6";
-    const GOLDEN_LIST: &str = "af12af0167771e03506952fff8a274fd";
+    const GOLDEN_LIST: &str = "abdbb8e6f2b104819c9b608dd77aaedf";
     const GOLDEN_OPAQUE_1_2_3: &str = "81a2a3d8b939f4f216a344cf10758953";
+    const GOLDEN_MAP: &str = "6a33dc4a1e560e465f7a50543f62c492";
 }

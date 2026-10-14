@@ -2,11 +2,11 @@
 //! links through which a value that changes size tells the values around
 //! it.
 //!
-//! A guard holds its value's region. A region knows its length, and how to
-//! find where it starts: a guard made on its own holds its start, relative
-//! to the nearest guard above it that was made together with its siblings
+//! A `Mut` holds its value's region. A region knows its length, and how to
+//! find where it starts: a `Mut` made on its own holds its start, relative
+//! to the nearest `Mut` above it that was made together with its siblings
 //! (or to the root), since nothing between the two can change size while it
-//! lives; a guard made together with its siblings by `parts` asks its
+//! lives; a `Mut` made together with its siblings by `parts` asks its
 //! parent's [`Node`] for its start at every write, since a sibling before it
 //! may have changed size meanwhile.
 //!
@@ -21,18 +21,18 @@ use kladde_store::{CutId, Error, WriteBackend};
 
 use crate::durable::Durable;
 
-/// What a guard records through: a [`WriteBackend`] that is cheap to copy,
-/// such as `&Store`, so that guards can hand it to their children and to
+/// What a `Mut` records through: a [`WriteBackend`] that is cheap to copy,
+/// such as `&Store`, so that `Mut`s can hand it to their children and to
 /// what outlives them, such as a [`Cut`](crate::Cut).
 pub trait Backend: WriteBackend + Copy {}
 
 impl<B: WriteBackend + Copy> Backend for B {}
 
 /// What a value whose children may change size keeps about them, in cells,
-/// so that a child's report can update it while sibling guards hold shared
+/// so that a child's report can update it while sibling `Mut`s hold shared
 /// references to it.
 ///
-/// A vector of variable-size elements keeps a tree of their sizes; a guard
+/// A vector of variable-size elements keeps a tree of their sizes; a `Mut`
 /// that hands out all of a struct's fields at once keeps their sizes in
 /// [`FieldSizes`].
 ///
@@ -56,7 +56,7 @@ pub trait Node {
 }
 
 /// The encoded sizes of a struct's fields, or of an enum variant's, kept by
-/// a guard that hands out guards for all of them at once, so that each
+/// a `Mut` that hands out `Mut`s for all of them at once, so that each
 /// finds its start however its siblings change size.
 ///
 /// See [`Node`] for an example.
@@ -168,12 +168,12 @@ impl Link<'_> {
 }
 
 /// The substring of the sequence that holds one value's encoding: what a
-/// value's guard writes through.
+/// value's `Mut` writes through.
 ///
 /// Every offset is relative to the region's start, and every method refuses
 /// one outside the region with [`Error::OutOfBounds`], recording nothing. A
 /// method that changes the region's size reports the change to the regions
-/// around it once the store has recorded it; a guard updates its in-memory
+/// around it once the store has recorded it; a `Mut` updates its in-memory
 /// value after its records succeeded, so that a failure leaves the value as
 /// it was.
 ///
@@ -319,11 +319,14 @@ impl<'r, B: Backend> Region<'r, B> {
         self.backend.move_range(start + from, len, start + to)
     }
 
-    /// Replaces the `removed` bytes at `at` with the bytes of `cut`.
-    pub fn paste(&self, at: u64, removed: u64, cut: CutId) -> Result<(), Error> {
+    /// Replaces the `removed` bytes at `at` with the bytes of `cut`, whose
+    /// encoding `bytes` is, as [`WriteBackend::paste`] does: writing none of
+    /// them while the cut's journal lasts, and `bytes` once it has been
+    /// folded.
+    pub fn paste(&self, at: u64, removed: u64, cut: CutId, bytes: &[u8]) -> Result<(), Error> {
         self.check(at, removed)?;
         let added = cut.len();
-        self.backend.paste(self.start() + at, removed, cut)?;
+        self.backend.paste(self.start() + at, removed, cut, bytes)?;
         let len = self.len();
         self.link.resized(len, len - removed + added);
         Ok(())
@@ -333,7 +336,7 @@ impl<'r, B: Backend> Region<'r, B> {
     ///
     /// If `f` fails, the store discards what it recorded, and is poisoned,
     /// since the regions around may have heard of size changes by then: a
-    /// guard checks what can fail before it opens a transaction, so that
+    /// `Mut` checks what can fail before it opens a transaction, so that
     /// only a broken invariant or the store's own failure gets here.
     pub fn transaction<R>(&self, f: impl FnOnce(&Self) -> Result<R, Error>) -> Result<R, Error> {
         let r = self.backend.atomically(|| f(self));
