@@ -42,6 +42,12 @@ pub trait Storage: Send {
     fn set_len(&mut self, len: u64) -> io::Result<()>;
     /// Makes everything written so far durable.
     fn sync(&mut self) -> io::Result<()>;
+    /// A second handle to the same bytes, which another thread may sync and
+    /// write through while this one writes elsewhere; `None` if there is
+    /// none, which keeps every flush on the caller's thread.
+    fn try_clone(&self) -> Option<Box<dyn Storage>> {
+        None
+    }
 }
 
 /// A [`Storage`] over a file on disk.
@@ -136,6 +142,11 @@ impl Storage for FileStorage {
 
     fn sync(&mut self) -> io::Result<()> {
         self.file.sync_data()
+    }
+
+    fn try_clone(&self) -> Option<Box<dyn Storage>> {
+        let file = self.file.try_clone().ok()?;
+        Some(Box::new(FileStorage { file }))
     }
 }
 
@@ -366,5 +377,9 @@ impl Storage for MemoryStorage {
             m.since_sync.clear();
         }
         Ok(())
+    }
+
+    fn try_clone(&self) -> Option<Box<dyn Storage>> {
+        Some(Box::new(self.clone()))
     }
 }

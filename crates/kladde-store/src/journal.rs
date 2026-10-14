@@ -536,6 +536,22 @@ pub fn decode_records(
     Ok(())
 }
 
+/// The records of a seal's transaction: the escape (a `Write` of no bytes
+/// at delta 0), escape 0, and the page where the next epoch's journal
+/// begins (`spec/journal.md#seals`).
+pub fn seal_payload(page: u32) -> Vec<u8> {
+    let mut out = vec![0x00, 0x00, 0x00];
+    kladde_varint::encode(page as u64, &mut out);
+    out
+}
+
+/// The page a transaction's records name if they are a seal.
+fn parse_seal(payload: &[u8]) -> Option<u32> {
+    let rest = payload.strip_prefix(&[0x00, 0x00, 0x00])?;
+    let (page, rest) = kladde_varint::decode(rest).ok()?;
+    (rest.is_empty() && page <= u32::MAX as u64).then_some(page as u32)
+}
+
 /// The CRC chain of the journal, seeded with its epoch.
 fn seeded_chain(epoch: u64) -> Crc32c {
     let mut c = Crc32c::new();
@@ -595,6 +611,12 @@ impl JournalWriter {
             recovered: true,
             ..JournalWriter::new(epoch, 0)
         }
+    }
+
+    /// Whether this is the journal of an earlier session, which nothing may
+    /// be appended to.
+    pub fn is_recovered(&self) -> bool {
+        self.recovered
     }
 
     /// Whether no transaction has been appended.
@@ -749,7 +771,7 @@ impl StreamReader<'_> {
 }
 
 /// Reads the valid prefix of the journal of epoch `epoch` starting at
-/// `first_page`.
+/// `first_page`, and of the journals of later epochs that seals lead to.
 pub fn recover(storage: &dyn Storage, epoch: u64, first_page: u32) -> Result<Recovered, Error> {
     let file_pages = storage.len()? / PAGE_SIZE as u64;
     let mut out = Recovered::default();
@@ -765,6 +787,9 @@ pub fn recover(storage: &dyn Storage, epoch: u64, first_page: u32) -> Result<Rec
         pages: vec![first_page],
     };
     storage.read_at(&mut r.buf[..], first_page as u64 * PAGE_SIZE as u64)?;
+    let mut epoch = epoch;
+    // The pages of the journals that seals ended, before the current one.
+    let mut sealed_pages: Vec<u32> = Vec::new();
     let mut valid_pages = 1;
     let mut cursor = 0u64;
     let mut cuts = DecodedCuts::new();
@@ -804,13 +829,33 @@ pub fn recover(storage: &dyn Storage, epoch: u64, first_page: u32) -> Result<Rec
         if !r.read(&mut crc, false)? || u32::from_le_bytes(crc) != expected {
             break;
         }
+        out.transactions += 1;
+        valid_pages = r.pages.len();
+        if let Some(next) = parse_seal(&payload) {
+            // The journal ends here, and the next epoch's begins at `next`,
+            // with a chain, a cursor and cuts of its own.
+            sealed_pages.extend_from_slice(&r.pages);
+            if next < 2 || next as u64 >= file_pages || sealed_pages.contains(&next) {
+                valid_pages = 0;
+                r.pages.clear();
+                break;
+            }
+            epoch += 1;
+            r.chain = seeded_chain(epoch);
+            r.pages = vec![next];
+            r.pos = 0;
+            storage.read_at(&mut r.buf[..], next as u64 * PAGE_SIZE as u64)?;
+            valid_pages = 1;
+            cursor = 0;
+            cuts = DecodedCuts::new();
+            continue;
+        }
         let at = out.records.end().at;
         decode_records(&payload, &mut cursor, &mut cuts, &mut out.records)?;
         out.records.mark_start(at);
-        out.transactions += 1;
-        valid_pages = r.pages.len();
     }
-    out.pages = r.pages[..valid_pages].to_vec();
+    out.pages = sealed_pages;
+    out.pages.extend_from_slice(&r.pages[..valid_pages]);
     Ok(out)
 }
 

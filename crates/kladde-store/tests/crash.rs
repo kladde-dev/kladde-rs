@@ -177,6 +177,62 @@ fn power_cuts_with_a_tiny_journal() {
     }
 }
 
+/// What survives when a flush's header is lost but the transactions
+/// appended after it are not: the image as of the flush's `fsync`, plus
+/// every later write but the header's.
+fn lost_header(opts: &Options) -> (Vec<u8>, Vec<u8>) {
+    let storage = MemoryStorage::with_crash_tracking();
+    let store = Store::create(Box::new(storage.clone()), opts.clone()).unwrap();
+    // Flushes that free pages, so that a later one has a reusable page for
+    // the next journal.
+    for i in 0..6u8 {
+        store.splice(0, store.len(), &vec![i; 3 * 4096]).unwrap();
+        store.flush().unwrap();
+    }
+    store.splice(0, 0, b"before").unwrap();
+    store.flush().unwrap();
+    store.splice(0, 0, b"after ").unwrap();
+    let mut expected = store.read_all().unwrap();
+    expected.splice(0..0, *b"after ");
+    // The first write after the flush's `fsync` is its header.
+    let image = storage.crash_image(|i| i != 0);
+    let store = Store::open(Box::new(MemoryStorage::from_image(image)), opts.clone()).unwrap();
+    store.check();
+    (store.read_all().unwrap(), expected)
+}
+
+/// Flushes that mutations trigger sync and write their header on a thread
+/// of their own, while the next transactions are appended: power cuts at
+/// every interleaving of the two must still land on a transaction boundary
+/// no earlier than the last flush that returned.
+#[test]
+fn power_cuts_with_commits_on_a_worker() {
+    let opts = Options {
+        journal_budget_pages: 1,
+        sync_on_worker: true,
+        ..Default::default()
+    };
+    for seed in 1..150 {
+        run(seed, &opts, true);
+    }
+}
+
+#[test]
+fn a_seal_leads_recovery_to_what_was_appended_after_a_lost_header() {
+    let (found, expected) = lost_header(&Options::default());
+    assert_eq!(found, expected);
+}
+
+#[test]
+fn without_a_seal_what_was_appended_after_a_lost_header_is_lost() {
+    let opts = Options {
+        seal: false,
+        ..Default::default()
+    };
+    let (found, expected) = lost_header(&opts);
+    assert_eq!(found, expected[6..]);
+}
+
 /// With a journal of one page, batches are cut and flushed often, and a
 /// splice of two pages is flushed before and after.
 #[test]

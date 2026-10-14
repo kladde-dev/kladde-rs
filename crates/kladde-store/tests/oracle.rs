@@ -238,6 +238,29 @@ fn without_consolidation() {
 }
 
 #[test]
+fn with_commits_on_a_worker() {
+    let opts = Options {
+        journal_budget_pages: 1,
+        sync_on_worker: true,
+        ..Default::default()
+    };
+    let mut on_worker = 0;
+    for seed in 1..30 {
+        let mut rng = Rng((seed * 0x9E37_79B9) | 1);
+        let mut w = World::new(opts.clone());
+        for _ in 0..300 {
+            w.step(&mut rng, 50_000);
+            on_worker += w.store.stats().commits_on_worker;
+        }
+        w.store.flush().unwrap();
+        w.verify(&format!("seed {seed}, at the end"));
+        w.reopen();
+        w.verify(&format!("seed {seed}, reopened at the end"));
+    }
+    assert!(on_worker > 0, "no flush handed its commit to a worker");
+}
+
+#[test]
 fn with_a_tiny_journal() {
     let opts = Options {
         journal_budget_pages: 1,

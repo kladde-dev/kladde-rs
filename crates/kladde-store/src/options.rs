@@ -21,6 +21,17 @@ pub struct Options {
     /// transaction too large for them on its own takes more, and a flush
     /// follows it at once.
     pub journal_budget_pages: u32,
+    /// Whether a flush seals the journal it folds, naming in it where the
+    /// next journal begins, so that recovery reaches the next journal from
+    /// either header (`spec/journal.md#seals`).
+    pub seal: bool,
+    /// Whether a flush that a mutation triggers hands its `fsync` and its
+    /// header write to a thread of its own, so that the mutation returns
+    /// without waiting for the disk, and the next ones append to the next
+    /// journal meanwhile. It does so only after sealing, and only with a
+    /// storage that [`Storage::try_clone`](crate::Storage::try_clone)
+    /// supports; an explicit flush, a read, and the next flush wait for it.
+    pub sync_on_worker: bool,
     /// New runs of bytes up to this many bytes are kept inline in their
     /// span's entry, up to the format's ceiling of 126 bytes.
     pub inline_threshold: u32,
@@ -68,6 +79,8 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             journal_budget_pages: 256,
+            seal: true,
+            sync_on_worker: false,
             inline_threshold: 64,
             rewrite_below: 64,
             span_min: 64,

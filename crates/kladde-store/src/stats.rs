@@ -63,6 +63,9 @@ pub struct Stats {
     /// again.
     pub walk_merges: u64,
     pub walk_merge_bytes: u64,
+    /// Flushes whose `fsync` and header write ran on a thread of their own
+    /// ([`Options::sync_on_worker`](crate::Options::sync_on_worker)).
+    pub commits_on_worker: u64,
 
     // A snapshot of the file, filled when the stats are read.
     /// The file's length in pages.

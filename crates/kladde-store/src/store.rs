@@ -72,6 +72,23 @@ impl Tx {
     }
 }
 
+/// A commit's `fsync` and header write, on a thread of their own
+/// (`impl/transactions-and-batches.md#a-flush-off-the-callers-thread`).
+pub(crate) struct PendingCommit {
+    pub worker: std::thread::JoinHandle<std::io::Result<()>>,
+    /// The pages the commit before it freed, which its `fsync` makes
+    /// reusable.
+    pub release: Vec<u32>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // The file must not be left with a header half written by a thread
+        // nobody waits for.
+        let _ = self.join_pending();
+    }
+}
+
 pub(crate) struct Inner {
     pub storage: Box<dyn Storage>,
     pub opts: Options,
@@ -106,6 +123,15 @@ pub(crate) struct Inner {
     /// that made each, with the number of the paste's record.
     pub pasted: BTreeMap<u64, u64>,
     pub first_flush: bool,
+    /// The page where the next journal begins, which the seal of the
+    /// journal being folded named; the flush's header names it too.
+    pub sealed_next: Option<u32>,
+    /// A flush's `fsync` and header write, running on a thread of their own,
+    /// and the pages that become reusable once they are done.
+    pub pending: Option<PendingCommit>,
+    /// Whether the flush running was asked for, and so waits for its
+    /// commit, rather than triggered by a mutation.
+    pub explicit_flush: bool,
     /// Data pages read at open, which decoding the sequence reads from;
     /// dropped by `end_load`.
     pub mirror: IdMap<Box<PageBuf>>,
@@ -243,6 +269,9 @@ impl Store {
             journal_cuts: JournalCuts::default(),
             pasted: BTreeMap::new(),
             first_flush: true,
+            sealed_next: None,
+            pending: None,
+            explicit_flush: false,
             mirror: loaded.mirror,
             cache: IdMap::default(),
             cons: Default::default(),

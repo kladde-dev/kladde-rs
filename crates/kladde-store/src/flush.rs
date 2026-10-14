@@ -13,7 +13,8 @@ use crate::hash::IdSet;
 use crate::journal::{Cursor, JournalCuts};
 use crate::page::{encode_page, new_page, seal_page, PageBuf};
 use crate::state::*;
-use crate::store::{take_page, Inner, Tx};
+use crate::storage::Storage;
+use crate::store::{take_page, Inner, PendingCommit, Tx};
 use crate::treap::NIL;
 
 /// A data page the flush fills.
@@ -80,7 +81,40 @@ impl Inner {
         };
         let committed = self.append(committed, ready)?;
         self.tx = self.tx.with_committed(committed);
-        self.fold_journal(committed)
+        // An explicit flush returns once what it folded is durable.
+        self.explicit_flush = true;
+        let r = self.fold_journal(committed);
+        self.explicit_flush = false;
+        r?;
+        self.join_pending()
+    }
+
+    /// Waits for the commit on its own thread, if one is running, and makes
+    /// the pages it waited to free reusable. A failure poisons the store.
+    pub(crate) fn join_pending(&mut self) -> Result<(), Error> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(());
+        };
+        match pending.worker.join() {
+            Ok(Ok(())) => {
+                for p in pending.release {
+                    debug_assert_eq!(self.state.pages[p as usize], Page::Fallback);
+                    self.state.pages[p as usize] = Page::Reusable;
+                    self.ready.insert(p);
+                }
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                self.poisoned = true;
+                Err(e.into())
+            }
+            Err(_) => {
+                self.poisoned = true;
+                Err(Error::Io(std::io::Error::other(
+                    "the commit's thread panicked",
+                )))
+            }
+        }
     }
 
     /// Flushes as [`flush_now`](Self::flush_now) does if the journal pages,
@@ -130,7 +164,51 @@ impl Inner {
         }
     }
 
+    /// Ends the journal with a seal that names the page where the next
+    /// journal begins (`spec/journal.md#seals`), which the flush's header
+    /// names too. The page is taken now, so that the flush's own pages
+    /// cannot be it, and a session's first flush clears it before the seal
+    /// names it (`spec/journal.md#the-start-of-a-session`).
+    ///
+    /// Without a reusable page it does not seal: a page added at the end
+    /// now would lie below every page the flush adds after it, and keep the
+    /// file from being truncated to them.
+    fn seal(&mut self) -> Result<(), Error> {
+        let Some(jp) = self.ready.pop_first() else {
+            return Ok(());
+        };
+        if self.first_flush {
+            self.storage
+                .write_at(&new_page()[..], jp as u64 * PAGE_SIZE as u64)?;
+        }
+        self.state.pages[jp as usize] = Page::Journal;
+        let payload = crate::journal::seal_payload(jp);
+        let Inner {
+            storage,
+            journal,
+            ready,
+            state,
+            file_pages,
+            stats,
+            ..
+        } = self;
+        let mut alloc = |s: &mut dyn Storage| -> Result<u32, Error> {
+            take_page(ready, state, file_pages, s, stats, Page::Journal)
+        };
+        let before = journal.bytes;
+        journal.append(&payload, &mut **storage, &mut alloc)?;
+        self.stats.journal_bytes += self.journal.bytes - before;
+        self.sealed_next = Some(jp);
+        Ok(())
+    }
+
     fn flush_inner(&mut self, committed: Cursor) -> Result<(), Error> {
+        // One commit at a time: the pages the last one freed become
+        // reusable only through its `fsync`.
+        self.join_pending()?;
+        if self.opts.seal && !self.journal.is_recovered() && !self.journal.is_empty() {
+            self.seal()?;
+        }
         let e = self.epoch + 1;
         self.state.flush_epoch = e;
         let mut f = Flush::default();
@@ -1252,10 +1330,15 @@ impl Inner {
     // ---------------------------------------------------------------- commit
 
     fn commit(&mut self, e: u64, out: Output) -> Result<(), Error> {
-        // The next journal starts in the lowest reusable page, or past the end.
-        let jp = match self.ready.pop_first() {
+        // The next journal starts where the seal said, or else in the lowest
+        // reusable page, or past the end.
+        let sealed = self.sealed_next.take();
+        let jp = match sealed {
             Some(p) => p,
-            None => self.file_pages,
+            None => match self.ready.pop_first() {
+                Some(p) => p,
+                None => self.file_pages,
+            },
         };
         let slot = (e % 2) as u32;
         if !matches!(self.state.pages[slot as usize], Page::Filling(_)) {
@@ -1286,12 +1369,12 @@ impl Inner {
             self.stats.table_pages_written += 1;
         }
         // A session's first flush clears the page it names for the next
-        // journal (`spec/journal.md#the-start-of-a-session`).
-        if self.first_flush && jp < self.file_pages {
+        // journal (`spec/journal.md#the-start-of-a-session`), unless the
+        // seal did already.
+        if self.first_flush && sealed.is_none() && jp < self.file_pages {
             self.storage
                 .write_at(&new_page()[..], jp as u64 * PAGE_SIZE as u64)?;
         }
-        self.storage.sync()?;
         self.header.journal_pointer = jp;
         self.header.format_version = FORMAT_VERSION;
         self.header.min_reader_version = MIN_READER_VERSION;
@@ -1306,8 +1389,24 @@ impl Inner {
             e,
             &out.header_content,
         );
-        self.storage
-            .write_at(&hbuf[..], slot as u64 * PAGE_SIZE as u64)?;
+        // The `fsync` and the header write, on a thread of their own when a
+        // mutation triggered the flush and the journal is sealed: the next
+        // journal is reachable through the seal whichever header governs,
+        // so appends may go on meanwhile.
+        let at = slot as u64 * PAGE_SIZE as u64;
+        let deferred = sealed.is_some() && self.opts.sync_on_worker && !self.explicit_flush;
+        let mut worker = None;
+        if let Some(mut s) = deferred.then(|| self.storage.try_clone()).flatten() {
+            let page = hbuf.clone();
+            self.stats.commits_on_worker += 1;
+            worker = Some(std::thread::spawn(move || {
+                s.sync()?;
+                s.write_at(&page[..], at)
+            }));
+        } else {
+            self.storage.sync()?;
+            self.storage.write_at(&hbuf[..], at)?;
+        }
         self.stats.headers_written += 1;
 
         // The pages the flush filled are in the world now.
@@ -1318,11 +1417,19 @@ impl Inner {
             }
         }
 
-        // Bookkeeping: the rotation of reusable pages first.
-        for p in std::mem::take(&mut self.retiring) {
-            debug_assert_eq!(self.state.pages[p as usize], Page::Fallback);
-            self.state.pages[p as usize] = Page::Reusable;
-            self.ready.insert(p);
+        // Bookkeeping: the rotation of reusable pages first. The pages the
+        // commit before freed are reusable once this commit's `fsync` is
+        // done, which a worker reports when it joins.
+        let release = std::mem::take(&mut self.retiring);
+        match worker {
+            Some(worker) => self.pending = Some(PendingCommit { worker, release }),
+            None => {
+                for p in release {
+                    debug_assert_eq!(self.state.pages[p as usize], Page::Fallback);
+                    self.state.pages[p as usize] = Page::Reusable;
+                    self.ready.insert(p);
+                }
+            }
         }
         let mut retiring = Vec::new();
         let candidates: Vec<u32> = self.state.dropped_candidates.drain().collect();
@@ -1371,7 +1478,10 @@ impl Inner {
             self.state.rebucket(p);
         }
         if jp < self.file_pages {
-            debug_assert_eq!(self.state.pages[jp as usize], Page::Reusable);
+            debug_assert!(
+                self.state.pages[jp as usize] == Page::Reusable
+                    || (sealed.is_some() && self.state.pages[jp as usize] == Page::Journal)
+            );
             self.state.pages[jp as usize] = Page::Journal;
         }
         self.journal = crate::journal::JournalWriter::new(e + 1, jp);
