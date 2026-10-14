@@ -207,7 +207,9 @@ fn main() {
             "--variant" => variant = Some(value::<String>(&mut args, "--variant")),
             "--focus" => focus = value(&mut args, "--focus"),
             "--focus-moves" => focus_moves = value(&mut args, "--focus-moves"),
-            "--journal-budget" => opts.journal_budget_pages = value(&mut args, "--journal-budget"),
+            "--journal-budget" => {
+                opts.journal_budget_pages = Some(value(&mut args, "--journal-budget"))
+            }
             "--span-min" => opts.span_min = value(&mut args, "--span-min"),
             "--rewrite-below" => opts.rewrite_below = value(&mut args, "--rewrite-below"),
             "--churn-floor" => opts.churn_floor = value(&mut args, "--churn-floor"),

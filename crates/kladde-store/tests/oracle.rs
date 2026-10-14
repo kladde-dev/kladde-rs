@@ -240,7 +240,7 @@ fn without_consolidation() {
 #[test]
 fn with_commits_on_a_worker() {
     let opts = Options {
-        journal_budget_pages: 1,
+        journal_budget_pages: Some(1),
         sync_on_worker: true,
         ..Default::default()
     };
@@ -263,7 +263,7 @@ fn with_commits_on_a_worker() {
 #[test]
 fn with_a_tiny_journal() {
     let opts = Options {
-        journal_budget_pages: 1,
+        journal_budget_pages: Some(1),
         ..Default::default()
     };
     for seed in 1..30 {

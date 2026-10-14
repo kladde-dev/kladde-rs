@@ -291,7 +291,11 @@ fn moving_an_element_writes_none_of_its_bytes() {
     let mut k = Kladde::create_in(
         Box::new(storage.clone()),
         DurableVec::from(vec![big, "a".into(), "b".into()]),
-        Options::default(),
+        // Consolidation would rewrite pages for reasons of its own.
+        Options {
+            consolidate: false,
+            ..Default::default()
+        },
     )
     .unwrap();
     let before = k.stats();

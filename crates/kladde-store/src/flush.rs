@@ -134,7 +134,7 @@ impl Inner {
             } => (committed, ready),
         };
         let held = self.journal.bytes + (ready.bytes - committed.bytes);
-        let budget = self.opts.journal_budget_pages as f64 * JOURNAL_STREAM as f64;
+        let budget = self.opts.journal_budget(self.len) as f64 * JOURNAL_STREAM as f64;
         if (held as f64) < fraction * budget {
             return Ok(false);
         }

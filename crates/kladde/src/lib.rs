@@ -177,7 +177,7 @@ impl<T: Durable + 'static> Kladde<T> {
     /// ```
     /// use kladde::{Kladde, MemoryStorage, Options};
     ///
-    /// let opts = Options { journal_budget_pages: 8, ..Default::default() };
+    /// let opts = Options { journal_budget_pages: Some(8), ..Default::default() };
     /// let k = Kladde::create_in(Box::new(MemoryStorage::new()), 7u8, opts)?;
     /// assert_eq!(*k.get(), 7);
     /// # Ok::<(), kladde::Error>(())

@@ -171,7 +171,7 @@ fn power_cuts_with_consolidation() {
 #[test]
 fn power_cuts_with_a_tiny_journal() {
     let opts = Options {
-        journal_budget_pages: 1,
+        journal_budget_pages: Some(1),
         ..Default::default()
     };
     for seed in 1..150 {
@@ -210,7 +210,7 @@ fn lost_header(opts: &Options) -> (Vec<u8>, Vec<u8>) {
 #[test]
 fn power_cuts_with_commits_on_a_worker() {
     let opts = Options {
-        journal_budget_pages: 1,
+        journal_budget_pages: Some(1),
         sync_on_worker: true,
         ..Default::default()
     };
@@ -240,7 +240,7 @@ fn without_a_seal_what_was_appended_after_a_lost_header_is_lost() {
 #[test]
 fn power_cuts_with_batches_cuts_and_overlong_splices_in_a_tiny_journal() {
     let opts = Options {
-        journal_budget_pages: 1,
+        journal_budget_pages: Some(1),
         ..Default::default()
     };
     for seed in 1..150 {

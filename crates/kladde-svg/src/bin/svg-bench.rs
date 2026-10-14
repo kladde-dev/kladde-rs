@@ -638,10 +638,11 @@ fn main() {
             "--only" => only = Some(args.next().expect("--only KIND")),
             "--variant" => variant = Some(args.next().expect("--variant NAME")),
             "--journal-budget" => {
-                opts.journal_budget_pages = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .expect("--journal-budget PAGES")
+                opts.journal_budget_pages = Some(
+                    args.next()
+                        .and_then(|s| s.parse().ok())
+                        .expect("--journal-budget PAGES"),
+                )
             }
             "--span-min" => {
                 opts.span_min = args

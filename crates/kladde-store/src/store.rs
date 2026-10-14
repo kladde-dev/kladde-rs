@@ -525,11 +525,11 @@ impl Store {
     /// use kladde_store::{MemoryStorage, Store, WriteBackend};
     ///
     /// let store = Store::create(Box::new(MemoryStorage::new()), Default::default())?;
-    /// store.splice(0, 0, &[1; 10_000])?;
+    /// store.splice(0, 0, &[1; 4_000])?;
     /// store.flush()?;
     /// let s = store.stats();
     /// assert_eq!(s.flushes, 1);
-    /// assert_eq!(s.sequence_bytes, 10_000);
+    /// assert_eq!(s.sequence_bytes, 4_000);
     /// # Ok::<(), kladde_store::Error>(())
     /// ```
     pub fn stats(&self) -> Stats {
@@ -806,7 +806,7 @@ impl Store {
                     committed,
                 } => {
                     i.append(committed, i.ops.end())?;
-                    if i.journal.over_budget(i.opts.journal_budget_pages) {
+                    if i.journal.over_budget(i.opts.journal_budget(i.len)) {
                         i.fold_journal(i.ops.end())?;
                     }
                     i.tx = Tx::Immediate;
@@ -910,7 +910,7 @@ impl Inner {
     /// transaction, and `ops[committed..ready]` is a batch's ready run, or
     /// empty outside a batch. Returns the committed cursor after.
     fn close(&mut self, committed: Cursor, ready: Cursor, in_batch: bool) -> Result<Cursor, Error> {
-        let (budget, end) = (self.opts.journal_budget_pages, self.ops.end());
+        let (budget, end) = (self.opts.journal_budget(self.len), self.ops.end());
         if ready == end {
             return Ok(committed);
         }

@@ -388,10 +388,11 @@ fn main() -> ExitCode {
             "--csv" => csv = PathBuf::from(args.next().expect("--csv needs a path")),
             "--render" => render = true,
             "--journal-budget" => {
-                opts.journal_budget_pages = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .expect("--journal-budget PAGES")
+                opts.journal_budget_pages = Some(
+                    args.next()
+                        .and_then(|s| s.parse().ok())
+                        .expect("--journal-budget PAGES"),
+                )
             }
             _ => paths.push(PathBuf::from(arg)),
         }
