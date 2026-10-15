@@ -70,23 +70,36 @@ impl Inner {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        let end = self.ops.end();
-        let (committed, ready) = match self.tx {
-            Tx::Immediate => (end, end),
-            Tx::InBatch { committed, .. } => (committed, end),
-            Tx::InTransaction { committed, .. } => (committed, committed),
-            Tx::InTxInBatch {
-                committed, ready, ..
-            } => (committed, ready),
-        };
-        let committed = self.append(committed, ready)?;
-        self.tx = self.tx.with_committed(committed);
+        let committed = self.append_ready()?;
         // An explicit flush returns once what it folded is durable.
         self.explicit_flush = true;
         let r = self.fold_journal(committed);
         self.explicit_flush = false;
         r?;
         self.join_pending()
+    }
+
+    /// The committed cursor, and the end of the operations outside any open
+    /// transaction: `ops[committed..ready]` is a batch's ready run, or empty.
+    pub(crate) fn closed(&self) -> (Cursor, Cursor) {
+        let end = self.ops.end();
+        match self.tx {
+            Tx::Immediate => (end, end),
+            Tx::InBatch { committed, .. } => (committed, end),
+            Tx::InTransaction { committed, .. } => (committed, committed),
+            Tx::InTxInBatch {
+                committed, ready, ..
+            } => (committed, ready),
+        }
+    }
+
+    /// Appends a batch's ready run to the journal, and returns the committed
+    /// cursor after.
+    pub(crate) fn append_ready(&mut self) -> Result<Cursor, Error> {
+        let (committed, ready) = self.closed();
+        let committed = self.append(committed, ready)?;
+        self.tx = self.tx.with_committed(committed);
+        Ok(committed)
     }
 
     /// Waits for the commit on its own thread, if one is running, and makes
@@ -124,15 +137,7 @@ impl Inner {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        let end = self.ops.end();
-        let (committed, ready) = match self.tx {
-            Tx::Immediate => (end, end),
-            Tx::InBatch { committed, .. } => (committed, end),
-            Tx::InTransaction { committed, .. } => (committed, committed),
-            Tx::InTxInBatch {
-                committed, ready, ..
-            } => (committed, ready),
-        };
+        let (committed, ready) = self.closed();
         let held = self.journal.bytes + (ready.bytes - committed.bytes);
         let budget = self.opts.journal_budget(self.len) as f64 * JOURNAL_STREAM as f64;
         if (held as f64) < fraction * budget {

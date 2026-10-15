@@ -336,6 +336,34 @@ impl<T: Durable + 'static> Kladde<T> {
         self.store.close()
     }
 
+    /// Closes the file by replacing it with a fully consolidated copy: the
+    /// smallest file that holds the value, with an empty journal.
+    ///
+    /// Writes the copy next to the file, syncs it, and renames it over the
+    /// file, so a crash at any point leaves either file, each with every
+    /// mutation that returned `Ok`. Takes time linear in the value's encoded
+    /// size, and holds one page of it in memory at a time; an application
+    /// calls it when the user closes a document, and [`close`](Self::close)
+    /// or nothing when it must be quick.
+    ///
+    /// ```
+    /// use kladde::Kladde;
+    ///
+    /// let path = std::env::temp_dir().join("kladde-close-consolidated-doc-example");
+    /// let mut k = Kladde::create(&path, (0u32, false))?;
+    /// for i in 0..1000 {
+    ///     k.get_mut().set((i, i % 2 == 0))?;
+    /// }
+    /// k.close_consolidated()?;
+    /// let k = Kladde::<(u32, bool)>::open(&path)?;
+    /// assert_eq!(*k.get(), (999, false));
+    /// # std::fs::remove_file(&path)?;
+    /// # Ok::<(), kladde::Error>(())
+    /// ```
+    pub fn close_consolidated(self) -> Result<()> {
+        self.store.close_consolidated()
+    }
+
     /// Opens a transaction: the mutations made through it reach the journal
     /// together when it is [committed](Transaction::commit), and a crash keeps
     /// all of them or none.

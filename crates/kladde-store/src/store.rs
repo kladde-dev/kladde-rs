@@ -373,6 +373,42 @@ impl Store {
         })
     }
 
+    /// Closes the file by replacing it with a fully consolidated copy of
+    /// itself: the smallest file that holds its content, with an empty
+    /// journal.
+    ///
+    /// Writes the schema, the sequence and the private chain back to back
+    /// into full data pages of a new storage that
+    /// [`Storage::sibling`] makes, syncs it, and puts it in the old one's
+    /// place with [`Storage::replace_with`]; the operations of an open
+    /// transaction are discarded. It takes time linear in the file's content,
+    /// rather than in what changed since the last flush, and holds one page of
+    /// it in memory at a time. A crash or a failure at any point leaves the
+    /// old file, or the new one, with everything recorded before the call.
+    /// Fails with an [`Error::Io`] of kind [`std::io::ErrorKind::Unsupported`]
+    /// if the storage cannot make a sibling, as
+    /// [`FileStorage`](crate::FileStorage) and
+    /// [`MemoryStorage`](crate::MemoryStorage) can.
+    ///
+    /// ```
+    /// use kladde_store::{MemoryStorage, Store, Storage, WriteBackend};
+    ///
+    /// let storage = MemoryStorage::new();
+    /// let store = Store::create(Box::new(storage.clone()), Default::default())?;
+    /// for i in 0..1000u64 {
+    ///     store.splice(i, 0, b"x")?;
+    /// }
+    /// store.close_consolidated()?;
+    /// // A header, a blank header slot, and one data page.
+    /// assert_eq!(storage.len()?, 3 * 4096);
+    /// let store = Store::open(Box::new(storage), Default::default())?;
+    /// assert_eq!(store.read_all()?, [b'x'; 1000]);
+    /// # Ok::<(), kladde_store::Error>(())
+    /// ```
+    pub fn close_consolidated(self) -> Result<(), Error> {
+        self.with(|i| i.close_consolidated())
+    }
+
     /// The schema chain's content as of the last flush, or the content
     /// [`set_schema`](Self::set_schema) gave it since.
     ///

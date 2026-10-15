@@ -3,9 +3,10 @@
 //! The store addresses its storage by byte offset and never relies on a shared
 //! file cursor, so every operation is positional.
 
+use std::any::Any;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// The byte interface a store reads and writes through.
@@ -30,7 +31,7 @@ use std::sync::{Arc, Mutex};
 // `len` is a fallible file length, not a collection's, and a kladde file is
 // never empty: an `is_empty` would have nothing to say.
 #[allow(clippy::len_without_is_empty)]
-pub trait Storage: Send {
+pub trait Storage: Send + Any {
     /// The current length in bytes.
     fn len(&self) -> io::Result<u64>;
     /// Reads exactly `buf.len()` bytes at `offset`, which must lie within the
@@ -48,6 +49,50 @@ pub trait Storage: Send {
     fn try_clone(&self) -> Option<Box<dyn Storage>> {
         None
     }
+    /// A new, empty storage beside this one, for
+    /// [`replace_with`](Storage::replace_with) to put in its place once it is
+    /// written and synced. Dropping it instead discards it.
+    ///
+    /// Fails with [`io::ErrorKind::Unsupported`] unless the implementation
+    /// provides it; [`FileStorage`] makes a hidden temporary file in the same
+    /// directory.
+    ///
+    /// ```
+    /// use kladde_store::{MemoryStorage, Storage};
+    ///
+    /// let mut s = MemoryStorage::new();
+    /// let mut fresh = s.sibling()?;
+    /// fresh.set_len(3)?;
+    /// fresh.write_at(b"new", 0)?;
+    /// fresh.sync()?;
+    /// s.replace_with(fresh)?;
+    /// assert_eq!(s.image(), b"new");
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    fn sibling(&self) -> io::Result<Box<dyn Storage>> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Puts `sibling`, which [`sibling`](Storage::sibling) made and which has
+    /// been synced since its last write, in this storage's place; this
+    /// storage reads and writes the sibling's bytes afterwards.
+    ///
+    /// The replacement is atomic: after a power cut, the storage holds either
+    /// all of its old bytes or all of the sibling's. Fails with
+    /// [`io::ErrorKind::InvalidInput`] if `sibling` is of another type, and
+    /// with [`io::ErrorKind::Unsupported`] unless the implementation provides
+    /// it. See [`sibling`](Storage::sibling) for an example.
+    fn replace_with(&mut self, sibling: Box<dyn Storage>) -> io::Result<()> {
+        drop(sibling);
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// The error of a [`Storage::replace_with`] given a sibling of another type.
+fn foreign_sibling() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "a sibling of another kind of storage",
+    )
 }
 
 /// A [`Storage`] over a file on disk.
@@ -73,13 +118,21 @@ pub trait Storage: Send {
 #[derive(Debug)]
 pub struct FileStorage {
     file: File,
+    path: PathBuf,
+    /// Whether this is a sibling that no `replace_with` took yet, whose file
+    /// a drop removes.
+    temporary: bool,
 }
 
 impl FileStorage {
     /// Opens an existing file for reading and writing.
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        Ok(FileStorage { file })
+        Ok(FileStorage {
+            file,
+            path: path.to_path_buf(),
+            temporary: false,
+        })
     }
 
     /// Creates a file, truncating it if it exists.
@@ -90,8 +143,32 @@ impl FileStorage {
             .create(true)
             .truncate(true)
             .open(path)?;
-        Ok(FileStorage { file })
+        Ok(FileStorage {
+            file,
+            path: path.to_path_buf(),
+            temporary: false,
+        })
     }
+}
+
+impl Drop for FileStorage {
+    fn drop(&mut self) {
+        if self.temporary {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Makes a rename in `dir` durable.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+/// Makes a rename in `dir` durable: the rename itself is, on Windows.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 impl Storage for FileStorage {
@@ -146,7 +223,59 @@ impl Storage for FileStorage {
 
     fn try_clone(&self) -> Option<Box<dyn Storage>> {
         let file = self.file.try_clone().ok()?;
-        Some(Box::new(FileStorage { file }))
+        Some(Box::new(FileStorage {
+            file,
+            path: self.path.clone(),
+            temporary: false,
+        }))
+    }
+
+    fn sibling(&self) -> io::Result<Box<dyn Storage>> {
+        let name = self
+            .path
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a path without a name"))?
+            .to_string_lossy();
+        let mut n = 0u32;
+        loop {
+            let mut temp = format!(".{name}.{}", std::process::id());
+            if n > 0 {
+                temp += &format!(".{n}");
+            }
+            let path = self.path.with_file_name(temp + ".tmp");
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Ok(Box::new(FileStorage {
+                        file,
+                        path,
+                        temporary: true,
+                    }))
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 100 => n += 1,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn replace_with(&mut self, sibling: Box<dyn Storage>) -> io::Result<()> {
+        let sibling: Box<dyn Any> = sibling;
+        let mut sibling = sibling
+            .downcast::<FileStorage>()
+            .map_err(|_| foreign_sibling())?;
+        std::fs::rename(&sibling.path, &self.path)?;
+        sibling.temporary = false;
+        let dir = match self.path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        };
+        sync_dir(dir)?;
+        std::mem::swap(&mut self.file, &mut sibling.file);
+        Ok(())
     }
 }
 
@@ -381,5 +510,27 @@ impl Storage for MemoryStorage {
 
     fn try_clone(&self) -> Option<Box<dyn Storage>> {
         Some(Box::new(self.clone()))
+    }
+
+    fn sibling(&self) -> io::Result<Box<dyn Storage>> {
+        Ok(Box::new(MemoryStorage::new()))
+    }
+
+    /// Takes the sibling's bytes as this storage's durable state, which every
+    /// clone of it then shares.
+    fn replace_with(&mut self, sibling: Box<dyn Storage>) -> io::Result<()> {
+        let sibling: Box<dyn Any> = sibling;
+        let sibling = sibling
+            .downcast::<MemoryStorage>()
+            .map_err(|_| foreign_sibling())?;
+        let bytes = std::mem::take(&mut sibling.inner.lock().unwrap().current);
+        let mut m = self.inner.lock().unwrap();
+        m.dead()?;
+        if m.track {
+            m.durable = bytes.clone();
+            m.since_sync.clear();
+        }
+        m.current = bytes;
+        Ok(())
     }
 }

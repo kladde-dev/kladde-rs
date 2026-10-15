@@ -24,6 +24,7 @@
 //! ```
 
 mod backend;
+mod compact;
 mod consolidate;
 mod consts;
 mod crc;
