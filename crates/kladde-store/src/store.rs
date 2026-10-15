@@ -1064,6 +1064,14 @@ impl Inner {
                     if left < t {
                         break;
                     }
+                    // The last reusable page is left to the seal of the flush
+                    // that a large transaction brings on: without one, that
+                    // flush would not seal, and could not commit on a worker.
+                    let spare = if self.ready.len() == 1 {
+                        self.ready.pop_first()
+                    } else {
+                        None
+                    };
                     let p = take_page(
                         &mut self.ready,
                         &mut self.state,
@@ -1071,7 +1079,9 @@ impl Inner {
                         &mut *self.storage,
                         &mut self.stats,
                         Page::Journal,
-                    )?;
+                    );
+                    self.ready.extend(spare);
+                    let p = p?;
                     self.journal.payload.push(p);
                     self.journal.open = Some((p, new_page(), 0));
                     continue;

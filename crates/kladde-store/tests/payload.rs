@@ -96,19 +96,19 @@ fn a_bit_flip_in_a_payload_page_drops_its_transaction() {
     let before = content(10_000, 5);
     store.splice(0, 0, &before).unwrap();
     store.flush().unwrap();
-    let pages_before = storage.len().unwrap() / PAGE;
-    store.splice(0, 0, &content(5_000, 6)).unwrap();
+    let later = content(5_000, 6);
+    store.splice(0, 0, &later).unwrap();
     drop(store);
-    // The payload pages are the ones the file grew by, or reused ones; find
-    // the page holding the new bytes and flip a bit in its content.
+    // The payload page is the data page whose content starts with the new
+    // bytes; flip a bit in its content.
     let mut image = storage.image();
-    let needle = content(5_000, 6);
-    let at = image
-        .windows(64)
-        .position(|w| w == &needle[..64])
-        .expect("the payload is in the file");
-    image[at + 10] ^= 1;
-    assert!((at as u64 / PAGE) < pages_before + 3);
+    let page = (0..image.len() / PAGE as usize)
+        .find(|&p| {
+            let at = p * PAGE as usize;
+            image[at] == 0x02 && image[at + 11..at + 11 + 64] == later[..64]
+        })
+        .expect("the payload page is in the file");
+    image[page * PAGE as usize + 11 + 10] ^= 1;
     let store = Store::open(
         Box::new(MemoryStorage::from_image(image)),
         Options::default(),
