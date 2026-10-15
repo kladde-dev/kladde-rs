@@ -10,6 +10,7 @@ members = [
     "crates/kladde-persist",
     "crates/kladde-bench",
     "crates/kladde-svg",
+    "crates/kladde-inspect",
 ]
 
 [workspace.package]

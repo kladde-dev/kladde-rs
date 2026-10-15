@@ -26,7 +26,7 @@ pub(crate) struct Sizes {
 }
 
 fn lowbit(k: usize) -> usize {
-    k & k.wrapping_neg()
+    k.isolate_lowest_one()
 }
 
 fn narrow(n: u64) -> u32 {

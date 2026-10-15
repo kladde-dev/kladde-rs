@@ -716,8 +716,12 @@ pub struct Recovered {
     /// The records of the complete transactions, in order, each
     /// transaction's start marked.
     pub records: Records,
-    /// How many complete transactions there were.
+    /// How many complete transactions there were, seals included.
     pub transactions: usize,
+    /// How many of them were seals.
+    pub seals: usize,
+    /// The stream bytes the complete transactions take, framing included.
+    pub stream_bytes: u64,
     /// The pages the valid part of the journal occupies.
     pub pages: Vec<u32>,
 }
@@ -830,8 +834,10 @@ pub fn recover(storage: &dyn Storage, epoch: u64, first_page: u32) -> Result<Rec
             break;
         }
         out.transactions += 1;
+        out.stream_bytes += framed_len(len);
         valid_pages = r.pages.len();
         if let Some(next) = parse_seal(&payload) {
+            out.seals += 1;
             // The journal ends here, and the next epoch's begins at `next`,
             // with a chain, a cursor and cuts of its own.
             sealed_pages.extend_from_slice(&r.pages);

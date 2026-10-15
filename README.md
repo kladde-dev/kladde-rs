@@ -45,12 +45,17 @@ The file holds the root value's encoding as one byte sequence, kept on copy-on-w
 | `kladde-varint` | LEB128 varints |
 | `kladde-svg` | an SVG drawing as a durable value, and `svg-bench`, a drawing editor's edits measured flush by flush |
 | `kladde-bench` | `text-bench`, typing into one text measured flush by flush; with `svg-bench`, the numbers behind the [evaluation](https://kladde-dev.github.io/evaluation/) |
+| `kladde-inspect` | `kladde-inspect`, a report on where the bytes of any kladde file go, whichever implementation wrote it |
 
 ```sh
 cargo test --workspace
 cargo run --release -p kladde-bench --bin text-bench -- <output directory>
 cargo run --release -p kladde-svg --bin svg-bench -- <drawing.svg> <output directory>
+cargo run --release -p kladde-inspect -- [--top N] [--types] [--map] [--no-decode] <file.kladde>
 ```
+
+`kladde-inspect` reads the file into memory and never writes to it.
+It reports every page by what it is to the governing header, and the live and dead bytes, slack and framing of each kind; the size of a fully consolidated copy, and what the difference consists of; the data pages' live fractions and ages, the spans, and the journal; and, decoded by the file's own schema, the bytes of each field, variant and type, and the largest values with where they lie.
 
 The branch `address-table` keeps the previous design, of [allocations and an address table](https://kladde-dev.github.io/superseded/allocations/), which most of the evaluation measured.
 

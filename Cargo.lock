@@ -194,6 +194,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kladde-inspect"
+version = "0.1.0"
+dependencies = [
+ "kladde-schema",
+ "kladde-store",
+ "kladde-varint",
+]
+
+[[package]]
 name = "kladde-persist"
 version = "0.1.0"
 dependencies = [

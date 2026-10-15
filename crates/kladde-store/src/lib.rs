@@ -33,6 +33,7 @@ mod error;
 mod flush;
 mod fold;
 mod hash;
+pub mod inspect;
 mod journal;
 mod load;
 mod options;
