@@ -219,6 +219,34 @@ fn power_cuts_with_commits_on_a_worker() {
     }
 }
 
+/// Payload pages for nearly every write and splice, written without an
+/// `fsync` beside the journal's appends: a power cut that keeps a
+/// transaction's records but not its payload pages loses the transaction.
+#[test]
+fn power_cuts_with_payload_pages() {
+    let opts = Options {
+        payload_threshold: 32,
+        journal_budget_pages: Some(16),
+        ..Default::default()
+    };
+    for seed in 1..150 {
+        run(seed, &opts, true);
+    }
+}
+
+#[test]
+fn power_cuts_with_payload_pages_and_commits_on_a_worker() {
+    let opts = Options {
+        payload_threshold: 32,
+        journal_budget_pages: Some(4),
+        sync_on_worker: true,
+        ..Default::default()
+    };
+    for seed in 1..150 {
+        run(seed, &opts, true);
+    }
+}
+
 #[test]
 fn a_seal_leads_recovery_to_what_was_appended_after_a_lost_header() {
     let (found, expected) = lost_header(&Options::default());

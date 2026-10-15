@@ -21,6 +21,12 @@ pub struct Stats {
     pub transactions: u64,
     /// Journal stream bytes appended.
     pub journal_bytes: u64,
+    /// Bytes of writes and splices written into payload pages rather than
+    /// into the journal, and the payload page writes that took.
+    pub payload_bytes: u64,
+    pub payload_pages_written: u64,
+    /// Bytes flushes took into the file where payload pages held them.
+    pub adopted_bytes: u64,
     /// Data pages written by flushes.
     pub data_pages_written: u64,
     /// Span-table pages written by flushes, headers excluded.

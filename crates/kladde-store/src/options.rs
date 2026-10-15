@@ -42,6 +42,17 @@ pub struct Options {
     /// New runs of bytes up to this many bytes are kept inline in their
     /// span's entry, up to the format's ceiling of 126 bytes.
     pub inline_threshold: u32,
+    /// The bytes of a write or splice of at least this many bytes are
+    /// written once, into data pages of their own that the journal names,
+    /// rather than into the journal and then again by the flush; `u32::MAX`
+    /// keeps every write's bytes in the journal.
+    ///
+    /// Either way the bytes are in the journal's world when the call
+    /// returns, and those data pages count toward
+    /// [`journal_budget_pages`](Self::journal_budget_pages), so a write
+    /// larger than the budget is followed by a flush, which keeps them where
+    /// they lie.
+    pub payload_threshold: u32,
     /// A span of bytes in a data page shorter than this is written again
     /// whole where an edit cuts into it, rather than split in two.
     pub rewrite_below: u32,
@@ -128,6 +139,7 @@ impl Default for Options {
             seal: true,
             sync_on_worker: false,
             inline_threshold: 64,
+            payload_threshold: 2048,
             rewrite_below: 64,
             span_min: 64,
             cold_flushes: 16,

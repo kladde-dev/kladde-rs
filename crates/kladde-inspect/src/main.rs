@@ -43,6 +43,7 @@ options:
 
 const MAP_LEGEND: &str = "\
   H governing header   h other header   T span-table page   J journal page
+  P payload page the journal names
   0-9 data page, by its live fraction in tenths (9: 90 % or more)
   f unreached, but kept for the other header   s unreached, stale but framed
   . unreached, zeros   ? unreached, unframed (an old journal page, say)";
@@ -400,6 +401,7 @@ struct Accounts {
     other_header: u64,
     data: Tally,
     journal: u64,
+    payload: u64,
     fallback: u64,
     stale_data: u64,
     stale_table: u64,
@@ -425,6 +427,7 @@ impl Accounts {
                 Role::Unreached if p.number < 2 => a.other_header += 1,
                 Role::Data => a.data.add(p),
                 Role::Journal => a.journal += 1,
+                Role::Payload => a.payload += 1,
                 Role::Unreached if p.fallback => a.fallback += 1,
                 Role::Unreached => match p.frame {
                     Frame::Framed { kind: 2, .. } => a.stale_data += 1,
@@ -497,6 +500,14 @@ impl Accounts {
             self.journal * page,
             file_len,
         );
+        if self.payload > 0 {
+            row(
+                "payload pages the journal names",
+                Some(self.payload),
+                self.payload * page,
+                file_len,
+            );
+        }
         row(
             "unreached pages",
             Some(self.unreached()),
@@ -539,6 +550,14 @@ impl Accounts {
             self.journal * page,
             overhead,
         );
+        if self.payload > 0 {
+            row(
+                "payload pages, which the copy holds as data",
+                Some(self.payload),
+                self.payload * page,
+                overhead,
+            );
+        }
         let tables = self.table.pages as i64 - c.table.pages as i64;
         println!(
             "  {:<44} {:>7} {:>12} {:>8}",
@@ -906,6 +925,7 @@ fn report_map(i: &Inspection) {
             Role::Header { governing: false } => 'h',
             Role::Table => 'T',
             Role::Journal => 'J',
+            Role::Payload => 'P',
             Role::Data => {
                 let tenths = p.live_bytes as usize * 10 / MAX_PAGE_CONTENT;
                 char::from_digit(tenths.min(9) as u32, 10).unwrap()

@@ -91,6 +91,10 @@ pub enum Role {
     Data,
     /// A page of the journal that follows the governing header.
     Journal,
+    /// A payload page that a complete transaction of that journal names:
+    /// a data page the journal wrote, which the flush folding the journal
+    /// takes into the file.
+    Payload,
     /// Nothing the governing header reaches: reusable, or kept for the
     /// fallback header (see [`PageInfo::fallback`]).
     Unreached,
@@ -217,6 +221,8 @@ pub struct Chain {
 pub struct Journal {
     /// The pages its valid prefix occupies, in order, through any seals.
     pub pages: Vec<u32>,
+    /// The payload pages its complete transactions name.
+    pub payload_pages: Vec<u32>,
     /// Its complete transactions, seals included, and how many of those
     /// were seals.
     pub transactions: u64,
@@ -335,6 +341,7 @@ impl Inspection {
         let recovered = recover(storage, header.epoch + 1, header.journal_pointer)?;
         let mut journal = Journal {
             pages: recovered.pages.clone(),
+            payload_pages: recovered.payload_pages.clone(),
             transactions: recovered.transactions as u64,
             seals: recovered.seals as u64,
             stream_bytes: recovered.stream_bytes,
@@ -374,6 +381,11 @@ impl Inspection {
         for &p in &journal.pages {
             if role[p as usize] == Role::Unreached {
                 role[p as usize] = Role::Journal;
+            }
+        }
+        for &p in &journal.payload_pages {
+            if role[p as usize] == Role::Unreached {
+                role[p as usize] = Role::Payload;
             }
         }
         let mut in_fallback = IdSet::default();
@@ -657,7 +669,7 @@ fn world(storage: &dyn Storage, header: &Header, file_pages: u32) -> Result<Worl
         tables.push((p, epoch, stats));
     }
     let journal = recover(storage, header.epoch + 1, header.journal_pointer)
-        .map(|r| r.pages)
+        .map(|r| r.pages.into_iter().chain(r.payload_pages).collect())
         .unwrap_or_default();
     Ok(World {
         tables,

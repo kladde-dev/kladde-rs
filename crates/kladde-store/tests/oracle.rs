@@ -272,6 +272,30 @@ fn with_a_tiny_journal() {
 }
 
 #[test]
+fn with_payload_pages_for_nearly_every_write() {
+    let opts = Options {
+        payload_threshold: 16,
+        ..Default::default()
+    };
+    for seed in 1..40 {
+        run(seed, opts.clone(), 300, 50_000);
+    }
+}
+
+#[test]
+fn with_payload_pages_a_large_journal_and_commits_on_a_worker() {
+    let opts = Options {
+        payload_threshold: 100,
+        journal_budget_pages: Some(32),
+        sync_on_worker: true,
+        ..Default::default()
+    };
+    for seed in 1..40 {
+        run(seed, opts.clone(), 300, 50_000);
+    }
+}
+
+#[test]
 fn with_eager_merges_and_a_tiny_header() {
     // Every flush walks the whole sequence, everything is cold at once, and
     // short spans merge readily.

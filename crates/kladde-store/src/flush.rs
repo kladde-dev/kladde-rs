@@ -10,7 +10,7 @@ use crate::entries::{children_len, estimate, Body, EntryOut, PageEncoder, Placed
 use crate::error::{corrupt, Error};
 use crate::fold::{fold, Piece, Src};
 use crate::hash::IdSet;
-use crate::journal::{Cursor, JournalCuts};
+use crate::journal::{Cursor, JournalCuts, Placement};
 use crate::page::{encode_page, new_page, seal_page, PageBuf};
 use crate::state::*;
 use crate::storage::Storage;
@@ -48,6 +48,9 @@ pub(crate) struct Flush {
     pub stated: IdSet,
     /// Those of them whose entry goes to the header; the rest go to leaves.
     pub header: IdSet,
+    /// Payload pages whose bytes new spans show, which the commit takes into
+    /// the file as data pages without writing them.
+    pub adopted: Vec<u32>,
 }
 
 /// What the flush writes, gathered before the commit.
@@ -57,6 +60,8 @@ pub(crate) struct Output {
     /// Leaves: page and buffer.
     pub tables: Vec<(u32, Box<PageBuf>)>,
     pub header_content: Vec<u8>,
+    /// Payload pages taken into the file as they lie.
+    pub adopted: Vec<u32>,
 }
 
 /// The largest run of bytes a span shows from a data page.
@@ -138,7 +143,7 @@ impl Inner {
             return Err(Error::Poisoned);
         }
         let (committed, ready) = self.closed();
-        let held = self.journal.bytes + (ready.bytes - committed.bytes);
+        let held = self.journal.held() + (ready.bytes - committed.bytes);
         let budget = self.opts.journal_budget(self.len) as f64 * JOURNAL_STREAM as f64;
         if (held as f64) < fraction * budget {
             return Ok(false);
@@ -247,6 +252,7 @@ impl Inner {
 
         // 4. The span table.
         self.cut(&mut f, &mut out)?;
+        out.adopted = std::mem::take(&mut f.adopted);
 
         // 5. Write, fsync, commit.
         self.commit(e, out)
@@ -406,21 +412,36 @@ impl Inner {
                     root = self.state.rope.merge(root, seg);
                 }
                 Src::Arena(a) => {
-                    let mut done = 0u64;
-                    while done < p.len {
-                        let n = (p.len - done).min(1 << 30);
-                        let start = f.scratch.len();
-                        f.scratch.resize(start + n as usize, 0);
-                        self.ops.copy_bytes(a + done, &mut f.scratch[start..]);
-                        self.stats.fresh_bytes += n;
-                        let node = self.state.rope.node(RopeItem::Lit {
-                            start: start as u32,
-                            len: n as u32,
-                        });
+                    // Bytes that lie in a payload page of this epoch keep
+                    // their place, as a span over it; the others are new.
+                    let e = self.state.flush_epoch;
+                    let min = (self.opts.rewrite_below as u64).max(1);
+                    let runs: Vec<(u64, u64, Placement)> = self
+                        .ops
+                        .placed_in(a, p.len)
+                        .filter_map(|(s, pl)| {
+                            let lo = s.max(a);
+                            let hi = (s + pl.len as u64).min(a + p.len);
+                            let skip = (lo - s) as u16;
+                            let at = Placement {
+                                len: (hi - lo) as u32,
+                                offset: pl.offset + skip,
+                                ..pl
+                            };
+                            (hi - lo >= min && pl.epoch == e).then_some((lo, hi - lo, at))
+                        })
+                        .collect();
+                    let mut at = a;
+                    let mut prev = 0;
+                    for (lo, n, pl) in runs {
+                        self.literal(f, at, lo - at, &mut root, &mut touched);
+                        let node = self.payload_span(f, pl, prev)?;
+                        prev = self.span_at(node);
                         touched.push(node);
                         root = self.state.rope.merge(root, node);
-                        done += n;
+                        at = lo + n;
                     }
+                    self.literal(f, at, a + p.len - at, &mut root, &mut touched);
                 }
             }
         }
@@ -437,6 +458,77 @@ impl Inner {
         }
         self.state.root = root;
         self.settle(f, touched)
+    }
+
+    /// Appends `len` bytes of the arena from `start` to the rope as literal
+    /// bytes, new content the flush writes.
+    fn literal(
+        &mut self,
+        f: &mut Flush,
+        start: u64,
+        len: u64,
+        root: &mut u32,
+        touched: &mut Vec<u32>,
+    ) {
+        let mut done = 0u64;
+        while done < len {
+            let n = (len - done).min(1 << 30);
+            let at = f.scratch.len();
+            f.scratch.resize(at + n as usize, 0);
+            self.ops.copy_bytes(start + done, &mut f.scratch[at..]);
+            self.stats.fresh_bytes += n;
+            let node = self.state.rope.node(RopeItem::Lit {
+                start: at as u32,
+                len: n as u32,
+            });
+            touched.push(node);
+            *root = self.state.rope.merge(*root, node);
+            done += n;
+        }
+    }
+
+    /// A new span of the sequence over the bytes `pl` names in a payload
+    /// page, which the flush takes into the file as a data page of its
+    /// epoch (`impl/flush.md#payload-pages`); returns its rope node. Its id
+    /// follows `after`, if that is free.
+    fn payload_span(&mut self, f: &mut Flush, pl: Placement, after: u32) -> Result<u32, Error> {
+        let page = pl.page;
+        match self.state.pages[page as usize] {
+            Page::Journal => {
+                self.state.pages[page as usize] = Filling::taken(PageKind::Data);
+                f.adopted.push(page);
+            }
+            Page::Filling(Filling {
+                kind: PageKind::Data,
+                ..
+            }) => {}
+            other => {
+                return Err(corrupt(format!(
+                    "payload page {page} is {other:?}, not the journal's"
+                )))
+            }
+        }
+        let e = self.state.flush_epoch;
+        let id = self.state.new_span(after).ok_or(Error::OutOfBounds)?;
+        let node = self.state.rope.node(RopeItem::Span { id, len: pl.len });
+        *self.state.span_mut(id) = Span {
+            len: pl.len,
+            next: 0,
+            content: Content::Ref {
+                page,
+                offset: pl.offset,
+            },
+            chain: Chain::Sequence,
+            entry_page: NONE,
+            heat: e,
+            node,
+            ..Span::default()
+        };
+        self.state.note_data(id);
+        self.state.cover(page, pl.len);
+        f.stated.insert(id);
+        self.stats.adopted_bytes += pl.len as u64;
+        Ok(node)
     }
 
     /// Makes position `x` of the committed sequence a boundary between rope
@@ -1355,6 +1447,7 @@ impl Inner {
         }
         let written: Vec<u32> = (out.data.iter().map(|dp| dp.page))
             .chain(out.tables.iter().map(|(p, _)| *p))
+            .chain(out.adopted.iter().copied())
             .chain([slot])
             .collect();
         debug_assert_eq!(
@@ -1459,7 +1552,7 @@ impl Inner {
                 retiring.push(p);
             }
         }
-        for &p in &self.journal.pages {
+        for &p in self.journal.pages.iter().chain(&self.journal.payload) {
             if p < self.file_pages && self.state.pages[p as usize] == Page::Journal {
                 self.state.pages[p as usize] = Page::Fallback;
                 retiring.push(p);

@@ -5,12 +5,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::{CutId, WriteBackend};
 use crate::consts::*;
+use crate::crc::Crc32c;
 use crate::error::{corrupt, Error};
 use crate::hash::IdMap;
-use crate::journal::{recover, Bytes, Cursor, JournalCuts, JournalWriter, Record, Records};
+use crate::journal::{
+    recover, Bytes, Cursor, JournalCuts, JournalWriter, Placement, Record, Records,
+};
 use crate::load::{load, pick_header};
 use crate::options::Options;
-use crate::page::{encode_page, new_page, HeaderFields, PageBuf};
+use crate::page::{encode_page, new_page, seal_page, HeaderFields, PageBuf};
 use crate::state::*;
 use crate::stats::Stats;
 use crate::storage::Storage;
@@ -225,7 +228,12 @@ impl Store {
         // to or not, and so is every page the journal went on to.
         let jp = loaded.header.fields.journal_pointer;
         let named = (jp >= 2 && jp < file_pages).then_some(jp);
-        for &p in recovered.pages.iter().chain(&named) {
+        for &p in recovered
+            .pages
+            .iter()
+            .chain(&recovered.payload_pages)
+            .chain(&named)
+        {
             match state.pages[p as usize] {
                 Page::Reusable | Page::Journal => state.pages[p as usize] = Page::Journal,
                 _ => return Err(corrupt(format!("journal page {p} is in the table's world"))),
@@ -240,7 +248,12 @@ impl Store {
         // be appended to it; an empty one is appended to from its start.
         let fold_recovered = recovered.transactions > 0;
         let journal = if fold_recovered {
-            JournalWriter::recovered(epoch + 1, recovered.pages, recovered.transactions as u64)
+            JournalWriter::recovered(
+                epoch + 1,
+                recovered.pages,
+                recovered.payload_pages,
+                recovered.transactions as u64,
+            )
         } else {
             JournalWriter::new(epoch + 1, jp)
         };
@@ -974,6 +987,10 @@ impl Inner {
             return Ok(to);
         }
         self.ensure_journal_page()?;
+        if let Err(e) = self.place_payloads(from, to) {
+            self.poisoned = true;
+            return Err(e);
+        }
         let mut payload = Vec::with_capacity((to.bytes - from.bytes) as usize);
         let mut cursor = self.journal.cursor;
         // The journal's cuts take the transaction's in place: copying them
@@ -1004,6 +1021,105 @@ impl Inner {
         self.stats.journal_bytes += self.journal.bytes - before;
         self.stats.transactions += 1;
         Ok(to)
+    }
+
+    /// Writes the bytes of every `Write` and `Splice` of `ops[from..to]`
+    /// that carries at least [`Options::payload_threshold`] bytes into the
+    /// journal's payload pages, as far as the open one has room and then a
+    /// page at a time, and records where they lie, so that the transaction
+    /// names them rather than holding them; a last part that would open a
+    /// page but is shorter than the threshold stays in the journal
+    /// (`impl/transactions-and-batches.md#payload-pages`). Each page the
+    /// transaction touched is written whole, before the transaction is
+    /// appended.
+    fn place_payloads(&mut self, from: Cursor, to: Cursor) -> Result<(), Error> {
+        let t = self.opts.payload_threshold as u64;
+        let first = self.journal_cuts.first;
+        let runs: Vec<Bytes> = self
+            .ops
+            .range(from, to)
+            .filter_map(|(_, _, r)| match r.as_written(first) {
+                Record::Write { bytes, .. } | Record::Splice { bytes, .. }
+                    if bytes.len as u64 >= t =>
+                {
+                    Some(bytes)
+                }
+                _ => None,
+            })
+            .filter(|b| self.ops.placed_in(b.start, b.len as u64).next().is_none())
+            .collect();
+        let epoch = self.journal.epoch;
+        let mut dirty = false;
+        for b in runs {
+            let len = b.len as u64;
+            let mut at = 0u64;
+            while at < len {
+                let left = len - at;
+                let room = self
+                    .journal
+                    .open
+                    .as_ref()
+                    .map_or(0, |o| MAX_PAGE_CONTENT - o.2);
+                if room == 0 {
+                    if left < t {
+                        break;
+                    }
+                    let p = take_page(
+                        &mut self.ready,
+                        &mut self.state,
+                        &mut self.file_pages,
+                        &mut *self.storage,
+                        &mut self.stats,
+                        Page::Journal,
+                    )?;
+                    self.journal.payload.push(p);
+                    self.journal.open = Some((p, new_page(), 0));
+                    continue;
+                }
+                let n = left.min(room as u64) as usize;
+                let Inner { journal, ops, .. } = self;
+                let (page, buf, used) = journal.open.as_mut().expect("a page with room");
+                let off = CONTENT_OFFSET + *used;
+                ops.copy_bytes(b.start + at, &mut buf[off..off + n]);
+                let mut crc = Crc32c::new();
+                crc.update(&buf[off..off + n]);
+                ops.place(
+                    b.start + at,
+                    Placement {
+                        len: n as u32,
+                        page: *page,
+                        offset: off as u16,
+                        crc: crc.value(),
+                        epoch,
+                    },
+                );
+                *used += n;
+                dirty = true;
+                self.stats.payload_bytes += n as u64;
+                at += n as u64;
+                if *used == MAX_PAGE_CONTENT {
+                    self.write_open_payload()?;
+                    self.journal.open = None;
+                    dirty = false;
+                }
+            }
+        }
+        if dirty {
+            self.write_open_payload()?;
+        }
+        Ok(())
+    }
+
+    /// Frames the open payload page with the journal's epoch and writes it
+    /// whole.
+    fn write_open_payload(&mut self) -> Result<(), Error> {
+        let epoch = self.journal.epoch;
+        let (page, buf, used) = self.journal.open.as_mut().expect("an open payload page");
+        seal_page(buf, None, KIND_DATA, epoch, *used);
+        self.storage
+            .write_at(&buf[..], *page as u64 * PAGE_SIZE as u64)?;
+        self.stats.payload_pages_written += 1;
+        Ok(())
     }
 
     /// Makes sure the page the journal appends to exists in the file.

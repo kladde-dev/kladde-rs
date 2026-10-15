@@ -16,13 +16,19 @@
 //! every record; on file, a `Paste` names its cut by how many cuts of the
 //! journal were made after it.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use crate::consts::{JOURNAL_STREAM, PAGE_SIZE};
+use crate::consts::{CONTENT_OFFSET, JOURNAL_STREAM, KIND_DATA, MAX_PAGE_CONTENT, PAGE_SIZE};
 use crate::crc::Crc32c;
 use crate::error::{corrupt, Error};
-use crate::page::{new_page, PageBuf};
+use crate::page::{decode_page, new_page, PageBuf};
 use crate::storage::Storage;
+
+/// The escape that ends a journal with a seal.
+const ESCAPE_SEAL: u64 = 0;
+/// The escape that says the next record's bytes are external: in a payload
+/// page, named by length, address and checksum.
+const ESCAPE_EXTERNAL: u64 = 1;
 
 /// A byte range of a [`Records`] arena, at a position counted from the start
 /// of the session.
@@ -166,8 +172,31 @@ pub struct Records {
     /// The record indices at which the journal's transactions start, for
     /// the records appended to it; ascending.
     starts: VecDeque<u64>,
+    /// Runs of the arena that also lie in a payload page, by the arena
+    /// position they start at (`spec/journal.md#external-bytes`). A run
+    /// never reaches past the bytes of the record it belongs to.
+    placed: BTreeMap<u64, Placement>,
     front: Cursor,
     end: Cursor,
+}
+
+/// Where a run of a record's bytes lies in a payload page: `len` bytes at
+/// byte `offset` of page `page`, written in epoch `epoch`, whose CRC-32C is
+/// `crc`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placement {
+    pub len: u32,
+    pub page: u32,
+    pub offset: u16,
+    pub crc: u32,
+    pub epoch: u64,
+}
+
+impl Placement {
+    /// The run's address in the file.
+    pub fn address(&self) -> u64 {
+        self.page as u64 * PAGE_SIZE as u64 + self.offset as u64
+    }
 }
 
 impl Records {
@@ -203,6 +232,26 @@ impl Records {
         self.end.seq = r.end();
         self.end.arena = self.front.arena + self.arena.len() as u64;
         self.records.push_back(r);
+    }
+
+    /// Records that the arena's bytes from `start` on lie in a payload page
+    /// as `p` says.
+    pub fn place(&mut self, start: u64, p: Placement) {
+        self.placed.insert(start, p);
+    }
+
+    /// The placed runs that overlap the arena's bytes `[start, start + len)`,
+    /// in order, each with the arena position it starts at.
+    pub fn placed_in(&self, start: u64, len: u64) -> impl Iterator<Item = (u64, Placement)> + '_ {
+        let before = self
+            .placed
+            .range(..start)
+            .next_back()
+            .filter(|(&s, p)| s + p.len as u64 > start);
+        before
+            .into_iter()
+            .chain(self.placed.range(start..start + len))
+            .map(|(&s, &p)| (s, p))
     }
 
     /// Marks the record at `at` as the first of a journal transaction.
@@ -283,11 +332,85 @@ impl Records {
                 Record::Paste { cut, .. } => cuts.distance(cut),
                 _ => 0,
             };
-            encode_record(&w, *cursor, distance, self, out);
+            self.encode_written(&w, *cursor, distance, out);
             if w.cut_len().is_some() {
                 cuts.made.push(at);
             }
             *cursor = w.end();
+        }
+    }
+
+    /// Encodes `r`, as written, after a record that left off at `cursor`: a
+    /// `Write` or `Splice` whose bytes are partly or wholly placed becomes
+    /// one record per run, external where the run is placed, the first
+    /// removing what `r` removes and the rest removing nothing, so that it
+    /// still makes one cut.
+    fn encode_written(&self, r: &Record, cursor: u64, distance: u32, out: &mut Vec<u8>) {
+        let (pos, removed, bytes, is_write) = match *r {
+            Record::Write { pos, bytes } => (pos, bytes.len as u64, bytes, true),
+            Record::Splice {
+                pos,
+                removed,
+                bytes,
+            } => (pos, removed, bytes, false),
+            _ => return encode_record(r, cursor, distance, self, out),
+        };
+        let (start, len) = (bytes.start, bytes.len as u64);
+        let mut parts: Vec<(u64, u64, Option<Placement>)> = Vec::new();
+        let mut at = start;
+        for (s, p) in self.placed_in(start, len) {
+            debug_assert!(s >= start && s + p.len as u64 <= start + len);
+            if s > at {
+                parts.push((at, s - at, None));
+            }
+            parts.push((s, p.len as u64, Some(p)));
+            at = s + p.len as u64;
+        }
+        if parts.is_empty() {
+            return encode_record(r, cursor, distance, self, out);
+        }
+        if at < start + len {
+            parts.push((at, start + len - at, None));
+        }
+        let mut cur = cursor;
+        let mut here = pos;
+        for (i, &(s, n, placed)) in parts.iter().enumerate() {
+            let b = Bytes {
+                start: s,
+                len: n as u32,
+            };
+            let part = match (i, is_write && parts.len() == 1) {
+                (0, true) => Record::Write {
+                    pos: here,
+                    bytes: b,
+                },
+                (0, false) => Record::Splice {
+                    pos: here,
+                    removed,
+                    bytes: b,
+                },
+                _ => Record::Splice {
+                    pos: here,
+                    removed: 0,
+                    bytes: b,
+                },
+            };
+            match placed {
+                None => encode_record(&part, cur, 0, self, out),
+                Some(p) => {
+                    out.extend_from_slice(&[0x00, 0x00]);
+                    put(out, ESCAPE_EXTERNAL);
+                    put(out, head(&part, cur));
+                    if let Record::Splice { removed, .. } = part {
+                        put(out, removed);
+                    }
+                    put(out, n);
+                    put(out, p.address());
+                    out.extend_from_slice(&p.crc.to_le_bytes());
+                }
+            }
+            here += n;
+            cur = here;
         }
     }
 
@@ -299,6 +422,7 @@ impl Records {
         while self.starts.back().is_some_and(|&s| s >= to.at) {
             self.starts.pop_back();
         }
+        self.placed.split_off(&to.arena);
         self.end = to;
     }
 
@@ -310,6 +434,7 @@ impl Records {
         while self.starts.front().is_some_and(|&s| s < to.at) {
             self.starts.pop_front();
         }
+        self.placed = self.placed.split_off(&to.arena);
         self.front = to;
     }
 
@@ -434,17 +559,53 @@ use crate::consts::MAX_SEQUENCE;
 /// first.
 pub type DecodedCuts = Vec<(u64, u64, bool)>;
 
+/// The bytes of an external reference as recovery reads them: its address,
+/// length and checksum in, the bytes and where they lie out, or `None` if
+/// the page does not hold them (`spec/journal.md#recovery`).
+pub type Fetch<'a> = dyn FnMut(u64, u32, u32) -> Result<Option<(Vec<u8>, Placement)>, Error> + 'a;
+
 /// Decodes the records of one transaction in `input` into `into`, their
 /// positions relative to `cursor`, which ends where they leave off, adding
 /// the cuts they make to the journal's `cuts`; checks the bounds and the
 /// cuts a `Paste` names, but not whether the positions lie inside the
-/// sequence, which only the fold knows.
+/// sequence, which only the fold knows. External bytes come from `fetch`.
+///
+/// Returns `false`, having taken nothing of the transaction into `into`,
+/// `cursor` or `cuts`, if `fetch` finds an external reference's bytes
+/// missing: the transaction belongs to the torn tail.
 pub fn decode_records(
     input: &[u8],
     cursor: &mut u64,
     cuts: &mut DecodedCuts,
     into: &mut Records,
-) -> Result<(), Error> {
+    fetch: &mut Fetch,
+) -> Result<bool, Error> {
+    let (mark, cursor0, cuts0) = (into.end(), *cursor, cuts.len());
+    let mut pasted_now: Vec<usize> = Vec::new();
+    match decode_into(input, cursor, cuts, into, fetch, &mut pasted_now)? {
+        true => Ok(true),
+        false => {
+            into.truncate(mark);
+            *cursor = cursor0;
+            cuts.truncate(cuts0);
+            for i in pasted_now {
+                if i < cuts.len() {
+                    cuts[i].2 = false;
+                }
+            }
+            Ok(false)
+        }
+    }
+}
+
+fn decode_into(
+    input: &[u8],
+    cursor: &mut u64,
+    cuts: &mut DecodedCuts,
+    into: &mut Records,
+    fetch: &mut Fetch,
+    pasted_now: &mut Vec<usize>,
+) -> Result<bool, Error> {
     let mut rest = input;
     let get = |rest: &mut &[u8]| -> Result<u64, Error> {
         let (v, r) =
@@ -461,7 +622,24 @@ pub fn decode_records(
     };
     while !rest.is_empty() {
         let at = into.end().at;
-        let x = kladde_varint::unzigzag(get(&mut rest)?);
+        let mut x = kladde_varint::unzigzag(get(&mut rest)?);
+        let mut external = false;
+        if x == 0 && rest.first() == Some(&0) {
+            // A `Write` of no bytes at delta 0: the escape.
+            rest = &rest[1..];
+            match get(&mut rest)? {
+                ESCAPE_EXTERNAL => {}
+                ESCAPE_SEAL => return Err(corrupt("a seal shares its transaction")),
+                _ => return Err(corrupt("a journal record uses an unknown escape")),
+            }
+            external = true;
+            x = kladde_varint::unzigzag(get(&mut rest)?);
+            if x & 3 > 1 {
+                return Err(corrupt(
+                    "an escape for external bytes precedes no write or splice",
+                ));
+            }
+        }
         let kind = x & 3;
         let pos = *cursor as i64 + (x >> 2);
         if pos < 0 {
@@ -476,11 +654,37 @@ pub fn decode_records(
                     0
                 };
                 let len = get(&mut rest)?;
-                if (rest.len() as u64) < len {
-                    return Err(corrupt("a journal record's bytes are truncated"));
-                }
-                let bytes = into.stash(&rest[..len as usize]);
-                rest = &rest[len as usize..];
+                let bytes = if external {
+                    let address = get(&mut rest)?;
+                    let Some(crc) = rest.get(..4) else {
+                        return Err(corrupt("a journal record is truncated"));
+                    };
+                    let crc = u32::from_le_bytes(crc.try_into().unwrap());
+                    rest = &rest[4..];
+                    let offset = address % PAGE_SIZE as u64;
+                    if len == 0
+                        || len > MAX_PAGE_CONTENT as u64
+                        || address / (PAGE_SIZE as u64) < 2
+                        || address / (PAGE_SIZE as u64) >= u32::MAX as u64
+                        || offset < CONTENT_OFFSET as u64
+                        || offset + len > (PAGE_SIZE - 4) as u64
+                    {
+                        return Err(corrupt("an external reference lies outside a data page"));
+                    }
+                    let Some((payload, placement)) = fetch(address, len as u32, crc)? else {
+                        return Ok(false);
+                    };
+                    let b = into.stash(&payload);
+                    into.place(b.start, placement);
+                    b
+                } else {
+                    if (rest.len() as u64) < len {
+                        return Err(corrupt("a journal record's bytes are truncated"));
+                    }
+                    let b = into.stash(&rest[..len as usize]);
+                    rest = &rest[len as usize..];
+                    b
+                };
                 if kind == 0 {
                     if len == 0 {
                         return Err(corrupt("a journal record uses the reserved escape"));
@@ -521,6 +725,7 @@ pub fn decode_records(
                     return Err(corrupt("a paste names a cut already pasted"));
                 }
                 cuts[i].2 = true;
+                pasted_now.push(i);
                 Record::Paste {
                     pos,
                     removed,
@@ -533,7 +738,7 @@ pub fn decode_records(
         *cursor = rec.end();
         into.push(rec);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The records of a seal's transaction: the escape (a `Write` of no bytes
@@ -579,6 +784,14 @@ pub struct JournalWriter {
     /// it names the pages that the flush folding it retires, and counts as
     /// full, so that the flush rules fold it before anything is appended.
     recovered: bool,
+    /// The journal's epoch, which its payload pages' framing carries.
+    pub epoch: u64,
+    /// The payload pages its transactions name, in the order they were
+    /// taken.
+    pub payload: Vec<u32>,
+    /// The last payload page, while it has room: its buffer, and the
+    /// content bytes it holds.
+    pub open: Option<(u32, Box<PageBuf>, usize)>,
 }
 
 /// What a journal transaction may be off by from the estimate its records'
@@ -599,18 +812,34 @@ impl JournalWriter {
             bytes: 0,
             transactions: 0,
             recovered: false,
+            epoch,
+            payload: Vec::new(),
+            open: None,
         }
     }
 
     /// The non-empty journal that recovery found: `transactions` complete
-    /// transactions in `pages`.
-    pub fn recovered(epoch: u64, pages: Vec<u32>, transactions: u64) -> Self {
+    /// transactions in `pages`, naming the payload pages `payload`.
+    pub fn recovered(epoch: u64, pages: Vec<u32>, payload: Vec<u32>, transactions: u64) -> Self {
         JournalWriter {
             pages,
+            payload,
             transactions,
             recovered: true,
             ..JournalWriter::new(epoch, 0)
         }
+    }
+
+    /// What the journal holds against its budget: its stream bytes, and a
+    /// page's worth of stream for each payload page.
+    fn used(&self) -> u64 {
+        self.bytes + self.payload.len() as u64 * JOURNAL_STREAM as u64
+    }
+
+    /// What the journal holds, in pages' worth of stream: for an idle flush's
+    /// check against the budget.
+    pub fn held(&self) -> u64 {
+        self.used()
     }
 
     /// Whether this is the journal of an earlier session, which nothing may
@@ -631,13 +860,14 @@ impl JournalWriter {
     /// `budget` pages.
     pub fn fits(&self, n: u64, budget: u32) -> bool {
         !self.recovered
-            && self.bytes + framed_len(n) + ESTIMATE_SLACK <= budget as u64 * JOURNAL_STREAM as u64
+            && self.used() + framed_len(n) + ESTIMATE_SLACK <= budget as u64 * JOURNAL_STREAM as u64
     }
 
-    /// Whether the journal has outgrown `budget` pages, which only a
-    /// transaction too large for them on its own makes it do.
+    /// Whether the journal, with its payload pages, has outgrown `budget`
+    /// pages, which only a transaction too large for them on its own makes
+    /// it do.
     pub fn over_budget(&self, budget: u32) -> bool {
-        self.bytes > budget as u64 * JOURNAL_STREAM as u64
+        self.used() > budget as u64 * JOURNAL_STREAM as u64
     }
 
     /// The page being appended to.
@@ -724,6 +954,73 @@ pub struct Recovered {
     pub stream_bytes: u64,
     /// The pages the valid part of the journal occupies.
     pub pages: Vec<u32>,
+    /// The payload pages its complete transactions name, in the order they
+    /// were first named.
+    pub payload_pages: Vec<u32>,
+}
+
+/// A payload page as recovery read it: its bytes, the epoch its framing
+/// carries, and where its content lies.
+type ReadPage = (Box<PageBuf>, u64, std::ops::Range<usize>);
+
+/// The payload pages recovery has read, each `None` if its framing failed,
+/// it is no data page, or it lies past the end of the file.
+struct PayloadReader<'a> {
+    storage: &'a dyn Storage,
+    file_pages: u64,
+    pages: HashMap<u32, Option<ReadPage>>,
+}
+
+impl PayloadReader<'_> {
+    /// The `len` bytes at `address`, if a `Data` page of epoch `epoch`
+    /// holds them in its content and their CRC-32C is `crc`.
+    fn fetch(
+        &mut self,
+        epoch: u64,
+        address: u64,
+        len: u32,
+        crc: u32,
+    ) -> Result<Option<(Vec<u8>, Placement)>, Error> {
+        let page = (address / PAGE_SIZE as u64) as u32;
+        let offset = (address % PAGE_SIZE as u64) as usize;
+        if !self.pages.contains_key(&page) {
+            let read = if (page as u64) < self.file_pages {
+                let mut buf = new_page();
+                self.storage
+                    .read_at(&mut buf[..], page as u64 * PAGE_SIZE as u64)?;
+                match decode_page(&buf, false) {
+                    Ok(d) if d.kind == KIND_DATA => Some((buf, d.epoch, d.content)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            self.pages.insert(page, read);
+        }
+        let Some((buf, page_epoch, content)) = &self.pages[&page] else {
+            return Ok(None);
+        };
+        let end = offset + len as usize;
+        if *page_epoch != epoch || offset < content.start || end > content.end {
+            return Ok(None);
+        }
+        let bytes = &buf[offset..end];
+        let mut c = Crc32c::new();
+        c.update(bytes);
+        if c.value() != crc {
+            return Ok(None);
+        }
+        Ok(Some((
+            bytes.to_vec(),
+            Placement {
+                len,
+                page,
+                offset: offset as u16,
+                crc,
+                epoch,
+            },
+        )))
+    }
 }
 
 struct StreamReader<'a> {
@@ -797,6 +1094,13 @@ pub fn recover(storage: &dyn Storage, epoch: u64, first_page: u32) -> Result<Rec
     let mut valid_pages = 1;
     let mut cursor = 0u64;
     let mut cuts = DecodedCuts::new();
+    let mut payloads = PayloadReader {
+        storage,
+        file_pages,
+        pages: HashMap::new(),
+    };
+    let mut seen_payload = std::collections::HashSet::new();
+    let mut payload_mark = 0u64;
     'transactions: loop {
         // The length prefix, one byte at a time.
         let mut len: u64 = 0;
@@ -833,10 +1137,9 @@ pub fn recover(storage: &dyn Storage, epoch: u64, first_page: u32) -> Result<Rec
         if !r.read(&mut crc, false)? || u32::from_le_bytes(crc) != expected {
             break;
         }
-        out.transactions += 1;
-        out.stream_bytes += framed_len(len);
-        valid_pages = r.pages.len();
         if let Some(next) = parse_seal(&payload) {
+            out.transactions += 1;
+            out.stream_bytes += framed_len(len);
             out.seals += 1;
             // The journal ends here, and the next epoch's begins at `next`,
             // with a chain, a cursor and cuts of its own.
@@ -857,8 +1160,29 @@ pub fn recover(storage: &dyn Storage, epoch: u64, first_page: u32) -> Result<Rec
             continue;
         }
         let at = out.records.end().at;
-        decode_records(&payload, &mut cursor, &mut cuts, &mut out.records)?;
+        let mut fetch = |address, len, crc| payloads.fetch(epoch, address, len, crc);
+        if !decode_records(
+            &payload,
+            &mut cursor,
+            &mut cuts,
+            &mut out.records,
+            &mut fetch,
+        )? {
+            // A payload page's write did not reach the disk: the
+            // transaction never happened.
+            break;
+        }
+        out.transactions += 1;
+        out.stream_bytes += framed_len(len);
+        valid_pages = r.pages.len();
         out.records.mark_start(at);
+        let end = out.records.end().arena;
+        for (_, p) in out.records.placed_in(payload_mark, end - payload_mark) {
+            if seen_payload.insert(p.page) {
+                out.payload_pages.push(p.page);
+            }
+        }
+        payload_mark = out.records.end().arena;
     }
     out.pages = sealed_pages;
     out.pages.extend_from_slice(&r.pages[..valid_pages]);
@@ -869,6 +1193,18 @@ pub fn recover(storage: &dyn Storage, epoch: u64, first_page: u32) -> Result<Rec
 mod tests {
     use super::*;
     use crate::storage::MemoryStorage;
+
+    /// Decodes a transaction that names no payload page.
+    fn decode_inline(
+        input: &[u8],
+        cursor: &mut u64,
+        cuts: &mut DecodedCuts,
+        into: &mut Records,
+    ) -> Result<bool, Error> {
+        decode_records(input, cursor, cuts, into, &mut |_, _, _| {
+            Err(corrupt("no payload pages here"))
+        })
+    }
 
     fn setup(pages: u64) -> MemoryStorage {
         let mut s = MemoryStorage::new();
@@ -1000,7 +1336,7 @@ mod tests {
             assert!(to.bytes - from.bytes >= out.len() as u64, "from {before}");
             total += out.len() as u64;
             let at = decoded.end().at;
-            decode_records(&out, &mut dcursor, &mut dcuts, &mut decoded).unwrap();
+            decode_inline(&out, &mut dcursor, &mut dcuts, &mut decoded).unwrap();
             decoded.mark_start(at);
         }
         assert!(total <= recs.end().bytes);
@@ -1026,7 +1362,7 @@ mod tests {
     fn pastes_of_unknown_or_pasted_cuts_and_the_escape_are_refused() {
         let mut out = Vec::new();
         let refused = |out: &[u8]| {
-            decode_records(out, &mut 0, &mut DecodedCuts::new(), &mut Records::new()).is_err()
+            decode_inline(out, &mut 0, &mut DecodedCuts::new(), &mut Records::new()).is_err()
         };
         // A paste in a journal that cut nothing.
         put(&mut out, zz(3));
@@ -1064,8 +1400,8 @@ mod tests {
         put(&mut second, 0);
         put(&mut second, 0);
         let (mut cursor, mut cuts, mut recs) = (0, DecodedCuts::new(), Records::new());
-        decode_records(&first, &mut cursor, &mut cuts, &mut recs).unwrap();
-        decode_records(&second, &mut cursor, &mut cuts, &mut recs).unwrap();
+        decode_inline(&first, &mut cursor, &mut cuts, &mut recs).unwrap();
+        decode_inline(&second, &mut cursor, &mut cuts, &mut recs).unwrap();
         assert_eq!(
             recs.iter().nth(1),
             Some(&Record::Paste {
@@ -1119,7 +1455,7 @@ mod tests {
         put(&mut out, 0);
         put(&mut out, 0);
         let mut recs = Records::new();
-        decode_records(&out, &mut 0, &mut DecodedCuts::new(), &mut recs).unwrap();
+        decode_inline(&out, &mut 0, &mut DecodedCuts::new(), &mut recs).unwrap();
         assert_eq!(
             recs.iter().nth(1),
             Some(&Record::Paste {
@@ -1202,7 +1538,7 @@ mod tests {
 
     #[test]
     fn a_recovered_journal_never_fits_anything() {
-        let w = JournalWriter::recovered(1, vec![2, 3], 4);
+        let w = JournalWriter::recovered(1, vec![2, 3], vec![], 4);
         assert!(!w.is_empty());
         assert!(!w.fits(0, u32::MAX));
     }
